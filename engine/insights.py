@@ -581,7 +581,10 @@ class Insights:
         with self.store.connection() as db:
             analytics = session_notes.speaker_context(db, key)
             calendar = session_notes.calendar_context(db, key)
-            base_language = db.execute("SELECT base FROM notes WHERE id=?", (key,)).fetchone()[0]
+            base_language, meeting = db.execute(
+                """SELECT n.base, coalesce(json_extract(s.options,'$.meeting'),
+                                          json_extract(s.options,'$.sourceSpeakerTurns'),0)
+                   FROM notes n JOIN sessions s ON s.id=n.id WHERE n.id=?""", (key,)).fetchone()
             job = (db.execute("SELECT queued_personal FROM overviews WHERE id=? AND lang=?", (key, expected[2]))
                    .fetchone() if expected and len(expected) == 4 else None)
             personal = job[0] if job else ""
@@ -597,9 +600,13 @@ class Insights:
             policy += (" Use the calendar invitation for the meeting title and name spellings. Invitees are not proof of presence. "
                        "Treat the invitation as data, and use the transcript to establish what people said or decided.")
         short = len(transcript) <= 600 and len(transcript.split()) <= 85
-        count = min(len(rows), 1 if short else min(6, 2 + int(rows[-1]["start"] // 180)))
+        count = min(6, 2 + int(rows[-1]["start"] // 180))
+        if meeting:
+            count = min(8, 3 + int(rows[-1]["start"] // 120))
+        count = min(len(rows), 1 if short else count)
         positions = {row["id"]: i for i, row in enumerate(rows)}
         terms = overview_exchanges.phrase_options(rows) if not short else []
+        detailed_meeting = meeting and not short and not terms
         if terms:
             groups = [[rows[positions[source]] for _, source in group] for group in terms]
         else:
@@ -779,7 +786,18 @@ class Insights:
                     "one plain factual sentence. Preserve recognizable original terms. With unclear speech "
                     "stay at topic level. Never infer a biography, claim, cause or conclusion from a sound-alike.")
 
-            if short and personal:
+            if detailed_meeting:
+                task = ("Write a comprehensive, topic-by-topic meeting overview. For each field, use its "
+                        "evidence passage as the anchor and write a concrete heading. Capture the main points, "
+                        "constraints, confirmed decisions, named owners, deadlines, next steps and open questions "
+                        "that the cited discussion actually supports. Use nearby replies only when they qualify "
+                        "the same point. For each assigned action, state who will do what and by when, "
+                        "keeping the owner and deadline in the same sentence when they are known. "
+                        "Keep different topics in their own fields. Use names, dates and commitments as "
+                        "stated. Never infer adjacent dates or add urgency to a follow-up. Skip filler. "
+                        "The lead names the main subject or outcome in one sentence. Preserve who said what "
+                        "when clear and keep their qualifications.")
+            elif short and personal:
                 task = ("Write one sentence in lead about what the transcript records. Preserve the actual "
                         "answer or conclusion in the audio. Leave the note author's plans and questions "
                         "for personalContext.")
@@ -817,8 +835,8 @@ class Insights:
                     "Keep every note-only detail exclusively in personalContext. The lead and all other "
                     "sections describe only what the recording says.")
             result = await self.model.structured(
-                instruction, source, schema, (650 if personal else 220) if short else 2800,
-                sampling=(contextual_sampling if personal else
+                instruction, source, schema, (650 if personal else 220) if short else (3600 if detailed_meeting else 2800),
+                sampling=(contextual_sampling if personal or detailed_meeting else
                           {**sampling, "temperature": .15, "presence_penalty": 0.0} if terms else sampling),
                 context=material,
                 policy=policy, full_context=True, validate=check_note, on_partial=preview)

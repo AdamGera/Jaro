@@ -11,6 +11,10 @@ import UniformTypeIdentifiers
     @MainActor
     static func main() {
         let args = Array(CommandLine.arguments.dropFirst())
+        if args == ["screen-recording-preflight"] {
+            send(["granted": CGPreflightScreenCaptureAccess()])
+            return
+        }
         // Retention needs Foundation only and must not activate Jard or Finder.
         if args.first == "trash", args.count == 2 {
             do {
@@ -25,10 +29,10 @@ import UniformTypeIdentifiers
         }
         guard let command = args.first,
               (["open-audio", "open-models"].contains(command) && args.count == 1)
-              || (command == "meeting-export-folder" && args.count == 2)
+              || (["meeting-export-folder", "annotation-folder"].contains(command) && args.count == 2)
               || (command == "save" && args.count == 2)
               || (command == "confirm" && args.count == 3) else {
-            send(["error": "Use open-audio, open-models, meeting-export-folder <folder>, save <name>, or confirm <title> <message>."])
+            send(["error": "Use open-audio, open-models, meeting-export-folder <folder>, annotation-folder <folder>, save <name>, or confirm <title> <message>."])
             exit(2)
         }
         let app = NSApplication.shared
@@ -55,15 +59,17 @@ import UniformTypeIdentifiers
         default:
             let panel = NSOpenPanel()
             let exports = command == "meeting-export-folder"
-            let folder = exports || command == "open-models"
+            let annotations = command == "annotation-folder"
+            let folder = exports || annotations || command == "open-models"
             panel.canChooseFiles = !folder
             panel.canChooseDirectories = folder
             panel.allowsMultipleSelection = false
-            panel.title = exports ? "Choose a meeting export folder" : folder ? "Choose the Jard model folder" : "Open audio"
-            if exports {
+            panel.title = exports ? "Choose a meeting export folder" : annotations ? "Choose an Annotations folder"
+                : folder ? "Choose the Jard model folder" : "Open audio"
+            if exports || annotations {
                 panel.canCreateDirectories = true
                 panel.prompt = "Choose"
-                panel.directoryURL = args[1].isEmpty
+                panel.directoryURL = args[1].isEmpty || !FileManager.default.fileExists(atPath: args[1])
                     ? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
                     : URL(fileURLWithPath: args[1], isDirectory: true)
             }

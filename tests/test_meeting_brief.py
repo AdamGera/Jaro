@@ -148,7 +148,13 @@ class MeetingBriefTests(unittest.TestCase):
                     ], None, language="Hebrew")
                     arabic = await meeting_brief.generate(model, [
                         {"start": 0, "text": "Speaker B: ستصل كتب المكتبة يوم الإثنين."},
-                    ], None, language="Arabic")
+                    ], None, language="English")
+                    live_arabic = await meeting_brief.generate_live_title(model, [
+                        {"start": 0, "text": "Speaker 1: قرر الفريق إطلاق المنتج يوم الثلاثاء.", "language": "Arabic"},
+                    ])
+                    live_hebrew = await meeting_brief.generate_live_title(model, [
+                        {"start": 0, "text": "Speaker 1: ועדת השיווק אישרה להתחיל את הקמפיין ביום שלישי.", "language": "Hebrew"},
+                    ])
                 self.assertIn("Monday", brief["summary"])
                 self.assertNotRegex(brief["summary"], r"(?i)following week|new collection|\[\d")
                 meeting_brief.validate(brief)
@@ -156,6 +162,8 @@ class MeetingBriefTests(unittest.TestCase):
                 self.assertIn("שני", hebrew["summary"])
                 self.assertRegex(arabic["title"], r"[\u0600-\u06ff]")
                 self.assertRegex(arabic["summary"], r"[إا]ثنين")
+                self.assertRegex(live_arabic, r"[\u0600-\u06ff]")
+                self.assertRegex(live_hebrew, r"[א-ת]")
             finally:
                 await model.close()
         asyncio.run(run())

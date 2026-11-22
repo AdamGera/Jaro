@@ -1,8 +1,9 @@
 import { useInterfaceLanguage } from "@/interface-language"
+import { MicrophoneLevel } from "./microphone-level"
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react"
 import { Activity, ArrowLeft, ArrowRight, Bluetooth, Check, ChevronLeft, ChevronRight, CircleAlert, Clipboard, Clock, Copy, FileText, Keyboard, Languages, LockKeyhole, Mic, Search, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Type, Volume2, Zap } from "lucide-react"
 import { AlertDialog, Dialog } from "radix-ui"
-import type { DesktopBridge, DesktopDevices } from "@/desktop"
+import type { DesktopBridge, DesktopInputDevices } from "@/desktop"
 import { profileName, type DictationHistory, type DictationHistoryEntry, type DictationPreferences, type DictationShortcutSide, type DictationStep, type SystemDictationControls } from "@/system-dictation"
 import { OutputOverview, OutputProfiles } from "./dictation-output-profiles"
 import { DictationSoundPicker } from "./dictation-sound-picker"
@@ -29,6 +30,106 @@ const modePrompt = {
   doubleTap: "Double-tap to start, then press once to finish.",
 }
 
+type ShortcutMode = DictationPreferences["mode"]
+type ShortcutSpan = readonly [start: number, end: number]
+const shortcutModes = [
+  { id: "holdDouble", title: "Hold or double-tap", presses: [[5, 29], [39, 42], [45, 48], [82, 85]], recording: [[5, 29], [48, 82]] },
+  { id: "hold", title: "Hold", presses: [[12, 78]], recording: [[12, 78]] },
+  { id: "tap", title: "Tap to start and stop", presses: [[12, 16], [78, 82]], recording: [[12, 78]] },
+  { id: "doubleTap", title: "Double-tap only", presses: [[12, 15], [18, 21], [78, 82]], recording: [[21, 78]] },
+] as const satisfies ReadonlyArray<{ id: ShortcutMode; title: string; presses: readonly ShortcutSpan[]; recording: readonly ShortcutSpan[] }>
+
+function ShortcutTimeline({ presses, recording }: { presses: readonly ShortcutSpan[]; recording: readonly ShortcutSpan[] }) {
+  return <span className="shortcut-timeline" aria-hidden="true">
+    {[presses, recording].map((lane, index) => <span className="shortcut-timeline-lane" key={index}>
+      {lane.map(([start, end]) => <span key={start} style={{ insetInlineStart: `${start}%`, width: `${end - start}%` }} />)}
+    </span>)}
+    <span className="shortcut-timeline-playhead" />
+  </span>
+}
+
+function ShortcutModePicker({ controls }: { controls: SystemDictationControls }) {
+  const { t } = useInterfaceLanguage()
+  const { status, run, pending, error } = controls
+  const [open, setOpen] = useState(false)
+  const active = useRef<HTMLButtonElement>(null)
+  const [attemptedSave, setAttemptedSave] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    const close = () => setOpen(false)
+    window.addEventListener("native-sdk:jard-window-navigation", close)
+    return () => window.removeEventListener("native-sdk:jard-window-navigation", close)
+  }, [open])
+
+  if (!status) return null
+  const selected = shortcutModes.find(mode => mode.id === status.mode) ?? shortcutModes[0]
+  function changeOpen(next: boolean) {
+    if (next && pending) return
+    setOpen(next)
+    if (next) {
+      setAttemptedSave(false)
+      if (status?.choosingShortcut) void run({ action: "cancelShortcut" })
+    }
+  }
+
+  return <Dialog.Root open={open} onOpenChange={changeOpen}>
+    <SettingRow icon={SlidersHorizontal} title={t("Shortcut mode")} label={false} find="Hold, tap, or double-tap to dictate">
+      <Dialog.Trigger asChild>
+        <Button type="button" variant="outline" size="sm" aria-label={t("Shortcut mode")} aria-disabled={pending || undefined}>
+          {t(selected.title)}<ChevronRight aria-hidden="true" />
+        </Button>
+      </Dialog.Trigger>
+    </SettingRow>
+    <Dialog.Portal>
+      <Dialog.Overlay className="dictation-tour-overlay" />
+      <Dialog.Content className="dictation-tour shortcut-mode-dialog"
+        onOpenAutoFocus={event => {
+          if (!active.current) return
+          event.preventDefault()
+          active.current.focus()
+        }}
+        onKeyDown={event => {
+          if (event.key !== "Tab" || event.altKey || event.ctrlKey || event.metaKey) return
+          // WebKit can skip buttons during Tab navigation depending on the Mac's keyboard settings.
+          const buttons = Array.from(event.currentTarget.querySelectorAll("button"))
+          const current = buttons.indexOf(document.activeElement as HTMLButtonElement)
+          const next = current < 0 ? (event.shiftKey ? buttons.length - 1 : 0)
+            : (current + (event.shiftKey ? -1 : 1) + buttons.length) % buttons.length
+          event.preventDefault()
+          buttons[next]?.focus()
+        }}>
+        <Dialog.Title>{t("Shortcut mode")}</Dialog.Title>
+        <Dialog.Description className="shortcut-mode-legend">
+          <kbd>{status.shortcutLabel}</kbd>
+          <span><i />{t("Shortcut")}</span><span><i />{t("Recording")}</span>
+        </Dialog.Description>
+        <div className="shortcut-mode-options">
+          {shortcutModes.map(mode => <button type="button" key={mode.id} className="shortcut-mode-choice"
+            ref={mode.id === selected.id ? active : undefined} aria-pressed={mode.id === selected.id}
+            aria-disabled={pending || status.choosingShortcut || undefined}
+            onClick={() => {
+              if (pending || status.choosingShortcut || mode.id === selected.id) return
+              setAttemptedSave(true)
+              void run({ action: "set", key: "mode", value: mode.id })
+            }}>
+            <span className="shortcut-mode-label">
+              <strong>{t(mode.title)}</strong>
+              <small>{t(modePrompt[mode.id])}</small>
+            </span>
+            <ShortcutTimeline presses={mode.presses} recording={mode.recording} />
+            <Check className="shortcut-mode-check" aria-hidden="true" />
+          </button>)}
+        </div>
+        {attemptedSave && error && <p className="dictation-error" role="alert">{error}</p>}
+        <div className="shortcut-mode-footer">
+          <Dialog.Close asChild><Button type="button" size="sm">{t("Done")}</Button></Dialog.Close>
+        </div>
+      </Dialog.Content>
+    </Dialog.Portal>
+  </Dialog.Root>
+}
+
 function Waveform({ live = false }: { live?: boolean }) {
   return <span className="dictation-wave" data-live={live} aria-hidden="true">
     {levels.map((level, i) => <span key={i} style={{ height: level, animationDelay: `${i * -73}ms` }} />)}
@@ -42,24 +143,30 @@ export function SystemDictationTour({ controls, modelReady, modelFailed, native 
   const [text, setText] = useState("")
   const [practiced, setPracticed] = useState(false)
   const field = useRef<HTMLTextAreaElement>(null)
+  const title = useRef<HTMLHeadingElement>(null)
   const step = status?.onboarding
   const current = steps.findIndex(item => item === step)
   const open = current >= 0
-  const ready = status?.microphone === "granted" && status.accessibility && status.listener && modelReady
-  const shortcutNeedsHelp = status?.listenerNeedsRestart && !status.listener
+  const microphoneAllowed = status?.microphone === "granted"
+  const accessAllowed = microphoneAllowed && status.accessibility
+  const ready = accessAllowed && status.listener && modelReady
+  const recovering = (step === "practice" || step === "ready") && !ready
+  const showAccess = step === "access" || recovering
+  const accessStep = !microphoneAllowed ? "microphone" : !accessAllowed ? "accessibility" : "model"
+  const shortcutNeedsHelp = accessAllowed && status.listenerNeedsRestart && !status.listener
   const busy = status?.phase === "starting" || status?.phase === "listening" || status?.phase === "processing"
 
   useEffect(() => {
-    if (step !== "practice" || !ready) return
-    const frame = requestAnimationFrame(() => field.current?.focus())
+    if (!showAccess && step !== "practice" && step !== "ready") return
+    const frame = requestAnimationFrame(() => (showAccess ? title.current : field.current ?? title.current)?.focus())
     return () => cancelAnimationFrame(frame)
-  }, [step, ready])
+  }, [step, showAccess, accessStep])
 
   if (!open || !status) return null
   function go(next: DictationStep) {
     return run({ action: "set", key: "onboarding", value: next })
   }
-  const heading = step === "welcome" ? "Speak where you write." : step === "access" ? "Give Jard access" :
+  const heading = step === "welcome" ? "Speak where you write." : showAccess ? "Give Jard access" :
     step === "practice" ? "Try the shortcut" : "Dictation is ready"
 
   return <Dialog.Root open modal>
@@ -70,8 +177,8 @@ export function SystemDictationTour({ controls, modelReady, modelFailed, native 
           <div className="dictation-tour-mark"><img src="/jard-icon.png" width="26" height="26" alt="" />{t("Jard Dictation")}</div>
           <Button size="sm" variant="ghost" disabled={pending || busy} onClick={() => void go("later")}>{t("Set up later")}</Button>
         </div>
-        <div key={step} className="dictation-tour-scene" data-step={step}>
-          <Dialog.Title>{t(heading)}</Dialog.Title>
+        <div key={showAccess ? `${step}-${accessStep}` : step} className="dictation-tour-scene" data-step={showAccess ? "access" : step}>
+          <Dialog.Title ref={title} tabIndex={-1}>{t(heading)}</Dialog.Title>
           {step === "welcome" && <>
             <Dialog.Description>{t("Hold a shortcut, speak, and watch your words land at the cursor. Your voice stays on your Mac.")}</Dialog.Description>
             <div className="dictation-demo" aria-hidden="true">
@@ -86,34 +193,40 @@ export function SystemDictationTour({ controls, modelReady, modelFailed, native 
               </div>
             </div>
           </>}
-          {step === "access" && <>
-            <Dialog.Description>{t("Two permissions connect your voice to the app you’re writing in.")}</Dialog.Description>
+          {showAccess && <>
+            <Dialog.Description>{t(accessAllowed ? "Your voice stays on your Mac." :
+              "Two permissions connect your voice to the app you’re writing in.")}</Dialog.Description>
             <div className="dictation-permissions">
-              <Permission icon={<Mic />} title={t("Microphone")} detail={t("Capture your voice while you dictate.")}
-                ready={status.microphone === "granted"} button={status.microphone === "request" ? "Allow microphone" : "Open settings"}
-                pending={pending} onClick={() => void run({ action: "microphone" })} />
-              <Permission icon={<LockKeyhole />} title={t("Accessibility")} detail={t("Listen for your shortcut and insert text at your cursor.")}
-                ready={status.accessibility} button="Open settings" pending={pending} onClick={() => void run({ action: "accessibility" })} />
-              <Permission icon={<Activity />} title="Rumble2 Flash" detail={modelFailed ? "The local speech model could not start." : t("Transcribe directly on this Mac.")}
-                ready={modelReady} />
+              {accessStep === "microphone" && <Permission icon={<Mic />} title={t("Microphone")}
+                detail={t("Capture your voice while you dictate.")} ready={false}
+                button={status.microphone === "request" ? "Allow microphone" : "Open settings"}
+                pending={pending} onClick={() => void run({ action: "microphone" })} />}
+              {accessStep === "accessibility" && <Permission icon={<LockKeyhole />} title={t("Accessibility")}
+                detail={t("Listen for your shortcut and insert text at your cursor.")} ready={false}
+                button="Open settings" pending={pending} onClick={() => void run({ action: "accessibility" })} />}
+              {accessStep === "model" && <Permission icon={<Activity />} title="Rumble2 Flash"
+                detail={t(modelFailed ? "The local speech model could not start." : "Transcribe directly on this Mac.")}
+                ready={modelReady} unavailable={modelFailed} />}
             </div>
-            {status.accessibilityStale && !status.accessibility && <>
+            {accessStep === "accessibility" && status.accessibilityStale && <>
               <p className="dictation-tour-hint">Jard still can’t use Accessibility. If its switch is already on, you can reopen Jard or reset its entry and grant access again.</p>
               <div className="dictation-settings-actions">
                 <Button variant="outline" size="sm" disabled={pending} onClick={() => void run({ action: "repairAccessibility" })}>Reset Accessibility</Button>
                 <Button variant="ghost" size="sm" disabled={pending} onClick={() => void run({ action: "reopen" })}>{t("Reopen Jard")}</Button>
               </div>
             </>}
-            {shortcutNeedsHelp && <>
+            {shortcutNeedsHelp ? <>
               <p className="dictation-tour-hint">{t("Jaro is retrying the shortcut. If it stays unavailable, reopen the app.")}</p>
               <div className="dictation-settings-actions">
                 <Button variant="outline" size="sm" disabled={pending} onClick={() => void run({ action: "reopen" })}>{t("Reopen Jard")}</Button>
-                {shortcutNeedsHelp && !status.inputMonitoring && <Button variant="outline" size="sm" disabled={pending}
+                {!status.inputMonitoring && <Button variant="outline" size="sm" disabled={pending}
                   onClick={() => void run({ action: "inputMonitoring" })}>Check Input Monitoring</Button>}
               </div>
-            </>}
+            </> : accessAllowed && !ready && !modelFailed && <p className="dictation-tour-hint" role="status">
+              {t("Waiting for microphone, shortcut, and model…")}
+            </p>}
           </>}
-          {step === "practice" && <>
+          {step === "practice" && !showAccess && <>
             <Dialog.Description><kbd>{status.shortcutLabel}</kbd> {t(modePrompt[status.mode])}</Dialog.Description>
             <div className="dictation-practice">
               <label htmlFor="dictation-practice">{t("Try saying “Here’s what I want to work on today.”")}</label>
@@ -123,7 +236,7 @@ export function SystemDictationTour({ controls, modelReady, modelFailed, native 
               {status.preview && <p className="dictation-preview" dir="auto">{status.preview}</p>}
               <div className="dictation-practice-state" aria-live="polite">
                 <Waveform live={busy} />
-                <span>{text && practiced ? t("Your words landed.") : !ready ? t("Waiting for microphone, shortcut, and model…") :
+                <span>{text && practiced ? t("Your words landed.") :
                   t(status.message || "Wait for Listening, then speak.")}</span>
                 {text && <Button variant="ghost" size="sm" onClick={() => { setText(""); setPracticed(false); field.current?.focus() }}>
                   {t("Try again")}
@@ -134,7 +247,7 @@ export function SystemDictationTour({ controls, modelReady, modelFailed, native 
               ? <>Press <kbd>{status.cancelLabel || "Escape"}</kbd> while recording to discard the take.</>
               : <>Press <kbd>Esc</kbd> while still holding your shortcut to discard the take.</>}</p>}
           </>}
-          {step === "ready" && <>
+          {step === "ready" && !showAccess && <>
             <Dialog.Description>{t("Your shortcut works anywhere Jard is running.")}</Dialog.Description>
             <div className="dictation-ready-mark"><Check size={36} strokeWidth={1.6} /></div>
             <div className="dictation-ready-key"><kbd>{status.shortcutLabel}</kbd><span>{t(modePrompt[status.mode])}</span></div>
@@ -148,9 +261,9 @@ export function SystemDictationTour({ controls, modelReady, modelFailed, native 
           <div className="dictation-progress" aria-label={t("Step {step} of {total}", { step: current + 1, total: steps.length })}>
             {steps.map((item, index) => <span key={item} data-active={index <= current} />)}
           </div>
-          <Button disabled={pending || busy || (step === "access" && !ready)}
+          <Button disabled={pending || busy || (showAccess && !ready)}
             onClick={() => void go(current === steps.length - 1 ? "done" : steps[current + 1])}>
-            {step === "welcome" ? t("Set up dictation") : step === "practice" && !(text && practiced) ? t("Skip practice") :
+            {step === "welcome" ? t("Set up dictation") : showAccess ? t("Continue") : step === "practice" && !(text && practiced) ? t("Skip practice") :
               step === "ready" ? t("Start using Jard") : t("Continue")}<ArrowRight />
           </Button>
         </div>
@@ -159,16 +272,16 @@ export function SystemDictationTour({ controls, modelReady, modelFailed, native 
   </Dialog.Root>
 }
 
-function Permission({ icon, title, detail, ready, button, pending, onClick }: {
-  icon: React.ReactNode; title: string; detail: string; ready: boolean; button?: string; pending?: boolean; onClick?: () => void
+function Permission({ icon, title, detail, ready, button, pending, unavailable, onClick }: {
+  icon: React.ReactNode; title: string; detail: string; ready: boolean; button?: string; pending?: boolean; unavailable?: boolean; onClick?: () => void
 }) {
   const { t } = useInterfaceLanguage()
   return <div className="dictation-permission" data-ready={ready}>
     <span className="dictation-permission-icon" aria-hidden="true">{icon}</span>
     <div><strong>{title}</strong><small>{detail}</small></div>
     {ready ? <span className="dictation-granted"><Check size={14} />{t("Ready")}</span> :
-      button ? <Button variant="outline" size="sm" disabled={pending} onClick={onClick}>{button}</Button> :
-      <span className="dictation-granted">Waiting</span>}
+      button ? <Button variant="outline" size="sm" disabled={pending} onClick={onClick}>{t(button)}</Button> :
+      <span className="dictation-granted">{t(unavailable ? "Unavailable" : "Waiting")}</span>}
   </div>
 }
 
@@ -178,12 +291,13 @@ type SettingsProps = {
   languages: { code: string; name: string }[]
 }
 
-export function SystemDictationSettings({ controls, native, languages, monitor = true, loginVisible = true }: SettingsProps & {
-  monitor?: boolean; loginVisible?: boolean
+export function SystemDictationSettings({ controls, native, languages, monitor = true, visible = true }: SettingsProps & {
+  monitor?: boolean; visible?: boolean
 }) {
   const { t } = useInterfaceLanguage()
   const { status, run, error, pending, setSettingsVisible } = controls
-  const [devices, setDevices] = useState<DesktopDevices>()
+  const [devices, setDevices] = useState<DesktopInputDevices>()
+  const refreshDevices = useRef<(() => void) | null>(null)
   const [feedbackVisible, setFeedbackVisible] = useState(false)
   const stopSoundPreview = useCallback(() => {
     void native.request("systemDictation", { action: "stopSoundPreview" }).catch(() => {})
@@ -199,10 +313,34 @@ export function SystemDictationSettings({ controls, native, languages, monitor =
   }, [monitor, setSettingsVisible])
 
   useEffect(() => {
+    if (!visible) return
     let active = true
-    void native.request("devices").then(result => { if (active) setDevices(result) }).catch(() => {})
-    return () => { active = false }
-  }, [native])
+    let reading = false
+    let invalidated = false
+    async function refresh() {
+      invalidated = true
+      if (reading) return
+      reading = true
+      while (active && invalidated && !document.hidden) {
+        invalidated = false
+        try {
+          const snapshot = await native.request("inputDevices")
+          if (active && !invalidated) setDevices(snapshot)
+        } catch { /* Keep the last available list until the next refresh. */ }
+      }
+      reading = false
+    }
+    refreshDevices.current = refresh
+    window.addEventListener("native-sdk:jard-input-devices", refresh)
+    document.addEventListener("visibilitychange", refresh)
+    void refresh()
+    return () => {
+      active = false
+      refreshDevices.current = null
+      window.removeEventListener("native-sdk:jard-input-devices", refresh)
+      document.removeEventListener("visibilitychange", refresh)
+    }
+  }, [native, visible])
 
   if (!status) return null
   function set<K extends keyof DictationPreferences>(key: K, value: DictationPreferences[K]) {
@@ -211,6 +349,13 @@ export function SystemDictationSettings({ controls, native, languages, monitor =
   const access = status.microphone === "granted" && status.accessibility
   const systemMicrophone = devices?.dictationMicrophones?.[status.avoidBluetooth ? 1 : 0] ?? devices?.microphone
   const warmInput = status.enabled && access && status.listener ? status.warmInput : undefined
+  const selectedInput = inputs.find(input => input.id === status.inputDevice)
+  const missingInput = !!status.inputDevice && !selectedInput
+  const unavailableInput = missingInput || selectedInput?.unavailable
+  const fallbackMicrophone = warmInput?.phase === "fallback" ? warmInput.microphone
+    : !warmInput && unavailableInput ? systemMicrophone : undefined
+  const lidBlocksInput = !warmInput && !systemMicrophone && (!status.inputDevice || unavailableInput)
+    && inputs.some(input => input.unavailable)
   const microphoneProblem = warmInput?.phase === "unavailable" ? warmInput.message : ""
   const failureMessage = microphoneProblem || status.lastFailure
   const soundVolume = status.soundVolume ?? 70
@@ -246,7 +391,7 @@ export function SystemDictationSettings({ controls, native, languages, monitor =
         <Button type="button" size="sm" variant="outline" disabled={!status.hasLast || pending}
           onClick={() => void run({ action: "copyLast" })}><Clipboard />Copy last</Button>
       </div>
-      {loginVisible && <LaunchAtLogin native={native} />}
+      {visible && <LaunchAtLogin native={native} />}
     </div>
 
     <SettingGroup id="dictation-shortcuts-title" title={t("Shortcuts")}>
@@ -257,17 +402,14 @@ export function SystemDictationSettings({ controls, native, languages, monitor =
           {status.shortcutTarget === "shortcut" ? "Press a key or Esc" : status.shortcutLabel}
         </Button>
       </SettingRow>
-      <SettingRow icon={SlidersHorizontal} title={t("Shortcut mode")}>
-        <select value={status.mode} disabled={pending}
-          onChange={event => void set("mode", event.target.value as DictationPreferences["mode"])}>
-          <option value="holdDouble">{t("Hold or double-tap")}</option><option value="hold">{t("Hold")}</option><option value="tap">Tap to start and stop</option><option value="doubleTap">Double-tap only</option>
-        </select>
-      </SettingRow>
+      {visible && <ShortcutModePicker controls={controls} />}
       {status.shortcutSide && <SettingRow icon={Keyboard} title={t("Shortcut side")}>
-        <select value={status.shortcutSide} disabled={pending || status.choosingShortcut}
-          onChange={event => void run({ action: "setShortcutSide", value: event.target.value as DictationShortcutSide })}>
-          <option value="left">{t("Left")}</option><option value="either">{t("Either")}</option><option value="right">{t("Right")}</option>
-        </select>
+        {labels => (
+          <select {...labels} value={status.shortcutSide} disabled={pending || status.choosingShortcut}
+            onChange={event => void run({ action: "setShortcutSide", value: event.target.value as DictationShortcutSide })}>
+            <option value="left">{t("Left")}</option><option value="either">{t("Either")}</option><option value="right">{t("Right")}</option>
+          </select>
+        )}
       </SettingRow>}
       {status.mode === "tap" && <SettingRow icon={CircleAlert} title="Cancel shortcut" find="Discard the current take" detail="Discards the current take." label={false}>
         <div className="dictation-row-actions">
@@ -310,26 +452,37 @@ export function SystemDictationSettings({ controls, native, languages, monitor =
 
     <SettingGroup id="dictation-input-title" title="Voice input">
       <SettingRow icon={Languages} title={t("Language")}>
-        <select disabled={pending} value={status.languages[0] || ""} onChange={event => void set("languages", event.target.value ? [event.target.value] : [])}>
-          <option value="">Detect automatically</option>
-          {languages.map(language => <option key={language.code} value={language.code}>{language.name}</option>)}
-        </select>
+        {labels => (
+          <select {...labels} disabled={pending} value={status.languages[0] || ""} onChange={event => void set("languages", event.target.value ? [event.target.value] : [])}>
+            <option value="">Detect automatically</option>
+            {languages.map(language => <option key={language.code} value={language.code}>{language.name}</option>)}
+          </select>
+        )}
       </SettingRow>
       <DictationVocabulary controls={controls} />
-      <SettingRow icon={Mic} title={t("Microphone")}
-        detail={warmInput?.phase === "fallback" ? t("Using {microphone} for dictation.", { microphone: warmInput.microphone }) : undefined}>
-        <select value={status.inputDevice ?? ""} disabled={pending}
-          onFocus={() => void native.request("devices").then(setDevices).catch(() => {})}
-          onChange={event => void set("inputDevice", event.target.value)}>
-          <option value="">{t("System default")}{systemMicrophone && " · " + systemMicrophone}</option>
-          {status.inputDevice && !inputs.some(input => input.id === status.inputDevice) &&
-            <option value={status.inputDevice}>Previously selected microphone</option>}
-          {inputs.map(input => <option key={input.id} value={input.id}>{input.name}</option>)}
-        </select>
+      <SettingRow icon={Mic} title={t("Microphone")} anchor="dictation-microphone"
+        detail={fallbackMicrophone ? t("Using {microphone} for dictation.", { microphone: fallbackMicrophone })
+          : lidBlocksInput ? t("The built-in microphone is off while the lid is closed. Open the lid or connect a microphone.") : undefined}>
+        {labels => (
+          <span className="dictation-microphone-control">
+            <MicrophoneLevel native={native} enabled={Boolean(visible && status.enabled && access && status.listener)} />
+            <select {...labels} value={status.inputDevice ?? ""} disabled={pending}
+              onFocus={() => refreshDevices.current?.()}
+              onChange={event => void set("inputDevice", event.target.value)}>
+              <option value="">{t("System default")}{systemMicrophone && " · " + systemMicrophone}</option>
+              {missingInput &&
+                <option value={status.inputDevice}>{t("Previously selected microphone")}{devices && " · " + t("Unavailable")}</option>}
+              {inputs.map(input => <option key={input.id} value={input.id} disabled={input.unavailable}>
+                {input.name}{input.unavailable && " · " + t("Unavailable")}</option>)}
+            </select>
+          </span>
+        )}
       </SettingRow>
       <SettingRow icon={Zap} title="Keep microphone ready" find={t("Turn off the mic when not dictating")} detail="macOS shows the mic in use while Jard is ready to dictate.">
-        <input type="checkbox" role="switch" checked={status.keepMicrophoneReady ?? false} disabled={pending}
-          onChange={event => void set("keepMicrophoneReady", event.target.checked)} />
+        {labels => (
+          <input {...labels} type="checkbox" role="switch" checked={status.keepMicrophoneReady ?? false} disabled={pending}
+            onChange={event => void set("keepMicrophoneReady", event.target.checked)} />
+        )}
       </SettingRow>
     </SettingGroup>
 
@@ -338,22 +491,26 @@ export function SystemDictationSettings({ controls, native, languages, monitor =
       <SettingDisclosure icon={Volume2} title="Audio and feedback"
         onToggle={setFeedbackVisible}>
         <SettingRow icon={Volume2} title={t("While dictating")} find="Playback volume, mute, lower audio or pause media">
-          <select value={status.audioWhileDictating ?? "none"} disabled={pending}
-            onChange={event => void set("audioWhileDictating", event.target.value as DictationPreferences["audioWhileDictating"])}>
-            <option value="none">{t("Do nothing")}</option><option value="mute">{t("Mute")}</option>
-            <option value="lower">{t("Lower audio")}</option><option value="pause">{t("Pause media")}</option>
-          </select>
+          {labels => (
+            <select {...labels} value={status.audioWhileDictating ?? "none"} disabled={pending}
+              onChange={event => void set("audioWhileDictating", event.target.value as DictationPreferences["audioWhileDictating"])}>
+              <option value="none">{t("Do nothing")}</option><option value="mute">{t("Mute")}</option>
+              <option value="lower">{t("Lower audio")}</option><option value="pause">{t("Pause media")}</option>
+            </select>
+          )}
         </SettingRow>
         {status.audioWhileDictating === "lower" && <SettingRow icon={Volume2} title={t("Lower to")} detail={t("Percent of the current output volume.")}>
-          <input type="number" min={0} max={100} step={1} required disabled={pending}
-            key={status.lowerAudioPercent} defaultValue={status.lowerAudioPercent ?? 20}
-            onBlur={event => {
-              const input = event.currentTarget
-              const previous = status.lowerAudioPercent ?? 20
-              if (!input.validity.valid) input.valueAsNumber = previous
-              else if (input.valueAsNumber !== previous) void set("lowerAudioPercent", input.valueAsNumber)
-            }}
-            onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur() }} />
+          {labels => (
+            <input {...labels} type="number" min={0} max={100} step={1} required disabled={pending}
+              key={status.lowerAudioPercent} defaultValue={status.lowerAudioPercent ?? 20}
+              onBlur={event => {
+                const input = event.currentTarget
+                const previous = status.lowerAudioPercent ?? 20
+                if (!input.validity.valid) input.valueAsNumber = previous
+                else if (input.valueAsNumber !== previous) void set("lowerAudioPercent", input.valueAsNumber)
+              }}
+              onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur() }} />
+          )}
         </SettingRow>}
         {status.audioWhileDictating === "pause" && <SettingRow icon={LockKeyhole} title="Playback control" find={false}
           detail={status.mediaAccessMessage || "Open Music, Spotify, or VLC before allowing playback control."} label={false}>
@@ -365,45 +522,61 @@ export function SystemDictationSettings({ controls, native, languages, monitor =
           </div>
         </SettingRow>}
         <SettingRow icon={Bluetooth} title="Prefer the Mac’s mic over Bluetooth">
-          <input type="checkbox" role="switch" checked={status.avoidBluetooth ?? false} disabled={pending || !!status.inputDevice}
-            onChange={event => void set("avoidBluetooth", event.target.checked)} />
+          {labels => (
+            <input {...labels} type="checkbox" role="switch" checked={status.avoidBluetooth ?? false} disabled={pending || !!status.inputDevice}
+              onChange={event => void set("avoidBluetooth", event.target.checked)} />
+          )}
         </SettingRow>
         <SettingRow icon={Activity} title={t("Recording indicator")} find="Dictation HUD position">
-          <select value={status.placement} disabled={pending}
-            onChange={event => void set("placement", event.target.value as DictationPreferences["placement"])}>
-            <option value="top">Top of screen</option><option value="bottom">Bottom of screen</option><option value="cursor">Near the cursor</option><option value="off">Hidden</option>
-          </select>
+          {labels => (
+            <select {...labels} value={status.placement} disabled={pending}
+              onChange={event => void set("placement", event.target.value as DictationPreferences["placement"])}>
+              <option value="top">Top of screen</option><option value="bottom">Bottom of screen</option><option value="cursor">Near the cursor</option><option value="off">Hidden</option>
+            </select>
+          )}
         </SettingRow>
         <SettingRow icon={FileText} title="Show live words in practice" detail="Show a draft in the setup practice field while you speak.">
-          <input type="checkbox" role="switch" checked={status.livePreview ?? false} disabled={pending}
-            onChange={event => void set("livePreview", event.target.checked)} />
+          {labels => (
+            <input {...labels} type="checkbox" role="switch" checked={status.livePreview ?? false} disabled={pending}
+              onChange={event => void set("livePreview", event.target.checked)} />
+          )}
         </SettingRow>
         <SettingRow icon={Volume2} title="Play dictation sounds">
-          <input type="checkbox" role="switch" checked={status.sound ?? false} disabled={pending}
-            onChange={event => void set("sound", event.target.checked)} />
+          {labels => (
+            <input {...labels} type="checkbox" role="switch" checked={status.sound ?? false} disabled={pending}
+              onChange={event => void set("sound", event.target.checked)} />
+          )}
         </SettingRow>
         <DictationSoundPicker controls={controls} visible={feedbackVisible} />
         <SettingRow icon={Volume2} title={t("Sound volume")}>
-          <input key={soundVolume} defaultValue={soundVolume} type="range" min={0} max={100}
-            disabled={pending || !status.sound} onPointerUp={event => saveSoundVolume(event.currentTarget)}
-            onKeyUp={event => saveSoundVolume(event.currentTarget)} />
+          {labels => (
+            <input {...labels} key={soundVolume} defaultValue={soundVolume} type="range" min={0} max={100}
+              disabled={pending || !status.sound} onPointerUp={event => saveSoundVolume(event.currentTarget)}
+              onKeyUp={event => saveSoundVolume(event.currentTarget)} />
+          )}
         </SettingRow>
       </SettingDisclosure>
 
       <SettingDisclosure icon={Type} title="Output and vocabulary corrections">
         <SettingRow icon={Clipboard} title="Insert text by">
-          <select value={status.output} disabled={pending}
-            onChange={event => void set("output", event.target.value as DictationPreferences["output"])}>
-            <option value="paste">{t("Paste")}</option><option value="type">Type</option><option value="copy">Copy only</option>
-          </select>
+          {labels => (
+            <select {...labels} value={status.output} disabled={pending}
+              onChange={event => void set("output", event.target.value as DictationPreferences["output"])}>
+              <option value="paste">{t("Paste")}</option><option value="type">Type</option><option value="copy">Copy only</option>
+            </select>
+          )}
         </SettingRow>
         <SettingRow icon={Type} title="Remove “um,” “uh,” and “erm”">
-          <input type="checkbox" role="switch" checked={status.fillerWords ?? false} disabled={pending}
-            onChange={event => void set("fillerWords", event.target.checked)} />
+          {labels => (
+            <input {...labels} type="checkbox" role="switch" checked={status.fillerWords ?? false} disabled={pending}
+              onChange={event => void set("fillerWords", event.target.checked)} />
+          )}
         </SettingRow>
         <SettingRow icon={FileText} title="Apply “new line” and “new paragraph”">
-          <input type="checkbox" role="switch" checked={status.spokenFormatting ?? false} disabled={pending}
-            onChange={event => void set("spokenFormatting", event.target.checked)} />
+          {labels => (
+            <input {...labels} type="checkbox" role="switch" checked={status.spokenFormatting ?? false} disabled={pending}
+              onChange={event => void set("spokenFormatting", event.target.checked)} />
+          )}
         </SettingRow>
         <RuleEditor label="Word replacements" help="Enter one correction per line, such as jard audio => Jard Audio." value={status.replacements}
           save={value => set("replacements", value)} />
@@ -455,17 +628,12 @@ export function SystemDictationWorkspace({ destination, ...props }: SettingsProp
       <div className="dictation-workspace-actions">
         <SettingsSearch scope={tab === "output" ? output : general} localFind={tab !== "history"}
           onReveal={() => setTab(tab === "output" ? "output" : "general")} />
-      {tab === "history" && status && <label className="dictation-retention"><Clock aria-hidden="true" />
-        <select aria-label={t("History retention")} value={status.retention} disabled={pending}
-          onChange={event => void run({ action: "set", key: "retention", value: Number(event.target.value) as DictationPreferences["retention"] })}>
-          <option value={0}>{t("History off")}</option><option value={1}>Keep for 1 day</option>
-          <option value={7}>Keep for 7 days</option><option value={30}>Keep for 30 days</option>
-        </select>
-      </label>}
+      {tab === "history" && status && <HistoryRetention value={status.retention} pending={pending}
+        onChange={value => void run({ action: "set", key: "retention", value })} />}
       </div>
     </div>
     <TabsContent value="general" forceMount hidden={tab !== "general"}>
-      <div ref={general}><SystemDictationSettings {...props} monitor={false} loginVisible={tab === "general"} /></div>
+      <div ref={general}><SystemDictationSettings {...props} monitor={false} visible={tab === "general"} /></div>
     </TabsContent>
     <TabsContent value="output"><div ref={output}>
       {status && <OutputOverview native={props.native} status={status} />}
@@ -474,12 +642,32 @@ export function SystemDictationWorkspace({ destination, ...props }: SettingsProp
   </Tabs>
 }
 
+export function HistoryRetention({ value, pending, onChange }: {
+  value: DictationPreferences["retention"]; pending: boolean; onChange: (value: DictationPreferences["retention"]) => void
+}) {
+  const { t } = useInterfaceLanguage()
+  return <label className="dictation-retention"><Clock aria-hidden="true" />
+    <select aria-label={t("History retention")} value={value} disabled={pending}
+      onChange={event => onChange(Number(event.target.value) as DictationPreferences["retention"])}>
+      <option value={0}>{t("History off")}</option><option value={1}>{t("Keep for 1 day")}</option>
+      <option value={7}>{t("Keep for 7 days")}</option><option value={30}>{t("Keep for 30 days")}</option>
+    </select>
+  </label>
+}
+
 function DictationHistoryTab({ controls, native }: Pick<SettingsProps, "controls" | "native">) {
   const { t } = useInterfaceLanguage()
   const { status, run, pending, error } = controls
+  const loadHistory = useCallback(async (query: string, offset: number) => {
+    const result = await native.request("systemDictation", { action: "history", query, offset })
+    if (!("entries" in result)) throw new Error("Could not read dictation history.")
+    return result
+  }, [native])
 
   return <section className="dictation-history-tab" aria-label={t("Dictation history")}>
-    <History native={native} run={run} pending={pending}
+    <DictationHistoryBrowser loadHistory={loadHistory} pending={pending}
+      copyHistory={ids => run({ action: "bulkHistory", operation: "copy", ids })}
+      deleteHistory={ids => run(ids ? { action: "bulkHistory", operation: "delete", ids } : { action: "clearHistory" })}
       historyRevision={[status?.historyRevision, status?.retention].join(":")} />
     {error && <p className="dictation-error" role="alert">{error}</p>}
   </section>
@@ -529,8 +717,12 @@ function HistoryProcessing({ processing }: Pick<DictationHistoryEntry, "processi
   return <div><dt>{t("Processing")}</dt><dd>{summary}</dd></div>
 }
 
-function History({ native, run, pending, historyRevision }: {
-  native: DesktopBridge; run: SystemDictationControls["run"]; pending: boolean; historyRevision: string
+export function DictationHistoryBrowser({ loadHistory, copyHistory, deleteHistory, pending, historyRevision }: {
+  loadHistory: (query: string, offset: number) => Promise<DictationHistory>
+  copyHistory: (ids: string[], text: string) => Promise<boolean>
+  deleteHistory: (ids?: string[]) => Promise<boolean>
+  pending: boolean
+  historyRevision: string
 }) {
   const { t } = useInterfaceLanguage()
   const [query, setQuery] = useState("")
@@ -551,8 +743,8 @@ function History({ native, run, pending, historyRevision }: {
   useEffect(() => {
     let active = true
     const timer = window.setTimeout(() => {
-      void native.request("systemDictation", { action: "history", query, offset }).then(result => {
-        if (!active || !("entries" in result)) return
+      void loadHistory(query, offset).then(result => {
+        if (!active) return
         if (offset > 0 && result.total <= offset) {
           setOffset(0)
           return
@@ -562,7 +754,7 @@ function History({ native, run, pending, historyRevision }: {
       }).catch(() => { if (active) setResponse({ query, offset }) })
     }, 125)
     return () => { active = false; window.clearTimeout(timer) }
-  }, [native, query, offset, revision, historyRevision])
+  }, [loadHistory, query, offset, revision, historyRevision])
 
   const current = response?.query === query && response.offset === offset ? response : undefined
   const results = current?.data
@@ -654,12 +846,13 @@ function History({ native, run, pending, historyRevision }: {
 
   async function copy(ids: string[], key: string) {
     setCopied(undefined)
-    if (await run({ action: "bulkHistory", operation: "copy", ids })) setCopied(key)
+    const ordered = entries.filter(item => ids.includes(item.id))
+    if (await copyHistory(ids, ordered.map(item => item.text).join("\n\n"))) setCopied(key)
   }
 
   async function remove() {
     if (!confirm) return
-    if (!await run(confirm === "all" ? { action: "clearHistory" } : { action: "bulkHistory", operation: "delete", ids: confirm.ids })) return
+    if (!await deleteHistory(confirm === "all" ? undefined : confirm.ids)) return
     setConfirm(undefined)
     setSelected([])
     setAnchor(undefined)
@@ -775,7 +968,7 @@ function History({ native, run, pending, historyRevision }: {
             else searchInput.current?.focus()
           }}>
           <AlertDialog.Title>{confirm === "all" ? "Clear dictation history?" : "Delete selected dictations?"}</AlertDialog.Title>
-          <AlertDialog.Description>These dictations will be removed from this Mac.</AlertDialog.Description>
+          <AlertDialog.Description>{t("These dictations will be removed from this device.")}</AlertDialog.Description>
           <div className="dictation-settings-actions">
             <AlertDialog.Cancel asChild><Button variant="outline">{t("Cancel")}</Button></AlertDialog.Cancel>
             <Button variant="destructive" disabled={pending} onClick={() => void remove()}>{t("Delete")}</Button>

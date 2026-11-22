@@ -44,6 +44,11 @@ def exercise(executable, folder, mode):
         result = child.wait(timeout=5)
         assert events[0]["event"] == "started", events
         assert any(e["event"] == "levels" and e["system"] == .5 and e["mic"] == .25 for e in events)
+        readings = [e["meetingRms"] for e in events if "meetingRms" in e]
+        if tracks:
+            assert 0.5 in readings, events
+        else:
+            assert not readings, events
         with wave.open(str(path), "rb") as w:
             assert w.getframerate() == 48000 and w.getnchannels() == 1 and w.getsampwidth() == 2
             frames = w.getnframes()
@@ -74,6 +79,37 @@ def exercise(executable, folder, mode):
         if child.poll() is None:
             child.kill()
             child.wait()
+
+
+def exercise_microphone_only(executable, folder):
+    path = folder / "mic-only.wav"
+    path.touch()
+    with subprocess.Popen([executable, "record", "--mode", "mic", "--output", str(path)],
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+        try:
+            started = json.loads(child.stdout.readline())
+            assert started["event"] == "started" and started["mode"] == "mic", started
+            for line in child.stdout:
+                event = json.loads(line)
+                if event["event"] == "levels":
+                    assert event["system"] == 0 and "meetingRms" not in event, event
+                    if event["seconds"] >= 1.25:
+                        assert event["mic"] == .25, event
+                        break
+            else:
+                raise AssertionError("Microphone recording ended before producing levels.")
+            remaining, _ = child.communicate("stop\n", timeout=5)
+            assert child.returncode == 0 and json.loads(remaining.splitlines()[-1])["event"] == "finished", remaining
+        finally:
+            if child.poll() is None:
+                child.kill()
+    with wave.open(str(path)) as audio:
+        assert (audio.getframerate(), audio.getnchannels(), audio.getsampwidth()) == (48000, 1, 2)
+        assert audio.getnframes() >= 48000
+        audio.setpos(16000)
+        assert struct.unpack("<h", audio.readframes(1)) == (8192,)
+    assert list(folder.glob("mic-only*")) == [path]
+    print("Mic-only capture preserved the microphone level and saved a single WAV.")
 
 
 def exercise_overlapping_takes(executable, folder):
@@ -167,6 +203,62 @@ def exercise_source_handoff(executable, root, *, system_restart):
             assert signal[handoff:handoff + 12000] == (4096,) * 12000
             assert mac.readframes(32000) == struct.pack("<h", 16384) * 32000
             print("Meeting microphone handoff dropped old tap callbacks and overlap while Mac audio stayed continuous.")
+
+
+def exercise_system_fallback(executable, root, *, scenario="waiting"):
+    recording = root / f"system-fallback-{scenario}.wav"
+    microphone = Path(str(recording) + ".mic.wav")
+    system = Path(str(recording) + ".system.wav")
+    for path in (recording, microphone, system):
+        path.touch()
+    backend = "tap" if scenario == "recover" else "screen"
+    option = "tap" if backend == "tap" else "tapAndScreen"
+    stop_after = 2.75 if scenario == "recover" else 1.25
+    with subprocess.Popen(
+        [executable, "record", "--mode", "both", "--output", str(recording), "--separate-tracks",
+         "--system-audio", option, "--host-pid", str(os.getpid())],
+        env={**os.environ, "JARD_TEST_SYSTEM_FALLBACK": scenario},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    ) as child:
+        statuses = []
+        late_closed = 0
+        try:
+            for line in child.stdout:
+                event = json.loads(line)
+                if event["event"] == "meetingSystemAudio":
+                    statuses.append((event["available"], event.get("backend")))
+                elif event["event"] == "fixtureLateTapClosed":
+                    late_closed += 1
+                elif event.get("seconds", 0) >= stop_after:
+                    child.stdin.write("stop\n")
+                    child.stdin.flush()
+                    break
+            assert child.wait(timeout=3) == 0
+        finally:
+            if child.poll() is None:
+                child.kill()
+    assert statuses == [(False, None), (True, backend)], statuses
+    assert late_closed == int(scenario != "waiting")
+    with wave.open(str(microphone), "rb") as mic, wave.open(str(system), "rb") as mac:
+        count = mic.getnframes()
+        assert count == mac.getnframes()
+        mic_signal = struct.unpack(f"<{count}h", mic.readframes(count))
+        mac_signal = struct.unpack(f"<{count}h", mac.readframes(count))
+        first_mic = mic_signal.index(8192)
+        first_mac = mac_signal.index(16384)
+        assert first_mac - first_mic >= 16_000
+        if scenario == "recover":
+            assert 70_000 <= first_mac - first_mic <= 110_000
+        assert not any(mac_signal[:first_mac])
+        assert set(mac_signal) <= {0, 16384}, "An abandoned tap leaked audio into the fallback track."
+        assert mic_signal[first_mic:first_mac + 8000] == (8192,) * (first_mac + 8000 - first_mic)
+        assert mac_signal[first_mac:first_mac + 8000] == (16384,) * 8000
+    if scenario == "recover":
+        print("A recovered tap restarted before backoff expired and joined the ongoing microphone track.")
+    elif scenario == "open":
+        print("A stalled open timed out, started fallback, and closed the late tap without mixing its audio.")
+    else:
+        print("A waiting tap never reported ready. ScreenCaptureKit fallback began on the same clock while the mic kept recording.")
 
 
 def exercise_timed_tails(executable, root):
@@ -328,9 +420,13 @@ if __name__ == "__main__":
         results = [pool.submit(exercise, sys.argv[1], Path(tmp), mode) for mode in ["stop", "eof", "term", "kill", "loss"]]
         for task in results:
             print(task.result(timeout=20))
+        exercise_microphone_only(sys.argv[1], Path(tmp))
         exercise_overlapping_takes(sys.argv[1], Path(tmp))
         exercise_source_handoff(sys.argv[1], Path(tmp), system_restart=False)
         exercise_source_handoff(sys.argv[1], Path(tmp), system_restart=True)
+        exercise_system_fallback(sys.argv[1], Path(tmp))
+        exercise_system_fallback(sys.argv[1], Path(tmp), scenario="open")
+        exercise_system_fallback(sys.argv[1], Path(tmp), scenario="recover")
         exercise_timed_tails(sys.argv[1], Path(tmp))
         exercise_microphone_interruption(sys.argv[1], Path(tmp))
         exercise_abandoned_cold_open(sys.argv[1], Path(tmp))

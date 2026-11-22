@@ -1,4 +1,6 @@
 import base64
+import errno
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import shutil
@@ -10,6 +12,8 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
+import annotation_retention
+import annotation_storage
 from annotation_assets import staged_annotation_paths
 from engine_paths import ENGINE_ROOT
 import meeting_brief
@@ -17,7 +21,8 @@ from meeting_rolling import RATE, append_rolling, read_rolling, rolling_path
 from meeting_retention import archive_path, audio_trash_path
 from native_recordings import recording_marker
 from session_store import SHUTDOWN_INTERRUPTION, MissingSession, SessionStore
-from saved_meetings import get_meeting, meeting_detail, meetings, render_export, search_meetings
+from saved_annotations import annotation_detail
+from saved_meetings import get_meeting, meeting_detail, meeting_search_report, meetings, render_export, search_meetings
 from personal_notes import NoteEdit, save
 from session_notes import passages
 
@@ -44,6 +49,189 @@ class SessionStoreTests(unittest.TestCase):
 
     def send_to_fixture_trash(self, path):
         shutil.move(path, self.trash / path.name)
+
+    def retention_annotation(self, age, *, older=False, processing=False, pending_writing=False, location=None, missing_video=None):
+        key = str(uuid4())
+        suffix, mime = ("wav", "audio/wav") if missing_video else ("mp4", "video/mp4")
+        upload = self.root / f"{key}.{suffix}"
+        upload.write_bytes(b"fixture movie")
+        assets = staged_annotation_paths(upload)
+        assets["manifest"].write_text("{}")
+        annotation = {"version": 1, "source": "display", "frames": [], "strokeCount": 1}
+        if missing_video:
+            annotation["missingVideo"] = missing_video
+        else:
+            assets["contact-sheet"].write_bytes(b"fixture sheet")
+            annotation["frames"] = [0.6]
+        _, movie = self.store.create(upload, f"Annotation.{suffix}", mime, {
+            "recording": False, "diarization": False, "languageHints": ["en"],
+        }, 2, key=key, annotation=annotation, annotation_location=location)
+        self.store.append(key, {"text": "Look at this chart.", "language": "English", "words": [], "segments": []}, 1)
+        if not processing:
+            self.store.finish(key)
+        with self.store.connection() as db:
+            db.execute("UPDATE sessions SET created=? WHERE id=?",
+                       ((datetime.now(timezone.utc) - timedelta(days=age)).isoformat(), key))
+            if not pending_writing:
+                db.execute("UPDATE overviews SET status='error' WHERE id=?", (key,))
+            if older:
+                db.execute("UPDATE sessions SET options=json_remove(options,'$.annotationRetentionEligible') WHERE id=?", (key,))
+        return key, movie
+
+    def test_annotation_folder_is_pinned_and_a_replaced_mount_does_not_expire_data(self):
+        original = self.root / "External"
+        replacement = self.root / "Another folder"
+        original.mkdir()
+        replacement.mkdir()
+        with self.store.connection() as db:
+            annotation_storage.select(db, str(original), self.store.root)
+            chosen = annotation_storage.status(db, self.store.audio)
+        with patch("annotation_storage.os.link", side_effect=OSError(errno.EXDEV, "Different volume")):
+            video, movie = self.retention_annotation(9, location=chosen["storageId"])
+            record, full_movie = self.retention_annotation(35, location=chosen["storageId"])
+        self.assertEqual(movie.parents[1], original.resolve())
+        self.assertEqual(movie.read_bytes(), b"fixture movie")
+        self.assertEqual(annotation_detail(self.store, video)["videoPath"], str(movie))
+        self.assertIsNone(self.store.get(video)["audioPath"])
+        with self.store.connection() as db:
+            annotation_storage.select(db, str(replacement), self.store.root)
+            self.assertEqual(annotation_storage.status(db, self.store.audio)["folder"], str(replacement.resolve()))
+        self.assertEqual(self.store.media(video)[0], movie)
+
+        aside = self.root / "Detached"
+        original.rename(aside)
+        original.mkdir()
+        recreated = original / movie.parent.name
+        recreated.mkdir()
+        (recreated / movie.name).write_text("Unrelated file")
+        reopened = SessionStore(self.store.root)
+        saved = reopened.get(video)
+        self.assertTrue(saved["annotationStorageUnavailable"])
+        self.assertIsNone(saved["audioUrl"])
+        self.assertEqual(annotation_detail(reopened, video)["transcript"], "Look at this chart.")
+        self.assertIsNone(annotation_detail(reopened, video)["contactSheetPath"])
+        self.assertEqual(annotation_retention.sweep(reopened, self.send_to_fixture_trash), (0, sorted([video, record])))
+        with self.assertRaises(annotation_storage.Unavailable):
+            reopened.delete(record)
+        self.assertEqual((recreated / movie.name).read_text(), "Unrelated file")
+        self.assertTrue((aside / full_movie.relative_to(original.resolve())).is_file())
+
+        original.rename(self.root / "Replacement data")
+        aside.rename(original)
+        self.assertEqual(annotation_retention.sweep(reopened, self.send_to_fixture_trash), (2, []))
+        self.assertIsNone(reopened.get(video)["audioUrl"])
+        self.assertEqual(reopened.annotation_asset(video, "contact-sheet")[0].read_bytes(), b"fixture sheet")
+        self.assertFalse(full_movie.parent.exists())
+        self.assertTrue((self.trash / f"Jaro Annotation {record}" / "Capture" / full_movie.name).is_file())
+
+    def test_annotation_folder_recovery_only_removes_its_own_unpublished_capture(self):
+        folder = self.root / "External"
+        folder.mkdir()
+        key = str(uuid4())
+        other_key = str(uuid4())
+        with self.store.connection() as db:
+            annotation_storage.select(db, str(folder), self.store.root)
+            location = annotation_storage.status(db, self.store.audio)["storageId"]
+            db.executemany("INSERT INTO annotation_file_operations VALUES(?,?,'import')",
+                           [(key, location), (other_key, location)])
+        partial = annotation_storage.allocate(folder, key)
+        unowned = annotation_storage.bundle_path(folder, other_key)
+        unowned.mkdir()
+        (unowned / "unrelated").write_text("Keep me")
+        SessionStore(self.store.root)
+        self.assertFalse(partial.exists())
+        self.assertEqual((unowned / "unrelated").read_text(), "Keep me")
+
+    def test_annotation_retention_expires_video_then_record_and_preserves_older_and_busy_items(self):
+        aged, movie = self.retention_annotation(8)
+        legacy, legacy_movie = self.retention_annotation(95, older=True)
+        active, active_movie = self.retention_annotation(95, processing=True)
+        waiting, waiting_movie = self.retention_annotation(95, pending_writing=True)
+        recent, recent_movie = self.retention_annotation(1)
+        reader = SessionStore(self.store.root, read_only=True)
+
+        self.assertEqual(annotation_retention.sweep(self.store, self.send_to_fixture_trash), (1, []))
+        self.assertFalse(movie.exists())
+        self.assertEqual(list(self.trash.iterdir())[0].read_bytes(), b"fixture movie")
+        with self.assertRaises(MissingSession):
+            reader.media(aged)
+        saved = reader.get(aged)
+        self.assertIsNone(saved["audioUrl"])
+        self.assertEqual(saved["transcript"]["text"], "Look at this chart.")
+        self.assertEqual(reader.annotation_asset(aged, "contact-sheet")[0].read_bytes(), b"fixture sheet")
+        self.assertEqual(reader.annotation_asset(aged, "manifest")[0].read_text(), "{}")
+        self.assertEqual({row["id"] for row in reader.annotations()}, {aged, legacy, active, waiting, recent})
+        self.assertTrue(all(path.is_file() for path in (legacy_movie, active_movie, waiting_movie, recent_movie)))
+
+        with self.store.connection() as db:
+            db.execute("UPDATE sessions SET created='2000-01-01T00:00:00Z' WHERE id=?", (aged,))
+            annotation_retention.set_policy(db, 7, 30, True)
+        self.assertEqual(annotation_retention.sweep(self.store, self.send_to_fixture_trash), (2, []))
+        self.assertEqual({row["id"] for row in reader.annotations()}, {active, waiting, recent})
+        archive = self.trash / f"Jaro Annotation {aged}"
+        self.assertIn("Look at this chart.", (archive / "Narration.md").read_text())
+        self.assertEqual(json.loads((archive / "Annotation.json").read_text())["id"], aged)
+        self.assertEqual((archive / "Capture" / "contact-sheet.png").read_bytes(), b"fixture sheet")
+        self.assertTrue((self.trash / f"Jaro Annotation {legacy}" / "Capture" / legacy_movie.name).is_file())
+
+    def test_narration_without_video_uses_only_annotation_record_retention(self):
+        key, narration = self.retention_annotation(12, missing_video="screenInterrupted")
+        self.assertEqual(annotation_retention.sweep(self.store, self.send_to_fixture_trash), (0, []))
+        self.assertTrue(narration.is_file())
+        detail = annotation_detail(self.store, key)
+        self.assertIsNone(detail["videoPath"])
+        self.assertEqual(detail["audioPath"], str(narration))
+        with self.store.connection() as db:
+            db.execute("UPDATE sessions SET created='2000-01-01T00:00:00Z' WHERE id=?", (key,))
+        self.assertEqual(annotation_retention.sweep(self.store, self.send_to_fixture_trash), (1, []))
+        self.assertTrue((self.trash / f"Jaro Annotation {key}" / "Capture" / narration.name).is_file())
+
+    def test_annotation_trash_failure_keeps_data_available_and_recovers_after_restart(self):
+        media, movie = self.retention_annotation(9)
+        record, full_movie = self.retention_annotation(95)
+
+        def unavailable(_):
+            raise OSError("Trash temporarily unavailable")
+
+        self.assertEqual(annotation_retention.sweep(self.store, unavailable), (0, sorted([media, record])))
+        self.assertEqual(self.store.media(media)[0], movie)
+        self.assertEqual(self.store.media(record)[0], full_movie)
+        stranded = self.store.root / ".annotation-trash" / "transfer-interrupted"
+        stranded.mkdir()
+        (stranded / "staging").write_text("Duplicate")
+        reopened = SessionStore(self.store.root)
+        self.assertEqual(annotation_retention.sweep(reopened, self.send_to_fixture_trash), (2, []))
+        self.assertFalse(stranded.exists())
+        self.assertFalse(movie.exists())
+        self.assertFalse(full_movie.exists())
+        self.assertIsNotNone(reopened.get(media)["audioRemovedAt"])
+        with self.assertRaises(MissingSession):
+            reopened.get(record)
+
+    def test_annotation_expiry_preserves_concurrent_edits_and_retries_committed_video_cleanup(self):
+        media, movie = self.retention_annotation(9)
+        record, full_movie = self.retention_annotation(95)
+
+        def save_then_trash(path):
+            if path.name == f"Jaro Annotation {record}":
+                with self.store.connection() as db:
+                    db.execute("UPDATE sessions SET name='Edited title' WHERE id=?", (record,))
+            self.send_to_fixture_trash(path)
+
+        with patch("annotation_retention.cleanup_videos", return_value=[]):
+            self.assertEqual(annotation_retention.sweep(self.store, save_then_trash), (1, []))
+        self.assertTrue(full_movie.exists())
+        self.assertEqual(self.store.get(record)["name"], "Edited title")
+        self.assertTrue(movie.exists())
+        with self.assertRaises(MissingSession):
+            self.store.media(media)
+
+        with self.store.connection() as db:
+            annotation_retention.set_policy(db, None, None, False)
+        reopened = SessionStore(self.store.root)
+        self.assertEqual(annotation_retention.sweep(reopened, self.send_to_fixture_trash), (0, []))
+        self.assertFalse(movie.exists())
+        self.assertTrue(full_movie.exists())
 
     def test_completed_session_and_managed_copy_survive_restart(self):
         self.store.finish(self.key)
@@ -109,7 +297,7 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(latest["transcript"], narration)
         self.assertEqual(latest["interruption"], "Narration stopped early.")
         self.assertEqual(latest["frames"], [0.2, 1.1])
-        self.assertEqual(latest["route"], f"/?session={ids[1]}&tab=annotation")
+        self.assertEqual(latest["route"], f"/?session={ids[1]}&tab=overview")
         self.assertEqual(Path(latest["videoPath"]).read_bytes(), b"fixture movie")
         self.assertEqual(Path(latest["manifestPath"]).name, "annotation.json")
         self.assertEqual(Path(latest["contactSheetPath"]).name, "contact-sheet.png")
@@ -180,7 +368,13 @@ class SessionStoreTests(unittest.TestCase):
 
     def test_meeting_query_export_and_read_only_agent_after_audio_removal(self):
         key, path = self.create_meeting()
+        with self.store.connection() as db:
+            meeting_brief.enqueue(db, key)
+            generation = db.execute("SELECT generation FROM meeting_briefs WHERE id=?", (key,)).fetchone()[0]
+            self.assertTrue(meeting_brief.settle(db, key, generation, {"title": "Review", "summary": "The team set a deadline."}))
         self.assertEqual([row["id"] for row in self.store.list("zoom", meetings_only=True)], [key])
+        self.assertEqual([row["id"] for row in self.store.list("follow up tuesday", meetings_only=True)], [key])
+        self.assertEqual(self.store.list("follow up tuesday"), [])
         removed = self.store.remove_meeting_audio(key, trash=self.send_to_fixture_trash)
         self.assertFalse(path.parent.exists())
         self.assertEqual(self.store.remove_meeting_audio(key, trash=self.send_to_fixture_trash), removed)
@@ -194,6 +388,7 @@ class SessionStoreTests(unittest.TestCase):
         self.assertIsNone(session["audioUrl"])
         self.assertEqual(session["audioRemovedAt"], removed)
         detail = meeting_detail(session, "00:07.5", "00:09.0")
+        self.assertEqual(detail["range"], {"from_ms": 7500, "to_ms": 9000})
         self.assertEqual([turn["text"] for turn in detail["turns"]], ["Send the agenda."])
         self.assertIn("00:00:08,000 --> 00:00:10,000", render_export(detail, "srt"))
         self.assertIn("Them: Send", render_export(detail, "vtt"))
@@ -204,12 +399,32 @@ class SessionStoreTests(unittest.TestCase):
 
         cli = [sys.executable, str(ENGINE_ROOT / "jardctl.py")]
         env = {**os.environ, "RUMBLE_DATA_DIR": str(reader.root), "RUMBLE_PORT": "1"}
-        output = subprocess.check_output([*cli, "meetings", "show", "latest", "--from", "7", "--json"], text=True, env=env, timeout=10)
-        self.assertEqual(json.loads(output)["turns"][0]["start"], 8)
+        show = [*cli, "meetings", "show", "latest"]
+        bounds = ["--from", "7.5s", "--to", "00:09"]
+        output = json.loads(subprocess.check_output([*show, *bounds, "--json"], text=True, env=env, timeout=10))
+        self.assertEqual(output["turns"], detail["turns"])
+        self.assertEqual(output["range"], detail["range"])
+        document = subprocess.check_output([*show, *bounds, "--md"], text=True, env=env, timeout=10)
+        self.assertIn("- **Range:** 00:07.500–00:09", document)
+        self.assertIn("- **Status:** Complete · final transcript", document)
+        self.assertIn("Follow up Tuesday.", document)
+        self.assertIn("Send the agenda.", document)
+        self.assertNotIn("Review the budget.", document)
+        self.assertEqual(document.count("## Summary"), 1)
+        self.assertNotIn("Follow up Tuesday.", render_export(detail, "md"))
+        for flag, expected in (("--srt", ""), ("--vtt", "WEBVTT\n\n")):
+            empty = subprocess.check_output([*show, "--to", "1s", flag], text=True, env=env, timeout=10)
+            self.assertEqual(empty, expected)
+        ambiguous = subprocess.run([*cli, "--json", "meetings", "show", "latest", "--srt"],
+                                   capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(ambiguous.returncode, 1)
+        self.assertEqual(ambiguous.stdout, "")
+        self.assertIn("single meeting output format", ambiguous.stderr)
         requests = [
             {"id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}},
             {"method": "notifications/initialized"}, {"id": 2, "method": "tools/list"},
-            {"id": 3, "method": "tools/call", "params": {"name": "get_transcript", "arguments": {"meeting_id": key, "start": 7}}},
+            {"id": 3, "method": "tools/call", "params": {"name": "get_transcript",
+                                                       "arguments": {"meeting_id": key, "from": 7.5, "to": "9s"}}},
             {"id": 4, "method": "tools/call", "params": {"name": "get_meeting_notes", "arguments": {"meeting_id": key}}},
             {"id": 5, "method": "resources/read", "params": {"uri": f"jard-meeting://{key}"}},
         ]
@@ -218,10 +433,13 @@ class SessionStoreTests(unittest.TestCase):
         init, tools, transcript, notes, resource = [json.loads(line)["result"] for line in result.stdout.splitlines()]
         self.assertEqual(init["protocolVersion"], "2025-11-25")
         self.assertTrue(all(tool["annotations"]["readOnlyHint"] for tool in tools["tools"]))
-        self.assertEqual(json.loads(transcript["content"][0]["text"])["turns"], detail["turns"])
+        transcript = json.loads(transcript["content"][0]["text"])
+        self.assertEqual(transcript["turns"], detail["turns"])
+        self.assertEqual(transcript["range"], detail["range"])
         self.assertEqual(json.loads(notes["content"][0]["text"])["personalNotes"], "Follow up Tuesday.")
         self.assertIn("Follow up Tuesday.", resource["contents"][0]["text"])
         self.assertIn("Send the agenda.", resource["contents"][0]["text"])
+        self.assertEqual(resource["contents"][0]["text"].count("## Summary"), 1)
         self.assertEqual(reader.path.read_bytes(), before)
 
     def test_meeting_overlap_and_ranked_passages(self):
@@ -245,6 +463,97 @@ class SessionStoreTests(unittest.TestCase):
         note = search_meetings(reader, '"up Tuesday"')[0]
         self.assertEqual(note["source"], "personalNotes")
         self.assertEqual(note["route"], f"/?session={key}&tab=notes")
+
+    def test_meeting_and_mcp_search_use_the_saved_glossary_with_timestamps(self):
+        from meeting_mcp import call as mcp_call
+
+        self.store.set_meeting_retention_days(0)
+        key, _ = self.create_meeting()
+        reader = SessionStore(self.store.root, read_only=True)
+        before = reader.path.read_bytes()
+        snapshot = {"JardSystemDictation": {
+            "vocabulary": "Agendaforge", "vocabularySoundsLike": {"agendaforge": ["the agenda"]}}}
+        with patch("saved_dictations.read_private_history_plist", return_value=snapshot) as preferences:
+            args = {"query": "Agendaforge", "meeting_id": key}
+            hits = search_meetings(reader, args["query"], identifier=key)
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(hits[0]["snippet"], "Send **the** **agenda**.")
+            self.assertEqual(hits[0]["route"], f"/?session={key}&tab=transcript&at=8")
+            created = datetime.fromisoformat(reader.get(key)["created"]).astimezone(timezone.utc)
+            self.assertEqual(datetime.fromisoformat(hits[0]["absoluteTime"]).astimezone(timezone.utc),
+                             (created + timedelta(seconds=8)).replace(microsecond=created.microsecond // 1000 * 1000))
+            self.assertEqual(mcp_call(reader, "search_transcripts", args)["passages"], hits)
+            self.assertEqual(mcp_call(reader, "search_transcripts", {**args, "fuzzy": False})["passages"], [])
+            self.assertEqual(preferences.call_count, 2)
+        self.assertEqual(before, reader.path.read_bytes())
+
+    def test_companion_search_counts_before_limiting_and_returns_neighboring_speech(self):
+        from meeting_mcp import call as mcp_call
+
+        self.store.set_meeting_retention_days(0)
+        key, _ = self.create_meeting(status="processing")
+        for start, end, speaker, text in [
+            (12, 14, 1, "Read the supporting material. " * 9),
+            (17, 19, 2, "Review that agenda again after the supporting material has been read."),
+        ]:
+            self.store.append(key, {"text": text, "words": [], "language": "English",
+                "segments": [{"speaker": speaker, "start": start, "end": end, "text": text}]}, end)
+        self.store.finish(key)
+        with self.store.connection() as db:
+            db.execute("""UPDATE sessions SET options=json_set(options,
+                '$.meetingStartedAt', '2026-10-21T09:00:00+00:00', '$.meetingEndedAt', '2026-10-21T09:00:19+00:00') WHERE id=?""", (key,))
+        reader = SessionStore(self.store.root, read_only=True)
+        before = reader.path.read_bytes()
+        report = mcp_call(reader, "search_transcripts", {"query": "agenda", "meeting_id": key, "limit": 1, "fuzzy": False})
+        self.assertEqual((report["totalMatches"], report["searchedMeetings"], len(report["passages"])), (2, 1, 1))
+        self.assertEqual(report["matchingMeetings"], [
+            {"id": key, "title": "Project sync", "status": "complete", "transcriptSource": "final", "matchCount": 2}])
+        hit = report["passages"][0]
+        self.assertEqual((hit["start"], hit["transcriptSource"]), (8, "final"))
+        self.assertEqual(datetime.fromisoformat(hit["absoluteTime"]).astimezone(timezone.utc),
+                         datetime(2026, 10, 21, 9, 0, 8, tzinfo=timezone.utc))
+        self.assertEqual(hit["before"]["text"], "Review the budget.")
+        self.assertEqual(hit["after"]["speaker"], "You")
+        self.assertLessEqual(len(hit["after"]["text"]), 120)
+        self.assertTrue(hit["after"]["text"].endswith("…"))
+        self.assertEqual(search_meetings(reader, "agenda", 1, fuzzy=False), [hit])
+        note = search_meetings(reader, '"up Tuesday"', 1, fuzzy=False)[0]
+        self.assertNotIn("before", note)
+        self.assertNotIn("after", note)
+        self.assertNotIn("absoluteTime", note)
+        empty = meeting_search_report(reader, "agenda", since="2026-10-22T00:00Z", fuzzy=False)
+        self.assertEqual(empty, {"passages": [], "totalMatches": 0, "searchedMeetings": 0, "matchingMeetings": []})
+        cli = [sys.executable, str(ENGINE_ROOT / "jardctl.py"), "meetings", "search", "agenda", "--limit", "1", "--no-fuzzy"]
+        environment = {**os.environ, "RUMBLE_DATA_DIR": str(reader.root), "RUMBLE_PORT": "1"}
+        self.assertEqual(json.loads(subprocess.check_output(cli + ["--json"], env=environment, timeout=10)), [hit])
+        rendered = subprocess.check_output(cli, env=environment, text=True, timeout=10)
+        self.assertIn("2 matching passages", rendered)
+        self.assertIn("Showing the top 1.", rendered)
+        self.assertIn("Before (00:01 Them): Review the budget.", rendered)
+        self.assertIn("After (00:12 You):", rendered)
+        self.assertEqual(before, reader.path.read_bytes())
+
+        second, _ = self.create_meeting()
+        combined = meeting_search_report(reader, "agenda", limit=1, fuzzy=False)
+        self.assertEqual(combined["totalMatches"], 3)
+        self.assertEqual({row["id"]: row["matchCount"] for row in combined["matchingMeetings"]}, {key: 2, second: 1})
+        final_turn = meeting_search_report(reader, "agenda", identifier=second, fuzzy=False)["passages"][0]
+        self.assertNotIn("after", final_turn)
+
+    def test_companion_search_keeps_staged_speech_separate(self):
+        key = str(uuid4())
+        start = "2026-11-21T10:00:00+00:00"
+        live = {"id": key, "name": "Live call", "created": start, "meetingStartedAt": start,
+                "duration": 6, "status": "recording", "staged": True, "meeting": True, "meetingTurns": [
+                    {"speaker": 1, "start": 0, "end": 2, "text": "The earlier roll call."},
+                    {"speaker": 2, "start": 3, "end": 5, "text": "The agenda comes next."}]}
+        reader = SessionStore(self.store.root, read_only=True)
+        report = meeting_search_report(reader, "agenda", live=live)
+        hit = report["passages"][0]
+        self.assertEqual((hit["transcriptSource"], hit["status"], hit["route"]), ("rolling", "recording", None))
+        self.assertEqual((hit["before"]["speaker"], hit["before"]["start"]), ("You", 0))
+        self.assertNotIn("after", hit)
+        self.assertEqual(meeting_search_report(reader, "agenda", live=live, include_in_progress=False)["passages"], [])
 
     def test_rolling_survives_staging_transfer_interruption_and_per_source_final_coverage(self):
         key = str(uuid4())

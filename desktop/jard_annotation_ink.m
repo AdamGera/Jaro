@@ -4,6 +4,14 @@
 #import <CoreText/CoreText.h>
 #import <ImageIO/ImageIO.h>
 
+const NSTimeInterval JardAnnotationInkHold = .65;
+const NSTimeInterval JardAnnotationInkLifetime = 1.30;
+
+CGFloat JardAnnotationInkAlpha(NSTimeInterval age) {
+    CGFloat left = fmin(1, fmax(0, (JardAnnotationInkLifetime - age) / (JardAnnotationInkLifetime - JardAnnotationInkHold)));
+    return left * left;
+}
+
 NSRect JardAnnotationAppKitRect(CGRect quartz, CGFloat primaryHeight) {
     return NSMakeRect(CGRectGetMinX(quartz), primaryHeight - CGRectGetMaxY(quartz),
                       CGRectGetWidth(quartz), CGRectGetHeight(quartz));
@@ -100,7 +108,7 @@ static void drawFrameTime(CGContextRef context, NSTimeInterval time, CGPoint loc
     CFRelease(font);
 }
 
-static NSArray<NSNumber *> *writeContactSheet(AVURLAsset *asset, NSURL *path, NSArray<NSNumber *> *times) {
+static NSArray<NSNumber *> *writeContactSheet(AVURLAsset *asset, NSURL *path, NSArray<NSNumber *> *times, id *firstFrame) {
     if (!times.count) return @[];
     AVAssetImageGenerator *generator = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
     generator.appliesPreferredTrackTransform = YES;
@@ -154,30 +162,57 @@ static NSArray<NSNumber *> *writeContactSheet(AVURLAsset *asset, NSURL *path, NS
     }
     if (output) CFRelease(output);
     if (sheet) CGImageRelease(sheet);
+    if (saved) *firstFrame = images.firstObject;
     return saved ? sampled : @[];
 }
 
-void JardWriteAnnotationAssets(NSURL *movie, NSString *source, NSDictionary *origin, NSArray<NSDictionary *> *events, void (^completion)(NSError *)) {
+void JardAnnotationMovieHasFrame(NSURL *movie, void (^completion)(BOOL)) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        BOOL playable = NO;
+        if (movie) {
+            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:movie options:nil];
+            AVAssetImageGenerator *generator = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
+            generator.maximumSize = CGSizeMake(32, 32);
+            CGImageRef frame = [generator copyCGImageAtTime:kCMTimeZero actualTime:NULL error:nil];
+            playable = frame != NULL;
+            if (frame) CGImageRelease(frame);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(playable); });
+    });
+}
+
+void JardWriteAnnotationAssets(NSURL *media, NSString *source, NSDictionary *origin, NSArray<NSDictionary *> *events,
+    NSString *missingVideo, void (^completion)(NSImage *preview, NSError *error)) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
-            NSURL *folder = movie.URLByDeletingLastPathComponent;
-            AVURLAsset *asset = [AVURLAsset URLAssetWithURL:movie options:nil];
-            NSArray *times = JardAnnotationFrameTimes(events, CMTimeGetSeconds(asset.duration));
-            NSArray *frames = writeContactSheet(asset, [folder URLByAppendingPathComponent:@"contact-sheet.png"], times);
+            NSURL *folder = media.URLByDeletingLastPathComponent;
+            id firstFrame = nil;
+            NSArray *frames = @[];
+            if (!missingVideo) {
+                AVURLAsset *asset = [AVURLAsset URLAssetWithURL:media options:nil];
+                NSArray *times = JardAnnotationFrameTimes(events, CMTimeGetSeconds(asset.duration));
+                frames = writeContactSheet(asset, [folder URLByAppendingPathComponent:@"contact-sheet.png"], times, &firstFrame);
+            }
             NSMutableArray *serialized = [NSMutableArray arrayWithCapacity:events.count];
             for (NSDictionary *event in events) {
                 if ([event[@"clear"] boolValue]) { [serialized addObject:event]; continue; }
                 NSPoint from = [event[@"from"] pointValue], to = [event[@"to"] pointValue];
-                [serialized addObject:@{@"time": event[@"time"], @"stroke": event[@"stroke"] ?: @0,
-                    @"from": @[@(from.x), @(from.y)], @"to": @[@(to.x), @(to.y)]}];
+                NSMutableDictionary *edge = [@{@"time": event[@"time"], @"stroke": event[@"stroke"] ?: @0,
+                    @"from": @[@(from.x), @(from.y)], @"to": @[@(to.x), @(to.y)]} mutableCopy];
+                if (event[@"liftedAt"]) edge[@"liftedAt"] = event[@"liftedAt"];
+                [serialized addObject:edge];
             }
             NSMutableDictionary *manifest = [@{@"version": @1, @"source": source, @"coordinateSpace": @"normalized-bottom-left",
                                                @"events": serialized, @"frames": frames} mutableCopy];
             if (origin.count) manifest[@"origin"] = origin;
+            if (missingVideo) manifest[@"missingVideo"] = missingVideo;
             NSError *error = nil;
             NSData *json = [NSJSONSerialization dataWithJSONObject:manifest options:0 error:&error];
             if (json) [json writeToURL:[folder URLByAppendingPathComponent:@"annotation.json"] options:NSDataWritingAtomic error:&error];
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(error); });
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSImage *preview = firstFrame ? [[NSImage alloc] initWithCGImage:(__bridge CGImageRef)firstFrame size:NSZeroSize] : nil;
+                completion(preview, error);
+            });
         }
     });
 }
@@ -192,28 +227,102 @@ static NSUInteger eventCount(NSArray<NSDictionary *> *events, NSTimeInterval tim
     return first;
 }
 
-static CIImage *inkImage(NSArray<NSDictionary *> *events, NSUInteger count, CGRect frame) {
-    NSUInteger start = count;
-    while (start > 0 && !events[start - 1][@"clear"]) start--;
-    if (start == count) return nil;
-    size_t width = CGRectGetWidth(frame), height = CGRectGetHeight(frame);
-    if (!width || !height) return nil;
+@interface JardRenderedStroke : NSObject
+@property(nonatomic) NSUInteger firstEdge, endEdge;
+@property(nonatomic) NSTimeInterval liftedAt, visibleUntil, previousVisibleUntil;
+@end
+
+@implementation JardRenderedStroke
+@end
+
+static NSArray<JardRenderedStroke *> *indexStrokes(NSArray<NSDictionary *> *events) {
+    NSMutableArray<JardRenderedStroke *> *strokes = NSMutableArray.array;
+    JardRenderedStroke *current = nil;
+    NSNumber *identifier = nil;
+    NSUInteger firstSinceClear = 0;
+    for (NSUInteger index = 0; index < events.count; index++) {
+        NSDictionary *event = events[index];
+        if ([event[@"clear"] boolValue]) {
+            NSTimeInterval clearedAt = [event[@"time"] doubleValue];
+            for (NSUInteger i = firstSinceClear; i < strokes.count; i++)
+                strokes[i].visibleUntil = MIN(strokes[i].visibleUntil, clearedAt);
+            firstSinceClear = strokes.count;
+            current = nil;
+            continue;
+        }
+        NSNumber *next = event[@"stroke"] ?: @0;
+        if (!current || ![identifier isEqual:next]) {
+            current = JardRenderedStroke.new;
+            current.firstEdge = index;
+            current.liftedAt = current.visibleUntil = INFINITY;
+            [strokes addObject:current];
+            identifier = next;
+        }
+        current.endEdge = index + 1;
+        if (event[@"liftedAt"]) {
+            current.liftedAt = [event[@"liftedAt"] doubleValue];
+            current.visibleUntil = current.liftedAt + JardAnnotationInkLifetime;
+        }
+    }
+    NSTimeInterval visibleUntil = 0;
+    for (JardRenderedStroke *stroke in strokes) {
+        visibleUntil = MAX(visibleUntil, stroke.visibleUntil);
+        stroke.previousVisibleUntil = visibleUntil;
+    }
+    return strokes;
+}
+
+static NSUInteger firstVisibleStroke(NSArray<JardRenderedStroke *> *strokes, NSTimeInterval time) {
+    NSUInteger first = 0, end = strokes.count;
+    while (first < end) {
+        NSUInteger middle = first + (end - first) / 2;
+        if (strokes[middle].previousVisibleUntil <= time) first = middle + 1;
+        else end = middle;
+    }
+    return first;
+}
+
+static CGContextRef inkContext(size_t width, size_t height) {
+    if (!width || !height) return NULL;
     CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     CGContextRef context = CGBitmapContextCreate(NULL, width, height, 8, 0, space, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
     CGColorSpaceRelease(space);
-    if (!context) return nil;
-    CGContextSetRGBStrokeColor(context, 1, .4, .22, 1);
-    CGContextSetLineCap(context, kCGLineCapRound);
-    CGContextSetLineWidth(context, MAX(3, MIN(width, height) * .007));
-    for (NSUInteger i = start; i < count; i++) {
-        NSPoint from = [events[i][@"from"] pointValue], to = [events[i][@"to"] pointValue];
-        CGContextMoveToPoint(context, from.x * width, from.y * height);
-        CGContextAddLineToPoint(context, to.x * width, to.y * height);
+    if (context) {
+        CGContextSetLineCap(context, kCGLineCapRound);
+        CGContextSetLineWidth(context, MAX(3, MIN(width, height) * .007));
     }
-    CGContextStrokePath(context);
+    return context;
+}
+
+static CIImage *inkImage(NSArray<NSDictionary *> *events, NSArray<JardRenderedStroke *> *strokes,
+                         NSUInteger count, NSTimeInterval time, CGRect frame, NSTimeInterval *validUntil, BOOL *failed) {
+    *validUntil = INFINITY;
+    *failed = NO;
+    size_t width = CGRectGetWidth(frame), height = CGRectGetHeight(frame);
+    CGContextRef context = NULL;
+    for (NSUInteger i = firstVisibleStroke(strokes, time); i < strokes.count; i++) {
+        JardRenderedStroke *stroke = strokes[i];
+        if (stroke.firstEdge >= count) break;
+        if (stroke.visibleUntil <= time) continue;
+        NSTimeInterval fadeAt = stroke.liftedAt + JardAnnotationInkHold;
+        *validUntil = MIN(*validUntil, MIN(fadeAt, stroke.visibleUntil));
+        if (!context) {
+            context = inkContext(width, height);
+            if (!context) { *failed = YES; return nil; }
+        }
+        CGContextSetRGBStrokeColor(context, 1, .4, .22, JardAnnotationInkAlpha(time - stroke.liftedAt));
+        NSUInteger end = MIN(stroke.endEdge, count);
+        for (NSUInteger edge = stroke.firstEdge; edge < end; edge++) {
+            NSPoint from = [events[edge][@"from"] pointValue], to = [events[edge][@"to"] pointValue];
+            CGContextMoveToPoint(context, from.x * width, from.y * height);
+            CGContextAddLineToPoint(context, to.x * width, to.y * height);
+        }
+        CGContextStrokePath(context);
+    }
+    if (!context) return nil;
     CGImageRef bitmap = CGBitmapContextCreateImage(context);
     CGContextRelease(context);
-    if (!bitmap) return nil;
+    if (!bitmap) { *failed = YES; return nil; }
     CIImage *image = [[CIImage alloc] initWithCGImage:bitmap];
     CGImageRelease(bitmap);
     return [image imageByApplyingTransform:CGAffineTransformMakeTranslation(frame.origin.x, frame.origin.y)];
@@ -224,25 +333,39 @@ static NSError *renderError(void) {
         @{NSLocalizedDescriptionKey: @"Could not render the annotation’s drawing layer."}];
 }
 
-void JardRenderAnnotation(NSURL *input, NSURL *output, NSArray<NSDictionary *> *events, void (^completion)(NSError *)) {
+static void renderAnnotation(NSURL *input, NSURL *output, NSArray<NSDictionary *> *events, NSArray<NSValue *> *ranges,
+    void (^completion)(NSError *)) {
     AVURLAsset *asset = [AVURLAsset URLAssetWithURL:input options:nil];
     NSLock *cacheLock = NSLock.new;
+    NSArray<JardRenderedStroke *> *strokes = indexStrokes(events);
     __block NSUInteger cachedCount = NSUIntegerMax;
     __block CGRect cachedSize = CGRectZero;
+    __block NSTimeInterval cachedAt = 0, cachedUntil = 0;
+    __block BOOL cachedFailure = NO;
     __block CIImage *cachedInk;
     [AVMutableVideoComposition videoCompositionWithAsset:asset applyingCIFiltersWithHandler:^(AVAsynchronousCIImageFilteringRequest *request) {
         @autoreleasepool {
             CIImage *video = request.sourceImage;
-            NSUInteger count = eventCount(events, CMTimeGetSeconds(request.compositionTime));
+            if (ranges) {
+                BOOL draw = NO;
+                for (NSValue *value in ranges) {
+                    if (CMTimeRangeContainsTime(value.CMTimeRangeValue, request.compositionTime)) { draw = YES; break; }
+                }
+                if (!draw) { [request finishWithImage:video context:nil]; return; }
+            }
+            NSTimeInterval time = CMTimeGetSeconds(request.compositionTime);
+            NSUInteger count = eventCount(events, time);
             [cacheLock lock];
-            if (count != cachedCount || !CGRectEqualToRect(cachedSize, video.extent)) {
+            if (count != cachedCount || time < cachedAt || time >= cachedUntil || !CGRectEqualToRect(cachedSize, video.extent)) {
                 cachedCount = count;
                 cachedSize = video.extent;
-                cachedInk = inkImage(events, count, video.extent);
+                cachedAt = time;
+                cachedInk = inkImage(events, strokes, count, time, video.extent, &cachedUntil, &cachedFailure);
             }
             CIImage *ink = cachedInk;
+            BOOL failed = cachedFailure;
             [cacheLock unlock];
-            if (count && !events[count - 1][@"clear"] && !ink) {
+            if (failed) {
                 [request finishWithError:renderError()];
                 return;
             }
@@ -259,4 +382,15 @@ void JardRenderAnnotation(NSURL *input, NSURL *output, NSArray<NSDictionary *> *
             completion(exporter.status == AVAssetExportSessionStatusCompleted ? nil : exporter.error ?: renderError());
         }];
     }];
+}
+
+void JardRenderAnnotation(NSURL *input, NSURL *output, NSArray<NSDictionary *> *events, void (^completion)(NSError *)) {
+    JardRenderAnnotationInRanges(input, output, events, nil, completion);
+}
+
+void JardRenderAnnotationInRanges(NSURL *input, NSURL *output, NSArray<NSDictionary *> *events, NSArray<NSValue *> *ranges,
+    void (^completion)(NSError *)) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        renderAnnotation(input, output, events, ranges, completion);
+    });
 }

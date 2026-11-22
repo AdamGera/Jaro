@@ -23,7 +23,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, self.environment))
 
     def test_writing_creates_private_files_and_compacts_complete_records(self):
-        with patch.multiple(diagnostics, EVENT_LIMIT=210, EVENT_KEEP=140):
+        with patch.multiple(diagnostics, LOG_LIMIT=210, LOG_KEEP=140):
             for _ in range(8):
                 diagnostics.write_event("dictation", "inference_complete", inference_ms=12)
         output = io.BytesIO()
@@ -33,6 +33,69 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertTrue(all(row["inferenceMs"] == 12 for row in events))
         self.assertEqual(self.directory.stat().st_mode & 0o777, 0o700)
         self.assertEqual((self.directory / diagnostics.EVENT_LOG).stat().st_mode & 0o777, 0o600)
+
+    def test_maintenance_compacts_both_logs_and_keeps_existing_appenders(self):
+        self.directory.mkdir()
+        events = self.directory / diagnostics.EVENT_LOG
+        process = self.directory / diagnostics.PROCESS_LOG
+        start = b"large record without a line break" * 128 + b"\n"
+        retained = "مرحبا\nآخر سطر\n".encode()
+        events.write_bytes(start + retained)
+        process.write_bytes(start + retained)
+        inode = process.stat().st_ino
+
+        def intervals():
+            self.assertEqual(events.read_bytes(), retained)
+            self.assertEqual(process.read_bytes(), retained)
+            self.assertEqual(process.stat().st_ino, inode)
+            writer.write(start + b"message from the running engine\n")
+            writer.flush()
+            yield
+            self.assertEqual(events.read_bytes(), retained)
+            self.assertEqual(process.read_bytes(), b"message from the running engine\n")
+            writer.write(b"still writing\n")
+            writer.flush()
+            raise KeyboardInterrupt
+
+        with process.open("ab") as writer:
+            calls = intervals()
+
+            def advance(seconds):
+                self.assertEqual(seconds, 3600)
+                next(calls)
+
+            with patch.multiple(diagnostics, LOG_LIMIT=128, LOG_KEEP=60), patch.object(
+                diagnostics.time, "sleep", side_effect=advance
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    diagnostics.maintain_logs()
+        output = io.BytesIO()
+        diagnostics.tail_log(diagnostics.PROCESS_LOG, 2, False, output)
+        self.assertEqual(output.getvalue(), b"message from the running engine\nstill writing\n")
+        self.assertEqual(process.stat().st_mode & 0o777, 0o600)
+
+    def test_maintenance_skips_missing_files_and_unsafe_paths(self):
+        def stop(_):
+            raise KeyboardInterrupt
+
+        with patch.object(diagnostics.time, "sleep", side_effect=stop):
+            with self.assertRaises(KeyboardInterrupt):
+                diagnostics.maintain_logs()
+            self.assertFalse(self.directory.exists())
+            self.directory.mkdir()
+            outside = self.root / "other.log"
+            original = b"unrelated text\n" * 64
+            outside.write_bytes(original)
+            mode = outside.stat().st_mode & 0o777
+            events = self.directory / diagnostics.EVENT_LOG
+            process = self.directory / diagnostics.PROCESS_LOG
+            events.symlink_to(outside)
+            process.hardlink_to(outside)
+            with patch.multiple(diagnostics, LOG_LIMIT=128, LOG_KEEP=60):
+                with self.assertRaises(KeyboardInterrupt):
+                    diagnostics.maintain_logs()
+            self.assertEqual(outside.read_bytes(), original)
+            self.assertEqual(outside.stat().st_mode & 0o777, mode)
 
     def test_tail_reads_recent_complete_lines_and_preserves_utf8(self):
         self.directory.mkdir()

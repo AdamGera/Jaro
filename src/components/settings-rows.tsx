@@ -1,16 +1,35 @@
-import type { ReactNode } from "react"
+import { useId, type ReactNode } from "react"
 import { ChevronDown, type LucideIcon } from "lucide-react"
 
-export function SettingRow({ icon: Icon, title, detail, label = true, find, children }: {
-  icon: LucideIcon; title: string; detail?: ReactNode; label?: boolean; find?: string | false; children: ReactNode
-}) {
-  const Element = label ? "label" : "div"
-  return <Element className="dictation-option dictation-setting-row" data-setting-title={find === false ? undefined : title}
+export type SettingControlLabels = { "aria-labelledby": string; "aria-describedby"?: string }
+
+type SettingRowProps = {
+  icon: LucideIcon; title: string; context?: string; detail?: ReactNode; find?: string | false; anchor?: string
+} & (
+  | { label?: true; children: (labels: SettingControlLabels) => ReactNode }
+  | { label: false; children: ReactNode }
+)
+
+export function SettingRow(row: SettingRowProps) {
+  const { icon: Icon, title, context, detail, find, anchor } = row
+  const Element = row.label === false ? "div" : "label"
+  const titleId = useId()
+  const contextId = context ? `${titleId}-context` : undefined
+  const detailId = detail ? `${titleId}-detail` : undefined
+  return <Element id={anchor} tabIndex={anchor ? -1 : undefined}
+    className="dictation-option dictation-setting-row" data-setting-title={find === false ? undefined : title}
     data-setting-description={find || undefined}>
     <span className="dictation-setting-label"><Icon aria-hidden="true" />
-      <span><strong>{title}</strong>{detail && <small>{detail}</small>}</span>
+      <span>
+        <strong id={titleId}>{title}</strong>
+        {contextId && <small id={contextId}>{context}</small>}
+        {detailId && <small id={detailId}>{detail}</small>}
+      </span>
     </span>
-    {children}
+    {row.label === false ? row.children : row.children({
+      "aria-labelledby": contextId ? `${titleId} ${contextId}` : titleId,
+      "aria-describedby": detailId,
+    })}
   </Element>
 }
 

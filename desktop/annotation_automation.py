@@ -6,7 +6,8 @@ import fcntl
 import os
 from pathlib import Path
 import stat
-from time import time
+from time import monotonic, time
+from uuid import uuid4
 
 from annotation_deliveries import AnnotationDeliveries, ROUTE_LIFETIME
 from annotation_routing import RouteUnavailable, RoutingError, resolve_automatic_rule, route_scopes
@@ -14,9 +15,53 @@ from managed_preferences import OPENCODE_MANAGED, opencode_managed
 
 COUNTDOWN = 3.0
 OFFER_TIMEOUT = 10.0
+CONFIRMATION_TIMEOUT = 2.0
+CONFIRMATION_LIFETIME = 1.0
 HOLD_TIMEOUT = 120.0
 MAX_ROUTES = 16
 RETRY_INTERVAL = 15.0
+
+
+class PanelUnavailable(Exception):
+    pass
+
+
+class PanelHeld(Exception):
+    pass
+
+UNDO_MESSAGES = {
+    "withdrawn": "Annotation taken back from the OpenCode inbox.",
+    "reverted": "OpenCode rolled back the annotation’s turn.",
+    "received": "OpenCode received the annotation. Review the delivery in Sessions to send a correction.",
+    "missing": "OpenCode could not locate the annotation. Check the delivery in Sessions.",
+    "rollback-files": "Review the file changes in Sessions before restoring them.",
+    "withdrawal-unconfirmed": "OpenCode could not confirm the withdrawal. Review the delivery in Sessions.",
+    "rollback-staged": "Review the staged revert in OpenCode.",
+    "rollback-unconfirmed": "OpenCode could not confirm the rollback. Review the delivery in Sessions.",
+    "rollback-commit-unconfirmed": "OpenCode could not confirm the rollback. Review the delivery in Sessions.",
+    "corrected": "A correction was sent to OpenCode.",
+    "correction-unconfirmed": "OpenCode could not confirm the correction. Review the delivery in Sessions.",
+}
+
+
+def describe_delivery(receipt):
+    detail = {"receiptStatus": receipt["status"], "title": receipt["session"].get("title") or "OpenCode"}
+    if receipt["status"] in UNDO_MESSAGES:
+        detail["message"] = UNDO_MESSAGES[receipt["status"]]
+    if receipt["status"] == "queued" and receipt["canUndo"] and not opencode_managed():
+        detail["undoUntil"] = receipt["undoUntil"]
+    if rule := receipt.get("rememberedRule"):
+        detail["rememberedRule"] = rule
+        status = rule["status"]
+        message = {
+            "saved": f"Automatic destination saved for {rule['label']}.",
+            "restored": "The previous destination was restored.",
+            "removed": "The automatic destination was removed.",
+            "changed": "The saved destination changed in another action.",
+        }.get(status)
+        if message:
+            detail["message"] = " ".join(filter(None, (detail.get("message"), message)))
+    return detail
 
 
 @dataclass
@@ -31,6 +76,7 @@ class Offer:
     deadline: float = 0
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task | None = None
+    confirmation: tuple[str, asyncio.Future] | None = None
 
 
 class AnnotationAutomation:
@@ -102,19 +148,33 @@ class AnnotationAutomation:
         offer.task = asyncio.create_task(self.run(offer))
         self.report(offer, "transcribing", "Waiting for the narration.")
 
-    @staticmethod
-    def stored_status(row, capture):
+    def route_receipt(self, row, capture):
+        if not row or row["state"] != "sent" or not row["delivery"]:
+            return None
+        receipt = self.receipts.get(row["delivery"])
+        return receipt if receipt and receipt["annotation"] == capture else None
+
+    def automatic_receipt(self, capture):
+        return self.route_receipt(self.receipts.get_route(capture), capture)
+
+    def stored_status(self, row, capture):
         if not row:
             return {"capture": capture, "phase": "idle"}
         pending = row["state"] == "pending"
-        return {"capture": capture, "phase": "waiting" if pending else row["state"],
-                "title": row["rule"]["title"],
-                "message": OPENCODE_MANAGED if pending and opencode_managed() else row["message"], "seconds": 0}
+        detail = {"capture": capture, "phase": "waiting" if pending else row["state"],
+                  "title": row["rule"]["title"],
+                  "message": OPENCODE_MANAGED if pending and opencode_managed() else row["message"], "seconds": 0}
+        if receipt := self.route_receipt(row, capture):
+            detail.update(describe_delivery(receipt))
+        return detail
+
+    def lookup_status(self, capture):
+        return self.stored_status(self.receipts.get_route(capture), capture)
 
     async def query(self, capture):
-        if capture in self.routes:
+        if capture in self.routes and self.routes[capture].phase != "sent":
             return self.status(capture)
-        return self.stored_status(await asyncio.to_thread(self.receipts.get_route, capture), capture)
+        return await asyncio.to_thread(self.lookup_status, capture)
 
     def status(self, capture):
         offer = self.routes.get(capture)
@@ -126,10 +186,10 @@ class AnnotationAutomation:
         return {"capture": offer.capture, "phase": offer.phase, "title": offer.title,
                 "message": offer.message, "seconds": seconds}
 
-    def report(self, offer, phase, message=""):
+    def report(self, offer, phase, message="", *, status=None):
         offer.phase = phase
         offer.message = message
-        self.notify(self.status(offer.capture))
+        self.notify(status if status is not None else self.status(offer.capture))
 
     async def cancel(self, capture, message="Automatic send cancelled."):
         if not await asyncio.to_thread(self.receipts.set_pending_route, capture, "cancelled", message):
@@ -166,6 +226,35 @@ class AnnotationAutomation:
             return
         offer.changed.set()
 
+    def confirm_from_panel(self, capture, nonce, state):
+        if not isinstance(capture, str) or state not in ("ready", "held", "unavailable"):
+            return False
+        offer = self.routes.get(capture)
+        if not offer or offer.phase != "preparing" or not offer.confirmation:
+            return False
+        expected, reply = offer.confirmation
+        if nonce != expected or reply.done():
+            return False
+        reply.set_result((state, monotonic()))
+        return True
+
+    async def request_confirmation(self, offer):
+        nonce = str(uuid4())
+        reply = asyncio.get_running_loop().create_future()
+        offer.confirmation = (nonce, reply)
+        self.notify({"capture": offer.capture, "nonce": nonce})
+        try:
+            state, confirmed_at = await asyncio.wait_for(reply, CONFIRMATION_TIMEOUT)
+        except TimeoutError as error:
+            raise PanelUnavailable from error
+        finally:
+            offer.confirmation = None
+        if state == "held":
+            raise PanelHeld
+        if state != "ready":
+            raise PanelUnavailable
+        return confirmed_at + CONFIRMATION_LIFETIME
+
     async def current_rule(self, offer):
         rule = await asyncio.to_thread(self.receipts.preferred_rule, route_scopes({"origin": offer.origin}))
         if not rule or rule["id"] != offer.rule["id"]:
@@ -182,10 +271,11 @@ class AnnotationAutomation:
                 return
             await asyncio.sleep(.5)
 
-    async def await_countdown(self, offer):
-        # Start only after the native panel is on screen and acknowledges the offer.
-        self.report(offer, "offer")
-        await asyncio.wait_for(offer.changed.wait(), OFFER_TIMEOUT)
+    async def await_countdown(self, offer, *, shown=False):
+        if not shown:
+            # Start only after the native panel acknowledges the offer.
+            self.report(offer, "offer")
+            await asyncio.wait_for(offer.changed.wait(), OFFER_TIMEOUT)
         while True:
             offer.changed.clear()
             if offer.phase == "held":
@@ -216,15 +306,29 @@ class AnnotationAutomation:
             except TimeoutError:
                 await self.finish_pending(offer, "cancelled", "Jard couldn’t show the automatic send countdown.")
                 return
-            self.report(offer, "preparing", "Verifying the destination.")
-
             async def authorize(key, chosen, included_sheet):
+                before = await self.request_confirmation(offer)
                 identifier = await asyncio.to_thread(self.receipts.claim_route, offer.capture, route_scopes({"origin": offer.origin}),
-                                                     offer.rule["id"], key, chosen, included_sheet)
+                                                     offer.rule["id"], key, chosen, included_sheet, confirmed_before=before)
+                if monotonic() >= before:
+                    await asyncio.to_thread(self.receipts.change, identifier, "refused")
+                    raise PanelUnavailable
                 self.report(offer, "sending", "Sending annotation…")
                 return identifier
 
-            await self.deliver(offer.capture, destination["id"], service, authorize)
+            while True:
+                self.report(offer, "preparing", "Verifying the destination.")
+                try:
+                    await self.deliver(offer.capture, destination["id"], service, authorize)
+                except PanelHeld:
+                    offer.remaining = 1.0
+                    self.report(offer, "held")
+                    await self.await_countdown(offer, shown=True)
+                except PanelUnavailable:
+                    await self.finish_pending(offer, "cancelled", "The automatic send panel was no longer available.")
+                    return
+                else:
+                    break
             await self.settle(offer)
 
     async def finish_pending(self, offer, state, message):
@@ -233,8 +337,8 @@ class AnnotationAutomation:
 
     async def settle(self, offer):
         row = await asyncio.to_thread(self.receipts.settle_route, offer.capture)
-        status = self.stored_status(row, offer.capture)
-        self.report(offer, status["phase"], status.get("message", ""))
+        status = await asyncio.to_thread(self.stored_status, row, offer.capture)
+        self.report(offer, status["phase"], status.get("message", ""), status=status)
 
     async def run(self, offer):
         try:

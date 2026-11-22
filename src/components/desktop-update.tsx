@@ -17,24 +17,26 @@ type Props = { controls: DesktopUpdateControls; busy: boolean }
 function updateControl(controls: DesktopUpdateControls, busy: boolean, t: ReturnType<typeof useInterfaceLanguage>["t"]) {
   const { update, pending, manual, error, run } = controls
   if (!update) return null
-  const { phase, notes, message, version, channel, offer, currentVersion } = update
+  const { phase, notes, message, version, channel, offer, offerVersion, currentVersion } = update
   const managed = update.updatesDisabled === true
   const unavailable = managed || phase === "unavailable"
   const nativeProgress = phase === "checking" || phase === "downloading" || phase === "staging"
   const checking = nativeProgress ? progress[phase] : pending === "check" ? progress.checking : null
-  const restarting = pending === "restart" || phase === "applying"
+  const restarting = pending === "restart" || phase === "applying" || update.restartInProgress === true
   const staged = !unavailable && (update.staged ?? phase === "ready")
   const ready = restarting || staged
   const restartBlocked = staged && (busy || update.restartBlocked)
   const visibleProgress = phase === "checking" && !manual ? null : checking
-  const switchLabel = phase === "switch" && offer && channel ? t("Switch to {channel} {version}", {
-    channel: t(channelLabel[channel]), version: version ?? "",
+  const switchLabel = (phase === "switch" || (phase === "ready" && staged)) && offer && channel ? t("Switch to {channel} {version}", {
+    channel: t(channelLabel[channel]), version: offerVersion ?? version ?? "",
   }) : null
+  const confirmSwitch = switchLabel && offer ? () => void run({ action: "confirmSwitch", offer }) : null
   const label = restarting ? t("Restarting…") : ready ? t("Restart to Update")
     : visibleProgress ? t(visibleProgress) : switchLabel ?? t(phase === "download" ? "Download Update" : "Look for new versions")
   const result = managed ? "Updates managed by your organization"
+    : restarting ? ""
     : restartBlocked ? "Finish your current work to restart Jard."
-    : error || (unavailable ? "Updates are disabled for this installation."
+    : error || update.restartError || (unavailable ? "Updates are disabled for this installation."
     : checking ? (ready ? checking : "")
     : phase === "error" ? (manual ? message || "Could not check for updates." : "")
     : phase === "current" && manual ? "Jard is up to date."
@@ -43,10 +45,10 @@ function updateControl(controls: DesktopUpdateControls, busy: boolean, t: Return
   return {
     label, result: result ? t(result) : "", notes: staged ? notes?.trim() : "", available, currentVersion, unavailable, managed, ready,
     compact: !ready && !switchLabel && phase !== "download",
-    checking: !!checking && !ready,
+    checking: !!checking && !ready, restarting, switchLabel, confirmSwitch,
     disabled: unavailable || !!pending || (!!checking && !ready) || restarting || restartBlocked,
-    apply: () => void run(switchLabel && offer ? { action: "confirmSwitch", offer }
-      : { action: ready ? "restart" : phase === "download" ? "download" : "check" }),
+    apply: ready ? () => void run({ action: "restart" }) : confirmSwitch ??
+      (() => void run({ action: phase === "download" ? "download" : "check" })),
   }
 }
 
@@ -65,7 +67,8 @@ function ReleaseNotes({ controls, notes, sidebar = false }: { controls: DesktopU
     <details key={`${channel}/${version}/${notes}`}>
       <summary>{t("Release notes")}</summary>
       <p>{notes}</p>
-      {external && <button type="button" className="update-release-link" disabled={!!pending}
+      {external && <button type="button" className="update-release-link"
+        disabled={!!pending || update?.restartInProgress || update?.phase === "applying"}
         aria-label={t("Open release page")} onClick={() => void run({ action: "releaseNotes", version, channel })}>
         <ExternalLink aria-hidden="true" />{t("Open release page")}
       </button>}
@@ -81,20 +84,29 @@ export function DesktopUpdateSettings({ controls, busy }: Props) {
   const action = updateControl(controls, busy, t)
   const { update, pending, run } = controls
   if (!action || !update) return null
+  const { channels } = update
   return <SettingGroup id="desktop-updates-title" title={t("Updates")}>
-    <SettingRow icon={RotateCw} title={t("App updates")} label={false} find="Look for new versions or restart Jard to install an update"
+    <SettingRow icon={RotateCw} title={t("App updates")} label={false} anchor="desktop-app-updates"
+      find="Look for new versions or restart Jard to install an update"
       detail={[action.currentVersion && t("Installed version {version}", { version: action.currentVersion }), action.available].filter(Boolean).join(" · ")}>
       {!action.managed && <Button size="sm" variant={action.ready ? "secondary" : "outline"} disabled={action.disabled} onClick={action.apply}>{action.label}</Button>}
     </SettingRow>
-    {!action.unavailable && update.channel && update.channels && update.channels.length > 1 &&
+    {!action.unavailable && update.channel && channels && channels.length > 1 &&
       <SettingRow icon={RotateCw} title={t("Update channel")} find="Stable or Development releases"
         detail={update.channelManaged ? "Your administrator manages this setting." :
           update.channel !== update.installedChannel && update.installedChannel ? `Installed channel is ${channelLabel[update.installedChannel]}.` : undefined}>
-        <select aria-label={t("Update channel")} value={update.channel} disabled={!!pending || update.channelManaged || update.phase === "applying"}
-          onChange={event => void run({ action: "channel", channel: event.target.value as DesktopUpdateChannel })}>
-          {update.channels.map(channel => <option value={channel} key={channel}>{t(channelLabel[channel])}</option>)}
-        </select>
+        {labels => (
+          <select {...labels} value={update.channel} disabled={!!pending || update.channelManaged || action.restarting}
+            onChange={event => void run({ action: "channel", channel: event.target.value as DesktopUpdateChannel })}>
+            {channels.map(channel => <option value={channel} key={channel}>{t(channelLabel[channel])}</option>)}
+          </select>
+        )}
       </SettingRow>}
+    {action.ready && action.confirmSwitch && <div className="update-settings-feedback">
+      <Button size="sm" variant="outline" disabled={!!pending || action.restarting} onClick={action.confirmSwitch}>
+        {action.switchLabel}
+      </Button>
+    </div>}
     {action.result && <p className="update-settings-feedback">{action.result}</p>}
     {action.available && action.notes && <ReleaseNotes controls={controls} notes={action.notes} />}
   </SettingGroup>
@@ -112,7 +124,7 @@ export function DesktopUpdateControl({ controls, busy }: Props) {
     <button className={compact ? "sidebar-update-icon" : action.ready ? "sidebar-home update-ready" : "sidebar-home sidebar-update-action"}
       type="button" title={action.label} aria-label={compact ? action.label : undefined}
       disabled={action.disabled} onClick={action.apply}>
-      <RotateCw aria-hidden="true" className={action.checking ? "motion-safe:animate-spin" : undefined} />
+      <RotateCw aria-hidden="true" className={action.checking || action.restarting ? "motion-safe:animate-spin" : undefined} />
       {!compact && <span>{action.label}</span>}
     </button>
     {feedback && <small>{feedback}</small>}
@@ -124,6 +136,7 @@ export function DesktopUpdateFeedback({ controls, busy }: Props) {
   const { t } = useInterfaceLanguage()
   const action = updateControl(controls, busy, t)
   return <span role="status" className="sr-only">
-    {controls.manual || controls.pending || controls.error ? action?.result || action?.label : action?.available}
+    {controls.manual || controls.pending || controls.error || action?.restarting || controls.update?.restartError
+      ? action?.result || action?.label : action?.available}
   </span>
 }

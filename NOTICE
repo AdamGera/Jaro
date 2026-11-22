@@ -6,7 +6,14 @@ The bundled place-name index contains selected names and alternate spellings fro
 GeoNames (https://www.geonames.org/), distributed under CC BY 4.0
 (https://creativecommons.org/licenses/by/4.0/), via geonamescache 3.0.2.
 
-The Dot Scope simulation, dictation sound assets, and portions of the dictation,
-meeting audio, wired capture, localization, and transformation code are by
-Christopher Langton. See licenses/Christopher-Langton-MIT.txt for the full
-copyright and MIT license notices.
+The Dot Scope simulation, dictation and annotation sound assets, and portions
+of the dictation, meeting audio, wired capture, localization, and transformation
+code are by Christopher Langton. See licenses/Christopher-Langton-MIT.txt for
+the full copyright and MIT license notices.
+
+The agent icons identify the respective send destinations. The Codex icons
+come from the OpenAI macOS app (https://openai.com/codex/). The Claude Code
+icon comes from Anthropic's Claude Code documentation (https://code.claude.com/).
+The OpenCode marks come from Anomaly's brand kit (https://opencode.ai/brand/),
+and the T3 Code mark comes from the T3 Tools repository
+(https://github.com/pingdotgg/t3code/blob/main/assets/prod/logo.svg).

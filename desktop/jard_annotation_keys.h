@@ -1,7 +1,9 @@
 #pragma once
 #include <stdbool.h>
 
-typedef enum { JardAnnotationUnavailable, JardAnnotationReady, JardAnnotationPicking, JardAnnotationRecording } JardAnnotationInputMode;
+typedef enum {
+    JardAnnotationUnavailable, JardAnnotationReady, JardAnnotationPicking, JardAnnotationPickingTarget, JardAnnotationRecording,
+} JardAnnotationInputMode;
 typedef enum { JardAnnotationNoPress, JardAnnotationStartPress, JardAnnotationDrawPress } JardAnnotationPress;
 typedef enum {
     JardAnnotationChordDown, JardAnnotationChordUp, JardAnnotationEscapeDown, JardAnnotationEscapeUp,
@@ -10,9 +12,11 @@ typedef enum {
 enum {
     JardAnnotationTake = 1 << 0, JardAnnotationBegin = 1 << 1, JardAnnotationSave = 1 << 2,
     JardAnnotationCancelPicker = 1 << 3, JardAnnotationArmDraw = 1 << 4, JardAnnotationEndDrawing = 1 << 5,
+    JardAnnotationConfirmTarget = 1 << 6,
 };
 enum {
-    JardAnnotationOption = 1 << 0, JardAnnotationShift = 1 << 1, JardAnnotationOtherModifier = 1 << 2,
+    JardAnnotationOption = 1 << 0, JardAnnotationShift = 1 << 1, JardAnnotationControl = 1 << 2,
+    JardAnnotationCommand = 1 << 3, JardAnnotationFn = 1 << 4,
     JardAnnotationChord = JardAnnotationOption | JardAnnotationShift,
 };
 
@@ -34,31 +38,32 @@ static inline unsigned JardAnnotationRelease(JardAnnotationKeys *keys, JardAnnot
     keys->press = JardAnnotationNoPress;
     keys->heldPen = false;
     if (press == JardAnnotationStartPress && mode == JardAnnotationReady) return action | JardAnnotationBegin;
+    if (press == JardAnnotationStartPress && mode == JardAnnotationPickingTarget) return action | JardAnnotationConfirmTarget;
     if (press == JardAnnotationDrawPress && mode == JardAnnotationRecording)
         return action | (drew ? JardAnnotationEndDrawing : JardAnnotationSave);
     return action;
 }
 
 static inline unsigned JardAnnotationKey(JardAnnotationKeys *keys, JardAnnotationInputMode mode, JardAnnotationKeyEvent event,
-        double now, double startedAt, unsigned modifiers, bool repeat, bool latchedPen) {
-    bool chordModifiers = (modifiers & JardAnnotationChord) == JardAnnotationChord;
+        double now, double startedAt, unsigned required, unsigned modifiers, bool repeat, bool latchedPen) {
+    bool chordModifiers = (modifiers & required) == required;
     bool shiftDown = (modifiers & JardAnnotationShift) != 0;
     switch (event) {
         case JardAnnotationChordDown:
             if (keys->chordCaptured) return JardAnnotationTake;
-            if (modifiers != JardAnnotationChord || repeat || mode == JardAnnotationUnavailable) return 0;
+            if (modifiers != required || repeat || mode == JardAnnotationUnavailable) return 0;
             keys->chordCaptured = true;
             keys->pressedAt = now;
             keys->shiftPen = false;
-            keys->blockShiftUntilUp = true;
-            if (mode == JardAnnotationReady) keys->press = JardAnnotationStartPress;
+            keys->blockShiftUntilUp = shiftDown;
+            if (mode == JardAnnotationReady || mode == JardAnnotationPickingTarget) keys->press = JardAnnotationStartPress;
             if (mode == JardAnnotationRecording && now - startedAt >= JardAnnotationStartDebounce) {
                 keys->press = JardAnnotationDrawPress;
                 return JardAnnotationTake | JardAnnotationArmDraw;
             }
             return JardAnnotationTake;
         case JardAnnotationChordUp:
-            if (keys->press == JardAnnotationStartPress && chordModifiers) {
+            if (keys->press == JardAnnotationStartPress && required && chordModifiers) {
                 keys->chordCaptured = false;
                 return JardAnnotationTake;
             }
@@ -71,13 +76,14 @@ static inline unsigned JardAnnotationKey(JardAnnotationKeys *keys, JardAnnotatio
         case JardAnnotationEscapeDown:
             if (keys->escapeCaptured) return JardAnnotationTake;
             if (repeat) return 0;
-            if (mode == JardAnnotationPicking || keys->press != JardAnnotationNoPress ||
+            bool picking = mode == JardAnnotationPicking || mode == JardAnnotationPickingTarget;
+            if (picking || keys->press != JardAnnotationNoPress ||
                 (mode == JardAnnotationRecording && (keys->shiftPen || keys->heldPen || latchedPen))) {
                 keys->escapeCaptured = true;
                 keys->shiftPen = keys->heldPen = false;
                 keys->blockShiftUntilUp = shiftDown;
                 keys->press = JardAnnotationNoPress;
-                return JardAnnotationTake | JardAnnotationEndDrawing | (mode == JardAnnotationPicking ? JardAnnotationCancelPicker : 0);
+                return JardAnnotationTake | JardAnnotationEndDrawing | (picking ? JardAnnotationCancelPicker : 0);
             }
             return 0;
         case JardAnnotationEscapeUp:

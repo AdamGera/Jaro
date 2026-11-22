@@ -4,13 +4,15 @@ import shutil
 import stat
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import quote
+from uuid import uuid4
 
 import meeting_brief
 import meeting_exports
-from saved_meetings import meeting_detail
+from saved_meetings import get_meeting, latest_transcript, meeting_detail, parse_offset, render_export
 from meeting_retention import archive_path
 from session_store import MissingSession, SessionStore
 
@@ -47,6 +49,96 @@ class MeetingExportTests(unittest.TestCase):
                 meeting_brief.enqueue(db, key)
             generation = db.execute("SELECT generation FROM meeting_briefs WHERE id=?", (key,)).fetchone()[0]
             self.assertTrue(meeting_brief.settle(db, key, generation, {"title": title, "summary": summary}))
+
+    def test_markdown_clock_uses_recording_start_without_changing_speech_timing(self):
+        self.choose(self.folder)
+        with self.store.connection() as db:
+            self.assertFalse(meeting_exports.clock_24(db))
+            meeting_exports.set_clock_24(db, True)
+            meeting_exports.set_separate_notes(db, True)
+        key = self.meeting()
+        detail = meeting_detail(self.store.get(key, include_turns=True))
+        started = datetime.fromisoformat(detail["startedAt"]).astimezone()
+        day = started.date().isoformat()
+        clock_12 = f"{started.hour % 12 or 12}:{started.minute:02d} {'AM' if started.hour < 12 else 'PM'}"
+        self.assertIn(f"- **Date:** {day}, {clock_12}", render_export(detail, "md"))
+        self.summarize(key, "Project timeline", "The group reviewed the timeline.")
+        meeting_exports.flush(self.store)
+        expected = f"- **Date:** {day}, {started:%H:%M}"
+        for suffix in ("transcript.md", "notes.md"):
+            path, = self.folder.glob(f"*.{suffix}")
+            self.assertIn(expected, path.read_text())
+        self.assertEqual(render_export(detail, "srt"), render_export(detail, "srt", use_24_hour=True))
+        self.assertEqual(render_export(detail, "vtt"), render_export(detail, "vtt", use_24_hour=True))
+
+    def test_transcript_offsets_and_live_range_boundaries(self):
+        self.assertEqual(parse_offset("113:03.125"), 6_783_125)
+        self.assertEqual(parse_offset("1:53:03.125"), 6_783_125)
+        self.assertEqual(parse_offset("1.25h"), 4_500_000)
+        self.assertEqual(parse_offset("1.5 m"), 90_000)
+        self.assertEqual(parse_offset(1.0005), 1001)
+        self.assertIsNone(parse_offset(" "))
+        for invalid in ("-0", "1:60", "1.5:03", "1:60:05", "inf", "1e30s"):
+            with self.subTest(offset=invalid), self.assertRaises(ValueError):
+                parse_offset(invalid)
+        with self.assertRaisesRegex(ValueError, "after the start"):
+            meeting_detail(self.store.get(self.meeting()), end="0.0001")
+
+        started = (datetime.now(timezone.utc) - timedelta(seconds=8)).isoformat()
+        live = {"id": str(uuid4()), "name": "Live review", "created": started, "meetingStartedAt": started,
+                "status": "recording", "duration": 1, "meeting": True,
+                "meetingTurns": [{"speaker": 1, "start": .25, "end": .75, "text": "Welcome."}]}
+        session = get_meeting(self.store, live["id"], live=live)
+        detail = meeting_detail(session, start="2s", end="4s")
+        self.assertEqual(detail["range"], {"from_ms": 2000, "to_ms": 4000})
+        self.assertEqual(detail["turns"], [])
+        self.assertEqual(meeting_detail(session, end=".75")["turns"][0]["text"], "Welcome.")
+        self.assertEqual(meeting_detail(session, end=".25")["turns"], [])
+        self.assertEqual(meeting_detail(session, start=".75")["turns"], [])
+        with self.assertRaisesRegex(ValueError, "so far"):
+            meeting_detail(session, start="1h")
+        with self.assertRaisesRegex(ValueError, "meeting's end"):
+            meeting_detail(self.store.get(self.meeting()), start="8s")
+
+    def test_subtitles_omit_empty_turns_and_escape_text_and_speaker_names(self):
+        detail = {"title": "Review", "turns": [
+            {"start": 0., "end": .5, "speaker": "Speaker A", "text": " \n "},
+            {"start": 1., "end": 2.25, "speaker": "<Review> & I", "text": "Hello\n\n A --> B"},
+            {"start": 3., "end": None, "speaker": None, "text": "Untimed"},
+        ]}
+        self.assertEqual(render_export(detail, "srt"),
+                         "1\n00:00:01,000 --> 00:00:02,250\n<Review> & I: Hello A -> B\n")
+        self.assertEqual(render_export(detail, "vtt"),
+                         "WEBVTT\n\n00:00:01.000 --> 00:00:02.250\n&lt;Review&gt; &amp; I: Hello A -&gt; B\n")
+
+    def test_copy_latest_meeting_uses_current_turns_or_most_recent_readable_speech(self):
+        with self.assertRaisesRegex(ValueError, "No meeting transcript"):
+            latest_transcript(self.store)
+        saved = self.meeting()
+        self.meeting(meeting=False)
+        source = self.root / "source.wav"
+        source.write_bytes(b"fixture")
+        silent, _ = self.store.create(source, "Silent.wav", "audio/wav", {
+            "meeting": True, "meetingStartedAt": "2026-09-17T09:00:00Z", "diarization": False, "recording": True,
+        }, 8)
+        self.store.finish(silent)
+        opened = datetime.now(timezone.utc).isoformat()
+        live = {"id": str(uuid4()), "name": "Live meeting", "meeting": True, "created": opened,
+                "meetingStartedAt": opened, "duration": 10, "status": "recording", "meetingTurns": []}
+        reader = SessionStore(self.store.root, read_only=True)
+        self.assertEqual(latest_transcript(reader, live), {
+            "session": saved, "text": "**00:01 · Speaker 1**  \nReview the project timeline.",
+        })
+        live["meetingTurns"] = [{"speaker": 1, "start": 4, "end": 7, "text": "The build is ready."}]
+        self.assertEqual(latest_transcript(reader, live), {
+            "session": live["id"], "text": "**00:04 · You**  \nThe build is ready.",
+        })
+        with self.store.connection() as db:
+            db.execute("UPDATE overviews SET status='ready' WHERE id=?", (saved,))
+        self.summarize(saved, "Agenda", "The team reviewed the timeline.")
+        self.assertFalse(self.store.delete(saved, trash=lambda path: shutil.move(path, self.root / "Archived recording")))
+        with self.assertRaisesRegex(ValueError, "No meeting transcript"):
+            latest_transcript(reader)
 
     def pair(self):
         self.choose(self.folder)

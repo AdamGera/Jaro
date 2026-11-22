@@ -32,7 +32,11 @@ const recording = await jard.dictation.start({ source: "My app" })
 const { transcript, durationMs } = await recording.finish()
 ```
 
-Use `recording.cancel()` to discard a take. The handle renews its ten-second lease every three seconds. Use `for await` with `recording.levels` for `rmsDb` and `peakDb`, or `recording.audio` for best-effort mono `Float32Array` batches at `recording.sampleRate`. The reader skips old batches if it falls behind. If the microphone drops, `finish()` uses any captured audio and returns a `microphone-lost` error when there is none. A finished take returns raw Rumble2 Flash text to the caller. It never pastes or appears in History or Sessions.
+Use `recording.cancel()` to discard a take. The handle renews its ten-second lease every three seconds. Use `for await` with `recording.levels` for `rmsDb` and `peakDb`, or `recording.audio` for best-effort mono `Float32Array` batches at `recording.sampleRate`. The reader skips old batches if it falls behind.
+
+If the recorder stops unexpectedly, another take can start right away. Call `finish()` on the interrupted handle to recover the audio already recorded. Jaro keeps the latest interrupted take until its lease expires, you cancel it, or another interrupted take replaces it. Finishing an empty or superseded take returns `microphone-lost`.
+
+A finished take returns raw Rumble2 Flash text only to the caller. It stays out of the clipboard, History, and Sessions.
 
 ## Embedded transcription
 

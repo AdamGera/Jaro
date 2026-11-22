@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreAudio
+import CoreGraphics
 import CoreMedia
 import Darwin
 import ScreenCaptureKit
@@ -67,7 +68,8 @@ private func checkAudioTap(_ status: OSStatus, _ action: String) throws {
     if status != noErr { throw AudioTapError(action: action, status: status) }
 }
 
-private final class MeetingAudioTap {
+// Startup hands ownership to the stop worker. The audio callback doesn't access these handles.
+private final class MeetingAudioTap: @unchecked Sendable {
     private var tap: AudioObjectID = 0
     private var device: AudioObjectID = 0
     private var callback: AudioDeviceIOProcID?
@@ -140,33 +142,161 @@ private final class MeetingAudioTap {
     deinit { stop() }
 }
 
+enum MeetingSystemAudioReadiness {
+    case waiting, ready, failed
+}
+
+struct MeetingSystemAudioHealth {
+    var openedAt: Double
+    var failed = false
+    private var lastPacketAt: Double?
+
+    init(openedAt: Double) { self.openedAt = openedAt }
+
+    func readiness(for backend: MeetingSystemAudioMode, at now: Double) -> MeetingSystemAudioReadiness {
+        if failed { return .failed }
+        // ScreenCaptureKit can pause audio callbacks while the Mac is quiet.
+        if backend == .screen { return .ready }
+        if now - (lastPacketAt ?? openedAt) >= 3 { return .failed }
+        return lastPacketAt == nil ? .waiting : .ready
+    }
+
+    mutating func receive(frames: Int, timestamp: Double, at now: Double) -> Bool {
+        guard frames > 0 else { return false }
+        guard timestamp.isFinite, abs(timestamp - now) < 10 else { failed = true; return false }
+        lastPacketAt = now
+        return true
+    }
+}
+
 protocol MeetingSystemAudioConnection {
-    var usable: Bool { get }
+    var readiness: MeetingSystemAudioReadiness { get }
     func stop() async
 }
 
-private final class MeetingSystemAudioSource: NSObject, SCStreamDelegate, SCStreamOutput, MeetingSystemAudioConnection {
+typealias MeetingSystemAudioOpener = (MeetingSystemAudioMode, pid_t?, @escaping ([Float], Double) -> Void) async throws
+    -> any MeetingSystemAudioConnection
+
+private final class MeetingSystemAudioSlots: @unchecked Sendable {
+    static let shared = MeetingSystemAudioSlots()
+    private let lock = NSLock()
+    private var occupied: Set<MeetingSystemAudioMode> = []
+
+    func reserve(_ backend: MeetingSystemAudioMode) -> Bool { lock.withLock { occupied.insert(backend).inserted } }
+    func isReserved(_ backend: MeetingSystemAudioMode) -> Bool { lock.withLock { occupied.contains(backend) } }
+    func release(_ backend: MeetingSystemAudioMode) { lock.withLock { _ = occupied.remove(backend) } }
+}
+
+private final class MeetingSystemAudioOpen: @unchecked Sendable {
+    private typealias Reply = CheckedContinuation<(any MeetingSystemAudioConnection)?, Never>
+    private enum State {
+        case starting, waiting(Reply), active, retired
+    }
+    private let lock = NSLock()
+    private var state = State.starting
+
+    private func wait(_ reply: Reply) -> Bool {
+        lock.withLock {
+            guard case .starting = state else { return false }
+            state = .waiting(reply)
+            return true
+        }
+    }
+
+    @discardableResult
+    private func resolve(_ source: (any MeetingSystemAudioConnection)?) -> Bool {
+        let reply: Reply? = lock.withLock {
+            if case .starting = state { state = .retired }
+            guard case let .waiting(reply) = state else { return nil }
+            state = source == nil ? .retired : .active
+            return reply
+        }
+        reply?.resume(returning: source)
+        return reply != nil
+    }
+
+    func retire() { lock.withLock { state = .retired } }
+
+    private func deliver(_ work: () -> Void) {
+        lock.withLock { if case .active = state { work() } }
+    }
+
+    func run(backend: MeetingSystemAudioMode, hostPID: pid_t?, timeout: Duration,
+             open: @escaping MeetingSystemAudioOpener,
+             receive: @escaping ([Float], Double) -> Void) async -> (any MeetingSystemAudioConnection)? {
+        let slots = MeetingSystemAudioSlots.shared
+        guard slots.reserve(backend) else { return nil }
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        let timer = Task {
+            do {
+                try await Task.sleep(until: deadline, clock: .continuous)
+                self.resolve(nil)
+            } catch is CancellationError {}
+        }
+        defer { timer.cancel() }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { reply in
+                guard wait(reply) else {
+                    slots.release(backend)
+                    reply.resume(returning: nil)
+                    return
+                }
+                // macOS can block in an open that Swift cannot cancel. The worker keeps
+                // the backend slot until a late connection has been stopped.
+                Task.detached {
+                    do {
+                        let source = try await open(backend, hostPID) { samples, time in
+                            self.deliver { receive(samples, time) }
+                        }
+                        if ContinuousClock.now < deadline && self.resolve(source) { return }
+                        self.resolve(nil)
+                        await source.stop()
+                    } catch {
+                        slots.release(backend)
+                        self.resolve(nil)
+                        return
+                    }
+                    slots.release(backend)
+                }
+            }
+        } onCancel: {
+            self.resolve(nil)
+        }
+    }
+}
+
+// The supervisor serializes start and stop. Audio callbacks use queue and healthLock.
+private final class MeetingSystemAudioSource: NSObject, SCStreamDelegate, SCStreamOutput, MeetingSystemAudioConnection, @unchecked Sendable {
     private let queue = DispatchQueue(label: "jard.capture.meeting-system")
     private let pending = DispatchSemaphore(value: 48)
-    private let health = NSLock()
-    private var failed = false
-    private var lastPacket = hostSeconds()
+    private let healthLock = NSLock()
+    private let backend: MeetingSystemAudioMode
+    private var health = MeetingSystemAudioHealth(openedAt: hostSeconds())
     private let converter = MonoConverter()
     private let receive: ([Float], Double) -> Void
     private var screen: SCStream?
     private var tap: MeetingAudioTap?
 
-    init(receive: @escaping ([Float], Double) -> Void) { self.receive = receive }
+    init(backend: MeetingSystemAudioMode, receive: @escaping ([Float], Double) -> Void) {
+        self.backend = backend
+        self.receive = receive
+    }
 
-    func start(_ backend: MeetingSystemAudioMode, hostPID: pid_t?) async throws {
+    func start(hostPID: pid_t?) async throws {
         if backend == .tap {
-            tap = try MeetingAudioTap(hostPID: hostPID) { [weak self] input, time, format in
-                self?.receiveTap(input, at: time, format: format)
+            tap = try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    continuation.resume(with: Result {
+                        try MeetingAudioTap(hostPID: hostPID) { [weak self] input, time, format in
+                            self?.receiveTap(input, at: time, format: format)
+                        }
+                    })
+                }
             }
-            health.withLock { lastPacket = hostSeconds() }
         } else {
             screen = try await openScreenSystemAudio(delegate: self, output: self, queue: queue)
         }
+        healthLock.withLock { health.openedAt = hostSeconds() }
     }
 
     func stop() async {
@@ -174,24 +304,30 @@ private final class MeetingSystemAudioSource: NSObject, SCStreamDelegate, SCStre
             try? await screen.stopCapture()
             self.screen = nil
         }
-        tap?.stop()
-        tap = nil
+        if let tap {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    tap.stop()
+                    continuation.resume()
+                }
+            }
+            self.tap = nil
+        }
         queue.sync { try? converter.finish(emit: forward) }
     }
 
-    var usable: Bool {
-        health.withLock { !failed && (tap == nil || hostSeconds() - lastPacket < 3) }
+    var readiness: MeetingSystemAudioReadiness {
+        healthLock.withLock { health.readiness(for: backend, at: hostSeconds()) }
     }
 
-    private func fail() { health.withLock { failed = true } }
+    private func fail() { healthLock.withLock { health.failed = true } }
 
     private func forward(_ samples: [Float], at timestamp: Double) {
-        guard timestamp.isFinite, abs(timestamp - hostSeconds()) < 10 else { fail(); return }
+        guard healthLock.withLock({ health.receive(frames: samples.count, timestamp: timestamp, at: hostSeconds()) }) else { return }
         receive(samples, timestamp)
     }
 
     private func receiveTap(_ input: UnsafePointer<AudioBufferList>, at time: AudioTimeStamp, format: AVAudioFormat) {
-        health.withLock { lastPacket = hostSeconds() }
         guard input.pointee.mNumberBuffers > 0 else { return }
         let buffer = input.pointee.mBuffers
         let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
@@ -223,9 +359,9 @@ private final class MeetingSystemAudioSource: NSObject, SCStreamDelegate, SCStre
 
 func openMeetingSystemAudio(_ backend: MeetingSystemAudioMode, hostPID: pid_t?,
                             receive: @escaping ([Float], Double) -> Void) async throws -> any MeetingSystemAudioConnection {
-    let source = MeetingSystemAudioSource(receive: receive)
+    let source = MeetingSystemAudioSource(backend: backend, receive: receive)
     do {
-        try await source.start(backend, hostPID: hostPID)
+        try await source.start(hostPID: hostPID)
         return source
     } catch {
         await source.stop()
@@ -233,44 +369,102 @@ func openMeetingSystemAudio(_ backend: MeetingSystemAudioMode, hostPID: pid_t?,
     }
 }
 
+enum MeetingSystemAudioRetry {
+    case elapsed, available, cancelled
+}
+
+private func meetingConsoleAvailable() -> Bool {
+    guard let session = CGSessionCopyCurrentDictionary() as? [String: Any],
+          session[kCGSessionOnConsoleKey as String] as? Bool == true else { return false }
+    return session["CGSSessionScreenIsLocked"] as? Bool != true && CGDisplayIsAsleep(CGMainDisplayID()) == 0
+}
+
+func waitForMeetingSystemAudioRetry(_ delay: Duration, becameAvailable: () -> Bool) async -> MeetingSystemAudioRetry {
+    let deadline = ContinuousClock.now.advanced(by: delay)
+    while !Task.isCancelled {
+        if becameAvailable() { return .available }
+        let remaining = ContinuousClock.now.duration(to: deadline)
+        if remaining <= .zero { return .elapsed }
+        do { try await Task.sleep(for: min(remaining, .milliseconds(250))) }
+        catch { return .cancelled }
+    }
+    return .cancelled
+}
+
 func superviseMeetingSystemAudio(mode: MeetingSystemAudioMode, hostPID: pid_t?,
                                  receive: @escaping (UUID, [Float], Double) -> Void,
                                  change: (Bool, MeetingSystemAudioMode?) -> Void,
-                                 open: (MeetingSystemAudioMode, pid_t?, @escaping ([Float], Double) -> Void) async throws
-                                     -> any MeetingSystemAudioConnection = openMeetingSystemAudio,
+                                 open: @escaping MeetingSystemAudioOpener = openMeetingSystemAudio,
+                                 openTimeout: Duration = .seconds(3),
                                  pause: (Duration) async -> Bool = { duration in
                                      do { try await Task.sleep(for: duration); return true }
                                      catch { return false }
-                                 }) async {
+                                 },
+                                 consoleAvailable: @escaping () -> Bool = meetingConsoleAvailable,
+                                 waitForRetry: (Duration, () -> Bool) async -> MeetingSystemAudioRetry
+                                     = waitForMeetingSystemAudioRetry) async {
     var delay = 1
     var unavailable = false
+    let slots = MeetingSystemAudioSlots.shared
     func reportUnavailable() {
         if !unavailable { change(false, nil); unavailable = true }
     }
     while !Task.isCancelled {
+        let consoleWasAvailable = consoleAvailable()
+        var blocked = [MeetingSystemAudioMode]()
         for backend in mode.backends {
-            let id = UUID()
-            let source: any MeetingSystemAudioConnection
-            do { source = try await open(backend, hostPID) { samples, time in receive(id, samples, time) } }
-            catch {
-                if Task.isCancelled { return }
+            if slots.isReserved(backend) {
+                blocked.append(backend)
                 continue
             }
-            let opened = hostSeconds()
-            if !Task.isCancelled { change(true, backend); unavailable = false }
-            while !Task.isCancelled && source.usable {
-                if !(await pause(.milliseconds(250))) {
-                    await source.stop()
-                    return
-                }
+            let id = UUID()
+            let attempt = MeetingSystemAudioOpen()
+            guard let source = await attempt.run(backend: backend, hostPID: hostPID, timeout: openTimeout, open: open,
+                                                 receive: { samples, time in receive(id, samples, time) }) else {
+                if Task.isCancelled { return }
+                reportUnavailable()
+                continue
             }
-            await source.stop()
-            if Task.isCancelled { return }
+            var readyAt: Double?
+            var failed = false
+            while !Task.isCancelled {
+                let readiness = source.readiness
+                if readiness == .failed {
+                    failed = true
+                    break
+                }
+                if readiness == .ready && readyAt == nil {
+                    readyAt = hostSeconds()
+                    change(true, backend)
+                    unavailable = false
+                }
+                if !(await pause(.milliseconds(250))) { break }
+            }
+            if !failed || Task.isCancelled {
+                await source.stop()
+                attempt.retire()
+                slots.release(backend)
+                return
+            }
+            let stable = readyAt.map { hostSeconds() - $0 >= 6 } ?? false
+            attempt.retire()
             reportUnavailable()
-            if hostSeconds() - opened >= 6 { delay = 1 }
+            Task.detached {
+                await source.stop()
+                slots.release(backend)
+            }
+            if stable { delay = 1 }
         }
         reportUnavailable()
-        if !(await pause(.seconds(delay))) { return }
-        delay = min(30, delay * 2)
+        let retry = await waitForRetry(.seconds(delay)) {
+            (!consoleWasAvailable && consoleAvailable()) || blocked.contains { !slots.isReserved($0) }
+        }
+        switch retry {
+        case .cancelled: return
+        case .available:
+            if !consoleWasAvailable && consoleAvailable() { delay = 1 }
+        case .elapsed:
+            delay = min(30, delay * 2)
+        }
     }
 }

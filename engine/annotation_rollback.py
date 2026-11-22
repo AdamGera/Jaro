@@ -188,6 +188,10 @@ async def rollback_turn(turn, saved, restore_files, store):
 async def undo_annotation(root, delivery, *, restore_files=False, directory=None):
     require_opencode()
     receipts, saved = await read_receipt(root, delivery)
+    if saved.get("rememberedRule", {}).get("status") == "saved":
+        saved = await asyncio.to_thread(receipts.undo_remembered_rule, saved["deliveryId"])
+        if not saved["message"]:
+            return saved
     if saved["status"] in ("queued", "withdrawal-unconfirmed"):
         saved = await withdraw_annotation(root, delivery, directory=directory)
     reviewing = saved["status"] in ROLLBACK_REVIEW

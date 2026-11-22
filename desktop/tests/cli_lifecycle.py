@@ -34,7 +34,7 @@ def wait_for(probe, message, timeout=30):
     raise AssertionError(message)
 
 
-def wait_for_exit(pid):
+def wait_for_exit(pid, timeout=30):
     with contextlib.closing(select.kqueue()) as queue:
         event = select.kevent(pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
                               fflags=select.KQ_NOTE_EXIT)
@@ -42,7 +42,7 @@ def wait_for_exit(pid):
             queue.control([event], 0, 0)
         except ProcessLookupError:
             return
-        assert queue.control(None, 1, 30), f"The menu did not exit fixture process {pid}."
+        assert queue.control(None, 1, timeout), f"Fixture process {pid} did not exit."
 
 
 def run(package, models, menu_host=None, *, clone_models=False):
@@ -59,6 +59,7 @@ def run(package, models, menu_host=None, *, clone_models=False):
         if menu_host:
             # Exercise the final refresh against an unavailable feed without reaching the production channel.
             info["JardUpdates"]["feed_url"] = "https://127.0.0.1:9/native-update.json"
+            info["JardUpdates"].pop("rollout_url", None)
             executable.unlink()
             subprocess.run(["/bin/cp", "-p", menu_host, executable], check=True)
         manifest.unlink()
@@ -114,6 +115,9 @@ def run(package, models, menu_host=None, *, clone_models=False):
                     return engine_status() == "ready"
             wait_for(ready, "The fixture engine did not become ready.")
 
+        def wait_staged_update():
+            wait_for(lambda: cli("update-channel")["staged"], "The signed stage did not restore in the background.")
+
         def invoke_fixture(action, title):
             receipt = root / ".update-menu-invoked"
             receipt.unlink(missing_ok=True)
@@ -139,9 +143,12 @@ def run(package, models, menu_host=None, *, clone_models=False):
         try:
             subprocess.run(["/usr/bin/defaults", "write", identifier, "JardCLIFixtureSentinel", "-string", "unchanged"], check=True)
             offline = {"dictation.mode": "hold", "dictation.retention": 1, "dictation.languages": ["en"],
-                       "dictation.audioWhileDictating": "lower", "dictation.lowerAudioPercent": 35}
+                       "dictation.audioWhileDictating": "lower", "dictation.lowerAudioPercent": 35,
+                       "capture.enabled": False, "capture.hotkey": "f9", "capture.show_overlays_in_recordings": True}
             assert cli("settings", "apply", "-", data=json.dumps(offline)) == offline
             assert not (root / ".native-control").exists(), "Offline settings launched a desktop process."
+            conflict = {"capture.enabled": True, "capture.hotkey": "option+shift+v", "dictation.mode": "tap"}
+            assert "already in use" in cli("settings", "apply", "-", data=json.dumps(conflict), succeeds=False)["error"]
             assert "Invalid" in cli("settings", "apply", "-", data='{"dictation.mode":"tap","dictation.retention":5}',
                                     succeeds=False)["error"]
             assert "supported" in cli("settings", "apply", "-", data='{"dictation.languages":["invalid"]}',
@@ -156,6 +163,8 @@ def run(package, models, menu_host=None, *, clone_models=False):
             assert preferences["JardCLIFixtureSentinel"] == "unchanged"
             assert preferences["JardSystemDictation"]["mode"] == "hold"
             assert preferences["JardSystemDictation"]["previousRetention"] == 1
+            assert preferences["JardSystemDictation"]["annotationEnabled"] is False
+            assert preferences["JardSystemDictation"]["annotateLabel"] == "F9"
             original = {**preferences["JardSystemDictation"], "soundVolume": ["invalid"],
                         "futurePreference": {"enabled": True}}
             preferences["JardSystemDictation"] = original
@@ -178,11 +187,26 @@ def run(package, models, menu_host=None, *, clone_models=False):
             subprocess.run(["/usr/bin/defaults", "import", identifier, "-"], input=plistlib.dumps(repaired), check=True)
             print("Offline writes repaired known fields, kept the original and future keys, and refused an unreadable root.", flush=True)
 
-            started = cli("start")
+            started = cli("start", "--hidden")
             assert started["status"] == "running" and started["bundle"] == str(app), started
-            assert cli("start")["changed"] is False
+            assert not started["windowVisible"] and not started["dockIconVisible"], started
+            still_running = cli("start", "--hidden")
+            assert still_running["changed"] is False and still_running["pid"] == started["pid"], still_running
             wait_engine()
             assert cli("status")["desktop"]["lastFailure"] == ""
+            capture_preferences = {"capture.enabled": False, "capture.hotkey": "f9", "capture.show_overlays_in_recordings": True}
+            assert cli("settings", "get", "capture.") == capture_preferences
+            refused = cli("annotate", "start", "--source", "display", succeeds=False)
+            assert "turned off" in refused["error"], refused
+            assert "already in use" in cli("settings", "apply", "-", data=json.dumps(conflict), succeeds=False)["error"]
+            assert cli("settings", "get", "dictation.mode") == {"dictation.mode": "hold"}
+            assert cli("settings", "get", "capture.") == capture_preferences
+            for invalid in ("k", "option++k", "option+option+k", "fn+k", "shift+keycode-53"):
+                assert "Invalid Annotate shortcut" in cli("settings", "set", "capture.hotkey", invalid, succeeds=False)["error"]
+            assert cli("settings", "set", "capture.hotkey", "ctrl + shift + k") == {"capture.hotkey": "ctrl + shift + k"}
+            assert cli("settings", "get", "capture.hotkey") == {"capture.hotkey": "control+shift+k"}
+            assert cli("settings", "set", "capture.enabled", "on") == {"capture.enabled": True}
+            assert cli("settings", "set", "capture.show_overlays_in_recordings", "off") == {"capture.show_overlays_in_recordings": False}
             assert "There is no active take" in cli("dictation", "stop", "--print", succeeds=False)["error"]
             annotation = cli("annotate", "status")
             assert annotation["phase"] == "idle" and annotation["capture"] is None and annotation["last"] is None
@@ -205,6 +229,9 @@ def run(package, models, menu_host=None, *, clone_models=False):
                            extra_env={"RUMBLE_DATA_DIR": str(folder / "different-library")})
             assert "Close Jard" in mismatch["error"], mismatch
             supported = cli("settings", "list")
+            assert supported["capture.enabled"] == {"type": "boolean", "readOnly": False}
+            assert supported["capture.hotkey"] == {"type": "string", "readOnly": False}
+            assert supported["capture.show_overlays_in_recordings"] == {"type": "boolean", "readOnly": False}
             assert supported["dictation.shortcutLabel"]["readOnly"] is True
             assert supported["dictation.mode"]["choices"] == ["hold", "holdDouble", "tap", "doubleTap"]
             assert cli("settings", "get", "dictation.lowerAudioPercent") == {"dictation.lowerAudioPercent": 35}
@@ -230,6 +257,8 @@ def run(package, models, menu_host=None, *, clone_models=False):
             saved = cli("settings", "get", "dictation.")
             assert {key: saved[key] for key in desired} == desired and saved["dictation.sound"] is False
             assert saved["dictation.audioWhileDictating"] == "pause" and saved["dictation.lowerAudioPercent"] == 35
+            assert cli("settings", "get", "capture.") == {"capture.enabled": True, "capture.hotkey": "control+shift+k",
+                                                        "capture.show_overlays_in_recordings": False}
             if menu_host:
                 wait_engine()
                 invoke_fixture("setup-reopen", "Reopen Jard")
@@ -239,14 +268,14 @@ def run(package, models, menu_host=None, *, clone_models=False):
                 resumed = wait_for(lambda: cli("status").get("desktop"), "The automatically reopened host did not answer.")
                 assert resumed["pid"] == new and resumed["bundle"] == str(app), resumed
                 invoke_fixture("setup-status", "access")
+                invoke_fixture("setup-dismiss", "later")
                 print("Reopen Jard resumed setup through the native WebView with the same app path and library.", flush=True)
             assert cli("quit")["status"] == "stopped"
 
             next_version = "99.0.0"
             stage_update(next_version)
             staged = cli("start")
-            pending = subprocess.run(["/usr/bin/defaults", "read", identifier, "JardPendingUpdate"], text=True, capture_output=True)
-            assert staged["update"] == "ready", (staged, stage.exists(), pending.stdout, pending.stderr)
+            wait_staged_update()
             wait_engine()
             if menu_host:
                 lease = base + f"/api/clients/{uuid4()}"
@@ -257,7 +286,7 @@ def run(package, models, menu_host=None, *, clone_models=False):
                 assert stage.is_dir() and installed_info()["CFBundleVersion"] == info["CFBundleVersion"]
                 change_lease(lease, "DELETE")
                 staged = cli("start")
-                assert staged["update"] == "ready", staged
+                wait_staged_update()
                 invoke_fixture("quit", f"Quit {info['CFBundleDisplayName']}")
                 wait_for_exit(staged["pid"])
             else:
@@ -266,13 +295,14 @@ def run(package, models, menu_host=None, *, clone_models=False):
             assert "before using desktop controls" in cli("settings", "list", succeeds=False)["error"]
             assert installed_info()["CFBundleVersion"] == next_version
             updated = cli("start")
-            assert updated["changed"] and updated["status"] == "running" and updated["version"] == next_version and not stage.exists(), updated
+            assert updated["changed"] and updated["status"] == "running" and updated["version"] == next_version, updated
+            wait_for(lambda: not stage.exists(), "Launch did not remove the previous update backup.")
             assert cli("quit")["status"] == "stopped"
             if menu_host:
                 print("AppKit Quit retained the stage and engine while another client was connected, then applied it on an idle quit.", flush=True)
                 stage_update("99.0.1")
                 old = cli("start")
-                assert old["update"] == "ready", old
+                wait_staged_update()
                 wait_engine()
                 browser = base + f"/api/clients/{uuid4()}/stream"
                 with urlopen(browser, timeout=5) as stream:
@@ -287,12 +317,13 @@ def run(package, models, menu_host=None, *, clone_models=False):
                 wait_engine()
                 updated = cli("start")
                 assert not updated["changed"] and updated["pid"] == new and updated["bundle"] == str(app), updated
-                assert updated["version"] == "99.0.1" and not stage.exists(), updated
+                assert updated["version"] == "99.0.1", updated
+                wait_for(lambda: not stage.exists(), "Relaunch did not remove the previous update backup.")
                 assert cli("quit")["status"] == "stopped"
                 print("Restart to Update protected the connected browser, then replaced and reopened the same app and library after disconnect.", flush=True)
                 stage_update("99.0.2")
                 superseded = cli("start")
-                assert superseded["update"] == "ready", superseded
+                wait_staged_update()
                 wait_engine()
                 invoke_fixture("restart-then-quit", "Restart to Update")
                 wait_for_exit(superseded["pid"])
@@ -300,12 +331,51 @@ def run(package, models, menu_host=None, *, clone_models=False):
                 time.sleep(1)
                 assert not list(process_ids(executable)), "Quit relaunched the pending update."
                 print("AppKit Quit won over a pending final check, applied the verified update, and stayed closed.", flush=True)
+                assert cli("start")["version"] == "99.0.2"
+                wait_for(lambda: not stage.exists(), "Launch did not remove the previous update backup.")
+                assert cli("quit")["status"] == "stopped"
+                stage_update("99.0.3")
+                system_quit = cli("start")
+                wait_staged_update()
+                wait_engine()
+                os.kill(system_quit["pid"], signal.SIGTERM)
+                wait_for_exit(system_quit["pid"])
+                assert installed_info()["CFBundleVersion"] == "99.0.3"
+                time.sleep(1)
+                assert not list(process_ids(executable)), "System termination relaunched the staged update."
+                print("The AppKit termination request installed the verified update on Quit without relaunching.", flush=True)
+                assert cli("start")["version"] == "99.0.3"
+                wait_for(lambda: not stage.exists(), "Launch did not remove the previous update backup.")
+                assert cli("quit")["status"] == "stopped"
+                for action, version in (("sidebar-restart", "99.0.4"), ("settings-restart", "99.0.5")):
+                    stage_update(version)
+                    previous = cli("start")
+                    wait_staged_update()
+                    wait_engine()
+                    invoke_fixture(action, "Restart to Update")
+                    wait_for_exit(previous["pid"])
+                    new = wait_for(lambda: next(iter(process_ids(executable)), None),
+                                   "The workspace control did not relaunch the same app.")
+                    wait_engine()
+                    current = cli("start")
+                    assert not current["changed"] and current["pid"] == new and current["bundle"] == str(app), current
+                    assert current["version"] == version, current
+                    wait_for(lambda: not stage.exists(), "Launch did not remove the previous update backup.")
+                    assert cli("quit")["status"] == "stopped"
+                print("Both real workspace buttons installed verified updates and reopened the same app and library.", flush=True)
             print("Offline settings stayed isolated, locked writers were rejected, and desktop updates preserved the app path.")
         finally:
             # Terminate only the fixture bundle even when an assertion interrupts it.
             for pid in process_ids(executable):
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(pid, signal.SIGTERM)
+                try:
+                    wait_for_exit(pid, timeout=5)
+                except AssertionError:
+                    if pid in process_ids(executable):
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(pid, signal.SIGKILL)
+                        wait_for_exit(pid, timeout=5)
             with contextlib.suppress(URLError):
                 with urlopen(base + "/api/status", timeout=2) as response:
                     ours = json.load(response)["libraryId"] == library_id

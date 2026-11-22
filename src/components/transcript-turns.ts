@@ -1,11 +1,26 @@
-import type { Transcript } from "@/audio"
+import type { SpeakerSegment, Transcript } from "@/audio"
+
+export function meetingSegments(segments: SpeakerSegment[]) {
+  const turns: SpeakerSegment[] = []
+  for (const segment of segments) {
+    const previous = turns.at(-1)
+    if (previous && previous.speaker === segment.speaker && previous.end !== null && segment.end !== null &&
+        segment.start - previous.end <= 3) {
+      turns[turns.length - 1] = { ...previous, end: Math.max(previous.end, segment.end),
+        text: `${previous.text.trimEnd()} ${segment.text.trimStart()}` }
+    } else {
+      turns.push(segment)
+    }
+  }
+  return turns
+}
 
 // Offsets always address the original segment string, including spaces and punctuation.
 export type TranscriptSpan = { from: number; to: number; index?: number; seek?: number }
 type Utterance = { from: number; spans: TranscriptSpan[] }
 
 export function transcriptTurns({ segments, words, text }: Transcript) {
-  const turns = segments.length ? segments : [{ text, start: 0, speaker: undefined }]
+  const turns = segments.length ? segments : [{ text, start: 0, end: null, speaker: undefined }]
   const nextAnchor: (number | null)[] = []
   for (let i = words.length - 1; i >= 0; i--) {
     const sameTurn = i + 1 < words.length && words[i].speaker === words[i + 1].speaker

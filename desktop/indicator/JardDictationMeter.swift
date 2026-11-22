@@ -2,12 +2,50 @@ import AppKit
 
 @objc(JardDictationMeter)
 final class JardDictationMeter: NSView {
-    private let tuning = DotScopeTuning.hud
+    private var tuning = DotScopeTuning.hud
     private let scope = DotScopeSimulation()
     private var stage = DotScopeStage.recording
     private var previousTick: TimeInterval?
     private var visible = false
+    private var anchorRight = false
+    private var announcedStatus: String?
     var reduceMotion = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+    var announceAccessibility: (NSView, String) -> Void = { view, status in
+        NSAccessibility.post(element: view, notification: .announcementRequested, userInfo: [
+            .announcement: status,
+            .priority: NSAccessibilityPriorityLevel.medium.rawValue
+        ])
+    }
+    @objc var embedded = false {
+        didSet {
+            tuning = .hud
+            if embedded {
+                tuning.columns = 31
+                tuning.width = 78
+                tuning.idleWidth = 78
+                tuning.fitsBounds = true
+            }
+            scope.tune(tuning, jumpLayout: true)
+            setAccessibilityElement(visible && !embedded && accessibilityLabel() != nil)
+            if embedded { announcedStatus = nil }
+            needsDisplay = true
+        }
+    }
+
+    @objc(fitEmbeddedWidth:anchorRight:)
+    func fitEmbeddedWidth(_ width: CGFloat, anchorRight: Bool) {
+        guard embedded else { return }
+        let pitch = CGFloat(tuning.spacing)
+        let columns = max(1, Int((width / pitch).rounded(.up)))
+        guard columns != tuning.columns || anchorRight != self.anchorRight else { return }
+        let fitted = Float(CGFloat(columns) * pitch)
+        self.anchorRight = anchorRight
+        tuning.columns = columns
+        tuning.width = fitted
+        tuning.idleWidth = fitted
+        scope.tune(tuning, jumpLayout: true)
+        needsDisplay = true
+    }
 
     @objc(setStage:label:)
     func setStage(_ value: Int, label: String) {
@@ -24,13 +62,25 @@ final class JardDictationMeter: NSView {
         }
         visible = true
         stage = next
-        setAccessibilityElement(true)
-        setAccessibilityLabel(label)
+        let status = next != .done && !label.isEmpty ? label : nil
+        setAccessibilityElement(!embedded && status != nil)
+        setAccessibilityLabel(status)
         setAccessibilityRole(.staticText)
+        if status == nil { announcedStatus = nil }
         needsDisplay = true
     }
 
+    @objc func announceStatus() {
+        guard isAccessibilityElement(), let status = accessibilityLabel(), status != announcedStatus else { return }
+        announcedStatus = status
+        announceAccessibility(self, status)
+    }
+
     @objc override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        embedded ? nil : super.hitTest(point)
+    }
 
     @objc(advanceAt:rms:)
     func advance(at time: TimeInterval, rms: Double) {
@@ -44,8 +94,12 @@ final class JardDictationMeter: NSView {
 
     @objc func beginDismissal() {
         visible = false
+        announcedStatus = nil
         setAccessibilityElement(false)
+        setAccessibilityLabel(nil)
     }
+
+    @objc var isSettled: Bool { scope.settled }
 
     @objc func dismiss() {
         beginDismissal()
@@ -68,20 +122,25 @@ final class JardDictationMeter: NSView {
         func fill(_ rgb: SIMD4<Float>) { context.setFillColor(color(SIMD3<Float>(rgb.x, rgb.y, rgb.z), rgb.w)) }
 
         context.saveGState()
-        context.translateBy(x: bounds.midX, y: bounds.midY)
+        if embedded { context.clip(to: bounds) }
+        let halfWidth = CGFloat(width * pose.scale)
+        let center = embedded ? (anchorRight ? bounds.maxX - halfWidth : bounds.minX + halfWidth) : bounds.midX
+        context.translateBy(x: center, y: bounds.midY)
         context.scaleBy(x: CGFloat(pose.scale), y: CGFloat(pose.scale))
         context.setAlpha(CGFloat(pose.opacity))
-        context.saveGState()
-        context.setShadow(offset: CGSize(width: 0, height: 2), blur: CGFloat(5 + pose.softness),
-                          color: color(.zero, palette.shadow.w))
-        fill(palette.plate)
-        context.addPath(path)
-        context.fillPath()
-        context.restoreGState()
-        context.setStrokeColor(color(SIMD3<Float>(palette.rim.x, palette.rim.y, palette.rim.z), palette.rim.w))
-        context.setLineWidth(0.6)
-        context.addPath(path)
-        context.strokePath()
+        if !embedded {
+            context.saveGState()
+            context.setShadow(offset: CGSize(width: 0, height: 2), blur: CGFloat(5 + pose.softness),
+                              color: color(.zero, palette.shadow.w))
+            fill(palette.plate)
+            context.addPath(path)
+            context.fillPath()
+            context.restoreGState()
+            context.setStrokeColor(color(SIMD3<Float>(palette.rim.x, palette.rim.y, palette.rim.z), palette.rim.w))
+            context.setLineWidth(0.6)
+            context.addPath(path)
+            context.strokePath()
+        }
         context.addPath(path)
         context.clip()
 

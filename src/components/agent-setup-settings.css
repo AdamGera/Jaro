@@ -1,0 +1,26 @@
+.agent-setup-guide {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: start;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px var(--setting-inset) 16px;
+  border-top: 1px solid var(--line);
+  color: var(--quiet);
+  font-size: 13px;
+}
+
+.agent-setup-guide pre {
+  width: 100%;
+  min-width: 0;
+  max-height: 196px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--background);
+  color: var(--foreground);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  text-align: left;
+}

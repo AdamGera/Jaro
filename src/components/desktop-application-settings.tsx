@@ -38,22 +38,24 @@ export function DesktopApplicationSettings({ native }: { native: DesktopBridge }
 
   const menuUnavailable = dock?.enabled === false && !dock.menuBarAvailable
   const choices = Object.entries(language?.choices ?? {}).sort((left, right) => left[1].localeCompare(right[1], locale))
-  return <div className="desktop-application-settings dictation-preferences">
-    <SettingGroup id="desktop-application-title" title={t("Application")}>
-      <SettingRow icon={Monitor} title={t("Show Dock icon")} find={t("Keep Jard in the Dock or reopen it from the menu bar")}
-        detail={menuUnavailable ? t("Jard stays in the Dock while the menu bar item is unavailable.")
-          : t("When off, reopen Jard from the menu bar after closing the window.")}>
-        <input type="checkbox" role="switch" aria-label={t("Show Dock icon")} checked={dock?.enabled ?? true}
+  return <SettingGroup id="desktop-application-title" title={t("Application")}>
+    <SettingRow icon={Monitor} title={t("Show Dock icon")} find={t("Keep Jard in the Dock or reopen it from the menu bar")}
+      detail={menuUnavailable ? t("Jard stays in the Dock while the menu bar item is unavailable.")
+        : t("When off, reopen Jard from the menu bar after closing the window.")}>
+      {labels => (
+        <input {...labels} type="checkbox" role="switch" checked={dock?.enabled ?? true}
           disabled={pending || !dock} onChange={event => void change(event.target.checked)} />
-      </SettingRow>
-      <SettingRow icon={Languages} title={t("Interface language")} find={t("Change the language of Jard’s controls and menus")}>
-        <select value={language?.selected ?? "system"} disabled={!language || switchingLanguage}
+      )}
+    </SettingRow>
+    <SettingRow icon={Languages} title={t("Interface language")} find={t("Change the language of Jard’s controls and menus")}>
+      {labels => (
+        <select {...labels} value={language?.selected ?? "system"} disabled={!language || switchingLanguage}
           onChange={event => void selectLanguage(event.target.value)}>
           <option value="system">{t("System")}</option>
           {choices.map(([code, label]) => <option key={code} value={code} lang={code}>{label}</option>)}
         </select>
-      </SettingRow>
-      {(error || languageError) && <p className="update-settings-feedback" role="alert">{t(error || languageError)}</p>}
-    </SettingGroup>
-  </div>
+      )}
+    </SettingRow>
+    {(error || languageError) && <p className="update-settings-feedback" role="alert">{t(error || languageError)}</p>}
+  </SettingGroup>
 }

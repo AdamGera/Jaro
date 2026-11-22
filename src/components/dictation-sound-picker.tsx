@@ -77,7 +77,7 @@ export function DictationSoundPicker({ controls, visible }: { controls: SystemDi
   }
 
   return <Dialog.Root open={open && visible} onOpenChange={changeOpen}>
-    <SettingRow label={false} icon={Volume2} title={t("Sound style")} find="Sound preview">
+    <SettingRow label={false} icon={Volume2} title={t("Sound style")} find="Sound preview" anchor="dictation-sound-styles">
       <Dialog.Trigger asChild>
         <Button type="button" variant="outline" size="sm" aria-label={t("Sound style")}>
           {t(selected.title)}<ChevronRight aria-hidden="true" />

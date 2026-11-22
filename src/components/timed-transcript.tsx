@@ -1,11 +1,14 @@
 import { Fragment, memo, useEffect, useMemo, useRef, type CSSProperties, type ReactNode } from "react"
 import type { Transcript } from "@/audio"
+import { useInterfaceLanguage } from "@/interface-language"
 import type { TranscriptMatch } from "@/transcript-search"
 import { clock, speakerColor, speakerLabel } from "@/speaker-activity"
 import { transcriptTurns } from "./transcript-turns"
 
 type Props = {
   result: Transcript
+  meeting: boolean
+  listening: boolean
   time: number
   citation?: { seconds: number } | null
   ready: boolean
@@ -28,8 +31,9 @@ function reveal(target: HTMLElement, always = false) {
 }
 
 export const TimedTranscript = memo(function TimedTranscript({
-  result, time, ready, seek, citation, matches = noMatches, activeMatch = -1,
+  result, meeting, listening, time, ready, seek, citation, matches = noMatches, activeMatch = -1,
 }: Props) {
+  const { t } = useInterfaceLanguage()
   const root = useRef<HTMLDivElement>(null)
   const elements = useRef<(HTMLButtonElement | null)[]>([])
   const { words } = result
@@ -86,6 +90,7 @@ export const TimedTranscript = memo(function TimedTranscript({
   // Neither time updates nor moving to the next search result rebuild the transcript.
   const content = useMemo(() => {
     let mi = 0
+    let endOfSpeech: number | null = null
     return turns.map((turn, turnIndex) => {
       function highlight(start: number, end: number) {
         while (mi < matches.length && (matches[mi].turn < turnIndex ||
@@ -107,38 +112,51 @@ export const TimedTranscript = memo(function TimedTranscript({
         return pieces
       }
       let first = true
-      const label = turn.speaker ? speakerLabel(turn.speaker, result.speakerNames) : undefined
-      return <article className="speaker-turn" data-turn={turnIndex} key={turnIndex} tabIndex={-1}
-        data-side={turn.speaker && turn.speaker % 2 === 0 ? "end" : "start"}
-        style={turn.speaker ? { "--speaker-color": speakerColor(turn.speaker) } as CSSProperties : undefined}>
-        {label && <header className="speaker-heading">
-          <span className="turn-badge"><i aria-hidden="true" />{label}</span>
-          <button type="button" disabled={!ready} aria-label={`Play ${label} at ${clock(turn.start)}`}
-            onClick={() => seek(turn.start, true)}><time dir="ltr">{clock(turn.start)}</time></button>
-        </header>}
-        {turn.bubbles.map(bubble => <p key={bubble.from} className="turn-bubble" dir="auto">
-          {bubble.spans.map(span => {
-            const label = highlight(span.from, span.to)
-            const index = span.index
-            if (index === undefined || span.seek === undefined) return <Fragment key={span.from}>{label}</Fragment>
-            const tabIndex = first ? 0 : -1
-            first = false
-            const target = span.seek
-            return <button key={span.from} type="button" className="transcript-word" data-word={index} tabIndex={tabIndex}
-              ref={el => { elements.current[index] = el }} disabled={!ready}
-              title={words[index].start == null ? "Play from nearby speech" : undefined}
-              onClick={() => seek(target, true)} onKeyDown={event => {
-                if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return
-                event.preventDefault()
-                const rtl = getComputedStyle(event.currentTarget).direction === "rtl"
-                const forward = (event.key === "ArrowRight") !== rtl
-                elements.current[index + (forward ? 1 : -1)]?.focus()
-              }}>{label}</button>
-          })}
-        </p>)}
-      </article>
+      const name = turn.speaker ? speakerLabel(turn.speaker, result.speakerNames) : meeting ? "Speaker" : undefined
+      const label = name && meeting ? t(name) : name
+      const pause = meeting && endOfSpeech !== null && Number.isFinite(turn.start) ? turn.start - endOfSpeech : 0
+      if (meeting) {
+        endOfSpeech = turn.end !== null && Number.isFinite(turn.end)
+          ? Math.max(endOfSpeech ?? turn.end, turn.end) : null
+      }
+      return <Fragment key={turnIndex}>
+        {pause >= 30 && <p className="meeting-transcript-pause">{t("{time} pause", { time: clock(pause) })}</p>}
+        <article className="speaker-turn" data-turn={turnIndex} tabIndex={-1}
+          data-side={turn.speaker && turn.speaker % 2 === 0 ? "end" : "start"}
+          data-local={meeting && name === "You" ? true : undefined}
+          style={turn.speaker ? { "--speaker-color": speakerColor(turn.speaker) } as CSSProperties : undefined}>
+          {label && <header className="speaker-heading">
+            <span className="turn-badge">{!meeting && <i aria-hidden="true" />}{label}</span>
+            <button type="button" disabled={!ready} aria-label={`Play ${label} at ${clock(turn.start)}`}
+              onClick={() => seek(turn.start, true)}><time dir="ltr">{clock(turn.start)}</time></button>
+          </header>}
+          {turn.bubbles.map(bubble => <p key={bubble.from} className="turn-bubble" dir="auto">
+            {bubble.spans.map(span => {
+              const label = highlight(span.from, span.to)
+              const index = span.index
+              if (index === undefined || span.seek === undefined) return <Fragment key={span.from}>{label}</Fragment>
+              const tabIndex = first ? 0 : -1
+              first = false
+              const target = span.seek
+              return <button key={span.from} type="button" className="transcript-word" data-word={index} tabIndex={tabIndex}
+                ref={el => { elements.current[index] = el }} disabled={!ready}
+                title={words[index].start == null ? "Play from nearby speech" : undefined}
+                onClick={() => seek(target, true)} onKeyDown={event => {
+                  if (event.key !== "ArrowRight" && event.key !== "ArrowLeft") return
+                  event.preventDefault()
+                  const rtl = getComputedStyle(event.currentTarget).direction === "rtl"
+                  const forward = (event.key === "ArrowRight") !== rtl
+                  elements.current[index + (forward ? 1 : -1)]?.focus()
+                }}>{label}</button>
+            })}
+          </p>)}
+        </article>
+      </Fragment>
     })
-  }, [turns, matches, ready, seek, words, result.speakerNames])
+  }, [turns, matches, ready, seek, words, result.speakerNames, meeting, t])
 
-  return <div ref={root} tabIndex={-1} className="transcript-text speaker-transcript">{content}</div>
+  return <div ref={root} tabIndex={-1} className={`transcript-text speaker-transcript${meeting ? " meeting-transcript" : ""}`}>
+    {content}
+    {listening && <p className="meeting-transcript-listening" role="status">{t("Listening…")}</p>}
+  </div>
 })

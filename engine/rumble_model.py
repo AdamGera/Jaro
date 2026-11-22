@@ -1,19 +1,34 @@
 import json
 import logging
 import os
+import re
 import shutil
+import sys
 from pathlib import Path
+from unicodedata import normalize
 
-from engine_paths import WORKSPACE_ROOT
+from engine_paths import WORKSPACE_ROOT, library_path
 
 MODEL_ID = "Reson8/Rumble-2-Flash"
 REVISION = "92ec9141fb1178c5e77fd0020fe86a33c355060b"
-MODEL_DIR = Path(os.environ.get("JARD_MODEL_DIR", WORKSPACE_ROOT / "model"))
+MODEL_DIR = Path(os.environ.get("JARD_MODEL_DIR") or
+                 (WORKSPACE_ROOT if sys.platform == "darwin" else library_path()) / "model")
 SAMPLE_RATE = 16_000
 MAX_SAMPLES = 25 * SAMPLE_RATE
 DIARIZATION_ID = "nvidia/Nemotron-3-Diarization"
 DIARIZATION_REVISION = "52a432672732425e4c19765b9fec9b5810e6f4ba"
 DIARIZATION_DIR = MODEL_DIR / "nemotron3"
+
+
+def vocabulary_echo(text, vocabulary):
+    if len(vocabulary) < 2:
+        return False
+
+    def normalized_words(value):
+        return re.findall(r"[^\W_]+", normalize("NFKC", value).casefold())
+
+    words = normalized_words(text)
+    return bool(words) and words == normalized_words(" ".join(vocabulary))
 
 # The model card's languages, plus Hebrew verified with this checkpoint.
 LANGUAGES = {
@@ -118,6 +133,20 @@ def language_prompt(language_codes: tuple[str, ...]) -> str | None:
     return f"\nExpected spoken languages: {names}. Transcribe speech in its original language."
 
 
+def speech_backend(torch):
+    device = os.environ.get("JARD_INFERENCE_DEVICE", "mps" if sys.platform == "darwin" else "cpu")
+    if device not in ("mps", "cpu"):
+        raise ValueError("JARD_INFERENCE_DEVICE must be mps or cpu.")
+    if device == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("Metal speech inference requires PyTorch MPS on an Apple Silicon Mac.")
+
+    precision = os.environ.get("JARD_INFERENCE_DTYPE", "float32" if device == "cpu" else "bfloat16")
+    if precision not in ("float32", "bfloat16"):
+        raise ValueError("JARD_INFERENCE_DTYPE must be float32 or bfloat16.")
+    dtype = torch.float32 if precision == "float32" else torch.bfloat16
+    return device, dtype
+
+
 class RumbleModel:
     def __init__(self):
         if not all((MODEL_DIR / name).is_file() for name in MODEL_FILES):
@@ -129,20 +158,23 @@ class RumbleModel:
         import torch
         from transformers import AutoModelForMultimodalLM, AutoProcessor
 
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("This demo requires PyTorch Metal on an Apple Silicon Mac.")
+        self.device, dtype = speech_backend(torch)
         self.np = np
         self.torch = torch
         self.processor = AutoProcessor.from_pretrained(MODEL_DIR, local_files_only=True)
         self.model = AutoModelForMultimodalLM.from_pretrained(
             MODEL_DIR,
             local_files_only=True,
-            dtype=torch.bfloat16,
+            dtype=dtype,
             attn_implementation="eager",
-        ).to("mps").eval()
+        ).to(self.device).eval()
         self.aligner = None
         self.reported_screen_failure = False
         self._decode(np.zeros(SAMPLE_RATE * 2, dtype=np.float32), max_new_tokens=1)
+
+    def release_device_cache(self):
+        if self.device == "mps":
+            self.torch.mps.empty_cache()
 
     def enable_alignment(self):
         from speaker_alignment import CtcAligner
@@ -163,22 +195,30 @@ class RumbleModel:
             raise ValueError("Audio contains invalid samples.")
         if self.np.max(self.np.abs(audio)) < 0.001:
             return "", None, []
-        prompt = language_prompt(language_codes)
+        base_prompt = language_prompt(language_codes)
+        prompt = base_prompt
         if vocabulary:
             terms = json.dumps(vocabulary, ensure_ascii=False)
             prompt = (prompt or "") + f"\nPossible names and terms in this audio: {terms}. Use them only when spoken."
+        def decode(prompt):
+            return self._decode(audio, prompt=prompt, cache_implementation=cache_implementation,
+                                screen_nonspeech=screen_nonspeech, speech_prefix_samples=speech_prefix_samples)
+
         if timed and self.aligner:
             with self.aligner.capture() as states:
-                text, language = self._decode(audio, prompt=prompt, cache_implementation=cache_implementation,
-                                              screen_nonspeech=screen_nonspeech, speech_prefix_samples=speech_prefix_samples)
+                text, language = decode(prompt)
+            if vocabulary_echo(text, vocabulary):
+                with self.aligner.capture() as states:
+                    text, language = decode(base_prompt)
             try:
                 words = self.aligner.words(text, states[0] if states else None)
             except (RuntimeError, ValueError, ArithmeticError):
                 logging.getLogger("uvicorn.error").warning("Word timing was unavailable for an audio block.")
                 words = []
             return text, language, words
-        text, language = self._decode(audio, prompt=prompt, cache_implementation=cache_implementation,
-                                      screen_nonspeech=screen_nonspeech, speech_prefix_samples=speech_prefix_samples)
+        text, language = decode(prompt)
+        if vocabulary_echo(text, vocabulary):
+            text, language = decode(base_prompt)
         return text, language, []
 
     def _audio_features(self, inputs):

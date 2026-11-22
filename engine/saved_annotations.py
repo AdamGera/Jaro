@@ -2,7 +2,7 @@
 import base64
 import re
 
-from annotation_assets import annotation_origin
+from annotation_assets import MISSING_VIDEO_REASONS, annotation_origin
 from session_store import MissingSession
 
 MAX_INLINE_SHEET = 9 * 1024 * 1024  # 12 MiB after base64 encoding.
@@ -28,16 +28,19 @@ def annotation_detail(library, identifier):
     def path_for(read, *parameters):
         try:
             path, _ = read(key, *parameters)
-        except MissingSession:
+        except (MissingSession, OSError):
             return None
         return str(path) if not path.is_symlink() and not path.parent.is_symlink() else None
 
     origin = annotation_origin(session["annotation"].get("origin"))
+    missing_video = session["annotation"].get("missingVideo")
+    media_path = path_for(library.media)
     return {"version": 1, **row, **({"origin": origin} if origin else {}),
             "status": session["status"], "durationSeconds": session["duration"],
-            "route": f"/?session={key}&tab=annotation",
+            "route": f"/?session={key}&tab=overview",
             "transcript": transcript["text"], "interruption": transcript.get("interruption"),
-            "videoPath": path_for(library.media), "manifestPath": path_for(library.annotation_asset, "manifest"),
+            **({"missingVideo": missing_video, "audioPath": media_path} if missing_video else {}),
+            "videoPath": None if missing_video else media_path, "manifestPath": path_for(library.annotation_asset, "manifest"),
             "contactSheetPath": path_for(library.annotation_asset, "contact-sheet")}
 
 
@@ -60,6 +63,8 @@ def annotation_context(detail, *, cursor=0, max_chars=None):
         lines.append(f"- Duration: {frame_time(duration)}")
     if detail["frames"]:
         lines.extend(["", "## Contact sheet times", "", ", ".join(frame_time(time) for time in detail["frames"])])
+    if reason := MISSING_VIDEO_REASONS.get(detail.get("missingVideo")):
+        lines.extend(["", reason])
     if detail["interruption"]:
         lines.extend(["", detail["interruption"]])
     lines.extend(["", "## Narration", "", transcript[cursor:end] if transcript else "No narration is available."])

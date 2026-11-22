@@ -4,14 +4,15 @@ import sqlite3
 import sys
 
 from saved_annotations import annotation_context, annotation_detail, inline_contact_sheet
-from saved_meetings import get_meeting, meeting_detail, meetings, notes, render_export, search_meetings
+from meeting_exports import clock_24
+from saved_meetings import get_meeting, meeting_detail, meeting_search_report, meetings, notes, render_export
 from session_store import MissingSession
 
 VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 TEXT = {"type": "string"}
 LIMIT = {"type": "integer", "minimum": 1}
 MEETING = {"meeting_id": {**TEXT, "description": "Meeting UUID, unique prefix, or latest."}}
-OFFSET = {"type": ["number", "string"], "description": "Seconds, MM:SS, or HH:MM:SS."}
+OFFSET = {"type": ["number", "string"], "description": "Seconds, MM:SS, HH:MM:SS, or an s, m, or h suffix."}
 BOOLEAN = {"type": "boolean"}
 ANNOTATION = {"annotation_id": {**TEXT, "description": "Annotation UUID, unique prefix, or latest."}}
 ANNOTATION_TOOLS = ("list_annotations", "get_annotation")
@@ -33,7 +34,7 @@ TOOLS = {
     spec["name"]: spec for spec in (
         tool("list_meetings", "Find Jard meetings by title or provider.", {
             "query": TEXT, **DATE_FILTERS, "limit": {**LIMIT, "maximum": 200}}),
-        tool("search_transcripts", "Find transcript and note passages with surrounding context, speaker, and time.", {
+        tool("search_transcripts", "Find ranked transcript and note passages with surrounding speech, timestamps, and per-meeting counts.", {
             "query": {**TEXT, "description": "Wrap exact phrases in double quotes."}, **MEETING, **DATE_FILTERS,
             "fuzzy": BOOLEAN, "limit": {**LIMIT, "maximum": 50}}, ("query",)),
         tool("get_transcript", "Read live or saved turns overlapping the requested time range.", {
@@ -77,8 +78,8 @@ def call(library, name, args, live=None):
     if name == "list_meetings":
         return {"meetings": meetings(library, args.get("query", ""), args.get("limit", 20), **filters)}
     if name == "search_transcripts":
-        return {"passages": search_meetings(library, args["query"], args.get("limit", 10), identifier=meeting_id,
-                                             fuzzy=args.get("fuzzy", True), **filters)}
+        return meeting_search_report(library, args["query"], args.get("limit", 10), identifier=meeting_id,
+                                     fuzzy=args.get("fuzzy", True), **filters)
     if name == "get_meeting_notes":
         record = get_meeting(library, meeting_id, turns=False, live=live)
         title = (record.get("meetingBrief") or {}).get("title")
@@ -150,8 +151,8 @@ def reply(library, incoming, live_snapshot=lambda **_: None):
             if not isinstance(uri, str) or not uri.startswith("jard-meeting://"):
                 raise ValueError
             detail = meeting_detail(get_meeting(library, uri.removeprefix("jard-meeting://"), live=live_snapshot()))
-            note_sections = render_export(detail, "notes").partition("\n\n")[2]
-            text = render_export(detail, "md") + ("\n" + note_sections if note_sections else "")
+            with library.connection() as db:
+                text = render_export(detail, "md", use_24_hour=clock_24(db), companion=True)
             result = {"contents": [{"uri": uri, "mimeType": "text/markdown", "text": text}]}
         except (ValueError, MissingSession, sqlite3.Error):
             return {"id": identifier, "error": {"code": -32002, "message": "Meeting resource not found."}}

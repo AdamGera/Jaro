@@ -5,7 +5,9 @@ import { Power } from "lucide-react"
 import { desktopBridge } from "@/desktop"
 import { Button } from "./ui/button"
 
-export function QuitButton({ recording, onQuit }: { recording: boolean; onQuit: () => void }) {
+export function QuitButton({ recording, recoverable = false, onQuit }: {
+  recording: boolean; recoverable?: boolean; onQuit: () => void
+}) {
   const { t } = useInterfaceLanguage()
   const native = desktopBridge()
   const [busy, setBusy] = useState(false)
@@ -48,7 +50,8 @@ export function QuitButton({ recording, onQuit }: { recording: boolean; onQuit: 
       <AlertDialog.Content className="note-language-confirm" onEscapeKeyDown={event => { if (busy) event.preventDefault() }}>
         <AlertDialog.Title>Quit Jaro Everywhere?</AlertDialog.Title>
         <AlertDialog.Description>
-          {recording && (native ? "The Mac app will save your recording first. " : "Quitting will discard this browser recording. ")}
+          {recording && (native ? "The Mac app will save your recording first. "
+            : recoverable ? "You can recover your recording when you reopen Jaro. " : "Quitting will discard this browser recording. ")}
           This stops the shared engine and active jobs for all clients. To leave other clients working, close this {native ? t("window") : "tab"}.
         </AlertDialog.Description>
         {error && <p role="alert">{error}</p>}

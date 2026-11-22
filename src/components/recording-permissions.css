@@ -1,7 +1,39 @@
-.recording-settings { max-width: 34rem; }
-.recording-settings h2 { font-size: 1rem; font-weight: 600; }
-.recording-settings > p { margin-block: .55rem; color: var(--quiet); font-size: .82rem; }
-.recording-settings .recording-access-sources { margin-top: .65rem; }
-.recording-settings .recording-access-help { margin-bottom: 1rem; }
+.recording-settings .dictation-setting-row { flex-wrap: wrap; }
+.recording-settings .dictation-setting-label { flex: 1 1 9rem; }
+.recording-access-setting-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  max-width: 100%;
+  margin-inline-start: auto;
+}
+.recording-access-setting-actions > button {
+  min-height: 32px;
+  height: auto;
+  white-space: normal;
+}
+.recording-access-setting-actions > small { color: var(--quiet); }
 .recording-access-action .recording-access-allowed { justify-content: end; }
-.recording-settings .recording-access-action button + button { margin-inline-start: .3rem; }
+
+.recording-access-settings-note,
+.recording-access-settings-help,
+.recording-access-settings-footer {
+  padding: 10px var(--setting-inset);
+  color: var(--quiet);
+  font-size: .78rem;
+  overflow-wrap: anywhere;
+}
+.recording-access-settings-note, .recording-access-settings-footer { border-top: 1px solid var(--line); }
+.recording-access-settings-help > p + p { margin-top: .5rem; }
+.recording-access-settings-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: .5rem;
+}
+.recording-access-settings-footer > button {
+  margin-inline-start: auto;
+  min-height: 32px;
+  height: auto;
+  white-space: normal;
+}

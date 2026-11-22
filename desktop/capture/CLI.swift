@@ -13,11 +13,16 @@ import Darwin
                                                         lidClosed: lidClosed, avoidBluetooth: avoidBluetooth)
                 return route.system.id == 0 ? "" : route.system.name
             }
+            let listedInputs = inputs.map { device -> [String: Any] in
+                var input: [String: Any] = ["id": device.uid, "name": device.name]
+                if lidClosed && device.isInternalMicrophone { input["unavailable"] = true }
+                return input
+            }
             emit(["event": "devices", "microphone": systemDefault.name, "dictationMicrophones": dictationMicrophones,
-                  "inputs": inputs.map { ["id": $0.uid, "name": $0.name] }])
+                  "inputs": listedInputs])
             return
         }
-        let usage = "Use devices, warm, or record --mode both|mic|system --output /absolute/file.wav [--separate-tracks [--call-application bundle-id] | --meter [--cold-recovery]] [--input device-uid] [--avoid-bluetooth]"
+        let usage = "Use devices, warm [--on-demand], or record --mode both|mic|system --output /absolute/file.wav [--separate-tracks [--call-application bundle-id] | --meter [--cold-recovery]] [--input device-uid] [--avoid-bluetooth]"
         let warm = args.first == "warm"
         guard warm || (args.count >= 5 && args[0] == "record" && args[1] == "--mode" &&
               CaptureMode(rawValue: args[2]) != nil && args[3] == "--output" && args[4].hasPrefix("/")) else {
@@ -25,6 +30,8 @@ import Darwin
             exit(2)
         }
         var options = Array(args.dropFirst(warm ? 1 : 5))
+        let onDemand = warm && options.first == "--on-demand"
+        if onDemand { options.removeFirst() }
         let retainSources = !warm && args[2] == "both" && options.first == "--separate-tracks"
         let detailedMeter = !warm && args[2] == "mic" && options.first == "--meter"
         if retainSources || detailedMeter { options.removeFirst() }
@@ -57,7 +64,7 @@ import Darwin
         }
         signal(SIGPIPE, SIG_IGN)
         if warm {
-            await runWarmMicrophone(uid: inputUID, avoidBluetooth: avoidBluetooth)
+            await runWarmMicrophone(uid: inputUID, avoidBluetooth: avoidBluetooth, onDemand: onDemand)
             return
         }
         let mode = CaptureMode(rawValue: args[2])!

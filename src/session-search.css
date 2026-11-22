@@ -65,7 +65,11 @@
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: .4rem;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--quiet) 65%, transparent) transparent;
 }
+
+.session-search-results::-webkit-scrollbar { display: revert; }
 
 .session-search-option {
   display: flex;

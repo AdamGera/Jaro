@@ -319,7 +319,7 @@ export async function create({ command = [DEFAULT_HELPER, "service", "--embedded
     throw new JardSDKError("invalid-timeout", "Pass a positive startup timeout in milliseconds.")
   }
   const child = spawn(command[0], command.slice(1), {
-    detached: true, stdio: ["pipe", "pipe", "ignore"],
+    detached: process.platform !== "win32", windowsHide: true, stdio: ["pipe", "pipe", "ignore"],
     env: library === undefined ? process.env : { ...process.env, RUMBLE_DATA_DIR: library },
   })
   child.stdin.on("error", () => {})
@@ -332,7 +332,8 @@ export async function create({ command = [DEFAULT_HELPER, "service", "--embedded
     child.stdin.end()
     if (await exitsWithin(exited, 5500)) return
     try {
-      process.kill(-child.pid, "SIGKILL")
+      if (process.platform === "win32") child.kill("SIGKILL")
+      else process.kill(-child.pid, "SIGKILL")
     } catch (error) {
       if (error.code !== "ESRCH") throw new JardSDKError("shutdown-failed", "Could not stop the owned Jard helper.")
     }

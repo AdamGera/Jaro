@@ -33,8 +33,8 @@ def stem(word):
     return word[:-1] if len(word) >= 4 and word.endswith("e") else word
 
 
-def soundex(word):
-    if len(word) < 4 or not word.isascii() or not word.isalpha():
+def sound_key(word):
+    if not word.isascii() or not word.isalpha():
         return None
     last = SOUNDS.get(word[0])
     digits = [word[0]]
@@ -45,7 +45,12 @@ def soundex(word):
         if code is not None and code != last:
             digits.append(str(code))
         last = code
-    return ("".join(digits) + "000")[:4]
+    return "".join(digits)
+
+
+def soundex(word):
+    key = sound_key(word) if len(word) >= 4 else None
+    return key[:4].ljust(4, "0") if key else None
 
 
 def distance(left, right, limit):
@@ -85,6 +90,50 @@ def expansions(term, frequency, total, fuzzy):
     return result
 
 
+def vocabulary_expansions(term, vocabulary, frequency, total):
+    aliases = {}
+    for name, spellings in vocabulary:
+        preferred = words(name)
+        if len(preferred) != 1 or stem(preferred[0]) != term:
+            continue
+        for spelling in spellings:
+            phrase = tuple(map(stem, words(spelling)))
+            if phrase and phrase != (term,) and all(word in frequency for word in phrase):
+                aliases[phrase] = 0.5
+        word = preferred[0]
+        for split in range(3, len(word) - 2):
+            phrase = (stem(word[:split]), stem(word[split:]))
+            if all(part in frequency for part in phrase):
+                aliases[phrase] = 0.5
+        key = sound_key(term)
+        if key and len(key) >= 3:
+            common = max(5, total * 0.005)
+            for word, count in frequency.items():
+                if (word != term and len(word) >= 4 and count <= common and word not in STOP
+                        and sound_key(word) == key):
+                    limit = max(len(term), len(word)) // 2
+                    if distance(term, word, limit) <= limit:
+                        aliases.setdefault((word,), 0.3)
+    return aliases
+
+
+def candidate_weights(term, frequency, total, fuzzy, vocabulary):
+    singles = expansions(term, frequency, total, fuzzy)
+    phrases = {}
+
+    def weight(quality, count):
+        return quality, math.log1p((total - count + 0.5) / (count + 0.5))
+
+    if fuzzy:
+        for phrase, quality in vocabulary_expansions(term, vocabulary, frequency, total).items():
+            if len(phrase) == 1:
+                word = phrase[0]
+                singles[word] = max(quality, singles.get(word, 0))
+            else:
+                phrases[phrase] = weight(quality, min(frequency[word] for word in phrase))
+    return {word: weight(quality, frequency[word]) for word, quality in singles.items()}, phrases
+
+
 def snippet(text, tokens, matched):
     width = min(len(tokens), 32)
     first = min(matched)
@@ -104,7 +153,7 @@ def snippet(text, tokens, matched):
     return " ".join("".join(output).split())
 
 
-def meeting_passages(passages, query, limit, fuzzy, *, stem_phrases=False):
+def rank_passages(passages, query, limit, fuzzy, *, stem_phrases=False, vocabulary=()):
     if len(query) > 500 or query.count('"') % 2:
         raise ValueError("Use up to 500 characters and close any quoted phrases.")
     parts = query.split('"')
@@ -131,17 +180,17 @@ def meeting_passages(passages, query, limit, fuzzy, *, stem_phrases=False):
             documents[passage["id"]].add(word)
         if tokens:
             length += len(tokens)
-            corpus.append((passage, text, tokens, stems if stem_phrases else folded, positions))
+            corpus.append((passage, text, tokens, folded, stems, positions))
     if not corpus:
-        return []
+        return [], Counter()
     frequency = Counter(word for document in documents.values() for word in document)
     total, average = len(documents), length / len(corpus)
-    weights = [{word: (quality, math.log1p((total - frequency[word] + 0.5) / (frequency[word] + 0.5)))
-                for word, quality in expansions(term, frequency, total, fuzzy).items()} for term in terms]
+    weights = [candidate_weights(term, frequency, total, fuzzy, vocabulary) for term in terms]
 
     ranked = []
-    for order, (passage, text, tokens, phrase_tokens, positions) in enumerate(corpus):
+    for order, (passage, text, tokens, folded, stems, positions) in enumerate(corpus):
         matches = set()
+        phrase_tokens = stems if stem_phrases else folded
         for phrase in phrases:
             found = {i + offset for i in range(len(phrase_tokens) - len(phrase) + 1)
                      if phrase_tokens[i:i + len(phrase)] == phrase for offset in range(len(phrase))}
@@ -151,20 +200,37 @@ def meeting_passages(passages, query, limit, fuzzy, *, stem_phrases=False):
         else:
             exact, coverage, score = 0, 0.0, 0.0
             normalization = 1.2 * (0.25 + 0.75 * len(tokens) / average)
-            for candidates in weights:
+            for candidates, aliases in weights:
                 choices = []
                 for word in positions.keys() & candidates.keys():
                     quality, rarity = candidates[word]
                     count = len(positions[word])
-                    choices.append((quality == 1, quality * rarity * (count * 2.2) / (count + normalization), quality, word))
+                    choices.append((quality == 1, quality * rarity * (count * 2.2) / (count + normalization),
+                                    quality, (word,), positions[word]))
+                for phrase, (quality, rarity) in aliases.items():
+                    size = len(phrase)
+                    hits = [index for index in positions.get(phrase[0], ()) if tuple(stems[index:index + size]) == phrase]
+                    if hits:
+                        count = len(hits)
+                        choices.append((False, quality * rarity * (count * 2.2) / (count + normalization),
+                                        quality, phrase, [index + offset for index in hits for offset in range(size)]))
                 if choices:
-                    exact_match, weight, quality, word = max(choices)
+                    exact_match, weight, quality, _, matched = max(choices)
                     exact += exact_match
                     coverage += quality
                     score += weight
-                    matches.update(positions[word])
+                    matches.update(matched)
             if matches and (coverage > 0 or not terms):
-                ranked.append((exact == len(terms), coverage, score, -order,
-                               {**passage, "snippet": snippet(text, tokens, matches), "score": round(score, 6)}))
-    ranked.sort(reverse=True)
-    return [hit for *_, hit in ranked[:limit]]
+                ranked.append((exact == len(terms), coverage, score, -order, matches))
+    ranked.sort(key=lambda hit: hit[:4], reverse=True)
+    counts = Counter(corpus[-order][0]["id"] for _, _, _, order, _ in ranked)
+    hits = []
+    for _, _, score, order, matches in ranked[:limit]:
+        passage, text, tokens, *_ = corpus[-order]
+        hits.append({**passage, "snippet": snippet(text, tokens, matches), "score": round(score, 6)})
+    return hits, counts
+
+
+def meeting_passages(passages, query, limit, fuzzy, *, stem_phrases=False, vocabulary=()):
+    hits, _ = rank_passages(passages, query, limit, fuzzy, stem_phrases=stem_phrases, vocabulary=vocabulary)
+    return hits

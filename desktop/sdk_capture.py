@@ -54,7 +54,13 @@ class SDKCapture:
         self.transcribe = transcribe
         self.on_release = on_release
         self.active: Take | None = None
+        self.interrupted: Take | None = None
+        self.recovering: Take | None = None
         self.completed = OrderedDict()
+
+    @property
+    def busy(self):
+        return self.active is not None or self.recovering is not None
 
     async def start(self, identifier, root, options, languages):
         if self.active:
@@ -76,16 +82,16 @@ class SDKCapture:
             if not take.started:
                 raise CaptureError("microphone-lost", "The selected microphone could not start.")
         except TimeoutError as error:
-            await self.close()
+            await self.close_active(take)
             raise CaptureError("microphone-lost", "The selected microphone could not start.") from error
         except BaseException:
-            await self.close()
+            await self.close_active(take)
             raise
-        self.renew(take)
+        if take is self.active or take is self.interrupted:
+            self.renew(take)
         return {"id": take.identifier, "ownerToken": take.owner, "sampleRate": RATE}
 
-    @staticmethod
-    async def read_events(take):
+    async def read_events(self, take):
         try:
             async for raw in take.child.stdout:
                 event = json.loads(raw)
@@ -105,7 +111,38 @@ class SDKCapture:
                     take.child.kill()
         finally:
             take.failed |= bool(await take.child.wait())
+            if self.active is take and take.started and not take.terminal:
+                self.retain_interrupted(take)
             take.ready.set()
+
+    def retain_interrupted(self, take):
+        self.active = None
+        take.failed = True
+        try:
+            with suppress(OSError):
+                if take.path.stat().st_size >= 46:
+                    if self.interrupted:
+                        self.drop_interrupted(self.interrupted, CaptureError("microphone-lost", "The microphone was interrupted again."))
+                    self.interrupted = take
+                    if not take.expiry:
+                        self.renew(take)
+                    return
+            self.complete(take, CaptureError("microphone-lost", "The recording did not capture any audio."))
+        finally:
+            self.on_release(take.identifier)
+
+    def complete(self, take, result):
+        if take.expiry:
+            take.expiry.cancel()
+        self.completed[take.identifier] = (take.owner, result)
+        if len(self.completed) > 16:
+            self.completed.popitem(last=False)
+        with suppress(OSError):
+            take.directory.cleanup()
+
+    def drop_interrupted(self, take, result):
+        self.interrupted = None
+        self.complete(take, result)
 
     def renew(self, take):
         if take.expiry:
@@ -115,20 +152,30 @@ class SDKCapture:
     def expire(self, take):
         if self.active is take and not take.terminal:
             self.end(take, discard=True)
+        elif self.interrupted is take:
+            self.drop_interrupted(take, {"phase": "cancelled"})
 
     def end(self, take, *, discard):
         if take.expiry:
             take.expiry.cancel()
         take.terminal = asyncio.create_task(self.finalize(take, discard=discard))
 
-    async def close(self):
-        take = self.active
-        if take:
+    async def close_active(self, take):
+        if take is not None and self.active is take:
             if not take.terminal:
                 self.end(take, discard=True)
             await asyncio.shield(take.terminal)
 
+    async def close(self):
+        if self.interrupted:
+            self.drop_interrupted(self.interrupted, {"phase": "cancelled"})
+        await self.close_active(self.active)
+        if self.recovering:
+            await asyncio.shield(self.recovering.terminal)
+
     async def stop_for_exit(self):
+        if self.interrupted:
+            self.drop_interrupted(self.interrupted, {"phase": "cancelled"})
         take = self.active
         if take and take.terminal:
             try:
@@ -136,7 +183,7 @@ class SDKCapture:
             except TimeoutError as error:
                 raise CaptureError("dictation-busy", "The SDK recorder is still closing.") from error
         else:
-            await self.close()
+            await self.close_active(take)
 
     async def finalize(self, take, *, discard):
         result = {"phase": "cancelled"}
@@ -165,18 +212,17 @@ class SDKCapture:
         except (OSError, httpx.HTTPError, ValueError, KeyError):
             result = CaptureError("transcription-failed", "The local model could not transcribe this recording.", 503)
         finally:
-            self.completed[take.identifier] = (take.owner, result)
-            if len(self.completed) > 16:
-                self.completed.popitem(last=False)
-            try:
-                take.directory.cleanup()
-            finally:
+            self.complete(take, result)
+            if self.active is take:
                 self.active = None
                 self.on_release(take.identifier)
+            elif self.recovering is take:
+                self.recovering = None
 
     def request(self, action, identifier, owner, cursor):
-        take = self.active
-        if not take or take.identifier != identifier or not hmac.compare_digest(take.owner, owner):
+        take = next((take for take in (self.active, self.interrupted, self.recovering)
+                     if take and take.identifier == identifier and hmac.compare_digest(take.owner, owner)), None)
+        if not take:
             cached = self.completed.get(identifier)
             if action in ("finish", "cancel") and cached and hmac.compare_digest(cached[0], owner):
                 if isinstance(cached[1], CaptureError):
@@ -186,6 +232,17 @@ class SDKCapture:
             raise CaptureError("dictation-not-found", "This recording is unavailable.", 404)
         if action in ("finish", "cancel"):
             if not take.terminal:
+                if take is self.interrupted:
+                    if action == "cancel":
+                        result = {"phase": "cancelled"}
+                        self.drop_interrupted(take, result)
+                        return result
+                    if self.recovering:
+                        # Keep the second clip available while the first uses the speech model.
+                        self.renew(take)
+                        return {"phase": "finishing"}
+                    self.interrupted = None
+                    self.recovering = take
                 self.end(take, discard=action == "cancel")
             return {"phase": "finishing"}
         if take.terminal or take.events.done():

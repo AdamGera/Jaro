@@ -1,6 +1,7 @@
 #import "../system_dictation.h"
 #import "../dictation_shortcut.h"
 #import "../jard_dictation_typing.h"
+#import "../jard_interface_language.h"
 #import "../jard_recording_environment.h"
 #import "../jard_secure_hotkeys.h"
 #import "../indicator/JardDictationMeter.h"
@@ -11,6 +12,7 @@
 #import <IOKit/hidsystem/IOLLEvent.h>
 #import <assert.h>
 #import <dlfcn.h>
+#import <objc/runtime.h>
 #import <stdatomic.h>
 #import <string.h>
 
@@ -20,6 +22,51 @@ Boolean IsSecureEventInputEnabled(void) { return fixtureSecureInput; }
 // Use real run-loop sources and invalidatable Mach ports without registering
 // OS input taps or requiring permissions on the test runner.
 static _Atomic bool fixtureEventTaps;
+static bool fixturePresence, fixtureDisplayAsleep;
+static NSDictionary *fixtureSession;
+static const pid_t windowFixturePID = 8251;
+static pid_t windowFixtureIdentity;
+static AXError windowFixtureFocusStatus;
+static NSMutableArray<NSArray *> *nativePasteEvents;
+
+void CGEventPost(CGEventTapLocation location, CGEventRef event) {
+    if (nativePasteEvents) {
+        [nativePasteEvents addObject:@[@(location), @(CGEventGetType(event)),
+            @(CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)), @(CGEventGetFlags(event))]];
+        return;
+    }
+    ((typeof(&CGEventPost))dlsym(RTLD_NEXT, "CGEventPost"))(location, event);
+}
+
+AXError AXUIElementCopyAttributeValue(AXUIElementRef element, CFStringRef attribute, CFTypeRef *value) {
+    pid_t pid = 0;
+    AXUIElementGetPid(element, &pid);
+    if (windowFixtureIdentity && pid == windowFixturePID) {
+        *value = NULL;
+        if (CFEqual(attribute, kAXFocusedUIElementAttribute)) {
+            if (windowFixtureFocusStatus == kAXErrorSuccess)
+                *value = AXUIElementCreateApplication(windowFixturePID + 1);
+            return windowFixtureFocusStatus;
+        }
+        if (CFEqual(attribute, kAXFocusedWindowAttribute)) {
+            *value = AXUIElementCreateApplication(windowFixtureIdentity);
+            return kAXErrorSuccess;
+        }
+        return kAXErrorNoValue;
+    }
+    return ((typeof(&AXUIElementCopyAttributeValue))dlsym(RTLD_NEXT, "AXUIElementCopyAttributeValue"))(element, attribute, value);
+}
+
+boolean_t CGDisplayIsAsleep(CGDirectDisplayID display) {
+    if (fixturePresence) return fixtureDisplayAsleep;
+    return ((typeof(&CGDisplayIsAsleep))dlsym(RTLD_NEXT, "CGDisplayIsAsleep"))(display);
+}
+
+CFDictionaryRef CGSessionCopyCurrentDictionary(void) {
+    if (fixturePresence) return (CFDictionaryRef)CFBridgingRetain(fixtureSession);
+    return ((typeof(&CGSessionCopyCurrentDictionary))dlsym(RTLD_NEXT, "CGSessionCopyCurrentDictionary"))();
+}
+
 static struct {
     CFMachPortRef port;
     CGEventTapCallBack callback;
@@ -127,10 +174,13 @@ void CGEventTapEnable(CFMachPortRef port, bool enabled) {
 - (BOOL)handleKey:(CGEventRef)event type:(CGEventType)type;
 - (void)rememberExternalApp:(NSRunningApplication *)app;
 - (void)noteAccessibilityRequestAt:(NSTimeInterval)now;
-- (void)observeAccessibilityAt:(NSTimeInterval)now trusted:(BOOL)trusted
+- (BOOL)observeAccessibilityAt:(NSTimeInterval)now trusted:(BOOL)trusted
                   settingsOpen:(BOOL)settingsOpen settingsFront:(BOOL)settingsFront active:(BOOL)active;
 - (void)activationChanged:(NSNotification *)notification;
+- (void)powerChanged:(NSNotification *)notification;
+- (BOOL)canStartCommandCapture;
 - (void)deliver:(NSString *)text mode:(NSString *)mode warning:(NSString *)warning;
+- (BOOL)postPasteShortcut;
 - (void)pasteLast;
 - (void)cancelCapture;
 - (void)discardShortcutTake;
@@ -187,7 +237,7 @@ static void testSecureRouting(void) {
     dictation.dictationKeyEnabled = YES;
     dictation.lastText = @"A recovery take";
     __block NSUInteger annotationPresses = 0, annotationReleases = 0, reset = 0, meetingPaste = 0;
-    [dictation setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, CGKeyCode shortcutCode, BOOL chordFree) {
+    [dictation setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, JardAnnotationShortcut shortcut, BOOL chordFree) {
         if (type == kCGEventTapDisabledByUserInput) { reset++; return NO; }
         if (type == kCGEventFlagsChanged) return NO;
         assert(chordFree && CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == kVK_ANSI_S);
@@ -259,6 +309,10 @@ static void testSecureRouting(void) {
     }
     return !fixtureSecureInput && !self.moved && (!self.editor ||
         (self.takeInputRevision == self.inputRevision && (!selection || !self.selectedRange || [self.selectedRange isEqual:self.caret])));
+}
+- (BOOL)dictationPasteAppStillActive { return [self targetStillFocusedCheckingSelection:YES]; }
+- (NSRunningApplication *)foregroundOutputApplication {
+    return (NSRunningApplication *)(id)self.editor;
 }
 - (void)rememberDestination {
     if (!self.editor) { [super rememberDestination]; return; }
@@ -613,16 +667,19 @@ static void testDictationDelivery(void) {
 @interface AnnotationPasteFixture : JardSystemDictation
 @property(nonatomic, strong) NSPasteboard *fixtureBoard;
 @property(nonatomic, strong) NSMutableArray *posted;
+@property(nonatomic, strong) AnnotationTargetFixture *activeApp;
 @property(nonatomic) pid_t front;
-@property(nonatomic) BOOL accessible, editable, focused, changeFocusAfterSheet, replaceClipboardAfterSheet;
+@property(nonatomic) NSUInteger activations;
+@property(nonatomic) BOOL accessible, editable, focused, modifiersHeld, changeFocusAfterSheet, replaceClipboardAfterSheet;
 @end
 
 @implementation AnnotationPasteFixture
 - (NSPasteboard *)pasteboard { return self.fixtureBoard; }
 - (BOOL)annotationAccessibilityAvailable { return self.accessible; }
 - (pid_t)annotationForegroundPID { return self.front; }
-- (BOOL)annotationModifiersReleased { return YES; }
-- (BOOL)activateAnnotationApp:(NSRunningApplication *)app { self.front = app.processIdentifier; return YES; }
+- (NSRunningApplication *)foregroundOutputApplication { return (id)self.activeApp; }
+- (BOOL)annotationModifiersReleased { return !self.modifiersHeld; }
+- (BOOL)activateAnnotationApp:(NSRunningApplication *)app { self.activations++; self.front = app.processIdentifier; return YES; }
 - (BOOL)prepareAnnotationFocus:(pid_t)pid { return self.editable && pid == self.front; }
 - (BOOL)annotationPasteFocusMatches:(NSUInteger)revision {
     return self.focused && revision == [self annotationPreparationRevision];
@@ -659,12 +716,17 @@ static void testAnnotationPaste(void) {
     NSData *custom = [@"original extra type" dataUsingEncoding:NSUTF8StringEncoding];
     NSString *context = @"# Annotation\nReview the chart.";
     NSString *path = @"/private/tmp/fixture-contact-sheet.png";
-    for (NSUInteger scenario = 0; scenario < 7; scenario++) {
-        paster.front = own.processIdentifier;
-        assert([paster annotationPasteDestination].processIdentifier == target.processIdentifier);
+    for (NSUInteger scenario = 0; scenario < 10; scenario++) {
+        BOOL fromPanel = scenario >= 7;
+        paster.front = fromPanel ? target.processIdentifier : own.processIdentifier;
+        paster.activeApp = fromPanel ? target : own;
+        paster.activations = 0;
+        assert([paster annotationPasteDestinationFromPanel:fromPanel].processIdentifier == target.processIdentifier);
+        assert(![paster annotationPasteDestinationFromPanel:!fromPanel]);
         target.bundleIdentifier = scenario == 1 ? @"com.apple.Terminal" : @"test.editor";
         paster.posted = NSMutableArray.array;
         paster.focused = YES;
+        paster.modifiersHeld = scenario == 9;
         paster.changeFocusAfterSheet = scenario == 2;
         paster.replaceClipboardAfterSheet = scenario == 3;
         paster.editable = scenario != 4;
@@ -675,21 +737,27 @@ static void testAnnotationPaste(void) {
         [paster.fixtureBoard writeObjects:@[original]];
         NSUInteger revision = [paster annotationPreparationRevision];
         if (scenario == 5) [paster activationChanged:nil];
+        if (scenario == 8) paster.front = 999;
         __block BOOL finished = NO;
         __block NSDictionary *result;
         __block NSString *error;
-        [paster pasteAnnotation:context image:scenario == 6 ? nil : sheet path:path destination:(id)target preparationRevision:revision
+        [paster pasteAnnotation:context image:scenario == 6 ? nil : sheet path:path destination:(id)target fromPanel:fromPanel preparationRevision:revision
             clipboardRevision:paster.fixtureBoard.changeCount reply:^(id value, NSString *problem) {
                 result = value; error = problem; finished = YES;
             }];
+        if (scenario == 9) {
+            [paster activationChanged:nil];
+            paster.modifiersHeld = NO;
+        }
         NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:3];
         while (!finished && deadline.timeIntervalSinceNow > 0)
             [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.01]];
         assert(finished && !paster.hasActivity);
         NSString *clipboard = [paster.fixtureBoard stringForType:NSPasteboardTypeString];
-        if (scenario < 2) {
+        if (scenario < 2 || scenario == 7) {
             assert(!error && [result[@"destination"] isEqual:target.localizedName] && [result[@"includedSheet"] boolValue]);
-            assert(([paster.posted isEqualToArray:@[(scenario == 0 ? (id)sheet : path), context]]));
+            assert(([paster.posted isEqualToArray:@[(scenario == 1 ? (id)path : sheet), context]]));
+            assert(paster.activations == (fromPanel ? 0 : 1));
         } else if (scenario < 4) {
             assert(!result && [error containsString:@"Part of the annotation"] && [paster.posted isEqualToArray:@[sheet]]);
         } else if (scenario == 6) {
@@ -702,7 +770,7 @@ static void testAnnotationPaste(void) {
         }
     }
     [paster.fixtureBoard releaseGlobally];
-    puts("Annotation paste activated the previous app, delivered ordered editor and terminal payloads, and preserved clipboard ownership.");
+    puts("Annotation paste delivered ordered editor and terminal payloads, preserved clipboard ownership, and kept the panel's original foreground app.");
 }
 
 @interface TestDictation : JardSystemDictation
@@ -717,7 +785,7 @@ static void testAnnotationPaste(void) {
 }
 - (NSRunningApplication *)foregroundOutputApplication {
     AnnotationTargetFixture *application = self.outputForeground ?: self.outputDestination;
-    return application ? (NSRunningApplication *)application : [super foregroundOutputApplication];
+    return (NSRunningApplication *)application;
 }
 - (BOOL)copyText:(NSString *)text { self.copiedText = text; return YES; }
 - (BOOL)canStartCommandCapture { return !self.captureID; }
@@ -875,6 +943,19 @@ static AnnotationTargetFixture *outputTarget(NSString *name, pid_t pid) {
 }
 @end
 
+@interface AnnotationCueEnvironmentFixture : JardRecordingEnvironment
+@property(nonatomic) BOOL recording;
+@property(nonatomic, copy) dispatch_block_t annotationCompletion;
+@end
+
+@implementation AnnotationCueEnvironmentFixture
+- (void)setAnnotationRecording:(BOOL)recording mode:(NSString *)mode percent:(double)percent
+    completion:(dispatch_block_t)completion {
+    self.recording = recording;
+    if (completion) self.annotationCompletion = completion;
+}
+@end
+
 @interface AuditionClipFixture : NSObject
 @property(nonatomic, copy) NSString *cue;
 @property(nonatomic, strong) NSMutableArray<NSString *> *events;
@@ -999,6 +1080,47 @@ static void testSoundSettings(void) {
     [fixture shutdown];
     [defaults removeObjectForKey:@"JardSystemDictation"];
     puts("Sound choices persisted, legacy assets resolved, auditions owned their clips and timing, and the setup-ready cue played once.");
+}
+
+static void testAnnotationCues(void) {
+    SoundSettingsFixture *fixture = [[SoundSettingsFixture alloc] initWithSend:nil];
+    fixture.played = NSMutableArray.array;
+    AnnotationCueEnvironmentFixture *environment = AnnotationCueEnvironmentFixture.new;
+    fixture.recordingEnvironment = environment;
+    assert([[fixture soundURL:@"annotationSent" style:@"signature"] isEqual:[fixture soundURL:@"done" style:@"signature"]]);
+    assert([[fixture soundURL:@"annotationSent" style:@"classic"].lastPathComponent isEqual:@"annotationSent.mp3"]);
+    assert([[fixture soundURL:@"annotationUndo" style:@"signature"].lastPathComponent isEqual:@"annotationUndo.mp3"]);
+
+    [fixture setAnnotationPhase:@"starting"];
+    [fixture setAnnotationPhase:@"picking"];
+    assert(!environment.recording && !fixture.played.count);
+    [fixture setAnnotationPhase:@"recording"];
+    [fixture setAnnotationPhase:@"recording"];
+    assert(environment.recording && [fixture.played isEqual:@[@"start"]]);
+    [fixture setAnnotationPhase:@"saving"];
+    assert(!environment.recording && [fixture.played isEqual:@[@"start"]]);
+    [fixture setAnnotationPhase:@"finished"];
+    environment.annotationCompletion();
+    assert(([fixture.played isEqual:@[@"start", @"stop"]]));
+
+    [fixture setAnnotationPhase:@"starting"];
+    [fixture setAnnotationPhase:@"recording"];
+    [fixture setAnnotationPhase:@"saving"];
+    dispatch_block_t staleStop = environment.annotationCompletion;
+    [fixture setAnnotationPhase:@"error"];
+    staleStop();
+    environment.annotationCompletion();
+    assert(([fixture.played isEqual:@[@"start", @"stop", @"start", @"error"]]));
+
+    [fixture setAnnotationPhase:@"starting"];
+    [fixture setAnnotationPhase:@"recording"];
+    [fixture setAnnotationPhase:@"cancelling"];
+    assert(!environment.recording && [fixture.played.lastObject isEqual:@"start"]);
+    [fixture setAnnotationPhase:@"cancelled"];
+    environment.annotationCompletion();
+    assert([fixture.played.lastObject isEqual:@"cancel"]);
+    [fixture shutdown];
+    puts("Annotation cues tracked confirmed recording and discard, waited for playback restoration, and discarded an outdated stop.");
 }
 
 static void testCompletionSounds(void) {
@@ -1797,6 +1919,79 @@ static void finishTake(JardSystemDictation *dictation, NSString *identifier, BOO
     assert(dictation.captureID == nil);
 }
 
+@interface WindowOnlyDictationFixture : JardSystemDictation
+@property(nonatomic, strong) AnnotationTargetFixture *editor;
+@property(nonatomic, strong) NSPasteboard *board;
+@property(nonatomic) NSUInteger pastes;
+@end
+
+@implementation WindowOnlyDictationFixture
+- (NSRunningApplication *)foregroundOutputApplication { return (NSRunningApplication *)(id)self.editor; }
+- (NSPasteboard *)pasteboard { return self.board; }
+- (BOOL)postPasteShortcut {
+    assert([[self.board stringForType:NSPasteboardTypeString] isEqual:@"A candidate sentence."]);
+    BOOL sent = [super postPasteShortcut];
+    if (sent) self.pastes++;
+    return sent;
+}
+@end
+
+static void testWindowOnlyDictationTarget(void) {
+    WindowOnlyDictationFixture *dictation = [[WindowOnlyDictationFixture alloc] initWithSend:
+        ^(NSString *command, NSDictionary *payload, JardDictationReply reply) {
+            assert([payload[@"action"] isEqual:@"transcribe"]);
+            reply(@{@"text": @"A candidate sentence."}, nil);
+        }];
+    dictation.board = NSPasteboard.pasteboardWithUniqueName;
+    [dictation.board clearContents];
+    [dictation.board setString:@"Original clipboard" forType:NSPasteboardTypeString];
+    dictation.editor = outputTarget(@"Window-only editor", windowFixturePID);
+    dictation.settings[@"placement"] = @"off";
+    dictation.settings[@"sound"] = @NO;
+    dictation.settings[@"output"] = @"paste";
+    dictation.settings[@"appRules"] = @"";
+    dictation.settings[@"retention"] = @0;
+    fixtureEventTaps = true;
+    NSUInteger total = 0;
+    for (NSUInteger scenario = 0; scenario < 9; scenario++) {
+        dictation.editor = outputTarget(@"Window-only editor", windowFixturePID);
+        windowFixtureIdentity = windowFixturePID + 2;
+        windowFixtureFocusStatus = scenario == 6 ? kAXErrorCannotComplete : kAXErrorNoValue;
+        [dictation rememberDestination];
+        dictation.takeInputRevision = dictation.inputRevision;
+        switch (scenario) {
+            case 1: windowFixtureIdentity++; break;
+            case 2: [dictation activationChanged:nil]; break;
+            case 3: fixtureSecureInput = true; break;
+            case 4: windowFixtureFocusStatus = kAXErrorCannotComplete; break;
+            case 5: windowFixtureFocusStatus = kAXErrorSuccess; break;
+            case 7: dictation.editor = outputTarget(@"Another active editor", windowFixturePID + 10); break;
+            case 8: dictation.editor = nil; break;
+        }
+        nativePasteEvents = NSMutableArray.array;
+        finishTake(dictation, @"window-only", NO);
+        BOOL allowed = scenario != 3 && scenario != 8;
+        total += allowed;
+        assert([dictation.phase isEqual:allowed ? @"inserted" : @"saved"] && dictation.pastes == total);
+        assert(nativePasteEvents.count == (allowed ? 4 : 0));
+        if (allowed) {
+            assert(([nativePasteEvents.firstObject isEqual:@[@(kCGHIDEventTap), @(kCGEventFlagsChanged), @(kVK_Command), @(kCGEventFlagMaskCommand)]]));
+            assert(([nativePasteEvents.lastObject isEqual:@[@(kCGHIDEventTap), @(kCGEventFlagsChanged), @(kVK_Command), @0]]));
+            assert([nativePasteEvents[1][1] unsignedIntegerValue] == kCGEventKeyDown);
+            assert([nativePasteEvents[2][1] unsignedIntegerValue] == kCGEventKeyUp);
+            assert([nativePasteEvents[1][2] isEqual:nativePasteEvents[2][2]]);
+        }
+        nativePasteEvents = nil;
+        waitForDelivery(dictation);
+        assert([[dictation.board stringForType:NSPasteboardTypeString] isEqual:@"Original clipboard"]);
+        fixtureSecureInput = false;
+    }
+    fixtureEventTaps = false;
+    windowFixtureIdentity = 0;
+    [dictation.board releaseGlobally];
+    puts("Fresh dictation followed the active caret through AX errors and changes, posted the full HID chord, and blocked secure input or a missing app.");
+}
+
 static void testHistoryTiming(void) {
     DictationDeliveryFixture *dictation = [[DictationDeliveryFixture alloc] initWithSend:
         ^(NSString *command, NSDictionary *payload, JardDictationReply reply) {
@@ -1852,9 +2047,13 @@ static void testHistoryTiming(void) {
         assert(!error && [result[@"changed"] boolValue] && [result[@"removed"] unsignedIntegerValue] == count);
     }];
     assert(![dictation.status[@"hasLast"] boolValue] && ![dictation.status[@"historyRevision"] length]);
+    dictation.settings[@"vocabulary"] = @"Zinash";
+    dictation.settings[@"vocabularySoundsLike"] = @{@"zinash": @[@"Zin Ash"]};
     [dictation control:@"history-snapshot" reply:^(id result, NSString *error) {
         assert(!error && [result[@"JardSystemDictationHistory"] isEqual:@[]]);
-        assert([result[@"JardSystemDictation"][@"retention"] isEqual:@7]);
+        NSDictionary *searchSettings = result[@"JardSystemDictation"];
+        assert([searchSettings[@"retention"] isEqual:@7] && [searchSettings[@"vocabulary"] isEqual:@"Zinash"]);
+        assert([searchSettings[@"vocabularySoundsLike"][@"zinash"] isEqual:@[@"Zin Ash"]]);
         if (identifier) assert([result[@"bundleId"] isEqual:identifier]);
     }];
     if (disposableDomain) {
@@ -1924,7 +2123,7 @@ static void testLastFailure(void) {
     dictation.settings[@"output"] = @"paste";
     finishTake(dictation, @"blocked-paste", NO);
     replies[3](@{@"text": @"Keep this text"}, nil);
-    assert([dictation.status[@"lastFailure"] containsString:@"insertion point changed"]);
+    assert([dictation.status[@"lastFailure"] containsString:@"active app is unavailable"]);
     assert([dictation.lastText isEqual:@"Keep this text"]);
     finishTake(dictation, @"failed-transcription", NO);
     replies[4](nil, @"Could not load the local speech model.");
@@ -1979,6 +2178,69 @@ static void testWarmInputStatus(void) {
     puts("Warm input feedback followed the active request, rejected stale events, and left the last take intact.");
 }
 
+static AVAuthorizationStatus fixtureMicrophoneGranted(id owner, SEL selector, AVMediaType mediaType) {
+    assert([mediaType isEqual:AVMediaTypeAudio]);
+    return AVAuthorizationStatusAuthorized;
+}
+
+static void testWarmMicrophoneWhenAway(void) {
+    Method method = class_getClassMethod(AVCaptureDevice.class, @selector(authorizationStatusForMediaType:));
+    IMP original = method_setImplementation(method, (IMP)fixtureMicrophoneGranted);
+    fixturePresence = fixtureEventTaps = true;
+    void (^notify)(JardSystemDictation *, NSString *) = ^(JardSystemDictation *dictation, NSString *name) {
+        [dictation powerChanged:[NSNotification notificationWithName:name object:nil]];
+    };
+    for (NSNumber *lockedAtLaunch in @[@YES, @NO]) {
+        fixtureDisplayAsleep = !lockedAtLaunch.boolValue;
+        fixtureSession = @{@"CGSSessionScreenIsLocked": lockedAtLaunch};
+        NSMutableArray<NSDictionary *> *warm = NSMutableArray.array;
+        JardSystemDictation *dictation = [[JardSystemDictation alloc] initWithSend:
+            ^(NSString *command, NSDictionary *payload, JardDictationReply reply) {
+                if ([command isEqual:@"jard.warm"]) [warm addObject:payload];
+            }];
+        dictation.settings[@"enabled"] = @YES;
+        dictation.settings[@"onboarding"] = @"done";
+        dictation.settings[@"keepMicrophoneReady"] = @YES;
+        [dictation workspaceReady];
+        assert(!warm.count && !dictation.dictationKeyEnabled && ![dictation canStartCommandCapture]);
+        assert(![dictation annotationRoutingDisplayAvailable]);
+
+        notify(dictation, lockedAtLaunch.boolValue ? NSWorkspaceScreensDidWakeNotification : @"com.apple.screenIsUnlocked");
+        assert(!warm.count && !dictation.dictationKeyEnabled);
+        notify(dictation, lockedAtLaunch.boolValue ? @"com.apple.screenIsUnlocked" : NSWorkspaceScreensDidWakeNotification);
+        assert(warm.count == 1 && [warm.lastObject[@"keep"] boolValue] && dictation.dictationKeyEnabled);
+        NSString *first = warm.lastObject[@"request"];
+
+        [dictation setAnnotationActive:YES microphoneShared:YES];
+        assert(dictation.dictationKeyEnabled && warm.count == 1);
+        [dictation setAnnotationActive:NO microphoneShared:NO];
+        assert(dictation.dictationKeyEnabled && warm.count == 1);
+
+        notify(dictation, @"com.apple.screenIsLocked");
+        assert(warm.count == 2 && ![warm.lastObject[@"keep"] boolValue] && !dictation.dictationKeyEnabled);
+        notify(dictation, NSWorkspaceScreensDidSleepNotification);
+        notify(dictation, NSWorkspaceWillSleepNotification);
+        notify(dictation, NSWorkspaceSessionDidResignActiveNotification);
+        notify(dictation, @"com.apple.screenIsUnlocked");
+        notify(dictation, NSWorkspaceDidWakeNotification);
+        notify(dictation, NSWorkspaceSessionDidBecomeActiveNotification);
+        assert(warm.count == 2 && !dictation.dictationKeyEnabled);
+        notify(dictation, NSWorkspaceScreensDidWakeNotification);
+        assert(warm.count == 3 && [warm.lastObject[@"keep"] boolValue] && dictation.dictationKeyEnabled);
+        assert(first.length && ![warm.lastObject[@"request"] isEqual:first]);
+        assert([dictation annotationRoutingDisplayAvailable]);
+        [dictation shutdown];
+    }
+    fixtureSession = nil;
+    fixturePresence = fixtureEventTaps = false;
+    for (NSUInteger i = 0; i < 3; i++) {
+        if (fixtureTaps[i].port) CFRelease(fixtureTaps[i].port);
+        memset(&fixtureTaps[i], 0, sizeof fixtureTaps[i]);
+    }
+    method_setImplementation(method, original);
+    puts("Warm dictation stayed closed at locked or display-asleep launch and reopened after the last idle hold ended.");
+}
+
 static void testAccessibilityRecovery(void) {
     JardSystemDictation *setup = [[JardSystemDictation alloc] initWithSend:nil];
     setup.settings[@"onboarding"] = @"access";
@@ -2005,7 +2267,55 @@ static void testAccessibilityRecovery(void) {
     [setup request:@{@"action": @"repairAccessibility"} reply:^(id result, NSString *failure) {
         assert(!result && [failure containsString:@"after returning from System Settings"]);
     }];
-    puts("Accessibility repair waited for Settings focus and grace periods, cleared on grant or deferral, and was denied outside setup.");
+
+    for (NSString *step in @[@"practice", @"ready"]) {
+        setup.settings[@"onboarding"] = step;
+        [setup noteAccessibilityRequestAt:300];
+        [setup observeAccessibilityAt:301 trusted:NO settingsOpen:YES settingsFront:YES active:NO];
+        [setup observeAccessibilityAt:302 trusted:NO settingsOpen:NO settingsFront:NO active:YES];
+        assert(!setup.accessibilityStale);
+        [setup observeAccessibilityAt:304 trusted:NO settingsOpen:NO settingsFront:NO active:YES];
+        assert(setup.accessibilityStale && [setup.settings[@"onboarding"] isEqual:step]);
+        [setup observeAccessibilityAt:305 trusted:YES settingsOpen:NO settingsFront:NO active:YES];
+        assert(!setup.accessibilityStale && [setup.settings[@"onboarding"] isEqual:step]);
+    }
+    puts("Accessibility repair waited for Settings and kept the saved practice and ready steps through recovery.");
+}
+
+static void testReturnFromAccessibilitySettings(void) {
+    JardSystemDictation *setup = [[JardSystemDictation alloc] initWithSend:nil];
+    setup.settings[@"onboarding"] = @"practice";
+    assert(![setup observeAccessibilityAt:100 trusted:YES settingsOpen:YES settingsFront:YES active:NO]);
+    [setup noteAccessibilityRequestAt:101];
+    assert(![setup observeAccessibilityAt:102 trusted:NO settingsOpen:YES settingsFront:YES active:NO]);
+    assert([setup observeAccessibilityAt:103 trusted:YES settingsOpen:YES settingsFront:YES active:NO]);
+    assert(![setup observeAccessibilityAt:104 trusted:YES settingsOpen:YES settingsFront:YES active:NO]);
+
+    // An authentication sheet can be frontmost when the grant first becomes usable.
+    [setup noteAccessibilityRequestAt:200];
+    assert(![setup observeAccessibilityAt:202 trusted:YES settingsOpen:YES settingsFront:NO active:NO]);
+    assert([setup observeAccessibilityAt:204 trusted:YES settingsOpen:YES settingsFront:YES active:NO]);
+    [setup noteAccessibilityRequestAt:300];
+    assert(![setup observeAccessibilityAt:302 trusted:YES settingsOpen:YES settingsFront:NO active:NO]);
+    assert(![setup observeAccessibilityAt:306 trusted:YES settingsOpen:YES settingsFront:YES active:NO]);
+    [setup noteAccessibilityRequestAt:400];
+    assert(![setup observeAccessibilityAt:402 trusted:YES settingsOpen:YES settingsFront:NO active:YES]);
+    assert(![setup observeAccessibilityAt:403 trusted:YES settingsOpen:YES settingsFront:YES active:NO]);
+    [setup noteAccessibilityRequestAt:500];
+    assert(![setup observeAccessibilityAt:502 trusted:YES settingsOpen:NO settingsFront:NO active:NO]);
+    assert(![setup observeAccessibilityAt:503 trusted:YES settingsOpen:YES settingsFront:YES active:NO]);
+
+    [setup noteAccessibilityRequestAt:600];
+    assert(![setup observeAccessibilityAt:602 trusted:YES settingsOpen:YES settingsFront:NO active:NO]);
+    [setup setValue:@YES forKey:@"screenLocked"];
+    assert(![setup observeAccessibilityAt:603 trusted:YES settingsOpen:YES settingsFront:YES active:NO]);
+    [setup setValue:@NO forKey:@"screenLocked"];
+    assert(![setup observeAccessibilityAt:604 trusted:YES settingsOpen:YES settingsFront:YES active:NO]);
+    [setup noteAccessibilityRequestAt:700];
+    assert(![setup observeAccessibilityAt:702 trusted:YES settingsOpen:YES settingsFront:NO active:NO]);
+    setup.settings[@"onboarding"] = @"later";
+    assert(![setup observeAccessibilityAt:703 trusted:YES settingsOpen:YES settingsFront:YES active:NO]);
+    puts("An Accessibility grant returned from System Settings once and respected focus, timeout, lock, and deferral.");
 }
 
 static BOOL press(JardSystemDictation *dictation, CGKeyCode code, CGEventType type, CGEventFlags flags, BOOL repeat) {
@@ -2628,7 +2938,7 @@ static void testCancelShortcuts(void) {
     dictation.settings[@"shortcutFlags"] = @0;
     [dictation applyShortcutMode];
     __block BOOL annotationHandlesEscape = NO;
-    [dictation setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, CGKeyCode shortcutCode, BOOL chordFree) {
+    [dictation setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, JardAnnotationShortcut shortcut, BOOL chordFree) {
         return annotationHandlesEscape && type == kCGEventKeyDown &&
             CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == kVK_Escape;
     }];
@@ -3022,7 +3332,7 @@ static void testEventTapRecovery(void) {
     dictation.settings[@"shortcutFlags"] = @0;
     [dictation applyShortcutMode];
     __block unsigned inputGaps = 0;
-    [dictation setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, CGKeyCode code, BOOL free) {
+    [dictation setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, JardAnnotationShortcut shortcut, BOOL free) {
         if (type == kCGEventTapDisabledByUserInput || type == kCGEventTapDisabledByTimeout) inputGaps++;
         return NO;
     }];
@@ -3204,9 +3514,9 @@ static void testShortcutLayoutChange(void) {
     assert(fixture.pastes == 2);
 
     __block NSUInteger annotationEdges = 0;
-    [fixture setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, CGKeyCode shortcutCode, BOOL chordFree) {
+    [fixture setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, JardAnnotationShortcut shortcut, BOOL chordFree) {
         if (type != kCGEventKeyDown && type != kCGEventKeyUp) return NO;
-        if (!chordFree || CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) != shortcutCode) return NO;
+        if (!chordFree || CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) != shortcut.code) return NO;
         annotationEdges++;
         return YES;
     }];
@@ -3239,9 +3549,107 @@ static void testShortcutLayoutChange(void) {
     [fixture routeSecureChord:secure edge:JardSecureReleased];
     assert(annotationEdges == 6);
     fixtureSecureInput = false;
+    fixture.shortcutTarget = @"annotate";
+    assert([fixture saveRecordedCode:kVK_ANSI_S flags:kCGEventFlagMaskControl label:@"⌃S"]);
+    [fixture stageShortcutLayout:moved];
+    code = [fixture annotationShortcutCode];
+    assert(code != kVK_ANSI_S);
+    assert(press(fixture, code, kCGEventKeyDown, kCGEventFlagMaskControl, NO));
+    [fixture stageShortcutLayout:qwerty];
+    assert(press(fixture, code, kCGEventKeyUp, 0, NO));
+    assert(press(fixture, kVK_ANSI_S, kCGEventKeyDown, kCGEventFlagMaskControl, NO));
+    assert(press(fixture, kVK_ANSI_S, kCGEventKeyUp, 0, NO) && annotationEdges == 10);
     [fixture shutdown];
     [NSUserDefaults.standardUserDefaults removeObjectForKey:@"JardSystemDictation"];
     puts("Native shortcuts followed letter mappings while held captures, paste, annotation and secure hotkeys balanced their original releases.");
+}
+
+static void testAnnotationShortcut(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSString *key = @"JardSystemDictation";
+    [defaults removeObjectForKey:key];
+    ShortcutEventFixture *fixture = [[ShortcutEventFixture alloc] initWithSend:nil];
+    CGEventFlags control = kCGEventFlagMaskControl;
+    CGEventFlags option = kCGEventFlagMaskAlternate;
+    __block NSUInteger edges = 0;
+    [fixture setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, JardAnnotationShortcut shortcut, BOOL free) {
+        if ((type != kCGEventKeyDown && type != kCGEventKeyUp) || !event || !free ||
+            CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) != shortcut.code) return NO;
+        if (type == kCGEventKeyDown && shortcut.pressed != shortcut.required) return NO;
+        edges++;
+        return YES;
+    }];
+    assert([fixture.status[@"annotateLabel"] isEqual:@"⌥⇧S"]);
+    fixture.shortcutTarget = @"annotate";
+    assert(![fixture saveRecordedCode:kVK_ANSI_V flags:control | option label:@"⌃⌥V"]);
+    assert(![fixture saveRecordedCode:kVK_ANSI_V flags:option | kCGEventFlagMaskShift label:@"⌥⇧V"]);
+    assert(![fixture saveRecordedCode:kVK_ANSI_J flags:0 label:@"J"]);
+    assert(![fixture saveRecordedCode:kVK_ANSI_J flags:kCGEventFlagMaskSecondaryFn label:@"Fn J"]);
+    fixture.choosingShortcut = YES;
+    assert(press(fixture, kVK_Escape, kCGEventKeyDown, 0, NO));
+    assert(press(fixture, kVK_Escape, kCGEventKeyUp, 0, NO));
+    assert(!fixture.choosingShortcut && [fixture.status[@"annotateLabel"] isEqual:@"⌥⇧S"]);
+    fixture.choosingShortcut = YES;
+    assert(press(fixture, kVK_ANSI_J, kCGEventKeyDown, control, NO));
+    assert(press(fixture, kVK_ANSI_J, kCGEventKeyUp, 0, NO));
+    assert(!fixture.choosingShortcut && [fixture.status[@"annotateLabel"] isEqual:@"⌃J"]);
+    assert(!press(fixture, kVK_ANSI_J, kCGEventKeyDown, option, NO));
+    assert(press(fixture, kVK_ANSI_J, kCGEventKeyDown, control, NO));
+    assert(press(fixture, kVK_ANSI_J, kCGEventKeyUp, 0, NO));
+    fixtureSecureInput = true;
+    [fixture routeSecureChord:(JardSecureChord){JardSecureAnnotate, kVK_ANSI_S, control} edge:JardSecurePressed];
+    JardSecureChord chord = {JardSecureAnnotate, kVK_ANSI_J, control};
+    [fixture routeSecureChord:chord edge:JardSecurePressed];
+    [fixture routeSecureChord:chord edge:JardSecureReleased];
+    fixtureSecureInput = false;
+    assert(edges == 4);
+    fixture.shortcutTarget = @"raw";
+    assert(![fixture saveRecordedCode:kVK_ANSI_J flags:control label:@"⌃J"]);
+    JardSystemDictation *reopened = [[JardSystemDictation alloc] initWithSend:nil];
+    assert([reopened.status[@"annotateLabel"] isEqual:@"⌃J"]);
+    [reopened shutdown];
+    [fixture request:@{@"action": @"resetAnnotationShortcut"} reply:^(id result, NSString *error) {
+        assert(!error && [result[@"annotateLabel"] isEqual:@"⌥⇧S"]);
+    }];
+    [fixture request:@{@"action": @"setAnnotationEnabled", @"enabled": @NO} reply:^(id result, NSString *error) {
+        assert(!error && ![result[@"annotationEnabled"] boolValue]);
+    }];
+    assert(!press(fixture, kVK_ANSI_S, kCGEventKeyDown, option | kCGEventFlagMaskShift, NO) && edges == 4);
+    fixture.shortcutTarget = @"raw";
+    assert([fixture saveRecordedCode:kVK_ANSI_S flags:option | kCGEventFlagMaskShift label:@"⌥⇧S"]);
+    [fixture request:@{@"action": @"setAnnotationEnabled", @"enabled": @YES} reply:^(id result, NSString *error) {
+        assert(!result && [error containsString:@"already in use"]);
+    }];
+    JardSystemDictation *disabled = [[JardSystemDictation alloc] initWithSend:nil];
+    assert(![disabled.settings[@"annotationEnabled"] boolValue] && [disabled.status[@"annotateLabel"] isEqual:@"⌥⇧S"]);
+    [disabled shutdown];
+    fixture.shortcutTarget = @"annotate";
+    assert([fixture saveRecordedCode:kVK_F8 flags:0 label:@"F8"]);
+    [fixture request:@{@"action": @"setAnnotationEnabled", @"enabled": @YES} reply:^(id result, NSString *error) {
+        assert(!error && [result[@"annotationEnabled"] boolValue] && [result[@"annotateLabel"] isEqual:@"F8"]);
+    }];
+    NSDictionary *cli = @{@"action": @"settings-apply", @"changes": @{@"capture.hotkey": @"f10"}};
+    [fixture setAnnotationActive:YES];
+    [fixture controlSettings:cli reply:^(id result, NSString *error) {
+        assert(!result && [error containsString:@"Finish the current recording"]);
+    }];
+    [fixture setAnnotationActive:NO];
+    assert([fixture.status[@"annotateLabel"] isEqual:@"F8"]);
+    [fixture controlSettings:cli reply:^(id result, NSString *error) {
+        assert(!error && [result[@"capture.hotkey"] isEqual:@"f10"]);
+    }];
+    assert([fixture.status[@"annotateLabel"] isEqual:@"F10"]);
+    assert(!press(fixture, kVK_F8, kCGEventKeyDown, 0, NO));
+    assert(press(fixture, kVK_F10, kCGEventKeyDown, 0, NO));
+    assert(press(fixture, kVK_F10, kCGEventKeyUp, 0, NO));
+    [fixture shutdown];
+    [defaults setObject:@{@"annotateCode": @(kVK_F5), @"annotateFlags": @0, @"soundVolume": @36} forKey:key];
+    JardSystemDictation *repaired = [[JardSystemDictation alloc] initWithSend:nil];
+    assert([repaired.status[@"preferencesWarning"] length] && [repaired.status[@"annotateLabel"] isEqual:@"⌥⇧S"]);
+    assert([repaired.status[@"soundVolume"] isEqual:@36]);
+    [repaired shutdown];
+    [defaults removeObjectForKey:key];
+    puts("Annotation shortcut editing, conflicts, secure routing, preferences, reset, and disable/enable passed.");
 }
 
 static void testDamagedPreferences(void) {
@@ -3401,8 +3809,14 @@ static void testHUDSpaces(void) {
     fixture.hud = panel;
     fixture.meter = meter;
     NSUInteger clears = panel.clearedBehavior;
-    [fixture showHUD:@"Listening" stage:JardIndicatorRecording];
+    fixture.phase = @"starting";
+    [fixture showHUD:@"Starting…" stage:JardIndicatorRecording];
     assert(panel.orderedIn == 1 && panel.clearedBehavior == clears + 1);
+    assert(!meter.isAccessibilityElement);
+    fixture.phase = @"listening";
+    [fixture showHUD:@"Listening · locked" stage:JardIndicatorRecording];
+    assert(panel.orderedIn == 1 && [meter.accessibilityLabel isEqual:JardLocalized(@"Listening…")]);
+    assert([meter.accessibilityHelp isEqual:JardLocalized(@"Dictation")]);
     assert(panel.collectionBehavior & NSWindowCollectionBehaviorCanJoinAllApplications);
     assert(panel.collectionBehavior & NSWindowCollectionBehaviorFullScreenAuxiliary);
     NSRect initialFrame = panel.frame;
@@ -3467,6 +3881,96 @@ static void testHUDSpaces(void) {
     puts("Dictation HUD repaired Space changes with a bounded retry, stayed hidden after a Dock policy change, and cleared the menu bar, notch, and Dock.");
 }
 
+static NSMutableArray *historyRows(NSUInteger count, NSString *text, NSString *raw) {
+    NSMutableArray *rows = [NSMutableArray arrayWithCapacity:count];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    for (NSUInteger i = 0; i < count; i++) {
+        [rows addObject:@{@"id": @(i).stringValue, @"time": @(now - i), @"text": text, @"raw": raw, @"seconds": @2}];
+    }
+    return rows;
+}
+
+static void testLargeHistory(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSString *key = @"JardSystemDictationHistory";
+    NSArray *before = [defaults arrayForKey:key];
+    [defaults setObject:historyRows(10001, @"Retained words", @"Retained words") forKey:key];
+    JardSystemDictation *dictation = [[JardSystemDictation alloc] initWithSend:nil];
+    assert(dictation.history.count == 10000 && [dictation.history.lastObject[@"id"] isEqual:@"9999"]);
+    [dictation control:@"history-snapshot" reply:^(id result, NSString *error) {
+        assert(!result && [error containsString:@"preferences file"]);
+    }];
+
+    __block NSDictionary *page = nil;
+    [dictation request:@{@"action": @"history", @"query": @"Retained", @"offset": @9998} reply:^(id result, NSString *error) {
+        assert(NSThread.isMainThread && !error);
+        page = result;
+    }];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:5];
+    while (!page && deadline.timeIntervalSinceNow > 0)
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.02]];
+    assert([page[@"total"] isEqual:@10000] && [page[@"words"] isEqual:@20000] && [page[@"seconds"] isEqual:@20000]);
+    assert(([[page[@"entries"] valueForKey:@"id"] isEqual:@[@"9998", @"9999"]]));
+    [dictation shutdown];
+
+    NSString *body = [@"" stringByPaddingToLength:4095 * 2 withString:@"😀" startingAtIndex:0];
+    NSMutableArray *large = historyRows(513, @"", @"");
+    for (NSUInteger i = 0; i < large.count; i++) {
+        NSMutableDictionary *row = [large[i] mutableCopy];
+        row[@"text"] = [NSString stringWithFormat:@"%04lX%@", (unsigned long)i, body];
+        row[@"raw"] = [NSString stringWithFormat:@"%04lX%@", (unsigned long)(i + 4096), body];
+        large[i] = row;
+    }
+    [defaults setObject:large forKey:key];
+    NSString *prefix = [@"" stringByPaddingToLength:16 * 1024 - 1 withString:@"a" startingAtIndex:0];
+    NSString *fullTake = [prefix stringByAppendingString:@"😀keep this ending"];
+    DictationDeliveryFixture *capture = [[DictationDeliveryFixture alloc] initWithSend:
+        ^(NSString *command, NSDictionary *payload, JardDictationReply reply) {
+            assert([payload[@"action"] isEqual:@"transcribe"]);
+            reply(@{@"text": fullTake, @"raw": fullTake}, nil);
+        }];
+    assert(capture.history.count == 512 && [capture.history.lastObject[@"id"] isEqual:@"511"]);
+    capture.settings[@"placement"] = @"off";
+    capture.settings[@"retention"] = @7;
+    capture.settings[@"output"] = @"copy";
+    capture.board = NSPasteboard.pasteboardWithUniqueName;
+    finishTake(capture, @"bounded-history", NO);
+    assert(capture.history.count == 512 && [capture.history.lastObject[@"id"] isEqual:@"510"]);
+    NSDictionary *entry = capture.history.firstObject;
+    assert([entry[@"text"] isEqual:prefix] && [entry[@"raw"] isEqual:prefix]);
+    assert([capture.lastText isEqual:fullTake] && [[capture.board stringForType:NSPasteboardTypeString] isEqual:fullTake]);
+
+    NSString *latest = entry[@"id"];
+    [capture request:@{@"action": @"bulkHistory", @"operation": @"delete", @"ids": @[latest]} reply:^(id result, NSString *error) {
+        assert(!error && ![result[@"hasLast"] boolValue]);
+    }];
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    __block BOOL checkpoint = NO;
+    [capture writeHistorySnapshot:path reply:^(id result, NSString *error) {
+        assert(NSThread.isMainThread && !error && [result boolValue]);
+        checkpoint = YES;
+    }];
+    deadline = [NSDate dateWithTimeIntervalSinceNow:5];
+    while (!checkpoint && deadline.timeIntervalSinceNow > 0)
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.02]];
+    assert(checkpoint && [[defaults arrayForKey:key] count] == 511);
+    NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+    assert([attributes filePosixPermissions] == 0600);
+    NSData *disk = [NSData dataWithContentsOfFile:path];
+    assert(disk.length > 8 * 1024 * 1024);
+    NSDictionary *saved = [NSPropertyListSerialization propertyListWithData:disk options:NSPropertyListImmutable format:nil error:nil];
+    assert([saved[key] count] == 511 && ![[saved[key] valueForKey:@"id"] containsObject:latest]);
+    assert([NSFileManager.defaultManager removeItemAtPath:path error:nil]);
+    [capture control:@"history-clear" reply:^(id result, NSString *error) {
+        assert(!error && [result[@"removed"] isEqual:@511]);
+    }];
+    assert([[defaults arrayForKey:key] count] == 0);
+    [capture shutdown];
+    if (before) [defaults setObject:before forKey:key];
+    else [defaults removeObjectForKey:key];
+    puts("History retained 10,000 takes under a combined UTF-8 budget, with bounded legacy replies, live checkpoint, and full current delivery.");
+}
+
 int main(void) {
     @autoreleasepool {
         testHUDSpaces();
@@ -3483,11 +3987,16 @@ int main(void) {
         testMicrophoneRecovery();
         testColdReopenDuringHold();
         testAccessibilityRecovery();
+        testReturnFromAccessibilitySettings();
         testCaptureEnvironment();
         testLastFailure();
         testWarmInputStatus();
+        testWarmMicrophoneWhenAway();
+        testWindowOnlyDictationTarget();
         testHistoryTiming();
+        testLargeHistory();
         testCancelShortcuts();
+        testAnnotationShortcut();
         testOptionalBindings();
         testRemappedModifiersAndGlobe();
         testShortcutSide();
@@ -3499,6 +4008,7 @@ int main(void) {
         testStartCueWorker();
         testStartCueGestures();
         testSoundSettings();
+        testAnnotationCues();
         testCompletionSounds();
         testPressDuringReleaseTail();
         testPasteLastMenu();
@@ -3554,7 +4064,7 @@ int main(void) {
         finishTake(dictation, @"focus-changed", NO);
         replies[5](@{@"text": @"next take", @"processed": @"recovered next take", @"outputWarning": @"Rewrite timed out."}, nil);
         assert(!dictation.copiedText && [dictation.lastText isEqual:@"recovered next take"] && [dictation.phase isEqual:@"saved"]);
-        assert([dictation.message containsString:@"insertion point changed"]);
+        assert([dictation.message containsString:@"active app is unavailable"]);
 
         dictation.settings[@"retention"] = @7;
         finishTake(dictation, @"profile-metadata", NO);
@@ -3624,9 +4134,9 @@ int main(void) {
 
         CGEventFlags annotationChord = kCGEventFlagMaskAlternate | kCGEventFlagMaskShift;
         __block NSUInteger reserved = 0, annotationEvents = 0, lostTap = 0;
-        [dictation setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, CGKeyCode shortcutCode, BOOL chordFree) {
+        [dictation setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, JardAnnotationShortcut shortcut, BOOL chordFree) {
             if (type == kCGEventTapDisabledByTimeout) { lostTap++; return NO; }
-            if (type != kCGEventKeyDown || CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) != shortcutCode) return NO;
+            if (type != kCGEventKeyDown || CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) != shortcut.code) return NO;
             if (chordFree) annotationEvents++;
             else reserved++;
             return chordFree;

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import runpy
 import shutil
 import socket
 import ssl
@@ -14,6 +15,10 @@ import tempfile
 from threading import Thread
 from time import monotonic, sleep
 from uuid import uuid4
+
+development_release_notes = runpy.run_path(
+    str(Path(__file__).resolve().parents[1] / "build-tools/package.py")
+)["development_release_notes"]
 
 
 def run(*arguments):
@@ -42,6 +47,8 @@ def exercise(root, executable):
     requests = []
     ranges = []
     feed_requests = []
+    feed_agents = []
+    rollout_requests = []
 
     class Releases(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -49,6 +56,11 @@ def exercise(root, executable):
 
         def do_GET(self):
             name = self.path.lstrip("/")
+            if name.endswith(".json"):
+                feed_agents.append((name, self.headers.get("User-Agent")))
+            if name in {"rollout-stable.json", "rollout-dev.json"}:
+                self.rollout_feed(name)
+                return
             if (root / "cache-mode").is_file() and name in {"stable.json", "development.json", "alternate-feed.json"}:
                 self.cached_feed(name)
                 return
@@ -86,6 +98,29 @@ def exercise(root, executable):
             self.end_headers()
             with file.open("rb") as source:
                 shutil.copyfileobj(source, self.wfile)
+
+        def rollout_feed(self, name):
+            mode = (root / name.removesuffix(".json")).read_text()
+            incoming = self.headers.get("If-None-Match")
+            rollout_requests.append((name, mode, incoming, self.headers.get("Cache-Control")))
+            if mode == "delayed-404":
+                sleep(5)
+            if mode in {"missing", "delayed-404", "unavailable"}:
+                self.send_error(503 if mode == "unavailable" else 404)
+                return
+            file = assets / mode
+            tag = f'"{mode}"'
+            if incoming == tag:
+                self.send_response(304)
+                self.send_header("ETag", tag)
+                self.end_headers()
+                return
+            payload = file.read_bytes()
+            self.send_response(200)
+            self.send_header("ETag", tag)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
 
         def cached_feed(self, name):
             mode = (root / "cache-mode").read_text()
@@ -157,7 +192,7 @@ def exercise(root, executable):
         dev = {"feed_url": origin + "/development.json", "public_key": public_keys["dev"],
                "release_url": origin + "/notes"}
 
-        def bundle(folder, channel, version, flavor):
+        def bundle(folder, channel, version, flavor, dev_notes=None):
             app = folder / "Fixture.app"
             binary = app / "Contents/MacOS/fixture"
             binary.parent.mkdir(parents=True)
@@ -166,17 +201,25 @@ def exercise(root, executable):
             if flavor == "resume":
                 (app / "Contents/Resources").mkdir()
                 (app / "Contents/Resources/fixture.bin").write_bytes(os.urandom(9 * 1024 * 1024))
+            if dev_notes is not None:
+                notes_file = app / "Contents/Resources/Jaro-development-notes.json"
+                notes_file.parent.mkdir(exist_ok=True)
+                notes_file.write_bytes(dev_notes)
+            updates = {**stable, "channel": channel, "development": dev}
+            if flavor == "rollout-installed":
+                updates["rollout_url"] = origin + "/rollout-stable.json"
+                updates["development"] = {**dev, "rollout_url": origin + "/rollout-dev.json"}
             (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
                 "CFBundleIdentifier": identity, "CFBundleVersion": version, "CFBundleShortVersionString": version,
                 "CFBundlePackageType": "APPL", "CFBundleExecutable": "fixture", "LSUIElement": True,
-                "JardUpdates": {**stable, "channel": channel, "development": dev}, "FixtureFlavor": flavor,
+                "JardUpdates": updates, "FixtureFlavor": flavor,
                 "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
             }))
             run("codesign", "--force", "--sign", "-", "-r", f'=designated => identifier "{identity}"', app)
             return app
 
-        def publish(asset, signer, channel, version="2.0.0"):
-            app = bundle(root / asset, channel, version, asset)
+        def publish(asset, signer, channel, version="2.0.0", dev_notes=None):
+            app = bundle(root / asset, channel, version, asset, dev_notes)
             archive = assets / f"{asset}.zip"
             run("ditto", "-c", "-k", "--norsrc", "--keepParent", app, archive)
             manifest = root / "release-app.json"
@@ -192,8 +235,19 @@ def exercise(root, executable):
         publish("stable", "stable", "stable")
         publish("stable-four", "stable", "stable", "4.0.0")
         publish("stable-five", "stable", "stable", "5.0.0")
+        publish("stable-six", "stable", "stable", "6.0.0")
         publish("dev-first", "dev", "dev")
-        publish("dev-second", "dev", "dev")
+        history = root / "prior-development-notes.json"
+        history.write_bytes(development_release_notes("1.1.0", "- Older change\n* Shared change", None))
+        notes_for_second = development_release_notes("2.0.0", "Current change\nShared change", history)
+        publish("dev-second", "dev", "dev", dev_notes=notes_for_second)
+        # Repacking the same version replaces its notes while carrying older builds.
+        history.write_bytes(notes_for_second)
+        assert development_release_notes("2.0.0", "Current change\nShared change", history) == notes_for_second
+        history.write_bytes(development_release_notes("2.2.0", "Skipped change\nShared change", history))
+        publish("dev-later", "dev", "dev", "2.10.0",
+                development_release_notes("2.10.0", "Latest change\nShared change", history))
+        publish("dev-invalid-notes", "dev", "dev", "2.1.0", notes_for_second)
         publish("dev-wrong-bundle", "dev", "stable")
         publish("resume", "stable", "stable", "6.0.0")
         publish("resume-full", "stable", "stable", "7.0.0")
@@ -207,6 +261,12 @@ def exercise(root, executable):
         resume_entry = resume_bundle / "Contents/MacOS/fixture"
         cache_bundle = bundle(root / "cache-install", "stable", "3.0.0", "cache-installed").rename(root / "Cache.app")
         cache_entry = cache_bundle / "Contents/MacOS/fixture"
+        schedule_bundle = bundle(root / "schedule-install", "dev", "2.0.0", "schedule-installed")
+        schedule_entry = schedule_bundle.rename(root / "Schedule.app") / "Contents/MacOS/fixture"
+        rollout_bundle = bundle(root / "rollout-install", "stable", "3.0.0", "rollout-installed")
+        rollout_entry = rollout_bundle.rename(root / "Rollout.app") / "Contents/MacOS/fixture"
+        preserved_bundle = bundle(root / "preserved-install", "stable", "3.0.0", "preserved-stage-installed")
+        preserved_app = preserved_bundle.rename(root / "Preserved.app")
         cache = Path.home() / "Library/Caches" / f"{identity}.update-archives"
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -219,6 +279,10 @@ def exercise(root, executable):
             print(marker.read_text())
             print((root / "stable-reopened").read_text())
             print((root / "late-stage-fenced").read_text())
+            print((root / "stage-cleanup").read_text())
+            print((root / "receipt-recovery").read_text())
+            print((root / "restore-admission").read_text())
+            print((root / "install-admission").read_text())
             assert requests.count("stable.zip") == 1, requests
             assert requests.count("stable-four.zip") == 2, requests
             assert requests.count("stable-five.zip") == 2, requests
@@ -226,9 +290,12 @@ def exercise(root, executable):
             assert requests.count("dev-wrong-bundle.zip") == 1, requests
             assert requests.count("dev-second.zip") == 1, requests
             assert requests.count("dev-first.zip") == 2, requests
+            assert requests.count("dev-invalid-notes.zip") == 1, requests
+            assert requests.count("dev-later.zip") == 1, requests
             assert requests.count("dev-invalid-key.json") == 1, requests
             assert requests.count("dev-missing.json") == 1, requests
             print("Native signatures, stale release confirmation, downgrade, equal-version switch, and restart refresh verified.")
+            print("Development notes covered skipped builds, survived stage recovery, and used signed feed notes for a mismatched index.")
 
             def transfer(name, behavior):
                 (root / "stable-feed").write_text(name)
@@ -289,6 +356,63 @@ def exercise(root, executable):
             assert "no-cache" in feed_requests[5][3] and "no-cache" in feed_requests[-3][3], feed_requests
             assert requests.count("stable-four.zip") == stable_downloads + 2
             print("Only verified feeds supplied validators, with fresh restart requests and independent channel and redirect resources.")
+            assert ("alternate-feed.json", "jaro/stable/3.0.0") in feed_agents, feed_agents
+            (root / "cache-mode").unlink()
+            run("defaults", "delete", identity, "JardUpdateChannel")
+            since = len(feed_agents)
+            subprocess.run([schedule_entry], check=True, timeout=30)
+            scheduled_feeds = ["development.json"] * 9 + ["stable.json"] * 2 + ["development.json", "stable.json"]
+            assert [name for name, _ in feed_agents[since:]] == scheduled_feeds, feed_agents[since:]
+            assert {agent for _, agent in feed_agents[since:]} == {"jaro/dev/2.0.0"}, feed_agents[since:]
+            print("Development backoff, focus, manual and restart overrides, Stable cadence, and installed-build User-Agent passed.")
+            sign_rollout = root / "sign-rollout"
+            desktop = Path(__file__).resolve().parents[1]
+            run("xcrun", "swiftc", "-O", desktop / "update/UpdateRollout.swift",
+                desktop / "build-tools/sign-update-rollout.swift", "-o", sign_rollout)
+
+            def policy(name, release, percentage, required=False, signer="stable", channel="stable"):
+                path = assets / (name + ".json")
+                run(sign_rollout, assets / (release + ".json"), path, keys[signer], channel, str(percentage), str(required).lower())
+                return path
+
+            policy("zero", "stable-five", 0)
+            policy("closed-boundary", "stable-five", 37)
+            policy("open-boundary", "stable-five", 38)
+            policy("required", "stable-six", 0, True)
+            policy("older-required", "stable", 0, True)
+            policy("wrong-channel", "stable-five", 100, channel="dev")
+            policy("wrong-key", "dev-first", 100, signer="dev")
+            policy("dev-zero", "dev-first", 0, signer="dev", channel="dev")
+            invalid = json.loads((assets / "required.json").read_text())
+            invalid["signature"] = "A" * 86 + "=="
+            (assets / "invalid-policy.json").write_text(json.dumps(invalid))
+            wrong_seed = subprocess.run([sign_rollout, assets / "stable-five.json", assets / "unsigned.json",
+                                         keys["dev"], "stable", "50", "false"], capture_output=True, text=True, timeout=5)
+            assert wrong_seed.returncode and "same key" in wrong_seed.stderr and not (assets / "unsigned.json").exists()
+
+            (root / "rollout-stable").write_text("zero.json")
+            (root / "rollout-dev").write_text("dev-zero.json")
+            since = len(requests)
+            subprocess.run([rollout_entry], check=True, timeout=45)
+            assert len(rollout_requests) == 1 and not requests[since:], (rollout_requests, requests[since:])
+            subprocess.run([rollout_entry], check=True, timeout=45)
+            assert requests[since:] == ["stable-four.json", "stable-four.zip", "stalled-feed.json",
+                                        "stable-five.zip", "stable-six.zip", "dev-first.zip"], requests[since:]
+            assert rollout_requests[0][:2] == ("rollout-stable.json", "zero.json"), rollout_requests
+            assert ("rollout-stable.json", "closed-boundary.json", '"closed-boundary.json"', None) in rollout_requests
+            assert any(mode == "closed-boundary.json" and validator is None and "no-cache" in (cache or "")
+                       for _, mode, validator, cache in rollout_requests)
+            assert all(agent == "jaro/stable/3.0.0" for name, agent in feed_agents if name.startswith("rollout-")), feed_agents
+            print("Signed rollout kept its private bucket across launches, enforced the percentage, required flag and channel authority, and preserved the legacy fallback and staged release.")
+            run("defaults", "delete", identity, "JardUpdateChannel")
+            (root / "stable-feed").write_text("stable-four")
+            (root / "development-feed").write_text("first")
+            since = len(requests)
+            subprocess.run([preserved_app / "Contents/MacOS/fixture"], check=True, timeout=25)
+            result = plistlib.loads((preserved_app / "Contents/Info.plist").read_bytes())
+            assert result["CFBundleVersion"] == "4.0.0" and result["JardUpdates"]["channel"] == "stable", result
+            assert requests[since:] == ["stable-four.json", "stable-four.zip", "dev-first.json"], requests[since:]
+            print("Quit installed the verified Stable update at the same path while a Development offer awaited confirmation.")
         finally:
             server.shutdown()
             thread.join()

@@ -1,6 +1,10 @@
 import asyncio
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+import os
+import plistlib
 import shutil
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
@@ -23,6 +27,77 @@ def write_mic_fixture(path, samples):
 
 
 class TranscriptionTests(unittest.TestCase):
+    def test_speech_backend_keeps_metal_default_and_supports_explicit_cpu(self):
+        from rumble_model import RumbleModel, speech_backend
+
+        torch = Mock()
+        torch.backends.mps.is_available.return_value = True
+        with patch.dict(os.environ, {}, clear=True), patch.object(sys, "platform", "darwin"):
+            self.assertEqual(speech_backend(torch), ("mps", torch.bfloat16))
+
+        torch.backends.mps.is_available.reset_mock()
+        torch.backends.mps.is_available.return_value = False
+        with patch.dict(os.environ, {}, clear=True), patch.object(sys, "platform", "linux"):
+            self.assertEqual(speech_backend(torch), ("cpu", torch.float32))
+        with patch.dict(os.environ, {"JARD_INFERENCE_DEVICE": "cpu"}, clear=True):
+            self.assertEqual(speech_backend(torch), ("cpu", torch.float32))
+            with patch.dict(os.environ, {"JARD_INFERENCE_DTYPE": "bfloat16"}):
+                self.assertEqual(speech_backend(torch), ("cpu", torch.bfloat16))
+            with patch.dict(os.environ, {"JARD_INFERENCE_DTYPE": "unknown"}):
+                with self.assertRaisesRegex(ValueError, "JARD_INFERENCE_DTYPE"):
+                    speech_backend(torch)
+        torch.backends.mps.is_available.assert_not_called()
+
+        model = object.__new__(RumbleModel)
+        model.torch = torch
+        model.device = "cpu"
+        model.release_device_cache()
+        torch.mps.empty_cache.assert_not_called()
+        model.device = "mps"
+        model.release_device_cache()
+        torch.mps.empty_cache.assert_called_once_with()
+
+    def test_shared_vocabulary_uses_private_preferences_and_the_model_limit(self):
+        from saved_dictations import shared_vocabulary
+
+        with TemporaryDirectory() as directory, patch("saved_dictations.preferences_path") as preferences:
+            file = Path(directory) / "preferences.plist"
+            preferences.return_value = file
+            self.assertEqual(shared_vocabulary(), ())
+            lines = ["  Café  ", "CAFE\u0301", "x" * 81, "אדם", *[f"Name {index}" for index in range(35)]]
+            file.write_bytes(plistlib.dumps({"JardSystemDictation": {"vocabulary": "\r\n".join(lines)}}))
+            file.chmod(0o600)
+            self.assertEqual(shared_vocabulary(), ("Café", "אדם", *(f"Name {index}" for index in range(30))))
+            file.chmod(0o644)
+            self.assertEqual(shared_vocabulary(), ())
+            file.chmod(0o600)
+            file.write_bytes(b"unreadable plist")
+            self.assertEqual(shared_vocabulary(), ())
+
+    def test_vocab_echo_retries_with_only_the_language_hint_and_new_alignment(self):
+        from rumble_model import RumbleModel, language_prompt
+
+        @contextmanager
+        def capture():
+            yield [next(frames)]
+
+        frames = iter(("prompted", "unprompted"))
+        engine = RumbleModel.__new__(RumbleModel)
+        engine.np = np
+        engine.aligner = SimpleNamespace(capture=capture, words=Mock(return_value=["word times"]))
+        engine._decode = Mock(side_effect=[("CAFÉ NOIR; אדם!", "French"), ("Café noir.", "French")])
+        audio = np.full(1600, .3, dtype="<f4").tobytes()
+        self.assertEqual(engine.transcribe(audio, ("fr",), timed=True, vocabulary=("Café noir", "אדם")),
+                         ("Café noir.", "French", ["word times"]))
+        first, retry = engine._decode.call_args_list
+        self.assertIn("Possible names and terms", first.kwargs["prompt"])
+        self.assertEqual(retry.kwargs["prompt"], language_prompt(("fr",)))
+        engine.aligner.words.assert_called_once_with("Café noir.", "unprompted")
+
+        engine._decode = Mock(return_value=("Café noir.", "French"))
+        self.assertEqual(engine.transcribe(audio, ("fr",), vocabulary=("Café noir",)), ("Café noir.", "French", []))
+        engine._decode.assert_called_once()
+
     def test_ctc_screen_passes_any_ambiguous_frame(self):
         import torch
         from speaker_alignment import CtcAligner
@@ -138,6 +213,75 @@ class TranscriptionTests(unittest.TestCase):
 
 
 class DecoderCacheTests(unittest.IsolatedAsyncioTestCase):
+
+    async def test_saved_jobs_reuse_terms_for_all_blocks_and_meeting_tracks(self):
+        from server import process_saved_audio
+
+        pcm = np.full(1600, .1, dtype="<f4").tobytes()
+
+        async def blocks(*args, **kwargs):
+            yield pcm
+            yield pcm
+
+        terms = ("Project Atlas", "Café Noir")
+        with TemporaryDirectory() as directory:
+            file = Path(directory) / "mixed.wav"
+            # The separate tracks path calculates the length from the committed WAV.
+            file.write_bytes(bytes(44 + (25 * 48_000 + 960) * 2))
+            library = Mock()
+            model = SimpleNamespace(audio_priority=lambda **_: nullcontext())
+            state = SimpleNamespace(library=library, diarizer=None, insights=SimpleNamespace(model=model, wake=asyncio.Event()),
+                                    meeting_subscriber=None)
+            options = {"languageHints": ["en"], "recording": True, "diarization": False}
+            for tracks in (None, {"mic": file, "system": file}):
+                with (
+                    self.subTest(tracks=bool(tracks)),
+                    patch("server.shared_vocabulary", return_value=terms) as preferences,
+                    patch("server.audio_blocks", side_effect=blocks),
+                    patch("server.read_window", return_value=({"mic": b"a", "system": b"b"}, None)),
+                    patch("server.resample_capture", new_callable=AsyncMock, return_value=pcm),
+                    patch("server.decode_pcm", new_callable=AsyncMock,
+                          return_value={"text": "", "segments": [], "words": []}) as decode,
+                ):
+                    await process_saved_audio(state, "capture", file, options, 25.02, tracks=tracks)
+                    preferences.assert_called_once_with()
+                    self.assertEqual(decode.await_count, 4 if tracks else 2)
+                    self.assertTrue(all(block.kwargs["vocabulary"] is terms for block in decode.await_args_list))
+                    library.finish.assert_called_once_with("capture")
+                    library.reset_mock()
+
+    async def test_sdk_file_uses_shared_or_embedded_snapshot_across_blocks(self):
+        from starlette.datastructures import QueryParams
+        from server import sdk_transcribe
+
+        async def blocks(*args, **kwargs):
+            yield bytes(1600 * 4)
+            yield bytes(1600 * 4)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = SimpleNamespace(sdk={"token": "fixture"}, status="ready", draining=False, sdk_pending=0,
+                                    library=SimpleNamespace(root=root),
+                                    insights=SimpleNamespace(model=SimpleNamespace(audio_priority=nullcontext)),
+                                    sdk_upload_root=root)
+            request = SimpleNamespace(app=SimpleNamespace(state=state),
+                                      headers={"authorization": "Bearer fixture", "content-type": "audio/wav"},
+                                      query_params=QueryParams("language=en"), is_disconnected=AsyncMock(return_value=False))
+            with (
+                patch("server.shared_vocabulary", return_value=("Shared name",)) as preferences,
+                patch("server.save_upload", new_callable=AsyncMock),
+                patch("server.audio_blocks", side_effect=blocks),
+                patch("server.decode_pcm", new_callable=AsyncMock, return_value={"text": "Spoken"}) as decode,
+            ):
+                self.assertEqual(await sdk_transcribe(request), {"transcript": "Spoken Spoken", "durationMs": 200})
+                self.assertEqual([block.kwargs["vocabulary"] for block in decode.await_args_list], [("Shared name",)] * 2)
+                preferences.assert_called_once_with()
+                state.sdk_embedded = True
+                state.embedded_vocabulary = ("Startup name",)
+                decode.reset_mock()
+                await sdk_transcribe(request)
+                self.assertEqual([block.kwargs["vocabulary"] for block in decode.await_args_list], [("Startup name",)] * 2)
+                preferences.assert_called_once_with()
     @unittest.skipUnless(shutil.which("ffmpeg"), "Requires the local FFmpeg decoder")
     async def test_audio_windows_follow_quiet_boundaries_without_losing_lookahead(self):
         with TemporaryDirectory() as directory:
@@ -195,14 +339,14 @@ class DecoderCacheTests(unittest.IsolatedAsyncioTestCase):
                 with patch("server.decode_pcm", new_callable=AsyncMock,
                            return_value={"text": "After restart.", "segments": [], "words": []}) as decode:
                     actual = await process_mixed_audio(state, key, source, saved["options"], duration,
-                                                       checkpoint=saved["next_frame"], progress_only=True, emit=lambda **kwargs: None)
+                                                       checkpoint=saved["next_frame"], progress_only=True,
+                                                       emit=lambda **kwargs: None, vocabulary=())
                     decode.assert_awaited_once()
                 self.assertEqual(decode.await_args.args[-1], checkpoint)
                 self.assertEqual(actual, len(samples))
                 self.assertEqual(reopened.get(key)["transcript"]["text"], "Before restart. After restart.")
 
     async def test_near_silent_native_take_never_calls_model(self):
-        from contextlib import nullcontext
         from starlette.datastructures import QueryParams
         from server import native_dictation
 
@@ -214,6 +358,7 @@ class DecoderCacheTests(unittest.IsolatedAsyncioTestCase):
         key = uuid4()
         with (
             TemporaryDirectory() as directory,
+            patch("server.shared_vocabulary", return_value=("Shared name",)) as preferences,
             patch("server.audio_blocks", side_effect=blocks) as decode,
             patch("server.decode_pcm", new_callable=AsyncMock, return_value={"text": "One take", "inferenceNs": 12_000_000}) as transcribe,
         ):
@@ -226,6 +371,7 @@ class DecoderCacheTests(unittest.IsolatedAsyncioTestCase):
                 headers={"x-jard-token": "fixture"}, query_params=QueryParams("language=en"),
             )
             self.assertEqual(await native_dictation(request, key), {"text": "", "inferenceMs": 0})
+            preferences.assert_not_called()
             decode.assert_not_called()
             transcribe.assert_not_awaited()
             write_mic_fixture(path, np.tile([200, -200], 2400))
@@ -298,7 +444,7 @@ class DecoderCacheTests(unittest.IsolatedAsyncioTestCase):
             call(pcm, ("en",), timed=True, cache_implementation="static"),
             call(pcm, ("en",), timed=True, cache_implementation=None),
         ])
-        model.torch.mps.empty_cache.assert_called_once_with()
+        model.release_device_cache.assert_called_once_with()
 
     async def test_dictation_passes_waiting_meeting_chunks_and_cancel_releases_priority(self):
         from server import SpeechInference

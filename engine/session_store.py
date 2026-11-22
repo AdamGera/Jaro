@@ -1,5 +1,4 @@
 """SQLite session metadata and inference output, with managed audio alongside it."""
-import fcntl
 import json
 import mimetypes
 import os
@@ -11,15 +10,18 @@ from pathlib import Path
 from threading import Lock
 from uuid import UUID, uuid4
 
+import annotation_retention
+import annotation_storage
 import meeting_brief
 import meeting_exports
 import meeting_retention
 import personal_notes
+import session_images
 import session_notes
 import writing_cache
 from annotation_assets import ASSETS as ANNOTATION_ASSETS, staged_annotation_paths
 from managed_preferences import meetings_managed
-from meeting_rolling import RATE as RECORDING_RATE, timeline_chunks
+from meeting_rolling import MIXED_SPEAKERS, RATE as RECORDING_RATE, SOURCE_LABELS, mixed_speaker_timeline, timeline_chunks
 from native_recordings import normalize_meeting_title
 
 SHUTDOWN_INTERRUPTION = "Processing stopped when Jaro closed."
@@ -78,7 +80,7 @@ def transcript_from_chunks(chunks, seconds, speakers, interruption=None, *, meet
     result = dict(text=" ".join(text), durationSeconds=seconds, detectedLanguages=languages,
                   segments=segments, words=words, speakerActivity=rows if speakers else None)
     if meeting:
-        result.update(speakerNames={"1": "You", "2": "Them"}, echoSuppressedUtterances=suppressed)
+        result.update(speakerNames=SOURCE_LABELS, echoSuppressedUtterances=suppressed)
     if interruption:
         result["interruption"] = interruption
     return result
@@ -93,8 +95,16 @@ def open_library(root):
     # Recovery can only run while this server owns the library.
     root = Path(root).expanduser()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with (root / ".server.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with (root / ".server.lock").open("a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         store = SessionStore(root)
         for upload in root.glob(".upload-*"):
             if upload.is_dir():
@@ -109,6 +119,7 @@ class SessionStore:
         self.path = self.root / "sessions.sqlite3"
         self.read_only = read_only
         self.retention_lock = Lock()
+        self.annotation_file_lock = Lock()
         self.export_lock = Lock()
         if read_only:
             return
@@ -141,11 +152,14 @@ class SessionStore:
                 );
             """)
             db.executescript(session_notes.SCHEMA)
+            db.executescript(session_images.SCHEMA)
             meeting_brief.migrate(db)
             meeting_exports.migrate(db)
             writing_cache.migrate(db)
             personal_notes.migrate(db)
             db.executescript(meeting_retention.SCHEMA)
+            db.executescript(annotation_retention.SCHEMA)
+            db.executescript(annotation_storage.SCHEMA)
             db.execute("INSERT OR IGNORE INTO meeting_audio_policy SELECT * FROM meeting_audio_retention")
             db.execute("UPDATE chat_turns SET status='stopped' WHERE status='streaming'")
             db.execute("""INSERT OR IGNORE INTO meeting_finalization(session_id,next_frame)
@@ -178,6 +192,7 @@ class SessionStore:
                 shutil.rmtree(path)
             elif path.name != name:
                 path.rename(self.audio / name)
+        self.recover_annotation_files()
 
     @contextmanager
     def connection(self):
@@ -192,8 +207,44 @@ class SessionStore:
             with db:
                 yield db
 
-    def create(self, source, name, mime, options, duration, *, key=None, notes_draft=None, tracks=None, rolling=(), annotation=None):
+    def recover_annotation_files(self, key=None):
+        with self.annotation_file_lock, self.connection() as db:
+            annotation_storage.recover(db, key=key)
+
+    @contextmanager
+    def new_media_folder(self, key, location):
+        if location is None:
+            folder = self.audio / key
+            folder.mkdir(mode=0o700)
+            try:
+                yield folder
+            except BaseException:
+                shutil.rmtree(folder)
+                raise
+            return
+        with self.annotation_file_lock:
+            with self.connection() as db:
+                root = annotation_storage.location_root(db, location)
+                annotation_storage.recover(db, key=key)
+                db.execute("INSERT INTO annotation_file_operations VALUES(?,?,'import')", (key, location))
+            try:
+                folder = annotation_storage.allocate(root, key)
+            except FileExistsError:
+                with self.connection() as db:
+                    db.execute("DELETE FROM annotation_file_operations WHERE id=?", (key,))
+                raise
+            try:
+                yield folder
+            except BaseException:
+                with self.connection() as db:
+                    annotation_storage.recover(db, key=key)
+                raise
+
+    def create(self, source, name, mime, options, duration, *, key=None, notes_draft=None, tracks=None, rolling=(),
+               annotation=None, annotation_location=None):
         staged = key is not None
+        if annotation_location is not None and (not annotation or not staged):
+            raise ValueError("Only a staged annotation can use a separate storage folder.")
         key = key or str(uuid4())
         if options.get("meeting", options.get("sourceSpeakerTurns")):
             options = {"retentionApplies": 1, **options}
@@ -206,11 +257,8 @@ class SessionStore:
         mime = mimetypes.guess_type("source" + suffix)[0] or mime
         if not mime.startswith("audio/") and mime not in ("video/webm", "video/mp4"):
             mime = "application/octet-stream"
-        folder = self.audio / key
-        folder.mkdir(mode=0o700)
         filename = "source" + suffix
-        moved = []
-        try:
+        with self.new_media_folder(key, annotation_location) as folder:
             files = {source: folder / filename}
             if tracks:
                 files.update({path: folder / f"{track}.wav" for track, path in tracks.items()})
@@ -221,28 +269,37 @@ class SessionStore:
                 files[paths["manifest"]] = folder / ANNOTATION_ASSETS["manifest"][0]
                 if annotation["frames"]:
                     files[paths["contact-sheet"]] = folder / ANNOTATION_ASSETS["contact-sheet"][0]
-                options = {**options, "annotation": {**annotation, "manifestUrl": base + "manifest",
+                options = {**options, "annotationRetentionEligible": 1, "annotation": {**annotation, "manifestUrl": base + "manifest",
                            "contactSheetUrl": base + "contact-sheet" if annotation["frames"] else None}}
-            for original, destination in files.items():
-                if staged:
-                    # Keep recoverable stage data in place until all files and metadata are committed.
-                    os.link(original, destination, follow_symlinks=False)
-                else:
-                    os.replace(original, destination)
-                    moved.append((original, destination))
-            with self.connection() as db:
-                db.execute("""INSERT INTO sessions(id,name,created,filename,mime,options,duration)
-                              VALUES (?,?,?,?,?,?,?)""", (key, name, created, filename, mime, encode(options), duration))
-                db.executemany("INSERT INTO meeting_rolling VALUES(?,?,?,?)",
-                               ((key, start, end, encode(result)) for start, end, result in rolling))
-                if options.get("meeting", options.get("sourceSpeakerTurns")):
-                    db.execute("INSERT INTO meeting_finalization(session_id) VALUES(?)", (key,))
-                personal_notes.attach(db, key, notes_draft)
-        except BaseException:
-            for original, destination in reversed(moved):
-                os.replace(destination, original)
-            shutil.rmtree(folder)
-            raise
+            if annotation_location is not None:
+                options["annotationLocation"] = annotation_location
+            moved = []
+            try:
+                for original, destination in files.items():
+                    if staged and annotation_location is not None:
+                        annotation_storage.duplicate(original, destination)
+                    elif staged:
+                        # Keep stage data in place until the Session is committed.
+                        os.link(original, destination, follow_symlinks=False)
+                    else:
+                        os.replace(original, destination)
+                        moved.append((original, destination))
+                if annotation_location is not None:
+                    meeting_retention.sync_directory(folder)
+                with self.connection() as db:
+                    db.execute("""INSERT INTO sessions(id,name,created,filename,mime,options,duration)
+                                  VALUES (?,?,?,?,?,?,?)""", (key, name, created, filename, mime, encode(options), duration))
+                    db.executemany("INSERT INTO meeting_rolling VALUES(?,?,?,?)",
+                                   ((key, start, end, encode(result)) for start, end, result in rolling))
+                    if options.get("meeting", options.get("sourceSpeakerTurns")):
+                        db.execute("INSERT INTO meeting_finalization(session_id) VALUES(?)", (key,))
+                    personal_notes.attach(db, key, notes_draft)
+                    if annotation_location is not None:
+                        db.execute("DELETE FROM annotation_file_operations WHERE id=?", (key,))
+            except BaseException:
+                for original, destination in reversed(moved):
+                    os.replace(destination, original)
+                raise
         return key, folder / filename
 
     def append(self, key, chunk, seconds, *, next_frame=None):
@@ -284,16 +341,20 @@ class SessionStore:
         chunks = [json.loads(c[0]) for c in db.execute("SELECT payload FROM chunks WHERE session_id=? ORDER BY seconds", (key,))]
         source_turns = options.get("sourceSpeakerTurns", False)
         is_meeting = options.get("meeting", source_turns)
+        mixed_speakers = options.get("meetingSpeakerMode") == MIXED_SPEAKERS
         # Offline consumers may open an older library before it has been migrated.
         rolling = db.execute("SELECT end_frame,payload FROM meeting_rolling WHERE session_id=? ORDER BY start_frame", (key,)).fetchall() if (
             is_meeting and db.execute("SELECT 1 FROM sqlite_master WHERE name='meeting_rolling'").fetchone()) else []
         if rolling:
-            chunks = timeline_chunks(chunks, [json.loads(draft["payload"]) for draft in rolling], mixed=not source_turns)
+            provisional = [json.loads(draft["payload"]) for draft in rolling]
+            chunks = (mixed_speaker_timeline(chunks, provisional, row["processed"]) if mixed_speakers else
+                      timeline_chunks(chunks, provisional, mixed=not source_turns))
         seconds = (row["duration"] or row["processed"]) if is_meeting else row["processed"]
         if rolling:
             seconds = max(seconds, rolling[-1]["end_frame"] / RECORDING_RATE)
         result = json.loads(row["transcript"]) if cached else transcript_from_chunks(
-            chunks, seconds, bool(rolling) or options["diarization"], row["error"], meeting=bool(rolling) or source_turns,
+            chunks, seconds, options["diarization"] or bool(rolling and not mixed_speakers), row["error"],
+            meeting=source_turns or bool(rolling and not mixed_speakers),
             reconcile=bool(rolling))
         if is_meeting and not cached:
             result["transcriptSource"] = ("final" if row["status"] == "complete" else
@@ -310,7 +371,8 @@ class SessionStore:
             if not updated.rowcount:
                 return
             row = db.execute("SELECT * FROM sessions WHERE id=?", (key,)).fetchone()
-            if not error and json.loads(row["options"]).get("sourceSpeakerTurns"):
+            options = json.loads(row["options"])
+            if not error and (options.get("sourceSpeakerTurns") or options.get("meetingSpeakerMode") == MIXED_SPEAKERS):
                 db.execute("DELETE FROM meeting_rolling WHERE session_id=?", (key,))
             if not closing:
                 db.execute("DELETE FROM meeting_finalization WHERE session_id=?", (key,))
@@ -339,23 +401,32 @@ class SessionStore:
             pending_brief = "coalesce(b.status='queued',0)" if briefs else "0"
             provisional = "json_extract(s.options,'$.provisionalTitle')"
             renamed = "json_extract(s.options,'$.meetingTitle')"
+            personal_search = ""
+            if meetings_only and query and db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='personal_notes'"
+            ).fetchone():
+                personal_search = """OR EXISTS(SELECT 1 FROM personal_notes p, json_tree(p.document) j
+                    WHERE p.id=s.id AND j.key='text' AND j.type='text' AND instr(fold(CAST(j.atom AS TEXT)),:folded))"""
+            brief_search = "OR instr(fold(coalesce(b.summary,'')),:folded)" if meetings_only and briefs else ""
             rows = db.execute(f"""SELECT s.id,coalesce({renamed},json_extract(s.options,'$.meetingCalendar.title'),{title},{provisional},o.title,s.name) AS name,s.created,s.duration,s.processed,s.status,
                 {meeting} AS meeting,
                 json_extract(s.options,'$.meetingProvider') AS meetingProvider,
                 json_extract(s.options,'$.meetingStartedAt') AS meetingStartedAt,
                 json_extract(s.options,'$.meetingEndedAt') AS meetingEndedAt,
                 json_extract(s.options,'$.audioRemovedAt') AS audioRemovedAt,
+                json_type(s.options,'$.annotation')='object' AS annotation,
                 CASE WHEN {meeting} THEN NULLIF({retention},0) END AS meetingRetentionDays,
                 {pending} AS finalizationPending, {title} AS summaryTitle, {provisional} AS provisionalTitle,
                 (SELECT count(*) FROM overviews v WHERE v.id=s.id AND v.status='queued')+{pending_brief} AS pendingOverview
                 FROM {source} s LEFT JOIN notes n ON n.id=s.id LEFT JOIN overviews o ON o.id=s.id AND o.lang=n.displayed {join}
-                WHERE (NOT ? OR meeting) AND (?='' OR instr(fold(s.name),?) OR instr(fold(coalesce(o.title,'')),?)
-                  OR instr(fold(s.search_text),?) OR instr(fold(coalesce(meetingProvider,'')),?)
-                  OR instr(fold(coalesce(json_extract(s.options,'$.meetingCalendar.title'),'')),?)
-                  OR instr(fold(coalesce({title},'')),?) OR instr(fold(coalesce({provisional},'')),?)
-                  OR instr(fold(coalesce({renamed},'')),?))
-                ORDER BY s.created DESC,s.id""", (meetings_only, query, *(query.casefold(),) * 8))
-            return [{**row, "meeting": bool(row["meeting"]), "finalizationPending": bool(row["finalizationPending"])} for row in rows]
+                WHERE (NOT :meetings_only OR meeting) AND (:query='' OR instr(fold(s.name),:folded) OR instr(fold(coalesce(o.title,'')),:folded)
+                  OR instr(fold(s.search_text),:folded) OR instr(fold(coalesce(meetingProvider,'')),:folded)
+                  OR instr(fold(coalesce(json_extract(s.options,'$.meetingCalendar.title'),'')),:folded)
+                  OR instr(fold(coalesce({title},'')),:folded) OR instr(fold(coalesce({provisional},'')),:folded)
+                  OR instr(fold(coalesce({renamed},'')),:folded) {personal_search} {brief_search})
+                ORDER BY s.created DESC,s.id""", {"meetings_only": meetings_only, "query": query, "folded": query.casefold()})
+            return [{**row, "meeting": bool(row["meeting"]), "annotation": bool(row["annotation"]),
+                     "finalizationPending": bool(row["finalizationPending"])} for row in rows]
 
     def exists(self, key):
         with self.connection() as db:
@@ -381,7 +452,16 @@ class SessionStore:
     def _metadata(self, db, row, *, initialize_notes=True):
         key = row["id"]
         options = json.loads(row["options"])
+        custom_location = options.pop("annotationLocation", None)
         has_audio = not options.get("audioRemovedAt")
+        if custom_location is not None:
+            options["annotationCustomStorage"] = True
+            try:
+                annotation_storage.folder_for(db, self.audio, key, custom_location)
+            except annotation_storage.Unavailable:
+                has_audio = False
+                options["annotationStorageUnavailable"] = True
+                options["annotation"] = {**options["annotation"], "manifestUrl": None, "contactSheetUrl": None}
         is_meeting = bool(options.get("meeting", options.get("sourceSpeakerTurns")))
         managed = is_meeting and meetings_managed()
         overview = session_notes.selection(db, key, initialize_missing=initialize_notes and not self.read_only and not managed)
@@ -403,7 +483,7 @@ class SessionStore:
                     options.get("provisionalTitle") or
                     (overview["version"]["title"] if overview and overview["version"] else row["name"]),
                 "audioName": row["name"] + Path(row["filename"]).suffix if options["recording"] else row["name"],
-                "audioPath": f"audio/{key}/{row['filename']}" if has_audio else None,
+                "audioPath": f"audio/{key}/{row['filename']}" if has_audio and custom_location is None else None,
                 "audioUrl": f"/api/sessions/{key}/audio" if has_audio else None}
 
     def rename_meeting(self, key, title):
@@ -443,10 +523,26 @@ class SessionStore:
                 if not path.is_file():
                     raise MissingSession(key)
                 return path, "audio/wav"
-            path = self.audio / key / row["filename"]
-            if not path.is_file():
+            folder = self.media_folder(db, key, options)
+            path = folder / row["filename"]
+            if path.parent != folder or path.is_symlink() or not path.is_file():
                 raise MissingSession(key)
             return path, row["mime"]
+
+    def meeting_recording_folder(self, key):
+        with self.connection() as db:
+            source = meeting_retention.readable_source(db)
+            row = db.execute(f"""SELECT filename FROM {source} s WHERE s.id=? AND s.status IN ('complete','interrupted')
+                AND coalesce(json_extract(s.options,'$.meeting'),json_extract(s.options,'$.sourceSpeakerTurns'),0)
+                AND json_extract(s.options,'$.audioRemovedAt') IS NULL
+                AND NOT EXISTS(SELECT 1 FROM meeting_finalization f WHERE f.session_id=s.id)""", (key,)).fetchone()
+        if row is None:
+            raise MissingSession(key)
+        folder = self.audio / key
+        media = folder / row["filename"]
+        if folder.is_symlink() or media.parent != folder or media.is_symlink() or not media.is_file():
+            raise MissingSession(key)
+        return folder
 
     def annotations(self, *, limit=20, prefix=""):
         if self.read_only and not self.path.is_file():
@@ -464,14 +560,19 @@ class SessionStore:
     def annotation_asset(self, key, kind):
         with self.connection() as db:
             source = meeting_retention.readable_source(db)
-            row = db.execute(f"SELECT json_extract(options,'$.annotation') AS annotation FROM {source} WHERE id=?", (key,)).fetchone()
-            if not row or not row["annotation"] or kind not in ANNOTATION_ASSETS:
+            row = db.execute(f"SELECT options FROM {source} WHERE id=?", (key,)).fetchone()
+            options = json.loads(row["options"]) if row else {}
+            if not options.get("annotation") or kind not in ANNOTATION_ASSETS:
                 raise MissingSession(key)
             name, _, mime, _ = ANNOTATION_ASSETS[kind]
-            path = self.audio / key / name
+            path = self.media_folder(db, key, options) / name
             if path.is_symlink() or not path.is_file():
                 raise MissingSession(key)
             return path, mime
+
+    def media_folder(self, db, key, options):
+        location = options.get("annotationLocation") if options.get("annotation") else None
+        return annotation_storage.folder_for(db, self.audio, key, location)
 
     def remove_meeting_audio(self, key, *, trash=meeting_retention.trash_path):
         with self.retention_lock:
@@ -623,8 +724,10 @@ class SessionStore:
         if archive.exists():
             # A crash before the transaction committed can leave a redundant snapshot.
             shutil.rmtree(archive)
+        use_24_hour = meeting_exports.clock_24(db)
         meeting_retention.write_snapshot(db, key, archive, self.audio / key,
-                                         render_export(detail, "md"), render_export(detail, "notes"))
+                                         render_export(detail, "md", use_24_hour=use_24_hour),
+                                         render_export(detail, "notes", use_24_hour=use_24_hour))
         db.execute("INSERT INTO meeting_trash(id) VALUES(?)", (key,))
         meeting_exports.queue_trash(db, key)
         db.execute("DELETE FROM sessions WHERE id=?", (key,))
@@ -654,7 +757,7 @@ class SessionStore:
                 else:
                     options = json.loads(row["options"])
                     if not options.get("meeting", options.get("sourceSpeakerTurns")):
-                        self._delete_session(db, key, row["status"])
+                        self._delete_session(db, key, row["status"], options)
                         return False
                     if not db.execute("SELECT 1 FROM archivable_meetings WHERE id=?", (key,)).fetchone():
                         raise ValueError("Wait for the meeting and its notes or exports to finish before moving it to the Trash.")
@@ -665,10 +768,17 @@ class SessionStore:
                 return True
             return False
 
-    def _delete_session(self, db, key, status):
+    def _delete_session(self, db, key, status, options):
         if status == "processing":
             raise ValueError("This session is still processing.")
-        folder = self.audio / key
+        folder = self.media_folder(db, key, options)
+        location = options.get("annotationLocation") if options.get("annotation") else None
+        if location is not None:
+            db.execute("INSERT INTO annotation_file_operations VALUES(?,?,'remove')", (key, location))
+            db.execute("DELETE FROM sessions WHERE id=?", (key,))
+            db.commit()
+            self.recover_annotation_files(key)
+            return
         staged = self.audio / (key + ".deleting")
         if folder.exists():
             folder.rename(staged)

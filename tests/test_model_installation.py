@@ -1,16 +1,19 @@
 from contextlib import contextmanager
 import hashlib
-from io import StringIO
+import importlib.util
+from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+import zipfile
 
 import jardctl
 import model_installation
@@ -42,7 +45,7 @@ class ModelInstallationTests(unittest.TestCase):
         self.enterContext(patch.dict(os.environ, {"RUMBLE_DATA_DIR": str(library)}))
         self.enterContext(patch.object(model_installation, "MODEL_DIR", self.install_dir))
         self.enterContext(patch.object(model_installation, "model_command",
-            side_effect=lambda action: [sys.executable, str(self.installer), action, "--speech-only"]))
+            side_effect=lambda action, *, all_models=False: [sys.executable, str(self.installer), action, "--speech-only"]))
 
     def run_full(self, action, *arguments):
         result = subprocess.check_output([sys.executable, str(self.installer), action, *arguments], text=True, timeout=10)
@@ -78,6 +81,54 @@ class ModelInstallationTests(unittest.TestCase):
             model_installation.install_model(self.source)
         self.assertFalse(model_installation.model_status()["ready"])
         self.assertFalse((self.install_dir / ".speech-complete").exists())
+
+    def test_portable_model_install_publishes_and_repairs_the_writing_runtime(self):
+        spec = importlib.util.spec_from_file_location("model_setup_fixture", self.installer)
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        archive = self.source / installer.LLAMA_ARCHIVE["file"]
+        archive.parent.mkdir()
+        with tarfile.open(archive, "w:gz") as bundle:
+            for name in (*installer.LLAMA_REQUIRED, "other-cli"):
+                item = tarfile.TarInfo(f"llama-{installer.LLAMA_BUILD}/{name}")
+                item.mode = 0o700
+                item.size = 1
+                bundle.addfile(item, BytesIO(b"a"))
+        installer.LLAMA_ARCHIVE = {**installer.LLAMA_ARCHIVE, "size": archive.stat().st_size,
+                                   "sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}
+        runtime = self.install_dir / "qwen" / f"llama-{installer.LLAMA_BUILD}"
+        with (patch.dict(os.environ, {"JARD_MODEL_DIR": str(self.install_dir)}),
+              patch("sys.platform", "linux"), patch.object(installer, "emit")):
+            self.assertFalse(installer.status(portable=True)["ready"])
+            installer.install(self.source, portable=True)
+            self.assertTrue(installer.status(portable=True)["ready"])
+            self.assertFalse((runtime / "other-cli").exists())
+            (runtime / "libggml.so.1").unlink()
+            self.assertFalse(installer.status(portable=True)["ready"])
+            with patch.object(installer, "fetch") as fetch:
+                installer.install(None, portable=True)
+                fetch.assert_not_called()
+            self.assertTrue(installer.status(portable=True)["ready"])
+
+    def test_windows_runtime_uses_its_own_receipt_and_extracts_only_worker_files(self):
+        spec = importlib.util.spec_from_file_location("model_setup_fixture", self.installer)
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        with patch("sys.platform", "win32"):
+            root = self.install_dir
+            archive = root / installer.runtime_archive()["file"]
+            archive.parent.mkdir(parents=True)
+            with zipfile.ZipFile(archive, "w") as bundle:
+                for name in (*installer.WINDOWS_LLAMA_REQUIRED, "ggml-cpu-haswell.dll", "llama-connect.exe"):
+                    bundle.writestr(name, b"fixture")
+            installer.install_runtime(root)
+            runtime = installer.runtime_directory(root)
+            self.assertTrue(runtime.name.endswith("-win-x64"))
+            self.assertTrue(installer.runtime_ready(runtime))
+            self.assertTrue((runtime / "ggml-cpu-haswell.dll").is_file())
+            self.assertFalse((runtime / "llama-connect.exe").exists())
+            (runtime / ".verified").write_text(installer.LLAMA_ARCHIVE["sha256"])
+            self.assertFalse(installer.runtime_ready(runtime))
 
     def test_terminal_must_consent_and_machine_output_never_prompts(self):
         for allow, is_terminal, answer, install in (

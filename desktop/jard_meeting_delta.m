@@ -66,8 +66,7 @@ NSString *JardMeetingExcerptText(NSArray<NSDictionary *> *turns, NSDictionary *l
         } else {
             NSString *label = labels[source.stringValue];
             if (![label isKindOfClass:NSString.class] || !label.length) {
-                label = source.intValue == 1 ? @"You" : source.intValue == 2 ? @"Them" :
-                    source.intValue > 0 ? [@"Speaker " stringByAppendingString:source.stringValue] : nil;
+                label = source.intValue > 0 ? [@"Speaker " stringByAppendingString:source.stringValue] : nil;
             }
             NSString *line = label ? [NSString stringWithFormat:@"%@: %@", label, turn[@"text"]] : turn[@"text"];
             [paragraphs addObject:line.mutableCopy];

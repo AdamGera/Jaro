@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
-from time import time
+from time import monotonic, time
 from uuid import uuid4
 
 from annotation_assets import terminal_path
@@ -53,7 +53,7 @@ class AnnotationDeliveries:
                         db.execute("""CREATE TABLE IF NOT EXISTS deliveries(
                             id TEXT PRIMARY KEY, annotation TEXT NOT NULL, service TEXT NOT NULL,
                             destination TEXT NOT NULL, message TEXT, state TEXT NOT NULL,
-                            created REAL NOT NULL, included_sheet INTEGER NOT NULL, correction_message TEXT
+                            created REAL NOT NULL, included_sheet INTEGER NOT NULL, correction_message TEXT, remembered_rule TEXT
                         )""")
                         db.execute("CREATE INDEX IF NOT EXISTS deliveries_by_annotation ON deliveries(annotation,created)")
                         db.execute("""CREATE TABLE IF NOT EXISTS annotation_rules(
@@ -75,7 +75,7 @@ class AnnotationDeliveries:
     @staticmethod
     def migrate_columns(db):
         migrations = {
-            "deliveries": {"correction_message": "TEXT"},
+            "deliveries": {"correction_message": "TEXT", "remembered_rule": "TEXT"},
             "annotation_rules": {"automatic": "INTEGER NOT NULL DEFAULT 0", "updated": "REAL NOT NULL DEFAULT 0"},
         }
         locked = False
@@ -101,9 +101,69 @@ class AnnotationDeliveries:
                    (identifier, annotation, service, json.dumps(destination, ensure_ascii=False), now, int(included_sheet)))
         return identifier
 
-    def begin(self, annotation, service, destination, included_sheet):
+    def begin(self, annotation, service, destination, included_sheet, *, remember_scope=None):
         with self.connection(write=True) as db:
-            return self.insert_delivery(db, annotation, service, destination, included_sheet)
+            identifier = self.insert_delivery(db, annotation, service, destination, included_sheet)
+            if remember_scope:
+                previous = self.exact_rule(db, remember_scope)
+                change = {"scope": remember_scope, "previous": dict(previous) if previous else None, "status": "pending"}
+                db.execute("UPDATE deliveries SET remembered_rule=? WHERE id=?", (json.dumps(change), identifier))
+            return identifier
+
+    @staticmethod
+    def exact_rule(db, scope):
+        return db.execute("SELECT * FROM annotation_rules WHERE kind=? AND source=?", (scope["kind"], scope["key"])).fetchone()
+
+    @staticmethod
+    def write_rule(db, *, kind, source, id, title, target, channel, automatic, updated):
+        db.execute("""INSERT INTO annotation_rules(kind,source,id,title,target,channel,automatic,updated)
+            VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(kind,source) DO UPDATE SET id=excluded.id,title=excluded.title,
+                target=excluded.target,channel=excluded.channel,automatic=excluded.automatic,updated=excluded.updated""",
+                   (kind, source, id, title, target, channel, int(automatic), updated))
+
+    def confirm_remembered_delivery(self, identifier, message, channel):
+        with self.connection(write=True) as db:
+            if not db.in_transaction:
+                db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM deliveries WHERE id=?", (identifier,)).fetchone()
+            if not row or not row["remembered_rule"] or row["state"] != "pending":
+                raise ReceiptError("The pending destination change is unavailable.")
+            change = json.loads(row["remembered_rule"])
+            scope, previous = change["scope"], change["previous"]
+            current = self.exact_rule(db, scope)
+            if (current["id"] if current else None) == (previous["id"] if previous else None):
+                destination = json.loads(row["destination"])
+                self.write_rule(db, kind=scope["kind"], source=scope["key"], id=identifier, title=destination["title"],
+                                target=destination["id"], channel=channel, automatic=True, updated=time())
+                change["status"] = "saved"
+            else:
+                change["status"] = "changed"
+            return self.encode(db.execute("""UPDATE deliveries SET state='queued',message=?,remembered_rule=?
+                WHERE id=? RETURNING *""", (message, json.dumps(change), identifier)).fetchone())
+
+    def undo_remembered_rule(self, identifier):
+        with self.connection(write=True) as db:
+            if not db.in_transaction:
+                db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM deliveries WHERE id=?", (identifier,)).fetchone()
+            if not row:
+                raise ReceiptError("Annotation delivery receipt not found.")
+            change = json.loads(row["remembered_rule"]) if row["remembered_rule"] else None
+            if not change or change["status"] != "saved" or time() >= row["created"] + UNDO_SECONDS:
+                return self.encode(row)
+            scope, previous = change["scope"], change["previous"]
+            current = self.exact_rule(db, scope)
+            if not current or current["id"] != identifier:
+                change["status"] = "changed"
+            elif previous:
+                # Reactivate the previous destination without reviving its old pending approvals.
+                self.write_rule(db, **{**previous, "id": str(uuid4()), "updated": time()})
+                change["status"] = "restored"
+            else:
+                db.execute("DELETE FROM annotation_rules WHERE id=?", (identifier,))
+                change["status"] = "removed"
+            return self.encode(db.execute("UPDATE deliveries SET remembered_rule=? WHERE id=? RETURNING *",
+                                          (json.dumps(change), identifier)).fetchone())
 
     def change(self, identifier, state, message=None, *, correction_message=None):
         with self.connection(write=True) as db:
@@ -149,8 +209,7 @@ class AnnotationDeliveries:
     @classmethod
     def match_rule(cls, db, scopes):
         for scope in cls.scope_candidates(scopes):
-            row = db.execute("SELECT * FROM annotation_rules WHERE kind=? AND source=?",
-                             (scope["kind"], scope["key"])).fetchone()
+            row = cls.exact_rule(db, scope)
             if row:
                 return {"scope": scope, "id": row["id"], "title": row["title"], "target": row["target"],
                         "channel": row["channel"], "automatic": bool(row["automatic"]) if "automatic" in row.keys() else False,
@@ -161,10 +220,8 @@ class AnnotationDeliveries:
         identifier = str(uuid4())
         updated = time()
         with self.connection(write=True) as db:
-            db.execute("""INSERT INTO annotation_rules(kind,source,id,title,target,channel,automatic,updated)
-                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(kind,source) DO UPDATE SET id=excluded.id,title=excluded.title,
-                    target=excluded.target,channel=excluded.channel,automatic=excluded.automatic,updated=excluded.updated""",
-                       (scope["kind"], scope["key"], identifier, title, target, channel, int(automatic), updated))
+            self.write_rule(db, kind=scope["kind"], source=scope["key"], id=identifier, title=title, target=target,
+                            channel=channel, automatic=automatic, updated=updated)
         return {"id": identifier, "scope": scope, "title": title, "target": target, "channel": channel,
                 "automatic": automatic, "updated": updated}
 
@@ -207,7 +264,7 @@ class AnnotationDeliveries:
             return bool(db.execute("""UPDATE annotation_outbox SET state=?,message=?
                                    WHERE capture=? AND state='pending'""", (state, message, capture)).rowcount)
 
-    def claim_route(self, capture, scopes, rule_id, service, destination, included_sheet):
+    def claim_route(self, capture, scopes, rule_id, service, destination, included_sheet, *, confirmed_before=None):
         with self.connection(write=True) as db:
             if not db.in_transaction:
                 db.execute("BEGIN IMMEDIATE")
@@ -219,6 +276,8 @@ class AnnotationDeliveries:
             rule = self.match_rule(db, scopes)
             if not rule or not rule["automatic"] or rule["id"] != rule_id or rule["target"] != destination["id"]:
                 raise ReceiptError("The saved destination changed before sending.")
+            if confirmed_before is not None and monotonic() >= confirmed_before:
+                raise ReceiptError("The automatic send panel’s confirmation expired.")
             delivery = self.insert_delivery(db, capture, service, destination, included_sheet)
             db.execute("""UPDATE annotation_outbox SET state='sending',message='Sending annotation…',delivery=?
                           WHERE capture=?""", (delivery, capture))
@@ -266,10 +325,13 @@ class AnnotationDeliveries:
     def encode(row):
         due = row["created"] + UNDO_SECONDS
         state = "unconfirmed" if row["state"] == "pending" else row["state"]
+        change = json.loads(row["remembered_rule"]) if "remembered_rule" in row.keys() and row["remembered_rule"] else None
+        can_withdraw = state in ("queued", "withdrawal-unconfirmed", "rollback-files") and row["message"]
         return {"deliveryId": row["id"], "annotation": row["annotation"], "service": row["service"],
                 "session": json.loads(row["destination"]), "message": row["message"], "status": state,
                 "includedSheet": bool(row["included_sheet"]), "createdAt": int(row["created"] * 1000),
                 "undoUntil": int(due * 1000),
                 "correctionMessage": row["correction_message"] if "correction_message" in row.keys() else None,
                 "canCorrect": bool(state in ("received", "queued", "withdrawal-unconfirmed", "rollback-files") and row["message"]),
-                "canUndo": bool(state in ("queued", "withdrawal-unconfirmed", "rollback-files") and row["message"] and time() < due)}
+                "canUndo": bool((can_withdraw or (change and change["status"] == "saved")) and time() < due),
+                **({"rememberedRule": {"status": change["status"], "label": change["scope"]["label"]}} if change else {})}

@@ -1,14 +1,42 @@
 import asyncio
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import httpx
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from local_qwen import BASE_CONTEXT, MAX_CONTEXT, LocalQwen
+from local_qwen import BASE_CONTEXT, LINUX_BIN_SHA, MAX_CONTEXT, LocalQwen, runtime_installed
+from llama_loopback import listening_port
 
 
 TITLE = {"type": "object", "properties": {"title": {"type": "string"}}}
+
+
+class RuntimeTests(unittest.TestCase):
+    def test_default_linux_binary_requires_the_pinned_install_receipt(self):
+        with TemporaryDirectory() as folder:
+            server = Path(folder) / "llama-server"
+            server.touch()
+            with patch("local_qwen.SERVER", server), patch("local_qwen.SERVER_OVERRIDE", None), patch("sys.platform", "linux"):
+                self.assertFalse(runtime_installed())
+                receipt = server.with_name(".verified")
+                receipt.write_text("older runtime")
+                self.assertFalse(runtime_installed())
+                receipt.write_text(LINUX_BIN_SHA + "\n")
+                self.assertTrue(runtime_installed())
+
+
+class WorkerAddressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_accepts_only_the_worker_loopback_address_and_a_valid_port(self):
+        output = asyncio.StreamReader()
+        output.feed_data(b"srv: listening on http://0.0.0.0:9000\nsrv: listening on http://127.0.0.1:99999\n")
+        output.feed_data(b"srv: listening on http://127.0.0.1:43651\r\n")
+        output.feed_eof()
+        self.assertEqual(await listening_port(output), 43651)
+        with self.assertRaisesRegex(RuntimeError, "before opening"):
+            await listening_port(output)
 
 
 class StructuredProgressTests(unittest.IsolatedAsyncioTestCase):

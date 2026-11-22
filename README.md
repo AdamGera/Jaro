@@ -34,6 +34,8 @@ Double-tap **Right Option** for hands-free dictation, then press it again to fin
 
 ## Install
 
+Before downloading, open **Apple menu → About This Mac**. Jaro requires an **Apple chip** (such as M1) and **macOS 26 or later**. Finder may show a crossed-out app icon if your Mac doesn’t meet these requirements. [Apple’s guide to identifying your Mac’s chip](https://support.apple.com/en-us/116943)
+
 Open the DMG, drag the app to **Applications**, and open it. First launch downloads about 4 GB of models. After setup, transcription, speaker labeling, and summaries work offline.
 
 Allow microphone or Mac audio access when you first record from those sources. The app is signed by Jard, and macOS may require first-launch approval.

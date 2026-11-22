@@ -25,7 +25,7 @@ DROP VIEW IF EXISTS expired_meetings;
 DROP VIEW IF EXISTS archivable_meetings;
 CREATE VIEW archivable_meetings AS
     SELECT s.id FROM sessions s
-    WHERE s.status='complete'
+    WHERE s.status IN ('complete','interrupted')
       AND coalesce(json_extract(s.options,'$.meeting'),json_extract(s.options,'$.sourceSpeakerTurns'),0)
       AND NOT EXISTS(SELECT 1 FROM meeting_finalization f WHERE f.session_id=s.id)
       AND NOT EXISTS(SELECT 1 FROM overviews o WHERE o.id=s.id AND o.status='queued')
@@ -37,7 +37,7 @@ CREATE VIEW archivable_meetings AS
       AND NOT EXISTS(SELECT 1 FROM chat_turns c WHERE c.id=s.id AND c.status='streaming');
 CREATE VIEW expired_meetings AS
     SELECT s.id FROM archivable_meetings a JOIN sessions s ON s.id=a.id LEFT JOIN meeting_retention r ON r.id=1
-    WHERE coalesce(r.days,json_extract(s.options,'$.retentionApplies'),0)>0
+    WHERE s.status='complete' AND coalesce(r.days,json_extract(s.options,'$.retentionApplies'),0)>0
       AND julianday('now') > coalesce(julianday(json_extract(s.options,'$.meetingEndedAt')),julianday(s.created))
                                + coalesce(r.days,json_extract(s.options,'$.retentionApplies'),0);
 CREATE VIEW readable_sessions AS
@@ -98,6 +98,10 @@ def write_snapshot(db, identifier, directory, source_audio, transcript, notes):
         "Transcript.md": transcript,
         "Notes.md": notes,
     }
+    write_archive(directory, files, source_audio, media_folder="Audio")
+
+
+def write_archive(directory, files, source_media, *, media_folder):
     directory.mkdir(mode=0o700)
     for name, text in files.items():
         with (directory / name).open("x", encoding="utf8") as output:
@@ -106,10 +110,10 @@ def write_snapshot(db, identifier, directory, source_audio, transcript, notes):
             output.flush()
             os.fsync(output.fileno())
 
-    if source_audio.is_dir():
-        audio = directory / "Audio"
+    if source_media.is_dir() and not source_media.is_symlink():
+        audio = directory / media_folder
         audio.mkdir(mode=0o700)
-        for file in source_audio.iterdir():
+        for file in source_media.iterdir():
             if file.is_file() and not file.is_symlink():
                 os.link(file, audio / file.name, follow_symlinks=False)
         sync_directory(audio)

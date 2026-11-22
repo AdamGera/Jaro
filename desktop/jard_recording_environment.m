@@ -129,6 +129,18 @@ static BOOL sameVolumes(NSArray<NSNumber *> *a, NSArray<NSNumber *> *b) {
 }
 @end
 
+typedef struct {
+    double factor;
+    BOOL mute, pause;
+} JardPlaybackEffects;
+
+static JardPlaybackEffects playbackEffects(NSString *mode, double percent) {
+    BOOL mute = [mode isEqual:@"mute"];
+    double factor = mute ? 0 : 1;
+    if ([mode isEqual:@"lower"]) factor = isfinite(percent) ? fmax(0, fmin(100, percent)) / 100 : 0;
+    return (JardPlaybackEffects){factor, mute, [mode isEqual:@"pause"]};
+}
+
 @interface JardRecordingEnvironment ()
 @property(nonatomic, strong) dispatch_queue_t queue;
 @property(nonatomic, copy) id<JardRecordingOutput> (^openOutput)(void);
@@ -139,7 +151,8 @@ static BOOL sameVolumes(NSArray<NSNumber *> *a, NSArray<NSNumber *> *b) {
 @property(nonatomic, copy) NSArray<NSNumber *> *original, *observed, *requested, *from, *target;
 @property(nonatomic) NSTimeInterval rampStart, rampDuration;
 @property(nonatomic) IOPMAssertionID sleepAssertion;
-@property(nonatomic) BOOL active, closed, lower, pausingMedia;
+@property(nonatomic) BOOL active, annotating, closed;
+@property(nonatomic) JardPlaybackEffects dictationEffects, annotationEffects;
 @end
 
 @implementation JardRecordingEnvironment
@@ -152,6 +165,7 @@ static BOOL sameVolumes(NSArray<NSNumber *> *a, NSArray<NSNumber *> *b) {
     if (!(self = [super init])) return nil;
     _queue = dispatch_queue_create("ai.jard.recording-environment", DISPATCH_QUEUE_SERIAL);
     _openOutput = [openOutput copy];
+    _dictationEffects = _annotationEffects = playbackEffects(nil, 0);
     return self;
 }
 
@@ -171,13 +185,17 @@ static BOOL sameVolumes(NSArray<NSNumber *> *a, NSArray<NSNumber *> *b) {
     self.from = self.target = nil;
 }
 
+- (void)completeRestoration {
+    dispatch_block_t completion = self.completion;
+    self.completion = nil;
+    if (completion) dispatch_async(dispatch_get_main_queue(), completion);
+}
+
 - (void)clearOutput {
     [self stopRamp];
     self.output = nil;
     self.original = self.observed = self.requested = nil;
-    dispatch_block_t completion = self.completion;
-    self.completion = nil;
-    if (completion) dispatch_async(dispatch_get_main_queue(), completion);
+    [self completeRestoration];
 }
 
 - (void)restoreImmediately {
@@ -213,8 +231,10 @@ static BOOL sameVolumes(NSArray<NSNumber *> *a, NSArray<NSNumber *> *b) {
     }
     if (progress < 1 ||
         (!sameVolumes(self.observed, self.target) && elapsed < self.rampDuration + .5)) return;
-    if (self.active) [self stopRamp];
-    else [self clearOutput];
+    if (fmin(self.dictationEffects.factor, self.annotationEffects.factor) < 1) {
+        [self stopRamp];
+        [self completeRestoration];
+    } else [self clearOutput];
 }
 
 - (void)rampFrom:(NSArray<NSNumber *> *)from to:(NSArray<NSNumber *> *)target duration:(NSTimeInterval)duration {
@@ -230,47 +250,99 @@ static BOOL sameVolumes(NSArray<NSNumber *> *a, NSArray<NSNumber *> *b) {
     dispatch_resume(self.timer);
 }
 
+- (JardPlaybackEffects)combinedEffects {
+    JardPlaybackEffects dictation = self.dictationEffects, annotation = self.annotationEffects;
+    return (JardPlaybackEffects){fmin(dictation.factor, annotation.factor), dictation.mute || annotation.mute,
+        dictation.pause || annotation.pause};
+}
+
+- (void)applyEffectsAfter:(JardPlaybackEffects)previous completion:(dispatch_block_t)completion {
+    JardPlaybackEffects effects = [self combinedEffects];
+    if (previous.pause != effects.pause) {
+        if (effects.pause) {
+            if (!self.media) self.media = JardDictationMedia.new;
+            [self.media begin];
+        } else [self.media finish];
+    }
+
+    if (previous.factor == effects.factor && previous.mute == effects.mute) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), completion);
+        return;
+    }
+    if (previous.factor == 1) [self restoreImmediately];
+    else [self completeRestoration];
+    if (effects.factor > previous.factor) self.completion = completion;
+    else if (completion) dispatch_async(dispatch_get_main_queue(), completion);
+
+    if (previous.factor == 1) {
+        self.output = self.openOutput();
+        self.original = self.observed = self.requested = [self.output readVolumes];
+    }
+    NSArray *current = [self.output readVolumes];
+    if (![self ownsVolumes:current]) {
+        [self clearOutput];
+        return;
+    }
+
+    if (effects.factor == 1 && previous.mute) {
+        [self restoreImmediately];
+        return;
+    }
+    NSMutableArray *target = NSMutableArray.array;
+    for (NSNumber *volume in self.original) [target addObject:@(volume.doubleValue * effects.factor)];
+    if (sameVolumes(current, target)) {
+        [self stopRamp];
+        if (effects.factor == 1) [self clearOutput];
+        else [self completeRestoration];
+    } else if (effects.mute) {
+        [self stopRamp];
+        if (![self writeStep:target]) [self restoreImmediately];
+    } else [self rampFrom:current to:target duration:effects.factor == 1 ? 1 : .12];
+}
+
 - (void)beginWithMode:(NSString *)mode percent:(double)percent {
     dispatch_async(self.queue, ^{
         if (self.closed || self.active) return;
-        [self restoreImmediately];
+        JardPlaybackEffects previous = [self combinedEffects];
         self.active = YES;
         IOPMAssertionID assertion = 0;
         if (IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep, kIOPMAssertionLevelOn,
                 CFSTR("Jard dictation"), &assertion) == kIOReturnSuccess) self.sleepAssertion = assertion;
-
-        self.pausingMedia = [mode isEqual:@"pause"];
-        if (self.pausingMedia) {
-            if (!self.media) self.media = JardDictationMedia.new;
-            [self.media begin];
-            return;
-        }
-        self.lower = [mode isEqual:@"lower"];
-        if (!self.lower && ![mode isEqual:@"mute"]) return;
-        self.output = self.openOutput();
-        self.original = self.observed = self.requested = [self.output readVolumes];
-        if (!self.original.count) { [self clearOutput]; return; }
-        double factor = self.lower && isfinite(percent) ? fmax(0, fmin(100, percent)) / 100 : 0;
-        NSMutableArray *target = NSMutableArray.array;
-        for (NSNumber *volume in self.original) [target addObject:@(volume.doubleValue * factor)];
-        if (sameVolumes(self.original, target)) { [self clearOutput]; return; }
-        if (self.lower) [self rampFrom:self.original to:target duration:.12];
-        else if (![self writeStep:target]) [self restoreImmediately];
+        self.dictationEffects = playbackEffects(mode, percent);
+        [self applyEffectsAfter:previous completion:nil];
     });
 }
 
 - (void)finish:(dispatch_block_t)completion {
     dispatch_async(self.queue, ^{
         if (!self.active) return;
+        JardPlaybackEffects previous = [self combinedEffects];
         self.active = NO;
         [self releaseSleepAssertion];
-        if (self.pausingMedia) [self.media finish];
-        self.pausingMedia = NO;
-        self.completion = completion;
-        NSArray *current = [self.output readVolumes];
-        if (self.lower && [self ownsVolumes:current] && !sameVolumes(current, self.original))
-            [self rampFrom:current to:self.original duration:1];
-        else [self restoreImmediately];
+        self.dictationEffects = playbackEffects(nil, 0);
+        [self applyEffectsAfter:previous completion:completion];
+    });
+}
+
+- (void)setAnnotationRecording:(BOOL)recording mode:(NSString *)mode percent:(double)percent
+    completion:(dispatch_block_t)completion {
+    dispatch_async(self.queue, ^{
+        if (self.closed) return;
+        if (self.annotating == recording) {
+            if (!completion) return;
+            if (self.timer) {
+                dispatch_block_t earlier = self.completion;
+                self.completion = ^{
+                    if (earlier) earlier();
+                    completion();
+                };
+            } else dispatch_async(dispatch_get_main_queue(), completion);
+            return;
+        }
+        JardPlaybackEffects previous = [self combinedEffects];
+        self.annotating = recording;
+        self.annotationEffects = playbackEffects(recording ? mode : nil, percent);
+        [self applyEffectsAfter:previous completion:completion];
     });
 }
 
@@ -278,6 +350,7 @@ static BOOL sameVolumes(NSArray<NSNumber *> *a, NSArray<NSNumber *> *b) {
     dispatch_sync(self.queue, ^{
         self.closed = YES;
         self.active = NO;
+        self.annotating = NO;
         [self releaseSleepAssertion];
         [self restoreImmediately];
         [self.media shutdown];

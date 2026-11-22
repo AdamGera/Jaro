@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS meeting_export_notes_policy (
     enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
     descriptive INTEGER NOT NULL DEFAULT 0 CHECK(descriptive IN (0,1))
 );
+CREATE TABLE IF NOT EXISTS meeting_clock_style (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    use_24_hour INTEGER NOT NULL CHECK(use_24_hour IN (0,1))
+);
 CREATE TABLE IF NOT EXISTS meeting_export_edits (
     id TEXT NOT NULL REFERENCES meeting_exports(id) ON DELETE CASCADE,
     kind TEXT NOT NULL CHECK(kind IN ('transcript','notes')),
@@ -89,6 +93,18 @@ def set_descriptive_names(db, enabled):
 
 def preferences(db):
     return {"folder": folder_preference(db), "separateNotes": separate_notes(db), "descriptiveNames": descriptive_names(db)}
+
+
+def clock_24(db):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meeting_clock_style'").fetchone():
+        return False
+    return bool(db.execute("SELECT 1 FROM meeting_clock_style WHERE id=1 AND use_24_hour").fetchone())
+
+
+def set_clock_24(db, enabled):
+    db.execute("""INSERT INTO meeting_clock_style VALUES(1,?)
+        ON CONFLICT(id) DO UPDATE SET use_24_hour=excluded.use_24_hour
+        WHERE meeting_clock_style.use_24_hour!=excluded.use_24_hour""", (enabled,))
 
 
 def folder_preference(db):
@@ -221,7 +237,9 @@ def publish(store, row, directory):
         return
     remove_stage(store, row, directory)
     detail = meeting_detail(store.get(row["id"], include_turns=True))
-    data = render_export(detail, "md").encode("utf8")
+    with store.connection() as db:
+        use_24_hour = clock_24(db)
+    data = render_export(detail, "md", use_24_hour=use_24_hour).encode("utf8")
     stage = f".jard-export-{uuid4().hex}.tmp"
     digest = hashlib.sha256(data).hexdigest()
     with store.connection() as db:
@@ -316,11 +334,11 @@ def write_edit(store, directory, key, kind, filename, data, previous=None):
                                 "stage": stage, "replacing": previous is not None}, directory)
 
 
-def notes_markdown(detail, transcript):
+def notes_markdown(detail, transcript, use_24_hour):
     from saved_meetings import render_export
 
     summary = {"summary": detail["notes"]["summary"], "personalNotes": None, "overview": None}
-    heading, body = render_export({**detail, "notes": summary}, "notes").split("\n\n", 1)
+    heading, body = render_export({**detail, "notes": summary}, "notes", use_24_hour=use_24_hour).split("\n\n", 1)
     return f"{heading}\n\n[Open transcript]({quote(transcript)})\n\n{body}".encode("utf8")
 
 
@@ -330,19 +348,19 @@ def forget_notes(store, key):
             notes_removed=1 WHERE id=?""", (key,))
 
 
-def refresh_notes(store, row, detail, directory, create):
+def refresh_notes(store, row, detail, directory, create, use_24_hour):
     name = row["notes_filename"]
     if name is not None:
         current, info = disk_file(directory, name)
         if current is None:
             forget_notes(store, row["id"])
         elif is_owned(current, info, row["notes_sha256"], row["notes_inode"]):
-            write_edit(store, directory, row["id"], "notes", name, notes_markdown(detail, row["filename"]), (current, info))
+            write_edit(store, directory, row["id"], "notes", name, notes_markdown(detail, row["filename"], use_24_hour), (current, info))
         return
     if not create or row["notes_removed"]:
         return
     stem = row["filename"].removesuffix(".md").removesuffix(".transcript")
-    data = notes_markdown(detail, row["filename"])
+    data = notes_markdown(detail, row["filename"], use_24_hour)
     # A long older plain export can leave little room for an added suffix.
     base = stem.encode("utf8")[:240].decode("utf8", errors="ignore").rstrip()
     for number in range(1, 101):
@@ -458,15 +476,17 @@ def refresh(store, row, directory, create_notes, descriptive):
     if current is None:
         return
     detail = meeting_detail(store.get(row["id"], include_turns=True))
+    with store.connection() as db:
+        use_24_hour = clock_24(db)
     if is_owned(current, info, row["sha256"], row["file_inode"]):
         if descriptive:
             rename_export(store, row, directory, detail)
             with store.connection() as db:
                 row = db.execute("SELECT * FROM meeting_exports WHERE id=?", (row["id"],)).fetchone()
         write_edit(store, directory, row["id"], "transcript", row["filename"],
-                   render_export(detail, "md").encode("utf8"), (current, info))
+                   render_export(detail, "md", use_24_hour=use_24_hour).encode("utf8"), (current, info))
     if current and detail["notes"]["summary"]:
-        refresh_notes(store, row, detail, directory, create_notes)
+        refresh_notes(store, row, detail, directory, create_notes, use_24_hour)
 
 
 def settle_refresh(store, row, error=None):

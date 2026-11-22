@@ -1,6 +1,8 @@
 import asyncio
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -14,8 +16,37 @@ from starlette.datastructures import State
 from starlette.requests import ClientDisconnect
 
 from sdk_discovery import SDK_DISCOVERY, SDK_MAX_REQUESTS, publish_sdk, read_sdk_record, remove_sdk, sdk_identity, sdk_proof
-from sdk_embedded import sdk_transcription
+from sdk_embedded import read_ready, sdk_transcription
 from server import app, quiesce_update
+
+
+class EmbeddedStartupTests(unittest.TestCase):
+    def test_reads_fragmented_handshake_and_checks_the_owned_pid(self):
+        script = """
+import json, os, sys, time
+port = 12345
+record = json.dumps(dict(type="ready", url=f"http://127.0.0.1:{port}", port=port, apiVersion=1,
+                         pid=os.getpid() + int(sys.argv[1]), token="a" * 64, libraryId="b" * 64))
+print(record[:40], end="", flush=True)
+time.sleep(0.02)
+print(record[40:], flush=True)
+"""
+        for pid_offset in (0, 1):
+            with subprocess.Popen([sys.executable, "-c", script, str(pid_offset)], stdout=subprocess.PIPE) as child:
+                if pid_offset == 0:
+                    self.assertEqual(read_ready(child, 5)["pid"], child.pid)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "invalid embedded startup record"):
+                        read_ready(child, 5)
+
+    def test_readiness_wait_is_bounded_on_a_child_with_an_open_pipe(self):
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as child:
+            try:
+                with self.assertRaisesRegex(RuntimeError, "did not become ready"):
+                    read_ready(child, 0.05)
+            finally:
+                child.stdin.close()
 
 
 class SDKDiscoveryTests(unittest.IsolatedAsyncioTestCase):

@@ -1,6 +1,6 @@
 #import "jard_interface_language.h"
 
-static NSString *const choiceKey = @"JardInterfaceLanguage";
+NSString *const JardInterfaceLanguagePreferenceKey = @"JardInterfaceLanguage";
 
 static NSDictionary *catalog(void) {
     static NSDictionary *value;
@@ -28,9 +28,20 @@ NSString *JardResolveInterfaceLanguage(NSString *tag, NSDictionary *choices) {
     return choices[language] ? language : @"en";
 }
 
-static NSString *selectedLanguage(NSDictionary *choices) {
-    id stored = [NSUserDefaults.standardUserDefaults objectForKey:choiceKey];
-    return [stored isKindOfClass:NSString.class] && choices[stored] ? stored : @"system";
+NSString *JardInterfaceLanguageChoice(id choice) {
+    if (choice == NSNull.null) return @"system";
+    if (![choice isKindOfClass:NSString.class]) return nil;
+    NSString *code = [[choice stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString];
+    if ([@[@"system", @"none"] containsObject:code]) return @"system";
+    for (NSString *supported in catalog()[@"choices"]) {
+        if ([supported.lowercaseString isEqual:code]) return supported;
+    }
+    return nil;
+}
+
+static NSString *selectedLanguage(void) {
+    id stored = [NSUserDefaults.standardUserDefaults objectForKey:JardInterfaceLanguagePreferenceKey];
+    return [stored isKindOfClass:NSString.class] && catalog()[@"choices"][stored] ? stored : @"system";
 }
 
 static NSString *resolvedLanguage(NSString *selected, NSDictionary *choices) {
@@ -40,16 +51,16 @@ static NSString *resolvedLanguage(NSString *selected, NSDictionary *choices) {
 NSDictionary *JardInterfaceLanguageStatus(void) {
     NSDictionary *data = catalog();
     NSDictionary *choices = data[@"choices"];
-    NSString *selected = selectedLanguage(choices), *resolved = resolvedLanguage(selected, choices);
+    NSString *selected = selectedLanguage(), *resolved = resolvedLanguage(selected, choices);
     return @{@"selected": selected, @"resolved": resolved, @"choices": choices, @"messages": data[@"messages"][resolved] ?: @{}};
 }
 
 BOOL JardSetInterfaceLanguage(id choice) {
-    if (![choice isKindOfClass:NSString.class]) return NO;
+    NSString *selected = JardInterfaceLanguageChoice(choice);
+    if (!selected) return NO;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    if ([choice isEqual:@"system"]) [defaults removeObjectForKey:choiceKey];
-    else if (catalog()[@"choices"][choice]) [defaults setObject:choice forKey:choiceKey];
-    else return NO;
+    if ([selected isEqual:@"system"]) [defaults removeObjectForKey:JardInterfaceLanguagePreferenceKey];
+    else [defaults setObject:selected forKey:JardInterfaceLanguagePreferenceKey];
     return YES;
 }
 
@@ -57,5 +68,5 @@ NSString *JardLocalized(NSString *source) {
     if (!source.length) return source;
     NSDictionary *data = catalog();
     NSDictionary *choices = data[@"choices"];
-    return data[@"messages"][resolvedLanguage(selectedLanguage(choices), choices)][source] ?: source;
+    return data[@"messages"][resolvedLanguage(selectedLanguage(), choices)][source] ?: source;
 }

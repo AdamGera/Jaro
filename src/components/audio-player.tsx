@@ -5,6 +5,11 @@ import { Button } from "@/components/ui/button"
 import { createPlaybackWaveform } from "@/playback-waveform"
 import { clock } from "@/speaker-activity"
 
+function seekableTime(seconds: number, duration: number) {
+  // Seeking to the exact end can request a byte past EOF in WebKit's WAV player.
+  return Math.max(0, Math.min(seconds, duration - 0.01))
+}
+
 export function usePlayback(source: Blob | string | null, transcriptDuration: number | null, onStart: () => void) {
   const audio = useRef<HTMLAudioElement>(null)
   const wave = useRef<HTMLSpanElement>(null)
@@ -97,7 +102,7 @@ export function usePlayback(source: Blob | string | null, transcriptDuration: nu
       if (switching.current?.source === source) {
         const saved = switching.current
         switching.current = null
-        el.currentTime = Math.min(saved.time, el.duration)
+        if (saved.time > 0) el.currentTime = seekableTime(saved.time, el.duration)
         sync()
         if (saved.playing) void el.play().catch(() => {})
       }
@@ -148,7 +153,7 @@ export function usePlayback(source: Blob | string | null, transcriptDuration: nu
   const seek = useCallback((seconds: number, startPlaying = false) => {
     const el = audio.current
     if (!el || !ready) return
-    el.currentTime = Math.max(0, Math.min(seconds, duration))
+    el.currentTime = seekableTime(seconds, duration)
     setTime(el.currentTime)
     if (startPlaying) play()
   }, [duration, ready, play])
@@ -163,7 +168,7 @@ export function usePlayback(source: Blob | string | null, transcriptDuration: nu
   function prepareSwitch(next: string | Blob) {
     const el = audio.current
     if (!el || next === source) return
-    switching.current = { source: next, time: switching.current?.time ?? el.currentTime,
+    switching.current = { source: next, time: switching.current?.time ?? (el.ended ? 0 : el.currentTime),
       playing: switching.current?.playing ?? !el.paused }
     setReady(false)
     setPlaying(false)

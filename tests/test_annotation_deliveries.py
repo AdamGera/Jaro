@@ -107,6 +107,56 @@ class AnnotationDeliveryTests(unittest.TestCase):
         self.assertEqual(route_scopes(capture(str(Path.home()), str(Path.home()))), [])
         self.assertEqual(route_scopes(capture("/fixture/sibling", "/fixture/team")), [])
 
+    def test_send_and_remember_activates_with_receipt_and_undo_restores_the_exact_scope(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = AnnotationDeliveries(root)
+            scopes = route_scopes({"origin": {"app": "org.example.Browser", "name": "Browser", "site": "first.example"}})
+            site, app = scopes
+            broad = store.remember_rule(app, "Browser", "ses_browser", "service.json")
+            original = store.remember_rule(site, "Original", "ses_original", "service.json", True)
+            delivery = store.begin("capture", "service", {"title": "Chosen", "id": "ses_chosen"}, False, remember_scope=site)
+            self.assertEqual(store.preferred_rule(scopes), original)
+            self.assertEqual(store.get(delivery)["rememberedRule"]["status"], "pending")
+            confirmed = store.confirm_remembered_delivery(delivery, "msg_one", "service.json")
+            self.assertEqual(confirmed["status"], "queued")
+            self.assertEqual(confirmed["rememberedRule"], {"status": "saved", "label": "first.example"})
+            self.assertEqual(store.preferred_rule(scopes)["id"], delivery)
+            self.assertEqual(store.preferred_rule([app]), broad)
+            self.assertEqual(AnnotationDeliveries(root).undo_remembered_rule(delivery)["rememberedRule"]["status"], "restored")
+            restored = store.preferred_rule(scopes)
+            self.assertEqual((restored["target"], restored["automatic"]), (original["target"], original["automatic"]))
+            self.assertNotEqual(restored["id"], original["id"])
+            self.assertEqual(store.undo_remembered_rule(delivery)["rememberedRule"]["status"], "restored")
+            self.assertEqual(store.preferred_rule(scopes), restored)
+
+    def test_send_and_remember_respects_newer_edits_and_deadline(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = AnnotationDeliveries(root)
+            scope = {"kind": "site", "key": "first.example", "label": "first.example"}
+            destination = {"title": "Chosen", "id": "ses_chosen"}
+            delivery = store.begin("capture", "service", destination, False, remember_scope=scope)
+            newer = store.remember_rule(scope, "Newer", "ses_newer", "service.json")
+            confirmed = store.confirm_remembered_delivery(delivery, "msg_one", "service.json")
+            self.assertEqual(confirmed["rememberedRule"]["status"], "changed")
+            self.assertEqual(store.preferred_rule([scope]), newer)
+
+            delivery = store.begin("another", "service", destination, False, remember_scope=scope)
+            store.confirm_remembered_delivery(delivery, "msg_two", "service.json")
+            newest = store.remember_rule(scope, "Newest", "ses_newest", "service.json")
+            self.assertEqual(store.undo_remembered_rule(delivery)["rememberedRule"]["status"], "changed")
+            self.assertEqual(store.preferred_rule([scope]), newest)
+
+            self.assertTrue(store.forget_rule([scope], newest["id"]))
+            with patch("annotation_deliveries.time", return_value=100):
+                delivery = store.begin("first", "service", destination, False, remember_scope=scope)
+                receipt = store.confirm_remembered_delivery(delivery, None, "service.json")
+                self.assertTrue(receipt["canUndo"])
+            with patch("annotation_deliveries.time", return_value=100 + UNDO_SECONDS):
+                self.assertEqual(store.undo_remembered_rule(delivery)["rememberedRule"]["status"], "saved")
+            with patch("annotation_deliveries.time", return_value=100 + UNDO_SECONDS - 1):
+                self.assertEqual(store.undo_remembered_rule(delivery)["rememberedRule"]["status"], "removed")
+                self.assertIsNone(store.preferred_rule([scope]))
+
     def test_terminal_suggestion_prefers_the_visible_title_over_stale_command_arguments(self):
         origin = annotation_origin({"app": "com.apple.Terminal", "name": "Terminal", "terminal":
             {"folder": "/fixture/Jard", "project": "/fixture/Jard", "title": "Release review", "session": "ses_stale"}})

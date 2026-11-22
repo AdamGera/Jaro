@@ -3,6 +3,7 @@ from contextlib import suppress
 import json
 import os
 from pathlib import Path
+import platform
 import signal
 import subprocess
 import sys
@@ -16,20 +17,25 @@ class ModelUnavailable(RuntimeError):
         super().__init__("Rumble2 Flash is unavailable. Run `jardctl model install` or open Jaro to set up the model.")
 
 
-def model_command(action):
+def model_command(action, *, all_models=False):
     helper = os.environ.get("JARD_EMBEDDED_HELPER")
     if helper:
-        return [helper, action, "--speech-only"]
-    installer = WORKSPACE_ROOT / "desktop/build-tools/model_setup.py"
-    return [sys.executable, str(installer), action, "--speech-only"]
+        return [helper, action, *([] if all_models else ["--speech-only"])]
+    command = [sys.executable, str(WORKSPACE_ROOT / "desktop/build-tools/model_setup.py"), action]
+    if all_models:
+        if sys.platform not in ("linux", "win32") or platform.machine().lower() not in ("x86_64", "amd64"):
+            raise RuntimeError("Use the installed macOS app or an x64 Linux or Windows workspace to set up the full local model set.")
+        return [*command, "--portable"]
+    return [*command, "--speech-only"]
 
 
 def model_environment():
     return {**os.environ, "JARD_MODEL_DIR": str(MODEL_DIR.resolve())}
 
 
-def model_status():
-    result = subprocess.run(model_command("model-status"), env=model_environment(), capture_output=True, timeout=10)
+def model_status(*, all_models=False):
+    result = subprocess.run(model_command("model-status", all_models=all_models),
+                            env=model_environment(), capture_output=True, timeout=10)
     try:
         status = json.loads(result.stdout)
         if result.returncode or type(status["ready"]) is not bool or type(status["bytes"]) is not int:
@@ -39,8 +45,9 @@ def model_status():
         raise RuntimeError("Could not read the pinned Jaro model status.") from error
 
 
-def install_model(source=None, *, progress=False):
-    command = model_command("models")
+def install_model(source=None, *, progress=False, all_models=False):
+    command = model_command("models", all_models=all_models)
+    label = "Jaro’s local models" if all_models else "Rumble2 Flash"
     if source is not None:
         command.extend(("--from", str(Path(source).resolve(strict=True))))
     failure = None
@@ -48,7 +55,7 @@ def install_model(source=None, *, progress=False):
     shown_progress = False
     try:
         with subprocess.Popen(command, env=model_environment(), stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True) as process:
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=os.name != "nt") as process:
             try:
                 for line in process.stdout:
                     event = json.loads(line)
@@ -58,19 +65,25 @@ def install_model(source=None, *, progress=False):
                         failure = event.get("message")
                     elif event.get("event") == "progress" and progress:
                         fraction = event["completed"] / max(event["total"], 1)
-                        print(f"\rPreparing Rumble2 Flash… {fraction:.0%}", end="", file=sys.stderr, flush=True)
+                        print(f"\rPreparing {label}… {fraction:.0%}", end="", file=sys.stderr, flush=True)
                         shown_progress = True
                 if process.wait() or not installed or installed.get("ready") is not True:
-                    raise RuntimeError(failure or "Could not install Rumble2 Flash. Retry to resume the download.")
+                    raise RuntimeError(failure or f"Could not install {label}. Retry to resume the download.")
             finally:
                 if process.poll() is None:
                     with suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGTERM)
+                        if os.name == "nt":
+                            process.terminate()
+                        else:
+                            os.killpg(process.pid, signal.SIGTERM)
                     try:
                         process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
                         with suppress(ProcessLookupError):
-                            os.killpg(process.pid, signal.SIGKILL)
+                            if os.name == "nt":
+                                process.kill()
+                            else:
+                                os.killpg(process.pid, signal.SIGKILL)
     finally:
         if shown_progress:
             print(file=sys.stderr)

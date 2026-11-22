@@ -30,12 +30,41 @@ type ProgressEvent =
 
 type AudioOptions = { name?: string; live?: boolean; recording?: boolean; diarization?: boolean; session?: string; offset?: number }
 
-export type Microphone = {
+export type AudioFrames = {
   sampleRate: number
   readonly length: number
   read: (start: number, end: number) => Float32Array
+}
+
+export type Microphone = AudioFrames & {
   stop: () => Promise<Blob>
   close: () => void
+}
+
+export function previewFrames(sampleRate: number) {
+  const frames: { offset: number; samples: Float32Array }[] = []
+  let length = 0
+  return {
+    sampleRate,
+    get length() { return length },
+    append(samples: Float32Array, offset = length) {
+      frames.push({ offset, samples })
+      length = offset + samples.length
+      const cutoff = length - PREVIEW_BUFFER_SECONDS * sampleRate
+      while (frames[0] && frames[0].offset + frames[0].samples.length <= cutoff) frames.shift()
+    },
+    read(start: number, end: number) {
+      const result = new Float32Array(end - start)
+      for (const { offset, samples } of frames) {
+        const from = Math.max(offset, start)
+        const to = Math.min(offset + samples.length, end)
+        if (to > from) result.set(samples.subarray(from - offset, to - offset), from - start)
+        if (offset + samples.length >= end) break
+      }
+      return result
+    },
+    clear() { frames.length = 0 },
+  }
 }
 
 export async function openMicrophone(
@@ -68,9 +97,8 @@ export async function openMicrophone(
   }
 
   const limit = context.sampleRate * MAX_SECONDS
-  const frames: { offset: number; samples: Float32Array }[] = []
+  const history = previewFrames(context.sampleRate)
   const chunks: Blob[] = []
-  let total = 0
   let closing = false
   let closed = false
   let recordingError: Error | undefined
@@ -94,28 +122,15 @@ export async function openMicrophone(
     worklet.port.close()
     source.disconnect()
     worklet.disconnect()
-    frames.length = 0
+    history.clear()
     chunks.length = 0
     void context.close()
   }
 
   const microphone: Microphone = {
     sampleRate: context.sampleRate,
-    get length() {
-      return total
-    },
-    read(start, end) {
-      const result = new Float32Array(end - start)
-      for (const { offset, samples: part } of frames) {
-        const from = Math.max(offset, start)
-        const to = Math.min(offset + part.length, end)
-        if (to > from) {
-          result.set(part.subarray(from - offset, to - offset), from - start)
-        }
-        if (offset + part.length >= end) break
-      }
-      return result
-    },
+    get length() { return history.length },
+    read: history.read,
     async stop() {
       closing = true
       if (recorder.state !== "inactive") recorder.stop()
@@ -132,14 +147,9 @@ export async function openMicrophone(
   }
 
   worklet.port.onmessage = ({ data }: MessageEvent<Float32Array>) => {
-    if (closing || total >= limit) return
-    const samples = data.subarray(0, limit - total)
-    frames.push({ offset: total, samples })
-    total += samples.length
-    const cutoff = total - PREVIEW_BUFFER_SECONDS * context.sampleRate
-    while (frames[0] && frames[0].offset + frames[0].samples.length <= cutoff) {
-      frames.shift()
-    }
+    if (closing || history.length >= limit) return
+    const samples = data.subarray(0, limit - history.length)
+    history.append(samples)
     onFrame(microphone, samples)
   }
   for (const track of stream.getAudioTracks()) {
@@ -238,6 +248,9 @@ export type SavedSession = {
   languageHints: string[]; recording: boolean; diarization: boolean; live: boolean
   audioUrl: string | null; audioPath: string | null; audioName: string; transcript: Transcript
   meeting?: boolean; meetingProvider?: string | null; audioRemovedAt?: string | null
+  annotationCustomStorage?: boolean
+  annotationStorageUnavailable?: boolean
+  meetingTurns?: SpeakerSegment[]
   meetingsManaged?: boolean
   finalizationPending?: boolean
   meetingRetentionDays?: number | null
@@ -249,8 +262,13 @@ export type SavedSession = {
   meetingExport?: MeetingExport | null
   recordingTracks?: Partial<Record<"mic" | "system", string>>
   annotation?: { version: 1; source: "display" | "window" | "area" | "phone"; strokeCount: number; frames: number[];
-    manifestUrl: string; contactSheetUrl: string | null }
+    missingVideo?: "noFrames" | "permissionDenied" | "screenInterrupted";
+    manifestUrl: string | null; contactSheetUrl: string | null }
   model: string; modelRevision: string; speakerModel: string | null; speakerModelRevision: string | null
+}
+
+export function isSettledMeeting(session?: Pick<SavedSession, "meeting" | "status" | "finalizationPending">) {
+  return !!session?.meeting && session.status !== "processing" && !session.finalizationPending
 }
 
 export class MissingSessionError extends Error {}
@@ -328,7 +346,7 @@ export function livePreview(
   let pending: Promise<void> | undefined
 
   return {
-    update(mic: Microphone) {
+    update(mic: AudioFrames) {
       if (controller.signal.aborted) return
       const seconds = (mic.length - start) / mic.sampleRate
       if (seconds > 8) {

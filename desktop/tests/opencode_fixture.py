@@ -97,7 +97,7 @@ def local_opencode(directory):
                 outcome["unreadable"] = True
             self.respond(200, {})
 
-    directory.mkdir(parents=True)
+    directory.mkdir(parents=True, exist_ok=True)
     registration = directory / "service.json"
     with ThreadingHTTPServer(("127.0.0.1", 0), Service) as server:
         with registration.open("x") as stream:
@@ -111,3 +111,4 @@ def local_opencode(directory):
         finally:
             server.shutdown()
             thread.join()
+            registration.unlink(missing_ok=True)

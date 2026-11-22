@@ -22,7 +22,7 @@ For an isolated test, set `RUMBLE_DATA_DIR` to a fresh private temporary directo
 
 ## Local iteration
 
-Use `/Applications/Jaro.app` for local UI checks. Build and sign a temporary staging bundle with the same publisher. Quit using Jard's regular capture and engine guards, replace the app at the installed path, and reopen it against the same library. Verify the running workspace and use macOS Trash for the superseded bundle and other generated copies. Keep the staging bundle closed until it is installed.
+Use `/Applications/Jaro.app` for local UI checks. Build and sign a temporary staging bundle with the same publisher. Quit using Jaro's regular capture and engine guards, wait for the engine to release its loopback listener, then replace the app at the installed path and reopen it against the same library. Verify that the workspace page and its assets load and use macOS Trash for the superseded bundle and other generated copies. Keep the staging bundle closed until it is installed.
 
 ## Updating the sound preview
 
@@ -35,6 +35,14 @@ xcrun swiftc -O -target arm64-apple-macos26.0 \
   desktop/build-tools/render-sound-preview.swift -o "$preview_build/render"
 "$preview_build/render" desktop/assets/dictation-sounds/preview.json src/assets/dictation-preview.png
 ```
+
+## Desktop preferences from the CLI
+
+`jardctl settings list` includes `ui_language` and `show_dock_icon`. Use `settings get ui_language` to read the saved choice, `settings set ui_language fr` to select French, or `settings set ui_language system` to follow macOS. `settings set show_dock_icon off` makes the menu bar the way back to a closed workspace. The Dock icon stays visible when the workspace needs it.
+
+`settings apply` accepts both application and speech preferences in one JSON document and can save them while Jaro is closed. `ui_language` configures the interface. Set `dictation.languages` separately when the speech hints need to change.
+
+Use `jardctl history --search 'phrase' --json` to search retained dictations even with Jaro closed. History keeps up to 10,000 takes or 16 MiB of combined raw and final text, whichever limit it reaches first. A newly saved raw or final field holds up to 16 KiB of UTF-8 text. The current dictation is delivered in full. The workspace and CLI read the same retained History.
 
 ## Reading and watching meetings
 
@@ -50,6 +58,8 @@ jard='/Applications/Jaro.app/Contents/Helpers/jardctl'
 ```
 
 Use the same executable with the `mcp` argument for a local stdio MCP client. It exposes meeting discovery, transcript and notes search, timed transcript reads, saved notes, and `jard-meeting://{meeting_id}` Markdown resources. The CLI and MCP label the rolling transcript while Jard records and finalizes it. Interrupted meetings retain readable provisional text when it was saved. They use the same meeting ID after recovery. Use `--no-in-progress` or `include_in_progress: false` to exclude current recordings and finalizations. Date filters match the meeting's full time span, and a date in `--until` includes that entire local day.
+
+Markdown meeting reads include the saved Quick Brief, Overview, and My Notes when available. Use `--from` and `--to` to excerpt the transcript without cutting speaker turns. JSON returns the requested bounds in milliseconds, and Markdown identifies the range above the transcript. The MCP transcript tool accepts `start` and `end` or `from` and `to` using the same offsets. Subtitle exports retain each selected turn's position from the beginning of the recording.
 
 When Jard reopens, it resumes pending meetings from their last committed audio checkpoint once the model is ready and the recorder is idle. Interrupted sessions show `finalizationPending` while waiting. Two unexpected stops during recovery leave the recording and available transcript in Sessions under the original ID.
 
@@ -91,5 +101,23 @@ python3 desktop/build-tools/package.py --dmg \
 Create a draft GitHub release tagged `v<version>` at the build commit. Attach the DMG as `Jaro-arm64.dmg`, the matching source as `Jaro-native-source.zip`, and both generated update files, `Jaro-arm64.zip` and `native-update.json`. Publish it as the latest stable release once all four assets are present. The app reads the feed from the latest release and stages the version-specific ZIP in the background after validating the signed feed. The user chooses Restart to Update when the verified bundle is ready. Leave the assets at their published URLs.
 
 To offer a Development channel, generate a separate Ed25519 feed key and provide `--dev-updates /path/to/development.json` when packaging both channels. This file supplies the Development HTTPS `feed_url`, the matching Base64 `public_key`, and an optional HTTPS `release_url` for manual downloads. `--channel dev` stamps a Development build. Pass the Development seed to `--update-key` for that build and publish its archive under `dev-v<version>` as a prerelease. Publish the signed `native-update.json` at the configured Development feed URL. Continue signing each application bundle with the same publisher certificate. Omit `--dev-updates` for bundles that follow the Stable feed alone.
+
+For a Development release, give `--notes` one change per line. Attach the generated `desktop/out/Jaro-development-notes.json` to the prerelease and pass that file as `--previous-dev-notes` when packaging the next Development release. The first release can omit it. The packager embeds the resulting rolling index in the signed app and also includes the current release's plain notes in the signed feed for older Jaro versions. A user who skipped Development releases sees the distinct changes since the version they have installed.
+
+### Gradual releases
+
+For a gradual release, add `--rollout-percent 10` to the signing command. The packager writes both feed formats. New builds check `native-update-v2.json` first and compare their private local bucket against the signed percentage. On HTTP 404 they check the regular feed. `--rollout-required` makes the candidate available to every eligible build when published to the rollout endpoint. Installation still uses Restart to Update or Quit.
+
+For Stable, publish the versioned archive at its signed URL on a prerelease. Attach `native-update-v2.json` to the separate `stable-rollout` prerelease. The previous Stable release stays Latest so existing installs can continue checking the regular feed. After the rollout, attach `native-update.json` to the candidate release and promote it to Latest, then remove the rollout feed asset so subsequent releases can use the normal feed. Keep the versioned archive available. Development can use an optional separate HTTPS `rollout_url` in `--dev-updates` and the same promotion sequence at its configured endpoints. `--stable-rollout-url` overrides the default for a self-hosted feed.
+
+Re-sign the same release to increase its percentage without rebuilding the app or archive. Run these commands from the repository root.
+
+```sh
+xcrun swiftc -O desktop/update/UpdateRollout.swift desktop/build-tools/sign-update-rollout.swift -o /tmp/jaro-sign-update-rollout
+/tmp/jaro-sign-update-rollout desktop/out/native-update.json /tmp/native-update-v2.json \
+  "$HOME/.config/jard/soundfolio-local/native-update.key" stable 50 false
+```
+
+Replace the rollout feed asset with the resulting file. The signing command verifies that the regular feed was signed with the supplied channel key. For Development, use `dev` and its own key.
 
 Forks distributing their own builds should generate their own key with `native update keygen --private-key /private/path/native-update.key` and configure their public key and release URLs before shipping.

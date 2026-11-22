@@ -18,8 +18,8 @@ import shutil
 import signal
 import sys
 import tempfile
-from time import time
-from dataclasses import dataclass
+from time import monotonic, time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 from uuid import UUID, uuid4
@@ -33,8 +33,9 @@ sys.path[:0] = [str(engine), str(workspace)] if engine != workspace else [str(en
 from engine_lifecycle import HOST, PORT, URL, library_path, running_engine
 from annotation_assets import ASSETS as ANNOTATION_ASSETS, annotation_input, annotation_origin, staged_annotation_paths
 from annotation_rollback import undo_annotation
-from annotation_routing import (RouteUnavailable, capture_for_routing, correct_annotation, destinations as annotation_destinations, recent_deliveries,
-                                forget_destination_rule, send_annotation, set_destination_rule)
+from annotation_routing import send_session_prompt
+from annotation_routing import (RouteUnavailable, capture_for_routing, correct_annotation, destinations as annotation_destinations,
+                                forget_destination_rule, recent_deliveries, route_scopes, send_annotation, set_destination_rule)
 from diagnostics import write_event
 from managed_preferences import ManagedFeatureError, meetings_managed, opencode_managed, require_annotation, require_meetings, require_opencode
 from output_transform_runtime import CAPABILITIES, is_embedded_config
@@ -45,11 +46,13 @@ from dictation_output import (MAX_REWRITE_DEADLINE, is_script_step, is_transform
 from dictation_settings import validate_changes
 from local_qwen import MODEL_NAME as REWRITE_MODEL_NAME
 from meeting_brief import LIVE_TITLE_INTERVAL, LiveTitlePlan
-from meeting_rolling import append_rolling
+from meeting_rolling import MIXED_SPEAKERS, append_rolling
 from native_recordings import normalize_meeting_title, recording_metadata, write_meeting_title, write_recording_metadata
 from saved_annotations import annotation_context, annotation_detail
+from saved_meetings import latest_transcript, saved_meeting_clipboard
 from session_store import MissingSession, SessionStore
-from desktop.annotation_automation import AnnotationAutomation
+from desktop import annotation_agents
+from desktop.annotation_automation import AnnotationAutomation, describe_delivery
 from desktop.sdk_capture import CaptureError, SDKCapture
 
 
@@ -117,9 +120,14 @@ def transcript_export(data):
 class WarmWorker:
     child: asyncio.subprocess.Process
     options: tuple[str, ...]
+    on_demand: bool = False
     reader: asyncio.Task | None = None
     events: asyncio.Queue | None = None
     availability: dict | None = None
+    meter: tuple[int, asyncio.Future] | None = None
+    input_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    annotation_reply: tuple[int, asyncio.Future] | None = None
+    meeting: tuple[str, asyncio.Queue] | None = None
 
 
 @dataclass
@@ -137,6 +145,7 @@ class Capture:
     title_plan: LiveTitlePlan | None = None
     title_job: asyncio.Task | None = None
     warm_events: asyncio.Queue | None = None
+    microphone_peak: tuple[float, float] | None = None
 
     def stop_titles(self):
         if self.title_job:
@@ -150,6 +159,12 @@ class Capture:
             while (event := await self.warm_events.get()) is not None:
                 yield event
 
+    async def command(self, message):
+        if self.warm_events is not None and (meeting := self.state.get("meeting")):
+            message = json.dumps({"meeting": meeting, "command": message})
+        self.child.stdin.write((message + "\n").encode())
+        await self.child.stdin.drain()
+
 
 class MacBridge:
     def __init__(self, helpers, http):
@@ -162,6 +177,8 @@ class MacBridge:
         self.connected = False
         self.lease_task = None
         self.setup_lock = asyncio.Lock()
+        self.meeting_clock_lock = asyncio.Lock()
+        self.meeting_clock = os.environ.get("JARD_MEETING_CLOCK")
         self.capture_lock = asyncio.Lock()
         self.captures: dict[str, Capture] = {}
         self.dialog_lock = asyncio.Lock()
@@ -175,13 +192,20 @@ class MacBridge:
         self.warm_requested = None
         self.warm_request_id = None
         self.warm_notice = None
+        self.meter_sequence = 0
         self.updating = False
         self.annotation = None
+        self.annotation_location = None
+        self.annotation_worker: WarmWorker | None = None
+        self.annotation_narration: Path | None = None
+        self.annotation_narrating = False
+        self.annotation_narration_stopped = False
+        self.annotation_command = 0
         self.annotation_delivery_busy = False
         self.annotation_started_at = None
         self.automatic_annotations = AnnotationAutomation(
             self.root, self.automatic_capture, self.automatic_send,
-            lambda detail: send({"event": "jard-annotation-routing", "detail": detail}),
+            lambda detail: send({"event": "jard-annotation-confirmation" if "nonce" in detail else "jard-annotation-routing", "detail": detail}),
         )
         self.control_server = None
         self.control_dir = None
@@ -219,6 +243,13 @@ class MacBridge:
     async def connect_if_ready(self):
         # Never pass a token or expose native controls to an unrelated local service.
         existing = await asyncio.to_thread(running_engine)
+        if existing:
+            response = await self.http.get("/", timeout=5)
+            if response.status_code in (500, 503) and not self.connected:
+                await self.recover_workspace()
+                existing = None
+            else:
+                response.raise_for_status()
         if not existing:
             status = json.loads(
                 await run_helper(self.helpers / "jard-engine", "model-status")
@@ -228,6 +259,8 @@ class MacBridge:
             await run_helper(self.helpers / "jard-engine", "start")
             if not await asyncio.to_thread(running_engine):
                 raise RuntimeError("The local engine stopped during startup.")
+            response = await self.http.get("/", timeout=5)
+            response.raise_for_status()
         self.http.headers["X-Jard-Token"] = (
             (self.root / ".native-token").read_text().strip()
         )
@@ -235,6 +268,8 @@ class MacBridge:
         if not self.connected:
             write_event("desktop", "connected")
         self.connected = True
+        if self.meeting_clock in ("12", "24"):
+            await self.sync_meeting_clock(self.meeting_clock)
         await self.start_control()
         if self.lease_task is None:
             self.lease_task = asyncio.create_task(self.lease())
@@ -243,6 +278,21 @@ class MacBridge:
             with contextlib.suppress(ValueError, OSError):
                 await self.automatic_annotations.resume()
         return {"ready": True}
+
+    async def sync_meeting_clock(self, clock):
+        async with self.meeting_clock_lock:
+            self.meeting_clock = clock
+            try:
+                await self.api("PUT", f"native/meeting-clock/{clock}", timeout=3)
+            except httpx.HTTPError:
+                write_event("desktop", "meeting_clock_sync_failed")
+
+    async def recover_workspace(self):
+        # An earlier install can leave its engine healthy but its bundled page missing.
+        # The restart guard protects every other client and admitted engine job.
+        token = (self.root / ".native-token").read_text().strip()
+        await self.api("POST", "native/update-quiesce/" + self.client_id, headers={"X-Jard-Token": token})
+        await self.wait_for_engine_exit()
 
     async def start_control(self):
         if self.control_server:
@@ -266,6 +316,7 @@ class MacBridge:
 
     async def control_connection(self, reader, writer):
         own = action = None
+        sdk_started = False
         try:
             async with asyncio.timeout(16) as deadline:
                 request = json.loads(await reader.readline())
@@ -276,9 +327,10 @@ class MacBridge:
                     raise ValueError("Invalid Jard control credentials.")
                 action = request.get("action")
                 if action not in ("status", "start", "stop", "toggle", "cancel", "paste-last", "setup", "history",
-                                  "dictation-start-raw", "dictation-toggle-raw", "dictation-stop-print", "history-clear", "history-snapshot",
+                                  "dictation-start-raw", "dictation-toggle-raw", "dictation-stop-print", "history-clear",
+                                  "history-checkpoint", "history-snapshot",
                                   "meeting-status", "meeting-record", "meeting-stop", "meeting-copy-last", "meeting-live",
-                                  "annotation-status", "annotation-start", "annotation-stop", "annotation-cancel",
+                                  "annotation-status", "annotation-start", "annotation-stop", "annotation-cancel", "annotation-storage",
                                   "annotation-route", "annotation-destinations", "annotation-remember", "annotation-forget", "annotation-send", "annotation-undo", "annotation-correct",
                                   "desktop-status", "desktop-quit", "desktop-restart", "settings-list", "settings-get", "settings-apply",
                                   "vocabulary-list", "vocabulary-add", "vocabulary-remove",
@@ -291,6 +343,10 @@ class MacBridge:
                     return
                 if action == "annotation-route":
                     result = await self.annotation_route({"id": request.get("id"), "action": request.get("routeAction", "status")})
+                    await self.write_control_reply(writer, {"ok": True, "result": result})
+                    return
+                if action == "annotation-storage":
+                    result = await self.annotation_storage(request, allow_path=True)
                     await self.write_control_reply(writer, {"ok": True, "result": result})
                     return
                 if action in ("annotation-destinations", "annotation-remember", "annotation-forget"):
@@ -316,6 +372,8 @@ class MacBridge:
                     owner, cursor = request.get("owner"), request.get("cursor", 0)
                     if not isinstance(owner, str) or not owner.isascii() or len(owner) != 64 or type(cursor) is not int or cursor < 0:
                         raise CaptureError("dictation-not-found", "This recording is unavailable.", 404)
+                    if action == "sdk-finish" and self.updating:
+                        raise CaptureError("engine-stopping", "Jaro is preparing to restart.", 503)
                     data = self.sdk_capture.request(action.removeprefix("sdk-"), identifier, owner, cursor)
                     await self.write_control_reply(writer, {"ok": True, "result": data})
                     return
@@ -329,10 +387,11 @@ class MacBridge:
                     options = {"query": query, "offset": offset}
                 elif action == "annotation-start":
                     require_annotation()
-                    source = request.get("source", "display")
-                    if source not in ("display", "window", "area", "phone"):
-                        raise ValueError("Choose a display, window, area, or wired iPhone or iPad to annotate.")
-                    options = {"source": source}
+                    if "source" in request:
+                        source = request["source"]
+                        if source not in ("display", "window", "area", "phone"):
+                            raise ValueError("Choose a display, window, area, or wired iPhone or iPad to annotate.")
+                        options["source"] = source
                     if "languages" in request:
                         languages = request["languages"]
                         if not isinstance(languages, list) or len(languages) > 25 or any(
@@ -348,7 +407,7 @@ class MacBridge:
                         raise ValueError("Confirm deletion of the entire dictation history.")
                 elif action == "window-show":
                     pane = request.get("pane", "settings")
-                    if pane not in ("settings", "general", "dictation", "history", "output", "meetings", "annotate", "home"):
+                    if pane not in ("settings", "general", "dictation", "history", "output", "meetings", "meeting-library", "annotate", "home"):
                         raise ValueError("Unknown Jaro workspace pane.")
                     options = {"pane": pane}
                 elif action == "settings-get":
@@ -391,12 +450,20 @@ class MacBridge:
                 if len(self.control_pending) >= 8:
                     raise ValueError("Jard is busy. Try again.")
                 own = str(uuid4())
-                future = asyncio.get_running_loop().create_future()
+                loop = asyncio.get_running_loop()
+                if action == "history-checkpoint":
+                    history_file = self.control_path.parent / f"history-{own}.plist"
+                    options = {"path": str(history_file)}
+                    loop.call_later(30, history_file.unlink, True)
+                future = loop.create_future()
                 self.control_pending[own] = future
                 send({"nativeRequest": {"id": own, "action": action, **options}})
                 result = await future
+                if action == "history-checkpoint" and result.get("ok"):
+                    result = {"ok": True, "result": history_file.name}
                 if action == "sdk-start" and result.get("ok"):
                     data = await self.start_sdk_capture(own, result["result"], request.get("languages", []))
+                    sdk_started = True
                     result = {"ok": True, "result": data}
         except CaptureError as error:
             result = {"ok": False, "error": str(error), "code": error.code, "status": error.status}
@@ -406,7 +473,7 @@ class MacBridge:
             result = {"ok": False, "error": str(error) or "The Jard control request timed out."}
         finally:
             self.control_pending.pop(own, None)
-            if own and action == "sdk-start" and (not self.sdk_capture.active or self.sdk_capture.active.identifier != own):
+            if own and action == "sdk-start" and not sdk_started:
                 self.release_sdk_capture(own)
         try:
             await self.write_control_reply(writer, result)
@@ -464,7 +531,7 @@ class MacBridge:
         return {"id": take.stage["id"], "name": name,
                 "meetingProvider": provider, "meeting": True, "meetingCalendar": calendar, "created": started,
                 "meetingStartedAt": started, "duration": capture["seconds"], "processed": capture["seconds"],
-                "status": "recording" if not take.finished else "processing",
+                "status": "recording" if not take.finished else "processing", "meetingSpeakerMode": MIXED_SPEAKERS,
                 **({"meetingMicrophoneWarning": "digitalSilence"} if capture.get("meetingMicrophoneWarning") else {}),
                 **({"provisionalTitle": title} if title else {}),
                 **({"meetingTurns": capture["meetingTurns"]} if turns else {})}
@@ -516,16 +583,21 @@ class MacBridge:
                     await p.wait()
             return await self.connect_if_ready()
 
-    async def devices(self):
+    async def input_devices(self):
         devices = json.loads(await run_helper(self.helpers / "jard-capture", "devices"))
+        result = {"microphone": devices["microphone"], "inputs": devices.get("inputs", [])}
+        if "dictationMicrophones" in devices:
+            result["dictationMicrophones"] = devices["dictationMicrophones"]
+        return result
+
+    async def devices(self):
+        devices = await self.input_devices()
         drafts = await self.api("GET", "native/staging")
         active = self.workspace_capture()
         active_stages = {take.stage["id"] for take in self.captures.values()}
         hide_meeting_drafts = meetings_managed()
         return {
-            "microphone": devices["microphone"],
-            **({"dictationMicrophones": devices["dictationMicrophones"]} if "dictationMicrophones" in devices else {}),
-            "inputs": devices.get("inputs", []),
+            **devices,
             "capture": active.state if active and active.started else None,
             "drafts": [
                 {"id": d["id"], "seconds": max(0, (d["bytes"] - 44) / 96000), "meeting": d.get("meeting", False)}
@@ -604,12 +676,30 @@ class MacBridge:
                 if not isinstance(event, dict):
                     continue
                 kind = event.get("event")
-                if kind == "warmAvailability":
+                if "sharedMeeting" in event:
+                    if worker.meeting and event["sharedMeeting"] == worker.meeting[0]:
+                        queue = worker.meeting[1]
+                        if kind != "levels" or queue.qsize() < 128:
+                            queue.put_nowait(event)
+                        if kind == "takeEnded":
+                            worker.meeting = None
+                elif kind == "warmAvailability":
                     phase, microphone, message = (event.get(key) for key in ("phase", "microphone", "message"))
                     if phase in ("ready", "fallback", "unavailable") and isinstance(microphone, str) and isinstance(message, str):
                         worker.availability = {"phase": phase, "microphone": microphone[:240], "message": message[:600]}
+                        if phase == "unavailable":
+                            worker.input_ready.clear()
+                        else:
+                            worker.input_ready.set()
                         if self.warm_worker is worker and worker.options == self.warm_requested:
                             self.publish_warm(worker.availability)
+                elif kind == "warmMeter":
+                    if worker.meter and event.get("request") == worker.meter[0] and not worker.meter[1].done():
+                        peak = event.get("peak")
+                        worker.meter[1].set_result(peak if type(peak) in (int, float) and 0 <= peak <= 1 else None)
+                elif kind == "warmAnnotation":
+                    if worker.annotation_reply and event.get("request") == worker.annotation_reply[0] and not worker.annotation_reply[1].done():
+                        worker.annotation_reply[1].set_result(event.get("error"))
                 elif kind == "microphoneClockReset" and event.get("result") in ("reset", "unavailable", "failed", "restoreFailed"):
                     write_event("microphone", "clock_" + event["result"])
                 elif worker.events is not None:
@@ -622,9 +712,17 @@ class MacBridge:
                 with contextlib.suppress(ProcessLookupError):
                     worker.child.terminate()
         finally:
+            worker.input_ready.set()
+            if worker.annotation_reply and not worker.annotation_reply[1].done():
+                worker.annotation_reply[1].set_result("The shared microphone stopped.")
+            if worker.meter and not worker.meter[1].done():
+                worker.meter[1].set_result(None)
             if worker.events is not None:
                 worker.events.put_nowait(None)
                 worker.events = None
+            if worker.meeting is not None:
+                worker.meeting[1].put_nowait(None)
+                worker.meeting = None
             if self.warm_worker is worker and worker.options == self.warm_requested:
                 self.publish_warm({"phase": "unavailable", "message": "The microphone stopped. Try the dictation shortcut to reconnect."})
 
@@ -645,18 +743,19 @@ class MacBridge:
         if worker.reader is not None:
             await worker.reader
 
-    async def open_warm(self, options):
+    async def open_warm(self, options, *, on_demand=False):
         worker = self.warm_worker
-        if worker and worker.child.returncode is None and worker.options == options and worker.reader and not worker.reader.done():
+        if (worker and worker.child.returncode is None and worker.options == options and worker.on_demand == on_demand
+                and worker.reader and not worker.reader.done()):
             if worker.availability is not None:
                 self.publish_warm(worker.availability)
             return worker
         await self.close_warm()
         child = await asyncio.create_subprocess_exec(
-            str(self.helpers / "jard-capture"), "warm", *options,
+            str(self.helpers / "jard-capture"), "warm", *(("--on-demand",) if on_demand else ()), *options,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         )
-        worker = self.warm_worker = WarmWorker(child, options)
+        worker = self.warm_worker = WarmWorker(child, options, on_demand=on_demand)
         try:
             raw = await asyncio.wait_for(child.stdout.readline(), 3)
             ready = json.loads(raw)
@@ -676,7 +775,7 @@ class MacBridge:
         async with self.capture_lock:
             recording = self.captures.get("recording")
             if (self.updating or self.annotation or self.sdk_capture.active or self.meeting_mic_lease
-                    or "dictation" in self.captures or (recording and not recording.state.get("meeting"))):
+                    or "dictation" in self.captures or (recording and (not recording.state.get("meeting") or recording.warm_events is not None))):
                 return
             if self.warm_requested is None:
                 await self.close_warm()
@@ -690,6 +789,30 @@ class MacBridge:
         await self.reconcile_warm()
         return {"warm": bool(self.warm_worker and self.warm_worker.child.returncode is None)}
 
+    async def microphone_level(self):
+        worker = self.warm_worker
+        if worker and worker.child.returncode is None and worker.options == self.warm_requested:
+            if worker.meter:
+                return {"peak": None}
+            self.meter_sequence += 1
+            future = asyncio.get_running_loop().create_future()
+            worker.meter = (self.meter_sequence, future)
+            try:
+                worker.child.stdin.write(json.dumps({"meter": self.meter_sequence}).encode() + b"\n")
+                await asyncio.wait_for(worker.child.stdin.drain(), 0.2)
+                peak = await asyncio.wait_for(future, 0.25)
+                return {"peak": peak if self.warm_worker is worker and worker.options == self.warm_requested else None}
+            except (TimeoutError, OSError):
+                return {"peak": None}
+            finally:
+                worker.meter = None
+        take = self.captures.get("dictation")
+        if take and take.global_dictation and not take.finished and take.microphone_peak:
+            at, peak = take.microphone_peak
+            if monotonic() - at <= 0.25:
+                return {"peak": peak}
+        return {"peak": None}
+
     def workspace_capture(self):
         dictation = self.captures.get("dictation")
         return self.captures.get("recording") or (dictation if dictation and not dictation.global_dictation else None)
@@ -699,15 +822,15 @@ class MacBridge:
             if self.captures.get("recording") is not take or take.finished or take.child.returncode is not None:
                 return
             allowed = not (self.meeting_mic_lease or "dictation" in self.captures or self.dictation_stages
-                           or self.dictation_jobs or self.sdk_capture.active or self.updating)
+                           or self.dictation_jobs or self.annotation or self.sdk_capture.active or self.updating)
             if allowed:
-                await self.close_warm()
+                if take.warm_events is None:
+                    await self.close_warm()
                 self.meeting_mic_lease = (take, identifier)
                 self.meeting_mic_available.clear()
             try:
                 command = "recover-mic" if allowed else "defer-mic"
-                take.child.stdin.write(f"{command} {identifier}\n".encode("ascii"))
-                await take.child.stdin.drain()
+                await take.command(f"{command} {identifier}")
             except (BrokenPipeError, ConnectionResetError):
                 if allowed:
                     self.release_meeting_mic(take, identifier)
@@ -728,8 +851,7 @@ class MacBridge:
             if not take or not take.state.get("meeting") or take.finished or take.child.returncode is not None:
                 return None
             with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                take.child.stdin.write(("input " + json.dumps(uid) + "\n").encode("ascii"))
-                await take.child.stdin.drain()
+                await take.command("input " + json.dumps(uid))
 
     async def record(self, args):
         if args.get("meeting") is not None:
@@ -742,8 +864,6 @@ class MacBridge:
                 raise ValueError("The meeting microphone is reconnecting. Try dictation again.") from None
             if self.updating:
                 raise ValueError("Jard is preparing to restart.")
-            if self.annotation:
-                raise ValueError("Stop the screen annotation first.")
             if self.sdk_capture.active:
                 raise ValueError("A recording is already active.")
             dictation = args.get("dictation")
@@ -762,9 +882,15 @@ class MacBridge:
                     char in "/\\:" or not char.isprintable() for char in meeting_label
                 ):
                     raise ValueError("Invalid meeting provider name.")
-            global_dictation = bool(dictation and args.get("global") is True)
             slot = "dictation" if dictation else "recording"
             recording, speaking = self.captures.get("recording"), self.captures.get("dictation")
+            global_dictation = bool(dictation and args.get("global") is True)
+            annotation_owns_worker = self.annotation_worker is not None and self.annotation_worker is self.warm_worker
+            shared_annotation = annotation_owns_worker and (global_dictation or (meeting and self.annotation_narrating))
+            if self.annotation and not shared_annotation:
+                raise ValueError("Stop the screen annotation first.")
+            shared_worker = (shared_annotation or (global_dictation and recording is not None and recording.warm_events is not None)
+                             or (meeting and speaking is not None and speaking.warm_events is not None))
             compatible = (
                 global_dictation and recording and recording.state.get("meeting")
                 or meeting and speaking and speaking.global_dictation
@@ -800,7 +926,13 @@ class MacBridge:
                     marker.flush()
                 options = self.input_options(args) if global_dictation else ()
                 worker = self.warm_worker
-                warm = worker if global_dictation and args.get("keep") is True and worker and worker.options == options else None
+                cold_recovery = global_dictation and args.get("keep") is not True
+                if cold_recovery and not shared_worker:
+                    warm = await self.open_warm(options, on_demand=True)
+                elif meeting and not shared_worker and speaking is None:
+                    warm = await self.open_warm(self.input_options({"inputDevice": args.get("inputDevice")}), on_demand=True)
+                else:
+                    warm = worker if shared_worker or (global_dictation and worker and worker.options == options) else None
                 warm_events = None
                 if meeting:
                     options = ("--separate-tracks",)
@@ -811,23 +943,46 @@ class MacBridge:
                     if backend in ("tap", "tapAndScreen", "screen"):
                         options += ("--system-audio", backend, "--host-pid", str(os.getppid()))
                     options += self.input_options({"inputDevice": args.get("inputDevice")})
-                if warm and warm.child.returncode is None and warm.reader and not warm.reader.done():
+                worker_available = warm and warm.child.returncode is None and warm.reader and not warm.reader.done()
+                if meeting and worker_available:
+                    application = args.get("meetingApplication")
+                    backend = args.get("meetingSystemAudio")
+                    warm_events = asyncio.Queue()
+                    warm.meeting = (meeting, warm_events)
+                    message = {"meeting": meeting, "start": stage["path"], "hostPID": os.getppid()}
+                    if backend in ("tap", "tapAndScreen", "screen"):
+                        message["systemAudio"] = backend
+                    if isinstance(application, str) and 0 < len(application) <= 255:
+                        message["callApplication"] = application
+                    input_options = self.input_options({"inputDevice": args.get("inputDevice")})
+                    if input_options:
+                        message["inputDevice"] = input_options[1]
+                    try:
+                        warm.child.stdin.write((json.dumps(message) + "\n").encode())
+                        await warm.child.stdin.drain()
+                    except (BrokenPipeError, ConnectionResetError):
+                        warm.meeting = None
+                        raise ValueError("The shared microphone stopped. Try the meeting again.") from None
+                elif worker_available:
                     try:
                         warm_events = warm.events = asyncio.Queue()
                         queued_at = args.get("queuedAt")
                         warm.child.stdin.write((json.dumps({
-                            "start": stage["path"], "preRoll": args.get("preRoll") is not False,
+                            "start": stage["path"], "preRoll": args.get("preRoll") is not False and not (cold_recovery and not shared_worker),
                             **({"queuedAt": queued_at} if type(queued_at) in (int, float) and 0 < queued_at < math.inf else {}),
                         }) + "\n").encode())
                         await warm.child.stdin.drain()
                     except (BrokenPipeError, ConnectionResetError):
+                        if shared_worker:
+                            raise ValueError("The shared microphone stopped. Try again when it reconnects.") from None
                         await self.close_warm()
                         warm = warm_events = None
                 else:
+                    if shared_worker:
+                        raise ValueError("The shared microphone is unavailable.")
                     if not meeting:
                         await self.close_warm()
                     warm = None
-                cold_recovery = global_dictation and args.get("keep") is not True
                 child = warm.child if warm else await asyncio.create_subprocess_exec(
                     str(self.helpers / "jard-capture"),
                     "record", "--mode", mode, "--output", stage["path"],
@@ -896,7 +1051,6 @@ class MacBridge:
         if meeting:
             metadata["meeting"] = meeting
         path = Path(take.stage["path"])
-        sources = [path.with_suffix(f".{source}.wav") for source in ("mic", "system")] if meeting else [path]
         while True:
             await asyncio.sleep(0.35)
             if not take.started:
@@ -905,7 +1059,7 @@ class MacBridge:
                 # Capture continues to disk. Wait before queuing another background
                 # decode so the spoken shortcut does not compete for the same model.
                 continue
-            available = max(0, (min(source.stat().st_size for source in sources) - 44) // 2)
+            available = max(0, (path.stat().st_size - 44) // 2)
             cut = copy_state.get("cut") if copy_state else None
             if not capture["live"] and cut is None:
                 if not copy_state:
@@ -971,7 +1125,6 @@ class MacBridge:
         state = take.copy_state if take else None
         if not state or take.state.get("meeting") != expected or take.finished:
             raise ValueError("This meeting is no longer active.")
-        child = take.child
         if state.get("request"):
             raise ValueError("Jard is already preparing a meeting excerpt.")
         request = str(uuid4())
@@ -979,8 +1132,7 @@ class MacBridge:
         state["cut"] = None
         try:
             async with asyncio.timeout(3):
-                child.stdin.write(f"copy {request}\n".encode())
-                await child.stdin.drain()
+                await take.command(f"copy {request}")
                 while not state.get("closed"):
                     cut = state["cut"]
                     if cut is not None and state["through"] >= cut:
@@ -1046,12 +1198,17 @@ class MacBridge:
                         "started",
                         mode=capture["mode"],
                         microphone=event["microphone"],
+                        **({"warm": True} if take.warm_events is not None else {}),
                         **({"live": True, "session": stage["id"]} if meeting else {}),
+                        **({"microphoneAvailable": event["microphoneAvailable"]}
+                           if meeting and type(event.get("microphoneAvailable")) is bool else {}),
                         **({"openedAt": event["openedAt"]} if capture_id and "openedAt" in event else {}),
                         **({"usingDefaultMicrophone": True} if capture_id and event.get("usingDefaultMicrophone") is True else {}),
                     )
                 elif kind == "levels" and take.started:
                     capture["seconds"] = event["seconds"]
+                    if take.global_dictation and type(event["mic"]) in (int, float) and 0 <= event["mic"] <= 1:
+                        take.microphone_peak = (monotonic(), event["mic"])
                     notify(
                         "levels",
                         seconds=event["seconds"],
@@ -1059,9 +1216,12 @@ class MacBridge:
                         system=event["system"],
                         microphone=event["microphone"],
                         **({"micRms": event["micRms"]} if "micRms" in event else {}),
+                        **({"meetingRms": event["meetingRms"]} if meeting and "meetingRms" in event else {}),
                     )
-                elif kind == "sourceChanged":
-                    notify(kind, microphone=event["microphone"], message=event["message"])
+                elif kind == "sourceChanged" and take.started:
+                    notify(kind, microphone=event["microphone"], message=event["message"],
+                           **({"microphoneAvailable": event["microphoneAvailable"]}
+                              if meeting and type(event.get("microphoneAvailable")) is bool else {}))
                 elif kind == "meetingSystemAudio" and meeting and take.started and type(event.get("available")) is bool:
                     notify(kind, available=event["available"])
                 elif kind == "meetingMicWarning" and meeting and take.started and type(event.get("active")) is bool:
@@ -1112,8 +1272,12 @@ class MacBridge:
         except (OSError, ValueError, KeyError) as e:
             reason = explain(e)
             if child.returncode is None:
-                child.terminate()
-                await child.wait()
+                if take.warm_events is not None:
+                    with contextlib.suppress(OSError):
+                        await take.command("stop")
+                else:
+                    child.terminate()
+                    await child.wait()
         finally:
             take.finished = True
             if meeting:
@@ -1125,8 +1289,7 @@ class MacBridge:
                 # Allow a cut pressed before Stop to read the final committed samples.
                 if copy_state.get("cut") is not None:
                     with contextlib.suppress(OSError):
-                        committed = min((path.with_suffix(f".{source}.wav").stat().st_size - 44) // 2
-                                        for source in ("mic", "system"))
+                        committed = (path.stat().st_size - 44) // 2
                         copy_state["cut"] = min(copy_state["cut"], max(0, committed))
                         copy_state["changed"].set()
                         while copy_state.get("request"):
@@ -1153,8 +1316,10 @@ class MacBridge:
                         notify("error", message=message, noSpeech=not permission and reason in (None, "", "Stopped"),
                                **permission, **interruption, **({"openingAbandoned": True} if opening_abandoned else {}))
                 return
-            if path.is_file() and path.stat().st_size > 44:
-                notify("finished", reason=reason or "Stopped")
+            recorded_bytes = path.stat().st_size if path.is_file() else 0
+            if recorded_bytes > 44:
+                notify("finished", reason=reason or "Stopped",
+                       **({"seconds": (recorded_bytes - 44) / 96000} if meeting else {}))
                 prefix = "Recording"
                 if meeting:
                     label = capture["meetingLabel"]
@@ -1203,8 +1368,7 @@ class MacBridge:
                     command = "cancel"
                 if command == "finish" and type(release_at) in (int, float) and 0 < release_at < math.inf:
                     command += f" {release_at:.9f}"
-                child.stdin.write((command + "\n").encode("ascii"))
-                await child.stdin.drain()
+                await take.command(command)
 
     async def discard_dictation(self, key):
         owner = next((capture for capture, stage in self.dictation_stages.items() if stage == key), None)
@@ -1224,6 +1388,12 @@ class MacBridge:
         if kind not in ("audio", "json", "md", "notes", "srt", "vtt") and annotation_kind not in ANNOTATION_ASSETS:
             raise ValueError("Unsupported export format.")
         session = await self.api("GET", "sessions/" + key)
+        library = SessionStore(self.root, read_only=True)
+        protected = self.root.resolve()
+        capture_folder = None
+        if session.get("annotation") and not session.get("annotationStorageUnavailable"):
+            with contextlib.suppress(MissingSession):
+                capture_folder = (await asyncio.to_thread(library.annotation_asset, key, "manifest"))[0].parent
         data = None
         if annotation_kind:
             name = Path(session["audioName"]).stem + "-" + ANNOTATION_ASSETS[annotation_kind][0]
@@ -1231,8 +1401,8 @@ class MacBridge:
             response.raise_for_status()
             data = response.content
         elif kind == "audio":
-            if not session.get("audioPath"):
-                raise ValueError("The audio has been removed from this meeting.")
+            if not session.get("audioUrl"):
+                raise ValueError("The recording is unavailable.")
             name = session["audioName"]
         elif kind == "json":
             name = Path(session["audioName"]).stem + ".json"
@@ -1245,7 +1415,8 @@ class MacBridge:
         if not choice:
             return None
         dest = Path(choice)
-        if dest.resolve().is_relative_to(self.root.resolve()):
+        resolved = dest.resolve()
+        if resolved.is_relative_to(protected) or (capture_folder and resolved.is_relative_to(capture_folder)):
             raise ValueError(
                 "Choose an export destination outside the session library."
             )
@@ -1255,7 +1426,8 @@ class MacBridge:
                 partial = Path(temp.name)
             try:
                 if kind == "audio":
-                    shutil.copyfile(self.root / session["audioPath"], partial)
+                    source, _ = library.media(key)
+                    shutil.copyfile(source, partial)
                 elif data is not None:
                     partial.write_bytes(data)
                 else:
@@ -1274,6 +1446,11 @@ class MacBridge:
 
     async def meeting_exports(self, args):
         action = args.get("action")
+        if action == "revealFiles":
+            key = str(UUID(args["id"]))
+            result = await self.api("GET", f"native/meetings/{key}/recording-files")
+            await run_helper("/usr/bin/open", result["folder"])
+            return result
         if action == "reveal" and args.get("id"):
             key = str(UUID(args["id"]))
             result = await self.api("GET", f"native/meeting-exports/{key}")
@@ -1304,66 +1481,219 @@ class MacBridge:
         key = str(UUID(args["id"]))
         async with self.capture_lock:
             if active:
-                if self.updating or self.annotation or self.captures or self.dictation_stages or self.dictation_jobs or self.sdk_capture.active:
+                if self.meeting_mic_lease:
+                    raise ValueError("The meeting microphone is reconnecting. Try Annotate again.")
+                if self.updating or self.annotation or self.sdk_capture.active:
                     raise ValueError("Finish the active recording or dictation first.")
-                await self.close_warm()
+                worker = self.warm_worker if self.captures else None
+                if self.captures and (worker is None or worker.child.returncode is not None or
+                        worker.reader is None or worker.reader.done() or any(
+                            take.warm_events is None or take.child is not worker.child for take in self.captures.values())):
+                    raise ValueError("Finish the active recording or dictation first.")
+                if worker is None and (self.dictation_stages or self.dictation_jobs):
+                    raise ValueError("Finish the active recording or dictation first.")
+                storage = await self.api("GET", "native/annotation-storage")
+                if not storage["available"]:
+                    raise ValueError("The Annotations folder is unavailable. Reconnect it or choose another folder.")
                 self.annotation = key
+                self.annotation_worker = worker
+                self.annotation_location = storage["storageId"] if storage["custom"] else None
                 self.annotation_started_at = time()
             elif self.annotation == key:
+                worker = self.annotation_worker
+                if self.annotation_narrating and worker:
+                    with contextlib.suppress(ValueError, OSError):
+                        await self.warm_annotation_command(worker, "cancel")
+                self.annotation_worker = self.annotation_narration = None
+                self.annotation_narrating = False
+                self.annotation_narration_stopped = False
                 self.annotation = None
+                self.annotation_location = None
                 self.annotation_started_at = None
                 asyncio.create_task(self.reconcile_warm())
         return {"active": self.annotation == key}
+
+    async def warm_annotation_command(self, worker, action, **fields):
+        if worker.child.returncode is not None or worker.reader is None or worker.reader.done():
+            raise ValueError("The shared microphone stopped.")
+        self.annotation_command += 1
+        request = self.annotation_command
+        future = asyncio.get_running_loop().create_future()
+        worker.annotation_reply = (request, future)
+        try:
+            message = {"annotation": request, "action": action, **fields}
+            worker.child.stdin.write((json.dumps(message, allow_nan=False) + "\n").encode())
+            await asyncio.wait_for(worker.child.stdin.drain(), 1)
+            error = await asyncio.wait_for(future, 4)
+            if isinstance(error, str):
+                raise ValueError(error[:600])
+        except TimeoutError:
+            raise ValueError("The shared microphone did not finish preparing the annotation.") from None
+        finally:
+            worker.annotation_reply = None
+
+    async def annotation_audio(self, args):
+        key = str(UUID(args["id"]))
+        action = args.get("action")
+        async with self.capture_lock:
+            if self.annotation != key or self.updating:
+                raise ValueError("This annotation is no longer active.")
+            if action == "prepare":
+                path = Path(args["path"])
+                parent = path.parent
+                if (not path.is_absolute() or parent.name != f"jard-annotation-{key}" or path.name != "Narration.wav"
+                        or parent.is_symlink() or not parent.is_dir() or path.exists() or path.is_symlink()):
+                    raise ValueError("The annotation narration destination is invalid.")
+                options = self.input_options(args)
+                worker = self.annotation_worker or await self.open_warm(options)
+                if worker is None:
+                    raise ValueError("Could not open the shared microphone.")
+                try:
+                    await asyncio.wait_for(worker.input_ready.wait(), 4)
+                except TimeoutError:
+                    raise ValueError("The shared microphone is unavailable. Check the selected input.") from None
+                if not worker.availability or worker.availability["phase"] == "unavailable" or worker.reader.done():
+                    raise ValueError("The shared microphone did not become ready.")
+                self.annotation_worker, self.annotation_narration = worker, path
+            elif action in ("start", "stop") and self.annotation_worker and self.annotation_narration:
+                boundary = args.get("at")
+                if type(boundary) not in (int, float) or not 0 < boundary < math.inf:
+                    raise ValueError("The annotation timing is invalid.")
+                if action == "start":
+                    if self.annotation_narrating:
+                        raise ValueError("Annotation narration is already recording.")
+                    # A failed acknowledgement can leave the file sink open. Release
+                    # the lease through the usual cancellation path in that case.
+                    self.annotation_narrating = True
+                    await self.warm_annotation_command(self.annotation_worker, "start", path=str(self.annotation_narration), at=boundary)
+                else:
+                    if not self.annotation_narrating:
+                        raise ValueError("The annotation has no microphone narration.")
+                    await self.warm_annotation_command(self.annotation_worker, "stop", at=boundary)
+                    self.annotation_narration_stopped = True
+            else:
+                raise ValueError("This annotation microphone operation is unavailable.")
+        return {"ready": True}
+
+    async def annotation_storage(self, args, *, allow_path=False):
+        action = args.get("storageAction") if allow_path else args.get("action")
+        actions = {"status", "reveal", "reset", "set"} if allow_path else {"status", "reveal", "choose", "reset"}
+        if action not in actions:
+            raise ValueError("Choose an annotation storage action.")
+        route = "native/annotation-storage"
+        status = await self.api("GET", route)
+        if action == "status":
+            return status
+        require_annotation()
+        if action == "reveal":
+            if not status["available"]:
+                raise ValueError("The Annotations folder is unavailable.")
+            await run_helper("/usr/bin/open", status["folder"])
+            return status
+        folder = args.get("folder") if action == "set" else None
+        if action == "choose":
+            folder = (await self.dialog("annotation-folder", status["folder"])).get("path")
+            if not folder:
+                return await self.api("GET", route)
+        async with self.capture_lock:
+            if self.updating or self.annotation:
+                raise ValueError("Finish the active annotation before changing its folder.")
+            return await self.api("PUT", route, json={"folder": folder})
 
     async def import_annotation(self, args):
         require_annotation()
         key = str(UUID(args["id"]))
         source = Path(args["path"])
-        if self.annotation != key or not source.is_absolute() or source.name != "Screen annotation.mp4" or (
-            source.parent.name != "jard-annotation-" + key or source.is_symlink()
+        narration_only = args.get("narrationOnly") is True
+        filename = "Narration.wav" if narration_only else "Screen annotation.mp4"
+        if self.annotation != key or not source.is_absolute() or source.name != filename or (
+            source.parent.name != "jard-annotation-" + key or source.is_symlink() or source.parent.is_symlink()
         ):
             raise ValueError("This screen annotation is unavailable.")
         if not source.is_file():
-            raise ValueError("The screen recording did not produce a video.")
+            raise ValueError("The capture did not produce usable media.")
         assets = args.get("assets") is True
+        narration = args.get("narration")
+        if narration_only and (not assets or narration is not None or source != self.annotation_narration or
+                               not self.annotation_narration_stopped):
+            raise ValueError("The shared annotation narration has not been saved.")
+        if narration is not None:
+            if not isinstance(narration, str) or self.annotation_narration != Path(narration):
+                raise ValueError("The shared annotation narration is unavailable.")
+            narration = self.annotation_narration
+            if narration.is_symlink() or narration.parent != source.parent or not narration.is_file():
+                raise ValueError("The shared annotation narration could not be read.")
         start = self.annotation_started_at
         origin = annotation_origin(args.get("routeOrigin")) if assets else None
         stage = await self.api("POST", "native/staging", params={"annotation_id": key})
         try:
             target = Path(stage["path"])
             def copy_annotation():
-                shutil.copyfile(source, target)
+                if narration is None:
+                    shutil.copyfile(source, target)
                 if assets:
                     for kind, destination in staged_annotation_paths(target).items():
                         original = source.with_name(ANNOTATION_ASSETS[kind][0])
-                        if kind == "manifest" or original.exists():
+                        if kind == "manifest" or (not narration_only and original.exists()):
                             shutil.copyfile(annotation_input(original, kind), destination)
                             destination.chmod(0o600)
 
+            if narration is not None:
+                packaged_ffmpeg = self.helpers / "ffmpeg"
+                ffmpeg = str(packaged_ffmpeg) if packaged_ffmpeg.is_file() else shutil.which("ffmpeg")
+                if not ffmpeg:
+                    raise ValueError("Could not find FFmpeg to attach the narration.")
+                try:
+                    await run_helper(ffmpeg, "-nostdin", "-v", "error", "-y", "-i", source, "-i", narration,
+                                     "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+                                     "-af", "apad", "-shortest", "-movflags", "+faststart", "-f", "mp4", target)
+                except RuntimeError as error:
+                    raise ValueError("Could not attach narration. The screen recording and narration are available in Finder.") from error
             await asyncio.to_thread(copy_annotation)
-            result = await self.submit(stage["id"], {**self.options(args), "annotation": str(assets).lower()}, name=source.name,
-                                       mime="video/mp4", recording=False)
+            location = {"annotation_location": self.annotation_location} if assets and self.annotation_location else {}
+            mime = "audio/wav" if narration_only else "video/mp4"
+            result = await self.submit(stage["id"], {**self.options(args), **location, "annotation": str(assets).lower()}, name=source.name,
+                                       mime=mime, recording=False)
             try:
                 await self.automatic_annotations.enqueue(key, origin, start)
             except (ValueError, OSError):
                 # Routing preferences do not affect whether the local recording was saved.
                 pass
+            routing = self.automatic_annotations.status(key)
+            if routing["phase"] != "idle":
+                result["routing"] = routing
             return result
         except BaseException:
             with contextlib.suppress(httpx.HTTPError):
                 await self.api("DELETE", "native/staging/" + stage["id"])
             raise
 
-    def annotation_handoff(self, key):
+    def annotation_handoff(self, key, *, require_narration=False):
+        if require_narration:
+            route = self.automatic_annotations.receipts.get_route(key)
+            if route and route["state"] not in ("cancelled", "failed"):
+                raise ValueError("Automatic delivery is pending or has already been attempted. Check the annotation in Sessions.")
         library = SessionStore(self.root, read_only=True)
         try:
             detail = annotation_detail(library, key)
         except MissingSession as error:
             raise ValueError("Annotation not found.") from error
+        if require_narration and detail["status"] == "processing":
+            return None
         markdown = annotation_context(detail)["markdown"]
         if len(json.dumps(markdown, ensure_ascii=False).encode()) > 3 * 1024 * 1024:
             raise ValueError("This annotation is too long to copy from Jard. Use jardctl annotate context.")
         return {"markdown": markdown, "imagePath": detail["contactSheetPath"]}
+
+    def annotation_review(self, key):
+        library = SessionStore(self.root, read_only=True)
+        try:
+            path, _ = library.annotation_asset(key, "contact-sheet")
+        except (MissingSession, OSError) as error:
+            raise ValueError("The contact sheet is unavailable. Open the annotation in Sessions.") from error
+        if path.parent.is_symlink():
+            raise ValueError("The contact sheet is unavailable. Open the annotation in Sessions.")
+        return {"imagePath": str(path)}
 
     async def annotation_routes(self, action, args):
         capture = args.get("id")
@@ -1382,6 +1712,40 @@ class MacBridge:
             raise RouteUnavailable("Another annotation operation is in progress.")
         return await self.change_annotation_delivery(send_annotation, capture, target, service, authorize=authorize)
 
+    async def send_session_to_agent(self, args):
+        agent, target = args.get("agent"), args.get("target")
+        identifier = str(UUID(args["id"]))
+        if agent not in (*annotation_agents.AGENT_NAMES, "opencode"):
+            raise ValueError("Choose a coding agent.")
+        if agent == "opencode":
+            require_opencode()
+        if self.annotation_delivery_busy or self.updating:
+            raise ValueError("Wait for the current delivery or restart to finish.")
+        self.annotation_delivery_busy = True
+        try:
+            text, images, has_images, annotation = await asyncio.to_thread(
+                annotation_agents.session_payload, self.root, identifier, agent, URL)
+            if agent == "opencode":
+                annotation_agents.check_size(agent, text, images)
+                files = [{"name": f"jaro-image-{index}.{'png' if mime == 'image/png' else 'jpg'}",
+                          "uri": f"data:{mime};base64,{data}"}
+                         for index, (mime, data) in enumerate(images, 1)]
+                body = {"text": text, "files": files, "delivery": "queue"}
+                if annotation:
+                    await self.automatic_annotations.cancel(identifier, "Automatic send replaced by a manual send.")
+                    await send_annotation(self.root, identifier, target, args.get("service"), body=body)
+                else:
+                    await send_session_prompt(body, target, args.get("service"))
+            else:
+                await annotation_agents.deliver(agent, target, text, images)
+            opened = args.get("open") is True and await annotation_agents.open_agent(agent, target)
+            return {"images": "references" if has_images and agent == "t3" else "attached" if has_images else "none",
+                    "opened": opened}
+        except MissingSession as error:
+            raise ValueError("Session not found.") from error
+        finally:
+            self.annotation_delivery_busy = False
+
     async def annotation_route(self, args):
         identifier = str(UUID(args["id"]))
         action = args.get("action", "status")
@@ -1390,6 +1754,19 @@ class MacBridge:
         if action == "cancel":
             await self.automatic_annotations.cancel(identifier)
         return await self.automatic_annotations.query(identifier)
+
+    async def undo_automatic_annotation(self, identifier):
+        async def undo_from_route(root):
+            receipt = await asyncio.to_thread(self.automatic_annotations.automatic_receipt, identifier)
+            if not receipt:
+                raise ValueError("The automatic annotation delivery could not be found.")
+            if receipt["status"] == "queued" and receipt["canUndo"]:
+                await undo_annotation(root, receipt["deliveryId"])
+
+        await self.change_annotation_delivery(undo_from_route)
+        status = await self.automatic_annotations.query(identifier)
+        send({"event": "jard-annotation-routing", "detail": status})
+        return status
 
     async def change_annotation_delivery(self, operation, *values, **options):
         require_opencode()
@@ -1410,6 +1787,89 @@ class MacBridge:
         await self.automatic_annotations.cancel(identifier, "Automatic send replaced by a manual send.")
         return await self.change_annotation_delivery(send_annotation, identifier, args.get("target"), args.get("service"))
 
+    @staticmethod
+    def panel_delivery_status(receipt):
+        return {"capture": receipt["annotation"], "deliveryId": receipt["deliveryId"],
+                "phase": "unconfirmed" if receipt["status"] == "unconfirmed" else "sent",
+                "message": "OpenCode accepted the annotation.", **describe_delivery(receipt)}
+
+    async def send_panel_annotation(self, identifier, target, service, remember_kind):
+        if not service:
+            raise ValueError("Refresh the OpenCode destinations and choose again.")
+
+        async def send_from_preview(root):
+            receipts = self.automatic_annotations.receipts
+            scope = None
+            if remember_kind is not None:
+                detail = await asyncio.to_thread(capture_for_routing, root, identifier)
+                scope = next((value for value in route_scopes(detail) if value["kind"] == remember_kind), None)
+                if not scope:
+                    raise ValueError("This annotation does not have that captured app, site, or terminal project.")
+            route = await asyncio.to_thread(receipts.get_route, identifier)
+            if route and route["state"] not in ("cancelled", "failed"):
+                previous = await asyncio.to_thread(self.automatic_annotations.route_receipt, route, identifier)
+                if not previous or previous["status"] not in ("withdrawn", "reverted"):
+                    raise ValueError("An automatic delivery is pending or was already attempted. Check Sessions.")
+            try:
+                async with asyncio.timeout(12):
+                    while (await self.automatic_capture(identifier))["status"] == "processing":
+                        await asyncio.sleep(.3)
+            except TimeoutError as error:
+                raise ValueError("Narration is still processing. Try Send again shortly.") from error
+            recent = await asyncio.to_thread(receipts.recent, identifier)
+            if any(item["status"] == "unconfirmed" or (item["service"] == service and item["session"]["id"] == target and
+                   item["status"] not in ("withdrawn", "reverted", "refused")) for item in recent):
+                raise ValueError("A delivery was already attempted. Review it in Sessions before sending again.")
+
+            attempt = None
+            destination_title = None
+
+            async def authorize(service_key, destination, included_sheet):
+                nonlocal attempt, destination_title
+                destination_title = destination["title"]
+                attempt = await asyncio.to_thread(receipts.begin, identifier, service_key, destination, included_sheet,
+                                                  remember_scope=scope)
+                return attempt
+
+            try:
+                receipt = await send_annotation(root, identifier, target, service, authorize=authorize, remember_scope=scope)
+            except (ValueError, OSError) as error:
+                if attempt is None:
+                    raise
+                receipt = None
+                with contextlib.suppress(ValueError, OSError):
+                    receipt = await asyncio.to_thread(receipts.get, attempt)
+                if receipt and receipt["status"] == "refused":
+                    raise
+                return {"capture": identifier, "phase": "unconfirmed", "title": destination_title, "message": str(error)}
+            finally:
+                if attempt:
+                    send({"event": "jard-annotation-delivery-changed", "detail": {"capture": identifier}})
+            return self.panel_delivery_status(receipt)
+
+        return await self.change_annotation_delivery(send_from_preview)
+
+    async def undo_panel_annotation(self, identifier, delivery):
+        async def undo_from_preview(root):
+            receipt = await asyncio.to_thread(self.automatic_annotations.receipts.get, delivery)
+            if not receipt or receipt["annotation"] != identifier:
+                raise ValueError("This delivery does not belong to the annotation.")
+            if receipt["status"] == "queued" and receipt["canUndo"]:
+                try:
+                    receipt = await undo_annotation(root, delivery)
+                except (ValueError, OSError) as error:
+                    current = await asyncio.to_thread(self.automatic_annotations.receipts.get, delivery)
+                    if not current or current.get("rememberedRule") == receipt.get("rememberedRule"):
+                        raise
+                    status = self.panel_delivery_status(current)
+                    return {**status, "message": f"{status['message']} {error}"}
+            return self.panel_delivery_status(receipt)
+
+        try:
+            return await self.change_annotation_delivery(undo_from_preview)
+        finally:
+            send({"event": "jard-annotation-delivery-changed", "detail": {"capture": identifier}})
+
     async def rewrite_dictation(self, text, instruction, vocabulary, deadline, *, application="", browser_host=""):
         if not instruction:
             raise ValueError("Set rewrite instructions in Dictation Settings.")
@@ -1425,33 +1885,38 @@ class MacBridge:
         async with self.capture_lock:
             if self.annotation_delivery_busy:
                 raise ValueError("Wait for the annotation delivery to finish before restarting.")
-            if self.annotation or self.captures or self.dictation_stages or self.dictation_jobs or self.sdk_capture.active:
+            if self.annotation or self.captures or self.dictation_stages or self.dictation_jobs or self.sdk_capture.busy:
                 raise ValueError("Finish your recording or dictation before restarting Jard.")
             self.updating = True
             await self.automatic_annotations.close()
             try:
                 await self.api("POST", "native/update-quiesce/" + self.client_id)
                 await self.close_warm()
-                for _ in range(40):
-                    try:
-                        _, writer = await asyncio.open_connection(HOST, PORT)
-                    except ConnectionRefusedError:
-                        return {"ready": True}
-                    writer.close()
-                    await writer.wait_closed()
-                    await asyncio.sleep(0.2)
-                raise RuntimeError("The local engine is still shutting down. Try restarting again.")
+                await self.wait_for_engine_exit()
+                return {"ready": True}
             except BaseException:
                 self.updating = False
                 with contextlib.suppress(ValueError, OSError):
                     await self.automatic_annotations.resume()
                 raise
 
+    @staticmethod
+    async def wait_for_engine_exit():
+        for _ in range(40):
+            try:
+                _, writer = await asyncio.open_connection(HOST, PORT)
+            except ConnectionRefusedError:
+                return
+            writer.close()
+            await writer.wait_closed()
+            await asyncio.sleep(0.2)
+        raise RuntimeError("The local engine is still shutting down. Try restarting again.")
+
     async def quiesce_desktop(self, *, force=False):
         async with self.capture_lock:
             if self.annotation_delivery_busy:
                 raise ValueError("Wait for the annotation delivery to finish before closing.")
-            if self.annotation or (not force and (self.captures or self.dictation_stages or self.dictation_jobs or self.sdk_capture.active)):
+            if self.annotation or (not force and (self.captures or self.dictation_stages or self.dictation_jobs or self.sdk_capture.busy)):
                 raise ValueError("Finish your recording or dictation before closing Jard.")
             self.updating = True
             await self.automatic_annotations.close()
@@ -1483,25 +1948,68 @@ class MacBridge:
             return None
         if not self.connected:
             raise ValueError("Open the local workspace first.")
+        if command == "jard.meetingClock":
+            clock = args.get("hours")
+            if clock not in ("12", "24"):
+                raise ValueError("Choose a 12- or 24-hour meeting clock.")
+            return await self.sync_meeting_clock(clock)
         if command == "jard.annotationLease":
             return await self.annotation_lease(args)
+        if command == "jard.annotationAudio":
+            return await self.annotation_audio(args)
         if command == "jard.importAnnotation":
             return await self.import_annotation(args)
         if command == "jard.annotationRoutingPolicy":
             return {"managed": opencode_managed()}
+        if command == "jard.annotationStorage":
+            return await self.annotation_storage(args)
         if command == "jard.annotationRoute":
             return await self.annotation_route(args)
+        if command == "jard.annotationRouteUndo":
+            return await self.undo_automatic_annotation(str(UUID(args["id"])))
+        if command == "jard.annotationRouteConfirm":
+            return {"accepted": self.automatic_annotations.confirm_from_panel(args.get("capture"), args.get("nonce"), args.get("state"))}
+        if command == "jard.annotationPanelSend":
+            return await self.send_panel_annotation(str(UUID(args["id"])), args.get("target"), args.get("service"), args.get("rememberScope"))
+        if command == "jard.annotationPanelUndo":
+            return await self.undo_panel_annotation(str(UUID(args["id"])), str(UUID(args["deliveryId"])))
         if command == "jard.annotationRoutePanel":
             await self.automatic_annotations.panel_action(args.get("capture"), args.get("action"), args.get("held") is True)
             return None
         if command == "jard.annotationHandoff":
-            return await asyncio.to_thread(self.annotation_handoff, str(UUID(args["id"])))
+            key = str(UUID(args["id"]))
+            require_narration = args.get("waitForNarration") is True
+            try:
+                async with asyncio.timeout(12):
+                    while True:
+                        handoff = await asyncio.to_thread(self.annotation_handoff, key, require_narration=require_narration)
+                        if handoff is not None:
+                            return handoff
+                        await asyncio.sleep(.3)
+            except TimeoutError as error:
+                raise ValueError("Narration is still processing. Try Paste again shortly.") from error
+        if command == "jard.annotationReview":
+            return await asyncio.to_thread(self.annotation_review, str(UUID(args["id"])))
         route_action = {"jard.annotationDestinations": "destinations", "jard.rememberAnnotationDestination": "remember",
                         "jard.forgetAnnotationDestination": "forget"}.get(command)
         if route_action:
             return await self.annotation_routes(route_action, args)
         if command == "jard.sendAnnotation":
             return await self.deliver_annotation(args)
+        if command == "jard.annotationAgentDestinations":
+            return await annotation_agents.destinations(args.get("agent"), args.get("query"))
+        if command == "jard.sendSessionToAgent":
+            return await self.send_session_to_agent(args)
+        if command == "jard.sendAnnotationToAgent":
+            if self.annotation_delivery_busy or self.updating:
+                raise ValueError("Wait for the current annotation delivery or restart to finish.")
+            self.annotation_delivery_busy = True
+            try:
+                return await annotation_agents.send_annotation(self.root, args.get("agent"), args.get("id"), args.get("target"))
+            except MissingSession as error:
+                raise ValueError("Annotation not found.") from error
+            finally:
+                self.annotation_delivery_busy = False
         if command == "jard.annotationDeliveries":
             return await asyncio.to_thread(recent_deliveries, self.root, args.get("id"))
         if command == "jard.undoAnnotationDelivery":
@@ -1588,6 +2096,10 @@ class MacBridge:
             return await self.warm(args)
         if command == "jard.devices":
             return await self.devices()
+        if command == "jard.inputDevices":
+            return await self.input_devices()
+        if command == "jard.microphoneLevel":
+            return await self.microphone_level()
         if command == "jard.record":
             return await self.record(args)
         if command == "jard.copyMeeting":
@@ -1635,20 +2147,24 @@ class MacBridge:
                 await self.stop(take)
             await asyncio.shield(take.job)
             return None
-        if command == "jard.meetingTranscript":
-            key = str(UUID(args["session"]))
-            session = await self.api("GET", "sessions/" + key)
-            if session.get("status") == "processing":
-                raise ValueError("The meeting transcript is still processing.")
-            transcript = session.get("transcript") or {}
-            text = transcript.get("text", "").strip()
-            if not session.get("meeting") or not text or len(text) > 500_000:
-                raise ValueError("There is no meeting transcript to copy here. Check Sessions.")
-            labels = transcript.get("speakerNames", {})
-            labeled = "\n".join(f"{labels.get(str(turn['speaker']), 'Speaker ' + str(turn['speaker']))}: {turn['text']}"
-                                if turn["speaker"] is not None else turn["text"]
-                                for turn in transcript["segments"]) if labels else text
-            return {"text": text, "labeledText": labeled}
+        if command == "jard.latestMeetingTranscript":
+            live = self.live_meeting(turns=True)
+            if live:
+                live["meetingTurns"] = list(live["meetingTurns"])
+            result = await asyncio.to_thread(latest_transcript, SessionStore(self.root, read_only=True), live)
+            if len(result["text"].encode("utf-8")) > 500_000:
+                raise ValueError("Open Sessions to copy or export this longer meeting transcript.")
+            return result
+        if command == "jard.savedMeetingTranscript":
+            key = str(UUID(args["id"]))
+            try:
+                text = await asyncio.to_thread(saved_meeting_clipboard, SessionStore(self.root, read_only=True), key)
+            except MissingSession as error:
+                raise ValueError("This meeting is no longer available.") from error
+            result = {"text": text}
+            if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > 3 * 1024 * 1024:
+                raise ValueError("Use Meeting exports to save this longer transcript.")
+            return result
         if command == "jard.stop":
             if take := self.workspace_capture():
                 await self.stop(take)
@@ -1864,7 +2380,8 @@ async def main():
     ) as http:
         bridge = MacBridge(helpers, http)
         loop = asyncio.get_running_loop()
-        reader = asyncio.StreamReader()
+        # Match the native host's line bound for older paginated history clients.
+        reader = asyncio.StreamReader(limit=4 * 1024 * 1024)
         transport, _ = await loop.connect_read_pipe(
             lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer
         )

@@ -1,6 +1,6 @@
 import { useInterfaceLanguage } from "@/interface-language"
 import { useEffect, useEffectEvent, useRef, useState, type ChangeEvent } from "react"
-import { ChevronDown, FolderOpen, Mic, Plus, Square, UsersRound } from "lucide-react"
+import { AudioLines, ChevronDown, FolderOpen, Mic, Plus, Square, UsersRound } from "lucide-react"
 
 import { captureSources, desktopBridge, RECORDING_MODES, savedRecordingMode, type CaptureSource, type DesktopCaptureEvent, type RecordingDraft, type RecordingMode } from "./desktop"
 import { useRecordingAccess } from "./use-recording-access"
@@ -8,12 +8,16 @@ import { DesktopAnnotationControls } from "@/components/desktop-annotation"
 import { DesktopMeetingControls } from "@/components/desktop-meetings"
 import { DesktopUpdateControl, DesktopUpdateFeedback, DesktopUpdateSettings } from "@/components/desktop-update"
 import { DesktopApplicationSettings } from "@/components/desktop-application-settings"
+import { AgentSetupSettings } from "@/components/agent-setup-settings"
+import { hasLinuxDictation, LinuxDictationWorkspace } from "@/components/linux-dictation-workspace"
 import { useDesktopUpdate } from "@/desktop-update"
 import { useSystemDictation } from "./system-dictation"
+import { discardPortableRecording, finishPortableRecording, hasPortableAudio, portableRecordingDrafts, openPortableRecording, type PortableRecording, type SourceLevels } from "./portable-capture"
 import { SystemDictationSettings, SystemDictationTour, SystemDictationWorkspace } from "@/components/system-dictation"
 import { RecordingAccessDialog, RecordingAccessSettings } from "@/components/recording-permissions"
 import { readSessionRoute, sessionTab, writeSessionRoute } from "./session-route"
-import { clock, meetingSpeakerNames, speakerLabel } from "./speaker-activity"
+import { clock, transcriptForClipboard } from "./speaker-activity"
+import { copySavedMeetingTranscript } from "./desktop-meeting"
 import { QuitButton } from "@/components/quit-button"
 import { SessionLibrary } from "@/components/session-library"
 import { ResultsPanel } from "@/components/results-panel"
@@ -23,12 +27,14 @@ import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
 import {
   EMPTY_TRANSCRIPT,
+  isSettledMeeting,
   livePreview,
   MAX_SECONDS,
   MissingSessionError,
   readSession,
   openMicrophone,
   transcribeMedia,
+  type AudioFrames,
   type Microphone,
   type SavedSession,
 } from "./audio"
@@ -37,7 +43,7 @@ type ModelStatus = "loading" | "ready" | "error"
 type Phase = "idle" | "starting" | "recording" | "transcribing"
 type ProcessingAudio = { seconds: number; duration: number | null }
 type Session = {
-  microphone: Microphone
+  microphone: Microphone | PortableRecording
   languages: string[]
   diarization: boolean
   id?: string
@@ -74,7 +80,6 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   const [previewPaused, setPreviewPaused] = useState(false)
   const [tab, setTab] = useState("transcript")
   const [result, setResult] = useState(EMPTY_TRANSCRIPT)
-  const { text: transcript, segments } = result
   const [feedback, setFeedback] = useState("")
   const [processed, setProcessed] = useState<ProcessingAudio | null>(null)
   const [elapsed, setElapsed] = useState(0)
@@ -85,7 +90,8 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   const systemDictation = useSystemDictation(native)
   const [permissionGuide, setPermissionGuide] = useState<"inspection" | "record" | null>(null)
   const [refusedSource, setRefusedSource] = useState<CaptureSource | null>(null)
-  const [mode, setMode] = useState<RecordingMode>(savedRecordingMode)
+  const [mode, setMode] = useState<RecordingMode>(() => hasPortableAudio ? "mic" : savedRecordingMode())
+  const portableMeeting = hasPortableAudio && mode === "both"
   const selectedSources = captureSources(mode)
   const selectedRefusal = refusedSource && selectedSources.includes(refusedSource) ? refusedSource : null
   const needsRecordingAccess = !!selectedRefusal || (recordingAccess.checked &&
@@ -98,6 +104,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   const nativeCapture = useRef(false)
   const nativeStopping = useRef(false)
   const nativeMeeting = useRef(false)
+  const [liveMeeting, setLiveMeeting] = useState<{ shared: boolean } | null>(null)
   const [meetingStopPending, setMeetingStopPending] = useState(false)
   const nativeSession = useRef<AbortController | null>(null)
   const deviceRevision = useRef(0)
@@ -111,6 +118,15 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   const pendingNavigation = useRef(false)
   const session = useRef<Session | null>(null)
   const copyTimer = useRef<number>(undefined)
+
+  useEffect(() => {
+    if (!hasPortableAudio) return
+    const controller = new AbortController()
+    void portableRecordingDrafts(controller.signal).then(drafts => {
+      if (!controller.signal.aborted) setRecoveredAudio(drafts)
+    }).catch(() => {})
+    return () => controller.abort()
+  }, [])
 
   useEffect(() => {
     if (native) return
@@ -200,7 +216,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   function openSaved(saved: SavedSession, reopening = true) {
     restoreRequest.current?.abort()
     setRestoring(false)
-    const tab = showSession(saved, saved.annotation ? "annotation" : reopening ? "overview" : "transcript")
+    const tab = showSession(saved, saved.annotation || reopening ? "overview" : "transcript")
     writeSessionRoute(saved.id, tab)
   }
 
@@ -235,6 +251,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         nativeCapture.current = true
         nativeStopping.current = false
         nativeMeeting.current = !!event.meeting
+        setLiveMeeting(event.meeting ? { shared: !!event.warm } : null)
         setMeetingStopPending(false)
         setMode(event.mode)
         if (event.live !== undefined) setLive(event.live)
@@ -260,8 +277,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         break
       case "preview":
         if (nativeCapture.current && live && !nativeStopping.current) {
-          setResult({ ...EMPTY_TRANSCRIPT, text: event.text, segments: event.segments ?? [],
-            speakerNames: event.meeting ? meetingSpeakerNames : undefined })
+          setResult({ ...EMPTY_TRANSCRIPT, text: event.text, segments: event.segments ?? [] })
         }
         break
       case "finished":
@@ -313,12 +329,12 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         if (devices.capture && !devices.capture.dictation && !nativeStopping.current) {
           nativeCapture.current = true
           nativeMeeting.current = !!devices.capture.meeting
+          setLiveMeeting(devices.capture.meeting ? { shared: !!devices.capture.warm } : null)
           if (!nativeMeeting.current) setMeetingStopPending(false)
           setMode(devices.capture.mode)
           setLive(devices.capture.live)
           setElapsed(Math.floor(devices.capture.seconds ?? 0))
-          if (devices.capture.text) setResult({ ...EMPTY_TRANSCRIPT, text: devices.capture.text, segments: devices.capture.segments ?? [],
-            speakerNames: devices.capture.meeting ? meetingSpeakerNames : undefined })
+          if (devices.capture.text) setResult({ ...EMPTY_TRANSCRIPT, text: devices.capture.text, segments: devices.capture.segments ?? [] })
           setPhase("recording")
         }
       } catch (error) {
@@ -385,6 +401,8 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   }, [phase])
 
   const selectedId = current?.saved?.id
+  const selectedAnnotation = !!current?.saved?.annotation
+  const selectedCustomStorage = !!current?.saved?.annotationCustomStorage
   useEffect(() => {
     if (!selectedId || phase !== "idle") return
     const controller = new AbortController()
@@ -398,8 +416,19 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         if (!selected) {
           clearSession("Session no longer exists.")
           writeSessionRoute(null, "overview", true)
+        } else if (selectedCustomStorage) {
+          const latest = await readSession(selectedId!, controller.signal)
+          if (controller.signal.aborted || readSessionRoute().id !== selectedId) return
+          setCurrent(previous => {
+            if (!previous?.saved || previous.saved.id !== selectedId ||
+                (previous.saved.annotationStorageUnavailable === latest.annotationStorageUnavailable &&
+                 previous.saved.audioRemovedAt === latest.audioRemovedAt)) return previous
+            return { ...previous, audioUrl: latest.audioUrl, saved: { ...previous.saved,
+              audioRemovedAt: latest.audioRemovedAt, audioUrl: latest.audioUrl, audioPath: latest.audioPath,
+              annotation: latest.annotation, annotationStorageUnavailable: latest.annotationStorageUnavailable } }
+          })
         } else {
-          if (selected.audioRemovedAt) meetingAudioRemoved(selected.id, selected.audioRemovedAt)
+          if (selected.audioRemovedAt) sessionMediaRemoved(selected.id, selected.audioRemovedAt)
           setCurrent(previous => {
             if (!previous?.saved || previous.saved.id !== selectedId || previous.saved.meetingRetentionDays === selected.meetingRetentionDays) return previous
             return { ...previous, saved: { ...previous.saved, meetingRetentionDays: selected.meetingRetentionDays } }
@@ -409,12 +438,16 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     }
     window.addEventListener("focus", checkSelection)
     window.addEventListener("jard-meeting-retention", checkSelection)
+    window.addEventListener("jard-annotation-retention", checkSelection)
+    const poll = selectedAnnotation ? window.setInterval(checkSelection, 30_000) : undefined
     return () => {
       controller.abort()
+      window.clearInterval(poll)
       window.removeEventListener("focus", checkSelection)
       window.removeEventListener("jard-meeting-retention", checkSelection)
+      window.removeEventListener("jard-annotation-retention", checkSelection)
     }
-  }, [selectedId, phase])
+  }, [selectedId, selectedAnnotation, selectedCustomStorage, phase])
 
   // A refresh can rejoin an offline transcription after its audio has been accepted.
   // While a meeting is processing, refresh its readable transcript only when coverage advances.
@@ -466,8 +499,8 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     if (viewingSession && current) writeSessionRoute(current.id, tab)
   }
 
-  function meetingAudioRemoved(id: string, audioRemovedAt: string) {
-    setCurrent(item => item?.id === id && item.saved ? {
+  function sessionMediaRemoved(id: string, audioRemovedAt: string) {
+    setCurrent(item => item?.id === id && item.saved && item.saved.audioRemovedAt !== audioRemovedAt ? {
       ...item, audioUrl: null, saved: { ...item.saved, audioUrl: null, audioPath: null, recordingTracks: undefined, audioRemovedAt },
     } : item)
   }
@@ -490,7 +523,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     setTab("transcript")
     setPhase("starting")
     const languages = selectedLanguages.map(({ code }) => code)
-    const withSpeakers = diarization && speakerLabelsAvailable
+    const withSpeakers = (diarization || portableMeeting) && speakerLabelsAvailable
     const id = withSpeakers ? crypto.randomUUID() : undefined
     try {
       if (native) {
@@ -514,22 +547,35 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         return
       }
       const preview = live ? livePreview(languages, id, setResult, () => setPreviewPaused(true)) : undefined
-      const microphone = await openMicrophone((mic, samples) => {
-        const seconds = mic.length / mic.sampleRate
+      const systemAudio = hasPortableAudio && mode === "system"
+      const onFrame = (audio: AudioFrames, samples: Float32Array, levels?: SourceLevels) => {
+        const seconds = audio.length / audio.sampleRate
         setElapsed(Math.floor(seconds))
-        let energy = 0
-        for (const sample of samples) energy += sample * sample
-        setLevel(Math.min(1, Math.sqrt(energy / samples.length) * 5))
+        if (levels) {
+          setLevel(levels.microphone)
+          setSystemLevel(levels.computerAudio)
+        } else {
+          let energy = 0
+          for (const sample of samples) energy += sample * sample
+          const nextLevel = Math.min(1, Math.sqrt(energy / samples.length) * 5)
+          if (systemAudio) setSystemLevel(nextLevel)
+          else setLevel(nextLevel)
+        }
         if (seconds >= MAX_SECONDS) {
           void stopRecording()
           return
         }
-        session.current?.preview?.update(mic)
-      }, () => void stopRecording())
+        session.current?.preview?.update(audio)
+      }
+      const onEnded = () => void stopRecording()
+      const microphone = hasPortableAudio
+        ? await openPortableRecording(mode, onFrame, onEnded)
+        : await openMicrophone(onFrame, onEnded)
       if (!pendingNavigation.current) writeSessionRoute(null)
       session.current = { microphone, languages, preview, diarization: withSpeakers, id }
       setElapsed(0)
       setLevel(0)
+      setSystemLevel(0)
       setCopied(false)
       setCurrent(null)
       setResult(EMPTY_TRANSCRIPT)
@@ -583,10 +629,21 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     setPhase("transcribing")
     try {
       active.preview?.stop()
+      const name = `Recording ${new Date().toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" })}`
+      if ("captureId" in active.microphone) {
+        const id = active.microphone.captureId
+        active.microphone.close()
+        const saved = await finishPortableRecording(id, {
+          name, languages: active.languages, diarization: active.diarization, live: !!active.preview, session: active.id,
+        })
+        setRecoveredAudio(drafts => drafts.filter(draft => draft.id !== id))
+        await openAcceptedSession(saved.id)
+        return
+      }
       const audio = await active.microphone.stop()
       const item: DownloadItem = {
         id: crypto.randomUUID(),
-        name: `Recording ${new Date().toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" })}`,
+        name,
         languageHints: active.languages, recording: true, audio: audio.size ? audio : undefined,
       }
       if (item.audio) setCurrent(item)
@@ -595,6 +652,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       })
     } catch (error) {
       setFeedback(message(error))
+      if (hasPortableAudio) void portableRecordingDrafts().then(setRecoveredAudio).catch(() => {})
     } finally {
       setPhase("idle")
     }
@@ -619,16 +677,26 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   }
 
   async function handleRecovery(id: string, discard: boolean) {
-    if (!native || !canStart) return
+    if ((!native && !hasPortableAudio) || !canStart) return
     setChoosingFile(true)
     setFeedback("")
     try {
-      if (discard) await native.request("discard", { id })
-      else {
-        const saved = await native.request("recover", {
-          id, diarization: diarization && speakerLabelsAvailable, languages: selectedLanguages.map(l => l.code),
-        })
-        await openAcceptedSession(saved.id)
+      if (hasPortableAudio) {
+        if (discard) await discardPortableRecording(id)
+        else {
+          const saved = await finishPortableRecording(id, {
+            diarization: diarization && speakerLabelsAvailable, languages: selectedLanguages.map(l => l.code),
+          })
+          await openAcceptedSession(saved.id)
+        }
+      } else if (native) {
+        if (discard) await native.request("discard", { id })
+        else {
+          const saved = await native.request("recover", {
+            id, diarization: diarization && speakerLabelsAvailable, languages: selectedLanguages.map(l => l.code),
+          })
+          await openAcceptedSession(saved.id)
+        }
       }
       setRecoveredAudio(drafts => drafts.filter(d => d.id !== id))
       setDiscarding(null)
@@ -666,17 +734,15 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   }
 
   async function copyTranscript() {
+    const meetingId = phase === "idle" && current?.saved?.meeting ? current.id : undefined
     try {
-      const text = segments.length
-        ? segments.map((segment) => segment.speaker === null ? segment.text :
-          `${speakerLabel(segment.speaker, result.speakerNames)}\n${segment.text}`).join("\n\n")
-        : transcript
-      await navigator.clipboard.writeText(text)
+      if (meetingId) await copySavedMeetingTranscript(meetingId, native)
+      else await navigator.clipboard.writeText(transcriptForClipboard(result))
       setCopied(true)
       window.clearTimeout(copyTimer.current)
       copyTimer.current = window.setTimeout(() => setCopied(false), 1600)
-    } catch {
-      setFeedback("Clipboard access is unavailable. You can select and copy the text.")
+    } catch (error) {
+      setFeedback(meetingId ? message(error) : "Clipboard access is unavailable. You can select and copy the text.")
     }
   }
 
@@ -706,7 +772,8 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     </div>
   )
 
-  const viewingSession = phase === "idle" && (current?.saved?.status === "complete" || Boolean(current?.saved?.annotation))
+  const viewingSession = phase === "idle" && (current?.saved?.status === "complete" || Boolean(current?.saved?.annotation) ||
+    isSettledMeeting(current?.saved))
   function newSession() {
     restoreRequest.current?.abort()
     setRestoring(false)
@@ -719,19 +786,24 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   return (
     <SessionLibrary update={native && <DesktopUpdateControl controls={desktopUpdate} busy={updateBusy} />}
       openUpdateSettings={desktopUpdate.update?.openUpdateSettings}
+      installedVersion={desktopUpdate.update?.currentVersion}
       native={native}
-      dictation={native && ((destination, id) => <SystemDictationWorkspace key={id} destination={destination}
-        controls={systemDictation} native={native} languages={languageOptions} />)}
+      meetingOptions={native ? { languages: selectedLanguages.map(language => language.code), elapsed, busy: updateBusy || status !== "ready" } : undefined}
+      dictation={native ? ((destination, id) => <SystemDictationWorkspace key={id} destination={destination}
+        controls={systemDictation} native={native} languages={languageOptions} />) :
+        hasLinuxDictation ? ((destination, id) => <LinuxDictationWorkspace key={id} destination={destination} />) : undefined}
       settings={native && {
-        general: <>
+        general: <div className="dictation-preferences">
           <DesktopUpdateSettings controls={desktopUpdate} busy={updateBusy} />
           <DesktopApplicationSettings native={native} />
           <RecordingAccessSettings native={native} access={recordingAccess} refusedSource={refusedSource} />
-        </>,
-        dictation: <SystemDictationSettings controls={systemDictation} native={native} languages={languageOptions} />,
+          <AgentSetupSettings native={native} />
+        </div>,
+        dictation: visible => <SystemDictationSettings controls={systemDictation} native={native} languages={languageOptions} visible={visible} />,
         meetings: <DesktopMeetingControls native={native} languages={selectedLanguages.map(language => language.code)} busy={updateBusy} />,
         annotate: <DesktopAnnotationControls native={native} languages={selectedLanguages.map(language => language.code)}
-          busy={phase !== "idle" || dictating} />,
+          controls={systemDictation} busy={updateBusy}
+          allowConcurrentCapture={phase === "recording" && !!liveMeeting?.shared && !meetingStopPending && !choosingFile && !dictating} />,
       }}
       busy={phase !== "idle" || restoring || dictating} currentId={current?.id}
       onHome={newSession} onSelect={openSaved} onDelete={id => {
@@ -753,16 +825,17 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           <span className="wordmark-text">Jaro</span>
         </div>
         <nav className="workspace-actions" aria-label="Session actions">
-          {viewingSession && <Downloads key={current?.id} item={current} compact onAudioRemoved={meetingAudioRemoved} />}
+          {viewingSession && <Downloads key={current?.id} item={current} compact onAudioRemoved={sessionMediaRemoved} />}
           <Button size="sm" variant="ghost" disabled={phase !== "idle" || restoring || dictating} onClick={newSession} title={t("New session")} aria-label={t("New session")}><Plus /><span>{t("New session")}</span></Button>
-          <QuitButton recording={recording || phase === "starting" || dictating} onQuit={onQuit} />
+          <QuitButton recording={recording || phase === "starting" || dictating} recoverable={hasPortableAudio} onQuit={onQuit} />
         </nav>
       </header>
 
       <main className="workspace" data-session={viewingSession}>
         <ResultsPanel key={phase === "idle" && current ? current.id : "capture"}
           session={phase === "idle" ? current?.saved : undefined} result={result} source={phase === "idle" && current ? current.audioUrl ?? current.audio ?? null : null}
-          tab={tab} onTab={changeTab} working={working} recording={recording} followLive={recording && !meetingStopPending} jump={jump}
+          tab={tab} onTab={changeTab} working={working} recording={recording} liveMeeting={(recording || phase === "transcribing") && !!liveMeeting}
+          followLive={recording && !meetingStopPending} jump={jump}
           dictationEnabled={status === "ready" && phase === "idle" && !choosingFile}
           onDictationBusy={setDictating}
           onMeetingRenamed={(id, title, meetingExport) => {
@@ -810,11 +883,12 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           </div>
           {recording && <div className="activity" role="status">
             <span className="capture-status">
-              {(!native || mode !== "system") && <span className="capture-meter">
-                {native && <span>Mic</span>}<meter min={0} max={1} value={level} aria-label="Microphone level" />
+              {((!native && !hasPortableAudio) || mode !== "system") && <span className="capture-meter">
+                {(native || portableMeeting) && <span>Mic</span>}<meter min={0} max={1} value={level} aria-label="Microphone level" />
               </span>}
-              {native && mode !== "mic" && <span className="capture-meter">
-                <span>Mac audio</span><meter min={0} max={1} value={systemLevel} aria-label="Mac audio level" />
+              {(native || hasPortableAudio) && mode !== "mic" && <span className="capture-meter">
+                <span>{hasPortableAudio ? "Computer audio" : "Mac audio"}</span>
+                <meter min={0} max={1} value={systemLevel} aria-label={hasPortableAudio ? "Computer audio level" : "Mac audio level"} />
               </span>}
               <span className="timer" aria-hidden="true">{clock(elapsed)}</span>
             </span>
@@ -836,31 +910,35 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
               variant="outline"
               size="sm"
               className="speaker-toggle"
-              aria-pressed={diarization && speakerLabelsAvailable}
-              disabled={!canStart || !speakerLabelsAvailable}
+              aria-pressed={(diarization || portableMeeting) && speakerLabelsAvailable}
+              disabled={!canStart || !speakerLabelsAvailable || portableMeeting}
               onClick={() => setDiarization(!diarization)}
-              title={speakerLabelsAvailable ? "Label who spoke" : "Speaker labeling is unavailable"}
+              title={!speakerLabelsAvailable ? "Speaker labeling is unavailable" : portableMeeting ? "Meetings label speakers automatically" : "Label who spoke"}
             >
               <UsersRound />
               Speakers
             </Button>
           </div>
-          {native && <div className="native-audio-source">
+          {(native || hasPortableAudio) && <div className="native-audio-source">
             <label className="native-source-picker">
-              <Mic aria-hidden="true" />
+              {hasPortableAudio && mode !== "mic" ? <AudioLines aria-hidden="true" /> : <Mic aria-hidden="true" />}
               <select aria-label="Recording source" value={mode} disabled={phase !== "idle" || choosingFile}
                 onChange={event => changeMode(event.target.value as RecordingMode)}>
-                {Object.entries(RECORDING_MODES).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
+                {hasPortableAudio ? <>
+                  <option value="mic">{t("Microphone only")}</option>
+                  <option value="system">{t("Computer audio only")}</option>
+                  <option value="both">{t("Microphone + computer audio")}</option>
+                </> : Object.entries(RECORDING_MODES).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
               </select>
               <ChevronDown aria-hidden="true" />
             </label>
-            {mode !== "system" && <span className="native-input-name" title="Current input from macOS Sound settings">
+            {native && mode !== "system" && <span className="native-input-name" title="Current input from macOS Sound settings">
               {microphoneName}
             </span>}
-            {needsRecordingAccess && <button className="native-permission-link" type="button" disabled={phase !== "idle" || choosingFile}
+            {native && needsRecordingAccess && <button className="native-permission-link" type="button" disabled={phase !== "idle" || choosingFile}
               onClick={() => setPermissionGuide("inspection")}>Recording access</button>}
           </div>}
-          {!!recoveredAudio.length && <section className="native-recovery" aria-label="Interrupted recordings">
+          {!recording && !!recoveredAudio.length && <section className="native-recovery" aria-label="Interrupted recordings">
             {recoveredAudio.map(d => <div className="native-recovery-row" key={d.id}>
               {discarding === d.id ? <>
                 <span>Permanently discard this {clock(d.seconds)} {t("recording?")}</span>

@@ -15,16 +15,19 @@ async function run() {
     const dist = path.resolve(__dirname, "../../dist")
     const meetingId = "3196de0c-cd84-4211-9367-98b5d859c20a"
     const annotationId = "bd09312a-4184-429e-8477-67be0d69237d"
-    const saved = { id: meetingId, name: "Fixture meeting", created: new Date().toISOString(), status: "complete", processed: 10,
+    const meetingStart = new Date()
+    meetingStart.setHours(14, 5, 0, 0)
+    const saved = { id: meetingId, name: "Fixture meeting", created: new Date().toISOString(), meetingStartedAt: meetingStart.toISOString(), status: "complete", processed: 10,
       meeting: true, meetingProvider: "Zoom", recording: true, languageHints: ["en"], audioUrl: `/api/sessions/${meetingId}/audio`,
       meetingMicrophoneWarning: "digitalSilence",
       transcript: { text: "Start here. Review the agenda.", durationSeconds: 10, detectedLanguages: ["English"], words: [],
         segments: [{ speaker: 1, start: 0, end: 2, text: "Start here." }, { speaker: 2, start: 7, end: 10, text: "Review the agenda." }],
         speakerNames: { 1: "You", 2: "Them" }, speakerActivity: null } }
     const annotationRoute = `/api/sessions/${annotationId}/annotation`
-    const annotated = { ...saved, id: annotationId, name: "Fixture annotation", meeting: false,
+    const annotated = { ...saved, id: annotationId, name: "Fixture annotation", meeting: false, annotationCustomStorage: true,
       audioUrl: `/api/sessions/${annotationId}/audio`, annotation: { version: 1, strokeCount: 2,
         source: "area", frames: [.1, .6], manifestUrl: `${annotationRoute}/manifest`, contactSheetUrl: `${annotationRoute}/contact-sheet` } }
+    const fixtureImages = new Map()
     let showSaved = false
     let showAnnotation = false
     let notesChunkMissing = false
@@ -34,6 +37,7 @@ async function run() {
     ] } }
     let retention = null
     let wholeRetention = null
+    let annotationRetention = { mediaDays: 7, recordDays: 30, includeExisting: false }
     let automaticNotes = true
     let meetingBrief = null
     let meetingBriefReads = 0
@@ -61,6 +65,24 @@ async function run() {
       if (pathname === "/assets/fixture-missing-notes.js") {
         return route.fulfill({ status: 404, headers: { "Cache-Control": "no-store" }, body: "Fixture missing Notes module" })
       }
+      if (pathname.endsWith("/images") && pathname.startsWith("/api/sessions/")) {
+        if (route.request().method() === "POST") {
+          const asset = { id: "fixture-image", url: `${pathname}/fixture-image` }
+          const data = route.request().postDataBuffer()
+          assert.equal(route.request().headers()["content-type"], "image/jpeg")
+          assert.deepEqual([...data.subarray(0, 2)], [255, 216])
+          fixtureImages.set(asset.url, { asset, data })
+          return route.fulfill({ status: 201, json: asset })
+        }
+        return route.fulfill({ json: [...fixtureImages.values()].filter(item => item.asset.url.startsWith(pathname + "/")).map(item => item.asset) })
+      }
+      if (fixtureImages.has(pathname)) {
+        if (route.request().method() === "DELETE") {
+          fixtureImages.delete(pathname)
+          return route.fulfill({ status: 204 })
+        }
+        return route.fulfill({ contentType: "image/jpeg", body: fixtureImages.get(pathname).data })
+      }
       if (pathname === `/api/sessions/${annotationId}`) return route.fulfill({ json: annotated })
       if (pathname === annotated.audioUrl) {
         const contentType = fixtureMovie ? "video/mp4" : "audio/wav"
@@ -81,9 +103,14 @@ async function run() {
         } else if (meetingBrief?.status === "queued" && ++meetingBriefReads >= 2) {
           meetingBrief = meetingBrief.summary
             ? { ...meetingBrief, status: "error", error: "The local writer could not restart." }
-            : { status: "ready", title: "Agenda approval", summary: "The group approved the agenda.", error: null }
+            : { status: "ready", title: "Agenda approval", summary: "The agenda was approved.", error: null }
         }
         return route.fulfill({ json: meetingBrief })
+      }
+      if (pathname === `/api/sessions/${meetingId}/overview`) {
+        return route.fulfill({ json: { preference: "auto", autoLanguage: "en", target: "en", status: "ready",
+          version: { language: "en", title: "Fixture meeting", summary: "The group reviewed the agenda.",
+            markdown: "- Reviewed next steps ⟦7⟧", topics: [] }, error: null, editRevision: "fixture" } })
       }
       if (pathname === `/api/sessions/${meetingId}/managed-export`) return route.fulfill({ json: managedExport })
       if (pathname === `/api/sessions/${meetingId}/meeting-title` && route.request().method() === "PUT") {
@@ -115,14 +142,28 @@ async function run() {
         }
         return route.fulfill({ json: { days: wholeRetention } })
       }
+      if (pathname === "/api/annotations/retention") {
+        if (route.request().method() === "PUT") annotationRetention = route.request().postDataJSON()
+        return route.fulfill({ json: annotationRetention })
+      }
       if (pathname === "/api/sessions" && showSaved) {
-        const { id, name, status, processed, created, meeting, meetingProvider, meetingRetentionDays, audioRemovedAt, finalizationPending } = saved
-        const row = { id, name: meetingTitle ?? meetingBrief?.title ?? name, status, processed, created, meeting, meetingProvider, meetingRetentionDays, audioRemovedAt, finalizationPending }
+        const { id, name, status, processed, created, meeting, meetingStartedAt, meetingProvider, meetingRetentionDays, audioRemovedAt, finalizationPending } = saved
+        const row = { id, name: meetingTitle ?? meetingBrief?.title ?? name, status, processed, created, meeting, meetingStartedAt, meetingProvider, meetingRetentionDays, audioRemovedAt, finalizationPending }
         const rows = meetingTrashed ? [] : [row]
         if (!searchParams.has("meetings")) rows.push({ ...row, id: "ordinary", name: "Ordinary recording", meeting: false })
         if (showAnnotation && !searchParams.has("meetings")) rows.unshift({ id: annotationId, name: annotated.name,
-          status: annotated.status, created: annotated.created, processed: annotated.processed, meeting: false })
-        return route.fulfill({ json: rows })
+          status: annotated.status, created: annotated.created, processed: annotated.processed, meeting: false,
+          annotation: true, audioRemovedAt: annotated.audioRemovedAt })
+        const query = searchParams.get("q")?.toLowerCase()
+        if (query === "paging fixture" && !searchParams.has("meetings")) {
+          return route.fulfill({ json: Array.from({ length: 24 }, (_, index) => ({
+            ...row, id: `paging-${index}`, name: `Paging fixture ${index + 1}`, meeting: false,
+            status: index % 2 === 0 ? "complete" : "processing",
+          })) })
+        }
+        return route.fulfill({ json: query && searchParams.has("meetings") ? rows.filter(item =>
+          [item.name, item.meetingProvider, saved.transcript.text, "Saved fixture notes"]
+            .some(value => value?.toLowerCase().includes(query))) : rows })
       }
       if (pathname === `/api/sessions/${meetingId}`) {
         if (route.request().method() === "DELETE") {
@@ -156,12 +197,17 @@ async function run() {
         microphone: "request", accessibility: false, accessibilityRequested: false, accessibilityStale: false,
         listenerNeedsRestart: false, inputMonitoring: false,
         listener: false, phase: "idle", message: "", preview: "", languages: [], retention: 7,
-        cancelLabel: "Escape", pasteLabel: "⌥⇧V", rawLabel: "", shortcutSide: "right", shortcutTarget: "", choosingShortcut: false,
+        cancelLabel: "Escape", pasteLabel: "⌥⇧V", rawLabel: "", annotateLabel: "⌥⇧S", annotationListener: true,
+        annotationEnabled: true, annotationRecorderAvailable: true,
+        shortcutSide: "right", shortcutTarget: "", choosingShortcut: false,
         outputProfiles: "default | compact", historyRevision: 0, vocabularyEntries: [],
         sound: true, soundSet: "classic", soundVolume: 70, soundPreview: false, soundPreviewRevision: 0, placement: "top",
       }
       window.fixtureLoginState = "disabled"
       window.fixturePendingLoginWrites = []
+      window.fixtureInputReads = 0
+      window.fixtureInputDevices = { microphone: "Fixture microphone",
+        dictationMicrophones: ["Fixture headset", "Fixture USB microphone"], inputs: [] }
       const stopSoundPreview = () => {
         state.soundPreview = false
         state.soundPreviewRevision++
@@ -188,14 +234,18 @@ async function run() {
         : { phase: "current" }
       window.annotationFixture = localStorage.getItem("managedAnnotationFixture") === "true"
         ? { phase: "idle", busy: false, managed: true, message: "Screen annotation is managed by your organization." }
-        : { phase: "idle", busy: false }
-      window.meetingsFixture = { phase: "idle", busy: false, detection: false, providerPolicies: [
+        : { phase: "idle", busy: 0, recoverable: 0, message: "" }
+      window.annotationAccessFixture = { authorization: "off", canRepair: 0, busy: 0 }
+      window.annotationAccessActions = []
+      window.annotationFolder = { folder: "/fixture/Jaro/audio", custom: false, available: true }
+      window.annotationFolderActions = []
+      window.meetingsFixture = { phase: "idle", busy: 0, detection: false, recoveryAvailable: 0, hasText: 0, providerPolicies: [
         { provider: "app:zoom", label: "Zoom", policy: "ask", canAlwaysRecord: true },
         { provider: "site:meet.google.com", label: "Google Meet", policy: "ask", canAlwaysRecord: true },
         { provider: "site:zoom.us", label: "Zoom", scope: "zoom.us", policy: "never", canAlwaysRecord: true },
         { provider: "browser:com.google.chrome", label: "Google Chrome", policy: "never", canAlwaysRecord: false },
       ], calendar: {
-        access: "notDetermined", connected: false, reminders: true, lead: 1, calendars: [], upcoming: [],
+        access: "notDetermined", connected: 0, reminders: true, lead: 1, calendars: [], upcoming: [],
       } }
       window.meetingsFixture.managed = localStorage.getItem("managedMeetingsFixture") === "true"
       window.calendarRequests = 0
@@ -207,8 +257,25 @@ async function run() {
           return { selected, resolved, choices: interfaceCatalog.choices, messages: interfaceCatalog.messages[resolved] ?? {} }
         }
         if (command === "jard.export") { window.lastExport = input; return { saved: true } }
+        if (command === "jard.copyMeetingTranscript") {
+          if (window.failSavedMeetingCopy) throw new Error("The clipboard changed while preparing the meeting transcript.")
+          window.meetingCopyRequests = [...(window.meetingCopyRequests ?? []), input]
+          window.meetingCopied = "**00:00 · You**  \nStart here.\n\n**00:07 · Them**  \nReview the agenda."
+          return { copied: true }
+        }
         if (command === "jard.copyAnnotation") { window.copiedAnnotation = input; return { includedImage: true } }
         if (command === "jard.pasteAnnotation") { window.pastedAnnotation = input; return { destination: "Fixture editor", includedSheet: true } }
+        if (command === "jard.annotationAgentDestinations") {
+          if (input.agent === "claude" && window.fixtureAgentUnavailable) throw new Error("Install the Claude Code command-line tool.")
+          return { sessions: [
+            { id: "agent-release", title: "Release planning", directory: "/local/releases" },
+            { id: "agent-notes", title: "Agent notes", directory: "/local/notes" },
+          ].filter(session => session.title.toLowerCase().includes(input.query.toLowerCase())) }
+        }
+        if (command === "jard.sendSessionToAgent" && input.agent !== "opencode") {
+          window.sentToAgent = input
+          return { images: input.agent === "t3" ? "references" : "attached", opened: true }
+        }
         if (command === "jard.annotationDestinations") {
           const sessions = [{ id: "ses_one", title: "Fixture release", directory: "/local/releases" },
                             { id: "ses_two", title: "Project notes", directory: "/local/notes" }]
@@ -247,7 +314,7 @@ async function run() {
           const rows = JSON.parse(localStorage.getItem("annotationRoutingFixture") || "[]")
           return { deliveries: rows.filter(item => item.annotation === input.id) }
         }
-        if (command === "jard.sendAnnotation") {
+        if (command === "jard.sendSessionToAgent" && input.agent === "opencode") {
           window.sentAnnotation = input
           const value = { annotation: input.id, delivery: "queued", status: "queued", deliveryId: "fixture-delivery",
             session: { id: "ses_two", title: "Project notes" }, canUndo: true, createdAt: Date.now(), undoUntil: Date.now() + 600000 }
@@ -255,7 +322,7 @@ async function run() {
           const edited = { ...value, deliveryId: "fixture-edited", session: { id: "ses_edit", title: "Project edits" },
             status: "rollback-files", canCorrect: true }
           localStorage.setItem("annotationRoutingFixture", JSON.stringify([value, delivered, edited]))
-          return value
+          return { images: "attached", opened: true }
         }
         if (command === "jard.undoAnnotationDelivery") {
           window.withdrawnAnnotation = input
@@ -276,13 +343,17 @@ async function run() {
           if (input.action === "choose") window.meetingExportFolder = "/Users/fixture/Meeting transcripts"
           if (input.action === "disable") window.meetingExportFolder = null
           if (input.action === "reveal") window.revealedExport = input.id ?? "folder"
+          if (input.action === "revealFiles") {
+            if (window.recordingMissing) throw new Error("This meeting's recording files are no longer available.")
+            window.revealedRecording = input.id
+          }
           if (input.action === "separateNotes") window.separateMeetingNotes = input.enabled
           if (input.action === "descriptiveNames") window.descriptiveMeetingNames = input.enabled
           return { folder: window.meetingExportFolder ?? null, separateNotes: window.separateMeetingNotes ?? false,
             descriptiveNames: window.descriptiveMeetingNames ?? false }
         }
         if (command === "jard.meetingAudioAccess") {
-          window.meetingAudioFixture ??= { authorization: "request", screen: true, canRepair: false, busy: false }
+          window.meetingAudioFixture ??= { authorization: "request", screen: true, canRepair: 0, busy: 0 }
           const access = window.meetingAudioFixture
           if (input.action === "allow") {
             if (access.authorization === "request") {
@@ -343,16 +414,34 @@ async function run() {
           if (input.action === "stop") Object.assign(meeting, { phase: "finished", busy: false, message: "Meeting saved to Sessions." })
           return { ...meeting }
         }
+        if (command === "jard.annotationAccess") {
+          if (input.action !== "status") window.annotationAccessActions.push(input.action)
+          if (input.action === "repair" && window.refuseAnnotationReset) throw new Error("Fixture Screen Recording reset failed.")
+          if (input.action === "restart") throw new Error("Finish the current recording before restarting.")
+          return { ...window.annotationAccessFixture }
+        }
+        if (command === "jard.annotationStorage") {
+          if (input.action !== "status") window.annotationFolderActions.push(input.action)
+          if (input.action === "choose" && window.nextAnnotationsFolder) {
+            window.annotationFolder = { folder: window.nextAnnotationsFolder, custom: true, available: true }
+          }
+          if (input.action === "reset") window.annotationFolder = { folder: "/fixture/Jaro/audio", custom: false, available: true }
+          return { ...window.annotationFolder }
+        }
         if (command === "jard.annotation") {
           if (input.action === "start" && window.annotationFixture.managed) {
             throw new Error("Screen annotation is managed by your organization.")
           }
           const sourcePrompts = { display: "Choose the display.", window: "Choose the window.", area: "Choose the display that contains the area.", phone: "Opening the wired screen mirror…" }
-          if (input.action === "start") window.annotationFixture = { phase: input.source === "phone" ? "starting" : "picking", busy: true,
-            source: input.source, message: sourcePrompts[input.source] }
+          if (input.action === "start") {
+            const hoverPicker = input.source === "window" && window.annotationAccessFixture.authorization === "granted"
+            window.annotationFixture = { phase: hoverPicker ? "selecting" : input.source === "phone" ? "starting" : "picking", busy: true,
+              source: input.source, message: hoverPicker ? "Click a window to record it. Press Escape to cancel." : sourcePrompts[input.source] }
+          }
           if (input.action === "stop" || input.action === "cancel") window.annotationFixture = {
             phase: input.action === "cancel" ? "cancelled" : "finished", busy: false,
           }
+          if (input.action === "reveal") window.revealedAnnotationRecording = true
           return window.annotationFixture
         }
         if (command === "jard.windowNavigation") {
@@ -367,13 +456,17 @@ async function run() {
             window.dispatchEvent(new CustomEvent("native-sdk:jard-update", { detail: window.updateFixture }))
           }
           if (input.action === "download") window.updateDownloads = (window.updateDownloads ?? 0) + 1
-          if (input.action === "restart") throw new Error("Finish your recording before restarting Jard.")
+          if (input.action === "restart") {
+            window.updateRestarts = (window.updateRestarts ?? 0) + 1
+            throw new Error("Finish your recording before restarting Jard.")
+          }
           if (input.action === "releaseNotes") window.requestedReleaseNotes = input
           if (input.action === "channel" || input.action === "confirmSwitch") {
             window.lastUpdateAction = input
             window.updateFixture = input.action === "channel"
               ? { ...window.updateFixture, phase: "switch", channel: input.channel, version: "0.11.0", offer: "a".repeat(64) }
-              : { ...window.updateFixture, phase: "ready", staged: true }
+              : { ...window.updateFixture, phase: "ready", staged: true, stageChannel: window.updateFixture.channel,
+                  version: window.updateFixture.offerVersion ?? window.updateFixture.version, offer: undefined, offerVersion: undefined }
             window.dispatchEvent(new CustomEvent("native-sdk:jard-update", { detail: window.updateFixture }))
           }
           return window.updateFixture
@@ -393,6 +486,16 @@ async function run() {
             window.fixtureLoginState = input.enabled ? "enabled" : "disabled"
           }
           return { state: window.fixtureLoginState }
+        }
+        if (command === "jard.microphoneLevel") return { peak: window.fixtureMicrophonePeak ?? null }
+        if (command === "jard.inputDevices") {
+          window.fixtureInputReads++
+          const snapshot = window.fixtureInputDevices
+          if (window.fixtureHoldInputRead) {
+            window.fixtureHoldInputRead = false
+            await new Promise(resolve => { window.fixtureReleaseInputRead = resolve })
+          }
+          return snapshot
         }
         if (command === "jard.devices") return {
           microphone: "Fixture microphone",
@@ -505,8 +608,17 @@ async function run() {
             state.browserAccessMessage = "Allowed for Fixture Browser."
             break
           case "openBrowserAutomationSettings": window.openedBrowserAutomationSettings = true; break
-          case "chooseShortcut": state.shortcutTarget = input.target || "shortcut"; state.choosingShortcut = true; break
+          case "chooseShortcut": state.shortcutTarget = input.target || "shortcut"; state.choosingShortcut = true; state.message = ""; break
           case "cancelShortcut": state.shortcutTarget = ""; state.choosingShortcut = false; break
+          case "cancelAnnotationShortcut":
+            if (state.shortcutTarget === "annotate") { state.shortcutTarget = ""; state.choosingShortcut = false }
+            break
+          case "resetAnnotationShortcut": state.annotateLabel = "⌥⇧S"; break
+          case "setAnnotationOverlays": state.annotationShowOverlays = input.show; break
+          case "setAnnotationEnabled":
+            if (input.enabled && window.annotationShortcutTaken) throw new Error("The Annotate shortcut is already in use.")
+            state.annotationEnabled = state.annotationListener = input.enabled
+            break
           case "setShortcutSide":
             state.shortcutSide = input.value
             state.shortcutLabel = { left: "Left ⌥", either: "⌥", right: "Right ⌥" }[input.value]
@@ -567,6 +679,10 @@ async function run() {
     const button = name => page.getByRole("button", { name, exact: true })
     const settingsTab = name => page.getByRole("tablist", { name: "Settings", exact: true }).getByRole("tab", { name, exact: true })
     const heading = name => page.getByRole("heading", { name, exact: true })
+    const descriptionOf = control => control.evaluate(node => {
+      const description = node.getAttribute("aria-describedby")
+      return description ? document.getElementById(description)?.textContent.trim() : undefined
+    })
     await page.goto("http://127.0.0.1:18997/?jard-launch=fixture")
     assert.equal(new URL(page.url()).searchParams.has("jard-launch"), false)
     await heading("Speak where you write.").waitFor()
@@ -622,8 +738,12 @@ async function run() {
     await heading("Speak where you write.").waitFor()
     await button("Set up dictation").click()
     await heading("Give Jard access").waitFor()
+    const setup = page.getByRole("dialog", { name: "Give Jard access" })
     assert.equal(await button("Continue").isEnabled(), false)
+    assert.equal(await setup.getByText("Accessibility", { exact: true }).count(), 0)
     await button("Allow microphone").click()
+    await setup.getByText("Accessibility", { exact: true }).waitFor()
+    assert.equal(await setup.getByText("Microphone", { exact: true }).count(), 0)
     await button("Open settings").click()
     assert.equal(await button("Reset Accessibility").count(), 0)
     assert.equal(await button("Reopen Jard").count(), 0)
@@ -650,6 +770,22 @@ async function run() {
     const practice = page.getByRole("textbox", { name: "Try saying “Here’s what I want to work on today.”" })
     await page.waitForFunction(() => document.activeElement?.id === "dictation-practice")
     await page.evaluate(() => {
+      window.accessibilityRepairRequested = false
+      Object.assign(window.dictationFixture, { accessibility: false, listener: false })
+    })
+    await setup.getByText("Accessibility", { exact: true }).waitFor()
+    assert.equal(await practice.count(), 0)
+    assert.equal(await button("Continue").isEnabled(), false)
+    assert.equal(await page.evaluate(() => window.dictationFixture.onboarding), "practice")
+    await button("Open settings").click()
+    await page.evaluate(() => { window.dictationFixture.accessibilityStale = true })
+    await button("Reset Accessibility").click()
+    await button("Reset Accessibility").waitFor({ state: "hidden" })
+    assert.equal(await page.evaluate(() => window.accessibilityRepairRequested), true)
+    await page.evaluate(() => { Object.assign(window.dictationFixture, { accessibility: true, listener: true }) })
+    await practice.waitFor()
+    await page.waitForFunction(() => document.activeElement?.id === "dictation-practice")
+    await page.evaluate(() => {
       window.dictationFixture.phase = "listening"
       window.dictationFixture.message = "Listening…"
     })
@@ -663,6 +799,12 @@ async function run() {
     await practice.fill("Here’s what I want to work on today.")
     await page.getByText("Your words landed.", { exact: true }).waitFor()
     await button("Continue").click()
+    await heading("Dictation is ready").waitFor()
+    await page.evaluate(() => { window.dictationFixture.microphone = "denied" })
+    await setup.getByText("Microphone", { exact: true }).waitFor()
+    assert.equal(await button("Start using Jard").count(), 0)
+    assert.equal(await page.evaluate(() => window.dictationFixture.onboarding), "ready")
+    await setup.getByRole("button", { name: "Open settings" }).click()
     await heading("Dictation is ready").waitFor()
     await page.getByRole("checkbox", { name: "Launch Jard at login" }).check()
     assert.equal(await page.evaluate(() => window.fixtureLoginState), "enabled")
@@ -719,6 +861,31 @@ async function run() {
     await publishUpdate({ phase: "current", currentVersion: "0.0.6", channel: "stable", channels: ["stable"] })
     await sidebarUpdate.getByText("Jard is up to date.", { exact: true }).waitFor()
     await updates.getByText("Jard is up to date.", { exact: true }).waitFor()
+    const whatsNew = settingsTab("What's new")
+    await whatsNew.click()
+    const highlights = page.getByRole("region", { name: "Installed version 0.0.6" })
+    await highlights.waitFor()
+    await button("Open sound styles").press("Enter")
+    const highlightedSoundStyles = page.getByRole("dialog", { name: "Sound style" })
+    await highlightedSoundStyles.waitFor()
+    assert.equal(await highlightedSoundStyles.getByRole("button", { name: "Classic", exact: true }).getAttribute("aria-pressed"), "true")
+    assert.equal(await page.evaluate(() => window.fixturePreviewCue), undefined)
+    await highlightedSoundStyles.getByRole("button", { name: "Close", exact: true }).click()
+    await page.waitForFunction(() => document.activeElement?.closest("#dictation-sound-styles"))
+    assert.equal(await settingsTab("Dictation").getAttribute("aria-selected"), "true")
+    await whatsNew.click()
+    await button("Open microphone settings").click()
+    await page.waitForFunction(() => document.activeElement?.matches("#dictation-microphone select"))
+    assert.equal(await page.getByRole("combobox", { name: "Microphone" }).inputValue(), "")
+    await whatsNew.click()
+    await button("Open Meetings").click()
+    await heading("Meetings").waitFor()
+    await button("Settings").click()
+    await whatsNew.click()
+    await button("Open update settings").click()
+    await page.waitForFunction(() => document.activeElement?.closest("#desktop-app-updates"))
+    await settingsAction("Look for new versions").waitFor()
+    assert.equal(await page.evaluate(() => window.updateChecks), 1)
     const updateChannel = page.getByRole("combobox", { name: "Update channel", exact: true })
     assert.equal(await updateChannel.count(), 0)
     await page.evaluate(() => { window.delayUpdateCheck = true })
@@ -777,6 +944,18 @@ async function run() {
     await offer.click()
     await settingsAction("Restart to Update").waitFor()
     assert.deepEqual(await page.evaluate(() => window.lastUpdateAction), { action: "confirmSwitch", offer: "a".repeat(64) })
+    const alternateOffer = "b".repeat(64)
+    await publishUpdate({ version: "0.10.1", stageChannel: "stable", offerVersion: "0.11.0", offer: alternateOffer })
+    await updates.getByText(/Jard 0\.10\.1 is ready to install/).waitFor()
+    const alternateAction = settingsAction("Switch to Development 0.11.0")
+    await alternateAction.waitFor()
+    assert.equal(await offer.count(), 0)
+    const restartCount = await page.evaluate(() => window.updateRestarts ?? 0)
+    await sidebarAction("Restart to Update").click()
+    await page.waitForFunction(count => window.updateRestarts === count + 1, restartCount)
+    await alternateAction.click()
+    await updates.getByText(/Jard 0\.11\.0 is ready to install/).waitFor()
+    assert.deepEqual(await page.evaluate(() => window.lastUpdateAction), { action: "confirmSwitch", offer: alternateOffer })
     const notes = "# Changes\n- Improved recording\n- Improved recording\n- Fixed setup\n- Faster search\n- Complete notes only"
     await publishUpdate({ stageChannel: "dev", notes, releaseNotesAvailable: true })
     const preview = sidebarUpdate.getByRole("list", { name: "Release notes" })
@@ -802,6 +981,21 @@ async function run() {
     assert.equal(await settingsAction("Restart to Update").isEnabled(), true)
     await settingsNotes.locator("summary").click()
     assert.equal(await settingsNotes.locator("p").textContent(), notes)
+    await publishUpdate({ restartInProgress: true })
+    await sidebarAction("Restarting…").waitFor()
+    assert.equal(await sidebarAction("Restarting…").isDisabled(), true)
+    assert.equal(await settingsAction("Restarting…").isDisabled(), true)
+    assert.equal(await updateChannel.isDisabled(), true)
+    assert.equal(await sidebarNotes.getByRole("button", { name: "Open release page" }).isDisabled(), true)
+    await publishUpdate({ phase: "ready" })
+    assert.equal(await settingsAction("Restarting…").isDisabled(), true)
+    const restartFailure = "The application could not be replaced."
+    await publishUpdate({ restartInProgress: false, restartError: restartFailure })
+    await sidebarUpdate.getByText(restartFailure).waitFor()
+    await updates.getByText(restartFailure).waitFor()
+    assert.equal(await settingsAction("Restart to Update").isEnabled(), true)
+    assert.equal(await updateChannel.isEnabled(), true)
+    await publishUpdate({ restartError: undefined })
     await publishUpdate({ phase: "ready", version: "0.11.1", notes: "New verified stage", releaseNotesAvailable: false })
     await preview.getByText("New verified stage").waitFor()
     assert.equal(await sidebarNotes.locator("p").isVisible(), false)
@@ -829,14 +1023,118 @@ async function run() {
     await page.keyboard.press("ArrowRight")
     assert.equal(await settingsTab("Dictation").getAttribute("aria-selected"), "true")
     await settingsTab("Annotate").click()
+    const annotationSettings = page.locator(".annotation-settings")
+    const annotationSources = annotationSettings.getByRole("region", { name: "Screen Annotation" })
+    const strayZeros = area => area.evaluate(node => {
+      const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT)
+      let found = 0
+      while (walker.nextNode()) if (walker.currentNode.textContent.trim() === "0") found++
+      return found
+    })
+    await annotationSources.getByRole("button", { name: "Choose Display…" }).waitFor()
+    assert.equal(await annotationSources.locator(".dictation-setting-row").count(), 6)
+    const storage = annotationSettings.getByRole("region", { name: "Storage" })
+    const annotationsFolder = storage.locator('[data-setting-title="Annotations folder"]')
+    await annotationsFolder.getByText("Jaro Session library").waitFor()
+    await annotationsFolder.getByRole("button", { name: "Choose Folder…" }).click()
+    await annotationsFolder.getByText("Jaro Session library").waitFor()
+    await page.evaluate(() => { window.nextAnnotationsFolder = "/Volumes/Fixture/Notes and captures" })
+    await annotationsFolder.getByRole("button", { name: "Choose Folder…" }).click()
+    await annotationsFolder.getByText("/Volumes/Fixture/Notes and captures").waitFor()
+    await annotationsFolder.getByRole("button", { name: "Reveal" }).click()
+    assert.deepEqual(await page.evaluate(() => window.annotationFolderActions), ["choose", "choose", "reveal"])
+    await page.evaluate(() => {
+      window.annotationFolder.available = false
+      dispatchEvent(new Event("focus"))
+    })
+    await annotationsFolder.getByText(/Reconnect this folder/).waitFor()
+    assert.equal(await annotationsFolder.getByRole("button", { name: "Reveal" }).isDisabled(), true)
+    await annotationsFolder.getByRole("button", { name: "Use Default" }).click()
+    await annotationsFolder.getByText("Jaro Session library").waitFor()
+    const keep = storage.getByRole("combobox", { name: "Keep annotations" })
+    await storage.getByRole("status").getByText(/after 30 days/).waitFor()
+    assert.equal(await keep.inputValue(), "week")
+    const legacy = storage.getByRole("switch", { name: "Include older annotations", exact: true })
+    assert.equal(await descriptionOf(legacy), "Apply this policy to annotations saved before retention was added.")
+    await legacy.click()
+    const retentionConfirmation = page.getByRole("alertdialog", { name: "Apply annotation retention?" })
+    await retentionConfirmation.getByRole("button", { name: "Cancel" }).click()
+    assert.equal(annotationRetention.includeExisting, false)
+    await legacy.click()
+    await retentionConfirmation.getByRole("button", { name: "Apply retention" }).click()
+    await retentionConfirmation.waitFor({ state: "detached" })
+    assert.deepEqual(annotationRetention, { mediaDays: 7, recordDays: 30, includeExisting: true })
+    await keep.selectOption("forever")
+    await storage.getByRole("status").getByText("Annotation records stay in Sessions.").waitFor()
+    await keep.selectOption("month")
+    await retentionConfirmation.getByRole("button", { name: "Apply retention" }).click()
+    await storage.getByRole("status").getByText(/after 90 days/).waitFor()
+    await annotationSettings.getByRole("region", { name: "Shortcuts" }).getByText("⌥⇧S", { exact: true }).waitFor()
+    const shortcut = annotationSettings.getByRole("button", { name: /Change Annotate shortcut/ })
+    await shortcut.click()
+    await annotationSettings.getByText("Press a key or Esc", { exact: true }).waitFor()
+    await page.evaluate(() => { window.dictationFixture.message = "That shortcut is already in use by Jard." })
+    await annotationSettings.getByRole("alert").getByText("That shortcut is already in use by Jard.").waitFor()
+    await settingsTab("General").click()
+    await page.waitForFunction(() => window.dictationFixture.shortcutTarget === "")
+    await settingsTab("Annotate").click()
+    await shortcut.click()
+    await page.evaluate(() => Object.assign(window.dictationFixture, { annotateLabel: "⌃J", shortcutTarget: "", choosingShortcut: false, message: "" }))
+    await shortcut.getByText("⌃J", { exact: true }).waitFor()
+    await annotationSettings.getByRole("button", { name: "Restore default" }).click()
+    await shortcut.getByText("⌥⇧S", { exact: true }).waitFor()
+    const captureEnabled = annotationSettings.getByRole("switch", { name: /Enable Annotate/ })
+    await captureEnabled.uncheck()
+    await annotationSettings.getByRole("button", { name: "Choose Display…" }).waitFor({ state: "detached" })
+    assert.equal(await shortcut.isEnabled(), true)
+    await page.evaluate(() => { window.annotationShortcutTaken = true })
+    await captureEnabled.click()
+    await annotationSettings.getByRole("alert").getByText("The Annotate shortcut is already in use.").waitFor()
+    assert.equal(await captureEnabled.isChecked(), false)
+    await page.evaluate(() => { window.annotationShortcutTaken = false })
+    await captureEnabled.check()
+    await annotationSettings.getByRole("button", { name: "Choose Display…" }).waitFor()
+    assert.equal(await strayZeros(annotationSettings), 0)
+    const screenAccess = annotationSettings.locator('[data-setting-title="Screen Recording"]')
+    await screenAccess.getByText(/You can still choose a source/).waitFor()
+    assert.deepEqual(await page.evaluate(() => window.annotationAccessActions), [])
+    await screenAccess.getByRole("button", { name: "Open System Settings" }).click()
+    assert.deepEqual(await page.evaluate(() => window.annotationAccessActions), ["allow"])
+    await page.evaluate(() => { window.annotationAccessFixture.canRepair = 1; window.refuseAnnotationReset = true })
+    const resetScreen = screenAccess.getByRole("button", { name: "Reset Screen Recording access" })
+    await resetScreen.click()
+    await screenAccess.getByRole("alert").getByText("Fixture Screen Recording reset failed.").waitFor()
+    await page.evaluate(() => { window.annotationAccessFixture = { authorization: "restart", canRepair: 0, busy: 0 } })
+    await screenAccess.getByRole("button", { name: "Restart Jaro" }).click()
+    await screenAccess.getByRole("alert").getByText("Finish the current recording before restarting.").waitFor()
+    await page.evaluate(() => { window.annotationAccessFixture = { authorization: "granted", canRepair: 0, busy: 0 } })
+    await screenAccess.getByRole("status").getByText("Allowed").waitFor()
+    assert.equal(await screenAccess.getByRole("button").count(), 0)
+    await page.evaluate(() => { window.annotationAccessFixture = { authorization: "off", canRepair: 0, busy: 0 } })
+    await screenAccess.getByRole("button", { name: "Open System Settings" }).waitFor()
+    const annotationViewport = page.viewportSize()
+    await page.setViewportSize({ width: 430, height: 730 })
+    await page.waitForFunction(() => document.documentElement.scrollWidth <= innerWidth)
+    assert.equal(await annotationSources.evaluate(node => node.scrollWidth <= node.clientWidth), true)
+    await page.setViewportSize(annotationViewport)
+    await findTrigger.click()
+    await findSettings.fill("Choose Area")
+    await page.getByRole("option", { name: /\bArea\b/ }).click()
+    await focusedSetting("Area")
     await button("Choose Display…").click()
     await page.getByText("Choose the display.", { exact: true }).waitFor()
+    assert.equal(await screenAccess.getByRole("button", { name: "Open System Settings" }).isDisabled(), true)
     await button("Cancel").click()
     await button("Choose Display…").waitFor()
     await button("Choose Window…").click()
     await page.getByText("Choose the window.", { exact: true }).waitFor()
     await button("Cancel").click()
     await button("Choose Window…").waitFor()
+    await page.evaluate(() => { window.annotationAccessFixture.authorization = "granted" })
+    await button("Choose Window…").click()
+    await page.getByText("Click a window to record it. Press Escape to cancel.", { exact: true }).waitFor()
+    await button("Cancel").click()
+    await page.evaluate(() => { window.annotationAccessFixture.authorization = "off" })
     await button("Wired iPhone or iPad").click()
     await page.getByText("Opening the wired screen mirror…", { exact: true }).waitFor()
     assert.equal(await page.evaluate(() => window.annotationFixture.source), "phone")
@@ -845,16 +1143,23 @@ async function run() {
     await button("Choose Area…").click()
     await page.getByText("Choose the display that contains the area.", { exact: true }).waitFor()
     await page.evaluate(() => {
-      window.annotationFixture = { phase: "selecting", busy: true, message: "Drag to select an area." }
+      window.annotationFixture = { phase: "selecting", busy: true, message: "Drag an area or click to record the display. Press Escape to cancel." }
       window.dispatchEvent(new CustomEvent("native-sdk:jard-annotation", { detail: window.annotationFixture }))
     })
-    await page.getByText("Drag to select an area.", { exact: true }).waitFor()
+    await page.getByText("Drag an area or click to record the display. Press Escape to cancel.", { exact: true }).waitFor()
     await button("Cancel").click()
     await button("Choose Area…").waitFor()
     await page.evaluate(() => {
       window.annotationFixture = { phase: "recording", busy: true, message: "Recording the selected area." }
       window.dispatchEvent(new CustomEvent("native-sdk:jard-annotation", { detail: window.annotationFixture }))
     })
+    const showOverlays = annotationSettings.getByRole("switch", { name: "Show in screen recordings" })
+    assert.equal(await showOverlays.isChecked(), false)
+    await showOverlays.check()
+    assert.equal(await page.evaluate(() => window.dictationFixture.annotationShowOverlays), true)
+    assert.equal(await page.evaluate(() => window.annotationFixture.phase), "recording")
+    await showOverlays.uncheck()
+    assert.equal(await page.evaluate(() => window.dictationFixture.annotationShowOverlays), false)
     await button("Discard…").click()
     await page.getByRole("alertdialog", { name: "Discard this annotation?" }).waitFor()
     await button("Keep recording").click()
@@ -864,6 +1169,13 @@ async function run() {
     await button("Discard").click()
     await button("Choose Area…").waitFor()
     assert.equal(await page.evaluate(() => window.annotationFixture.phase), "cancelled")
+    await page.evaluate(() => {
+      window.annotationFixture = { phase: "error", busy: 0, recoverable: 1, message: "Jaro kept the recorded video." }
+      window.dispatchEvent(new CustomEvent("native-sdk:jard-annotation", { detail: window.annotationFixture }))
+    })
+    await annotationSettings.getByRole("alert").getByText("Jaro kept the recorded video.").waitFor()
+    await button("Show Recording in Finder").click()
+    assert.equal(await page.evaluate(() => window.revealedAnnotationRecording), true)
     await findTrigger.click()
     await findSettings.fill("Meeting export folder")
     await page.getByRole("option", { name: /Meeting export folder/ }).click()
@@ -872,6 +1184,7 @@ async function run() {
     await heading("Meetings").waitFor()
     const meetingAudio = page.locator('[data-setting-title="System Audio Recording"]')
     await meetingAudio.getByText(/Screen Recording is allowed as a fallback/).waitFor()
+    assert.equal(await strayZeros(page.locator(".meetings-settings")), 0)
     assert.equal(await page.evaluate(() => !!window.requestedMeetingAudio), false)
     await meetingAudio.getByRole("button", { name: "Allow Mac audio" }).click()
     await meetingAudio.getByRole("button", { name: "Waiting for macOS…" }).waitFor()
@@ -890,6 +1203,7 @@ async function run() {
     await page.evaluate(() => { window.refuseMeetingAudioReset = false })
     await meetingAudio.getByRole("button", { name: "Reset Mac audio access" }).click()
     await meetingAudio.getByRole("status").getByText("Allowed", { exact: true }).waitFor()
+    assert.equal(await strayZeros(page.locator(".meetings-settings")), 0)
     assert.equal(await page.evaluate(() => window.repairedMeetingAudio && window.meetingAudioFixture.screen), true)
     const folderControls = page.locator('[data-setting-title="Meeting export folder"]')
     await folderControls.getByRole("button", { name: "Choose Folder…" }).click()
@@ -930,6 +1244,30 @@ async function run() {
     })
     await button("Connect Calendar").click()
     await page.getByText("Design sync", { exact: true }).waitFor()
+    const hintsBeforeLocale = await page.evaluate(() => window.dictationFixture.languages)
+    await page.evaluate(() => {
+      const start = new Date()
+      start.setDate(start.getDate() + 1)
+      start.setHours(14, 5, 0, 0)
+      window.meetingsFixture.calendar.upcoming[0].start = start.getTime() / 1000
+      window.meetingsFixture.calendar.upcoming[0].end = start.getTime() / 1000 + 1800
+      window.dispatchEvent(new CustomEvent("native-sdk:jard-meetings", { detail: { ...window.meetingsFixture } }))
+    })
+    const calendarClock = page.locator(".meeting-calendar-event small")
+    await calendarClock.filter({ hasText: /2:05\s*PM/ }).waitFor()
+    await page.getByRole("tab", { name: "General", exact: true }).click()
+    await page.getByRole("combobox", { name: "Interface language" }).selectOption("fr")
+    const translatedInterface = page.getByRole("combobox", { name: "Langue de l'interface" })
+    await translatedInterface.waitFor()
+    await page.getByRole("tab", { name: "Nouveautés", exact: true }).click()
+    await button("Ouvrir les styles sonores").waitFor()
+    await page.getByRole("tab", { name: "Réunions", exact: true }).click()
+    await calendarClock.filter({ hasText: "14:05" }).waitFor()
+    assert.deepEqual(await page.evaluate(() => window.dictationFixture.languages), hintsBeforeLocale)
+    await page.getByRole("tab", { name: "Général", exact: true }).click()
+    await translatedInterface.selectOption("system")
+    await page.getByRole("tab", { name: "Meetings", exact: true }).click()
+    await calendarClock.filter({ hasText: /2:05\s*PM/ }).waitFor()
     await page.getByRole("combobox", { name: "Reminder time" }).selectOption("5")
     await page.getByRole("region", { name: "Calendar", exact: true }).getByText("Calendars (1 of 1)").click()
     await page.getByRole("switch", { name: /Work calendar/ }).uncheck()
@@ -968,6 +1306,26 @@ async function run() {
       }, microphoneSilent)
       await microphoneWarning.waitFor({ state: microphoneSilent ? "visible" : "hidden" })
     }
+    const microphoneReconnect = recordingSettings.getByRole("alert").filter({ hasText: "Microphone is reconnecting." })
+    const bothReconnect = recordingSettings.getByRole("alert").filter({ hasText: "Microphone and Mac audio are reconnecting." })
+    const publishMeetingCapture = patch => page.evaluate(patch => {
+      Object.assign(window.meetingsFixture, patch)
+      window.dispatchEvent(new CustomEvent("native-sdk:jard-meetings", { detail: { ...window.meetingsFixture } }))
+    }, patch)
+    await publishMeetingCapture({ microphoneUnavailable: true, microphoneSilent: true })
+    await microphoneReconnect.waitFor()
+    assert.equal(await microphoneWarning.count(), 0)
+    assert.equal(await recordingSettings.getByText("Call headset", { exact: true }).count(), 0)
+    await publishMeetingCapture({ systemAudioUnavailable: true })
+    await bothReconnect.waitFor()
+    assert.equal(await recordingSettings.getByRole("button", { name: "Stop & Save" }).isEnabled(), true)
+    await publishMeetingCapture({ microphoneUnavailable: false, microphoneSilent: false })
+    await systemWarning.waitFor()
+    await recordingSettings.getByText("Call headset", { exact: true }).waitFor()
+    await publishMeetingCapture({ microphoneSilent: true })
+    await recordingSettings.getByText("Mac audio is reconnecting. The microphone is silent.", { exact: true }).waitFor()
+    await publishMeetingCapture({ systemAudioUnavailable: false, microphoneSilent: false })
+    await systemWarning.waitFor({ state: "hidden" })
     assert.equal(await recordingSettings.getByRole("button", { name: "Stop & Save" }).isEnabled(), true)
     await recordingSettings.locator('[data-setting-title="Meeting transcript"]').getByRole("button", { name: "Copy New" }).waitFor()
     assert.equal(await meetingsSettings.getByRole("region", { name: "Markdown export" }).count(), 1)
@@ -1038,10 +1396,11 @@ async function run() {
     assert.equal(wholeRetention, 7)
     assert.equal(await keepAudio.inputValue(), "-1")
     assert.equal(retention, -1)
-    const automaticTitles = page.getByRole("switch", { name: /Automatic titles and summaries/ })
+    const automaticTitles = page.getByRole("switch", { name: "Automatic titles and summaries", exact: true })
     await automaticTitles.waitFor()
+    assert.equal(await descriptionOf(automaticTitles), "Write a live title and short meeting summary with local Qwen.")
     assert.equal(await automaticTitles.isChecked(), true)
-    await automaticTitles.click()
+    await page.getByText("Automatic titles and summaries", { exact: true }).click()
     await page.locator('[data-setting-title="Automatic titles and summaries"] input:not(:checked):enabled').waitFor()
     assert.equal(automaticNotes, false)
     const workspaceSize = page.viewportSize()
@@ -1063,8 +1422,19 @@ async function run() {
     assert.equal(await findSettings.getAttribute("aria-expanded"), "false")
     await findSettings.fill("dictation")
     const settingsResults = page.getByRole("listbox", { name: "Matching settings" }).locator("..")
-    await settingsResults.evaluate(node => { node.scrollTop = node.scrollHeight })
-    assert.ok(await settingsResults.evaluate(node => node.scrollTop > 0))
+    const settingOptions = settingsResults.getByRole("option")
+    await settingOptions.first().waitFor()
+    const firstSetting = await findSettings.getAttribute("aria-activedescendant")
+    await findSettings.press("PageDown")
+    const pagedSetting = await findSettings.getAttribute("aria-activedescendant")
+    assert.notEqual(pagedSetting, firstSetting)
+    assert.notEqual(pagedSetting, await settingOptions.last().getAttribute("id"))
+    await findSettings.press("Home")
+    assert.equal(await findSettings.getAttribute("aria-activedescendant"), pagedSetting)
+    await findSettings.press("PageUp")
+    assert.equal(await findSettings.getAttribute("aria-activedescendant"), firstSetting)
+    await findSettings.press("PageDown")
+    await page.waitForFunction(() => document.querySelector(".session-search-results")?.scrollTop > 0)
     await findSettings.fill("advanced")
     await page.waitForFunction(() => document.querySelector(".session-search-results")?.scrollTop === 0)
     await findSettings.fill("shortcut")
@@ -1107,7 +1477,9 @@ async function run() {
     })
     await page.getByText("Using Fixture USB microphone for dictation.", { exact: true }).waitFor({ state: "hidden" })
     await page.getByText("Last dictation failed", { exact: true }).waitFor({ state: "hidden" })
-    const shortcutMode = page.getByRole("region", { name: "Shortcuts" }).getByRole("combobox", { name: "Shortcut mode" })
+    const shortcutMode = page.getByRole("region", { name: "Shortcuts" }).getByRole("button", { name: "Shortcut mode" })
+    const modeDialog = page.getByRole("dialog", { name: "Shortcut mode" })
+    const modeChoice = name => modeDialog.getByRole("button", { name })
     await shortcutMode.waitFor()
     const shortcutSide = page.getByRole("combobox", { name: "Shortcut side" })
     assert.equal(await shortcutSide.inputValue(), "right")
@@ -1120,7 +1492,39 @@ async function run() {
     await page.evaluate(() => { window.dictationFixture.shortcutSide = "" })
     await shortcutSide.waitFor({ state: "hidden" })
     assert.equal(await button("Change Cancel shortcut (Escape)").count(), 0)
-    await shortcutMode.selectOption("tap")
+    await button("Change dictation shortcut (Right ⌥)").click()
+    await button("Press a key or Esc").waitFor()
+    await page.emulateMedia({ reducedMotion: "no-preference" })
+    await shortcutMode.click()
+    await modeDialog.waitFor()
+    await page.waitForFunction(() => !window.dictationFixture.shortcutTarget)
+    await page.waitForFunction(() => document.activeElement?.getAttribute("aria-pressed") === "true")
+    assert.equal(await modeChoice(/^Hold or double-tap/).getAttribute("aria-pressed"), "true")
+    assert.equal(await modeDialog.getByText("Right ⌥", { exact: true }).count(), 1)
+    const lanes = modeDialog.locator(".shortcut-timeline")
+    assert.equal(await lanes.count(), 4)
+    assert.equal(await lanes.first().locator(".shortcut-timeline-playhead").evaluate(el => getComputedStyle(el).animationName), "shortcut-mode-progress")
+    await page.emulateMedia({ reducedMotion: "reduce" })
+    await page.waitForFunction(() => getComputedStyle(document.querySelector(".shortcut-timeline-playhead")).display === "none")
+    assert.equal(await lanes.nth(3).locator(".shortcut-timeline-lane").count(), 2)
+    await page.keyboard.press("Meta+k")
+    assert.equal(await findSettings.count(), 0)
+    await page.keyboard.press("Shift+Tab")
+    assert.equal(await modeChoice("Done").evaluate(el => el === document.activeElement), true)
+    await page.keyboard.press("Tab")
+    assert.equal(await modeChoice(/^Hold or double-tap/).evaluate(el => el === document.activeElement), true)
+    await page.keyboard.press("Tab")
+    assert.equal(await modeChoice(/^Hold\s*Hold while/).evaluate(el => el === document.activeElement), true)
+    await page.keyboard.press("Space")
+    await page.waitForFunction(() => window.dictationFixture.mode === "hold")
+    await modeChoice(/^Double-tap only/).click()
+    await page.waitForFunction(() => window.dictationFixture.mode === "doubleTap")
+    await modeChoice(/^Tap to start and stop/).click()
+    await page.waitForFunction(() => window.dictationFixture.mode === "tap")
+    await page.keyboard.press("Escape")
+    await modeDialog.waitFor({ state: "hidden" })
+    await focusedSetting("Shortcut mode")
+    await page.emulateMedia({ reducedMotion: "no-preference" })
     await button("Change Cancel shortcut (Escape)").click()
     await button("Stop recording Cancel shortcut").waitFor()
     assert.equal(await page.evaluate(() => window.dictationFixture.shortcutTarget), "cancel")
@@ -1131,7 +1535,9 @@ async function run() {
     await button("Change Cancel shortcut (⌃K)").waitFor()
     await button("Reset to Escape").click()
     await button("Change Cancel shortcut (Escape)").waitFor()
-    await shortcutMode.selectOption("holdDouble")
+    await shortcutMode.click()
+    await modeChoice(/^Hold or double-tap/).click()
+    await modeChoice("Done").click()
     await button("Change Cancel shortcut (Escape)").waitFor({ state: "hidden" })
     await page.getByText("Other shortcuts", { exact: true }).click()
     await button("Change Dictate raw text shortcut (Off)").click()
@@ -1152,7 +1558,8 @@ async function run() {
     await button("Change Paste Last shortcut (⌥⇧V)").waitFor()
     await page.getByText("Paste Last uses ⌥⇧V.", { exact: true }).waitFor()
     await page.getByRole("region", { name: "Voice input" }).getByRole("combobox", { name: "Language" }).waitFor()
-    const keepMicrophone = page.getByRole("switch", { name: /Keep microphone ready/ })
+    const keepMicrophone = page.getByRole("switch", { name: "Keep microphone ready", exact: true })
+    assert.equal(await descriptionOf(keepMicrophone), "macOS shows the mic in use while Jard is ready to dictate.")
     const micRowColor = () => keepMicrophone.evaluate(node => getComputedStyle(node.closest(".dictation-setting-row")).backgroundColor)
     const unfocusedRow = await micRowColor()
     await keepMicrophone.press("Space")
@@ -1166,6 +1573,65 @@ async function run() {
     await bluetooth.check()
     await microphone.getByText("System default · Fixture USB microphone", { exact: true }).waitFor({ state: "attached" })
     await bluetooth.uncheck()
+    const inputChanged = () => window.dispatchEvent(new CustomEvent("native-sdk:jard-input-devices"))
+    await page.evaluate(() => {
+      window.fixtureInputDevices = { microphone: "Desk microphone", dictationMicrophones: ["Desk microphone", "Desk microphone"],
+        inputs: [{ id: "desk", name: "Desk microphone" }] }
+      window.dispatchEvent(new CustomEvent("native-sdk:jard-input-devices"))
+    })
+    await microphone.getByText("System default · Desk microphone", { exact: true }).waitFor({ state: "attached" })
+    await microphone.selectOption("desk")
+    await page.evaluate(() => {
+      window.fixtureInputDevices = { microphone: "Built-in microphone", inputs: [] }
+      window.dispatchEvent(new CustomEvent("native-sdk:jard-input-devices"))
+    })
+    await page.getByText("Using Built-in microphone for dictation.", { exact: true }).waitFor()
+    assert.equal(await descriptionOf(microphone), "Using Built-in microphone for dictation.")
+    assert.equal(await microphone.inputValue(), "desk")
+    await microphone.getByText("Previously selected microphone · Unavailable", { exact: true }).waitFor({ state: "attached" })
+    await page.evaluate(() => {
+      window.fixtureHoldInputRead = true
+      window.fixtureInputDevices = { microphone: "Old default" }
+      window.dispatchEvent(new CustomEvent("native-sdk:jard-input-devices"))
+    })
+    await page.waitForFunction(() => !!window.fixtureReleaseInputRead)
+    const readsBeforeBurst = await page.evaluate(() => window.fixtureInputReads)
+    await page.evaluate(() => {
+      window.fixtureInputDevices = { microphone: "Built-in microphone",
+        inputs: [{ id: "desk", name: "Desk microphone" }] }
+      for (let index = 0; index < 5; index++) window.dispatchEvent(new CustomEvent("native-sdk:jard-input-devices"))
+    })
+    assert.equal(await page.evaluate(() => window.fixtureInputReads), readsBeforeBurst)
+    await page.evaluate(() => window.fixtureReleaseInputRead())
+    await microphone.getByText("Desk microphone", { exact: true }).waitFor({ state: "attached" })
+    assert.equal(await microphone.inputValue(), "desk")
+    assert.equal(await microphone.getByText("System default · Old default", { exact: true }).count(), 0)
+    await microphone.selectOption("")
+    await page.getByRole("tab", { name: "History" }).click()
+    const hiddenReads = await page.evaluate(() => window.fixtureInputReads)
+    await page.evaluate(inputChanged)
+    assert.equal(await page.evaluate(() => window.fixtureInputReads), hiddenReads)
+    await page.getByRole("tab", { name: "General", exact: true }).click()
+    await microphone.getByText("System default · Built-in microphone", { exact: true }).waitFor({ state: "attached" })
+    await page.evaluate(() => {
+      window.fixtureInputDevices = { microphone: "Built-in microphone", dictationMicrophones: ["", ""],
+        inputs: [{ id: "built-in", name: "Built-in microphone", unavailable: true }] }
+      window.dispatchEvent(new CustomEvent("native-sdk:jard-input-devices"))
+    })
+    await page.getByText("The built-in microphone is off while the lid is closed. Open the lid or connect a microphone.").waitFor()
+    assert.equal(await microphone.locator('option[value="built-in"]').isDisabled(), true)
+    await page.evaluate(() => {
+      window.fixtureInputDevices = { microphone: "Built-in microphone",
+        inputs: [{ id: "built-in", name: "Built-in microphone" }] }
+      window.dispatchEvent(new CustomEvent("native-sdk:jard-input-devices"))
+    })
+    await microphone.getByText("System default · Built-in microphone", { exact: true }).waitFor({ state: "attached" })
+    const microphoneMeter = page.getByRole("region", { name: "Voice input" }).getByRole("meter", { name: "Microphone level" })
+    await microphoneMeter.scrollIntoViewIfNeeded()
+    await page.evaluate(() => { window.fixtureMicrophonePeak = 0.35 })
+    await microphoneMeter.and(page.locator('[aria-valuenow="6"]')).waitFor()
+    await page.evaluate(() => { window.fixtureMicrophonePeak = null })
+    await microphoneMeter.and(page.locator('[data-receiving="false"]')).waitFor()
     const soundToggle = page.getByRole("switch", { name: "Play dictation sounds" })
     await soundToggle.waitFor()
     const soundStyle = button("Sound style")
@@ -1498,11 +1964,28 @@ async function run() {
     assert.deepEqual(await historyRetention.boundingBox(), retentionBox)
     await list.getByRole("button", { name: /^Long transcript/ }).click()
     assert.equal(await detail.getByText("Processing", { exact: true }).count(), 0)
-    const copyBox = await button("Copy selected dictation").boundingBox()
     const detailBody = detail.locator(".dictation-history-detail-body")
-    await detailBody.evaluate(element => { element.scrollTop = 100 })
+    assert.equal(await detailBody.evaluate(element => getComputedStyle(element).scrollbarWidth), "thin")
+    await page.getByRole("heading", { name: "Dictation", level: 1, exact: true }).focus()
+    await detailBody.hover()
+    const copyBox = await button("Copy selected dictation").boundingBox()
+    await page.keyboard.press("PageDown")
     assert.ok(await detailBody.evaluate(element => element.scrollTop > 0))
     assert.deepEqual(await button("Copy selected dictation").boundingBox(), copyBox)
+    await detailBody.focus()
+    await historySearch.hover()
+    await page.keyboard.press("Home")
+    assert.equal(await detailBody.evaluate(element => element.scrollTop), 0)
+    await page.keyboard.press("End")
+    assert.ok(await detailBody.evaluate(element => element.scrollHeight - element.clientHeight - element.scrollTop < 2))
+    const detailEnd = await detailBody.evaluate(element => element.scrollTop)
+    await page.keyboard.press("PageUp")
+    assert.ok(await detailBody.evaluate((element, end) => element.scrollTop < end, detailEnd))
+    const detailPosition = await detailBody.evaluate(element => element.scrollTop)
+    await historySearch.focus()
+    await detailBody.hover()
+    await page.keyboard.press("Home")
+    assert.equal(await detailBody.evaluate(element => element.scrollTop), detailPosition)
     await list.getByRole("button", { name: /Send the revised notes/ }).click()
     assert.equal(await secondEntry.getAttribute("tabindex"), "0")
     await detail.getByText("Rumble2 Flash").waitFor()
@@ -1579,7 +2062,69 @@ async function run() {
     await list.getByRole("button", { name: /After clearing/ }).waitFor()
     showSaved = true
     await page.setViewportSize({ width: 1100, height: 750 })
+    await button("Meetings").click()
+    await heading("Meetings").waitFor()
+    const meetingWorkspace = page.locator('[data-pane="meetings"]')
+    const previousMeetingPhase = await page.evaluate(() => window.meetingsFixture.phase)
+    await publishMeetingCapture({ phase: "recording", microphoneUnavailable: true })
+    const workspaceWarning = meetingWorkspace.getByRole("alert").filter({ hasText: "Microphone is reconnecting." })
+    await workspaceWarning.waitFor()
+    assert.equal(await meetingWorkspace.getByRole("button", { name: "Stop & Save" }).isEnabled(), true)
+    await publishMeetingCapture({ phase: previousMeetingPhase, microphoneUnavailable: false })
+    await workspaceWarning.waitFor({ state: "hidden" })
+    const meetingsQuery = page.getByRole("searchbox", { name: "Search meetings" })
+    await meetingWorkspace.getByRole("heading", { name: "Today" }).waitFor()
+    assert.equal(await meetingWorkspace.getByText("Ordinary recording").count(), 0)
+    await meetingsQuery.fill("no fixture match")
+    await meetingWorkspace.getByText("No meetings match.", { exact: true }).waitFor()
+    await meetingsQuery.fill("saved fixture notes")
+    const meetingRow = meetingWorkspace.getByRole("button", { name: /Fixture meeting/ })
+    await meetingRow.waitFor()
+    const recordedStart = meetingWorkspace.locator(`time[datetime="${saved.meetingStartedAt}"]`)
+    await recordedStart.filter({ hasText: /2:05\s*PM/ }).waitFor()
+    await meetingWorkspace.getByRole("button", { name: "Copy transcript" }).click()
+    await meetingWorkspace.getByRole("button", { name: "Copied" }).waitFor()
+    assert.match(await page.evaluate(() => window.meetingCopied), /\*\*00:07 · Them\*\*/)
+    await meetingWorkspace.getByRole("button", { name: "Move meeting to Trash" }).click()
+    await page.getByRole("alertdialog").getByRole("button", { name: "Cancel" }).click()
+    await meetingRow.click()
+    await heading("Fixture meeting").waitFor()
+    await page.getByRole("tab", { name: "Transcript", exact: true }).click()
+    await button("Copy transcript").click()
+    await button("Copied").waitFor()
+    await page.getByRole("tab", { name: "Overview", exact: true }).click()
+    await button("Meeting exports").click()
+    await page.getByRole("menuitem", { name: "Copy transcript", exact: true }).click()
+    await page.getByText("Copied meeting transcript.", { exact: true }).waitFor()
+    assert.deepEqual(await page.evaluate(() => window.meetingCopyRequests), [{ id: meetingId }, { id: meetingId }, { id: meetingId }])
+    await page.evaluate(() => { window.failSavedMeetingCopy = true })
+    await button("Meeting exports").click()
+    await page.getByRole("menuitem", { name: "Copy transcript", exact: true }).click()
+    await page.getByText("The clipboard changed while preparing the meeting transcript.", { exact: true }).waitFor()
+    await page.evaluate(() => { window.failSavedMeetingCopy = false })
+    await button("Meetings").click()
+    assert.equal(await meetingsQuery.inputValue(), "saved fixture notes")
     await button("Search sessions").click()
+    const sessionInput = page.getByRole("combobox", { name: "Search sessions" })
+    const sessionOptions = page.getByRole("listbox", { name: "Sessions" })
+    const recentRecording = sessionOptions.getByRole("option", { name: /Ordinary recording/ })
+    await recentRecording.waitFor()
+    await sessionInput.press("End")
+    assert.equal(await recentRecording.getAttribute("aria-selected"), "true")
+    await sessionInput.press("Home")
+    assert.equal(await sessionOptions.getByRole("option", { name: "New session" }).getAttribute("aria-selected"), "true")
+    await sessionInput.fill("Paging fixture")
+    const finalPagingResult = sessionOptions.getByRole("option", { name: /^Paging fixture 23/ })
+    await finalPagingResult.waitFor()
+    await sessionInput.press("PageDown")
+    const pagedResult = sessionOptions.locator('[aria-selected="true"]')
+    assert.notEqual(await pagedResult.getAttribute("aria-disabled"), "true")
+    assert.doesNotMatch(await pagedResult.textContent(), /^Paging fixture (?:1|23)(?:\D|$)/)
+    for (let pageNumber = 0; pageNumber < 6; pageNumber++) await sessionInput.press("PageDown")
+    assert.equal(await finalPagingResult.getAttribute("aria-selected"), "true")
+    for (let pageNumber = 0; pageNumber < 6; pageNumber++) await sessionInput.press("PageUp")
+    assert.equal(await sessionOptions.getByRole("option", { name: /^Paging fixture 1\b/ }).getAttribute("aria-selected"), "true")
+    await sessionInput.clear()
     await page.getByRole("checkbox", { name: "Meetings only" }).check()
     const meetingResult = page.getByRole("option", { name: /Fixture meeting/ })
     await meetingResult.waitFor()
@@ -1606,14 +2151,44 @@ async function run() {
     await button("Reveal Markdown").click()
     assert.equal(await page.evaluate(() => window.revealedExport), meetingId)
     await page.getByRole("tab", { name: "Overview" }).click()
-    await button("Summarize meeting").click()
-    await button("Summarizing…").waitFor()
+    await page.getByText("The group reviewed the agenda.").waitFor()
+    await button("Play transcript at 0:07").waitFor()
+    const briefToggle = page.locator("summary").filter({ hasText: /^Quick brief$/ })
+    const briefText = page.getByText("The agenda was approved.", { exact: true })
+    await briefToggle.waitFor()
+    assert.equal(await briefText.isVisible(), false)
+    assert.equal(await button("Write quick brief").isVisible(), false)
+    await briefToggle.focus()
+    await page.keyboard.press("Enter")
+    await button("Write quick brief").click()
+    await button("Writing brief…").waitFor()
     await heading("Agenda approval").waitFor()
-    const meetingSummary = page.getByRole("region", { name: "Meeting summary" })
-    await meetingSummary.getByText("The group approved the agenda.").waitFor()
-    await button("Regenerate summary").click()
-    await meetingSummary.getByRole("alert").getByText("The local writer could not restart.").waitFor()
-    await meetingSummary.getByText("The group approved the agenda.").waitFor()
+    await briefText.waitFor()
+    await button("Regenerate brief").click()
+    await page.getByRole("alert").filter({ hasText: "The local writer could not restart." }).waitFor()
+    await briefText.waitFor()
+    await briefToggle.click()
+    await briefText.waitFor({ state: "hidden" })
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async text => {
+        if (window.clipboardUnavailable) throw new Error("Clipboard unavailable")
+        window.copiedSummary = text
+      } } })
+      window.clipboardUnavailable = true
+    })
+    await button("Copy overview").click()
+    await page.getByRole("alert").filter({ hasText: "Could not copy the overview." }).waitFor()
+    await page.evaluate(() => { window.clipboardUnavailable = false })
+    await button("Copy overview").click()
+    await page.locator(".session-meta").getByRole("button", { name: "Copied" }).waitFor()
+    assert.equal(await page.evaluate(() => window.copiedSummary), "The group reviewed the agenda.\n\n- Reviewed next steps (0:07)")
+    await briefToggle.click()
+    await briefText.waitFor()
+    await button("Copy quick brief").click()
+    assert.equal(await page.evaluate(() => window.copiedSummary), "The agenda was approved.")
+    await briefToggle.click()
+    await briefText.waitFor({ state: "hidden" })
+    await button("Play transcript at 0:07").waitFor()
     await button("Rename meeting").click()
     const meetingTitleField = page.getByRole("textbox", { name: "Meeting title" })
     await meetingTitleField.fill("Cancelled title")
@@ -1631,15 +2206,60 @@ async function run() {
     await button("Meeting exports").click()
     await page.getByRole("menuitem", { name: "Notes (.md)" }).click()
     assert.deepEqual(await page.evaluate(() => window.lastExport), { id: meetingId, kind: "notes" })
+    await page.evaluate(() => { window.recordingMissing = true })
+    await button("Meeting exports").click()
+    await page.getByRole("menuitem", { name: "Reveal files" }).click()
+    await page.getByRole("alert").getByText("This meeting's recording files are no longer available.").waitFor()
+    await page.evaluate(() => { window.recordingMissing = false })
+    await button("Meeting exports").click()
+    await page.getByRole("menuitem", { name: "Reveal files" }).click()
+    assert.equal(await page.evaluate(() => window.revealedRecording), meetingId)
     await button("Meeting exports").click()
     await page.getByRole("menuitem", { name: "Move meeting audio to Trash…" }).click()
     await button("Move to Trash").click()
     await page.getByText("Audio removed", { exact: true }).waitFor()
     assert.equal(await button("Open audio player").count(), 0)
+    await button("Meeting exports").click()
+    await page.getByRole("menuitem", { name: "Notes (.md)" }).waitFor()
+    assert.equal(await page.getByRole("menuitem", { name: "Reveal files" }).count(), 0)
+    await page.keyboard.press("Escape")
     await page.evaluate(() => sessionStorage.setItem("fixtureOnboarded", "true"))
     await page.goto(`http://127.0.0.1:18997/?session=${meetingId}&tab=transcript&at=7`)
     await page.waitForFunction(() => document.activeElement?.dataset.turn === "1")
     assert.equal(new URL(page.url()).searchParams.get("at"), "7")
+    const originalTranscript = saved.transcript
+    const originalAudio = saved.audioUrl
+    saved.audioUrl = `/api/sessions/${meetingId}/audio`
+    saved.meetingTurns = [
+      { speaker: 1, start: 0, end: .2, text: "Opening." },
+      { speaker: 1, start: .4, end: 50, text: "Continued." },
+      { speaker: 2, start: 4, end: 6, text: "Overlapping reply." },
+      { speaker: 1, start: 78, end: 79, text: "Short break." },
+      { speaker: 1, start: 114, end: 115, text: "Back again." },
+    ]
+    saved.transcript = { ...originalTranscript, durationSeconds: 115, text: saved.meetingTurns.map(turn => turn.text).join(" "),
+      segments: [{ speaker: 1, start: 0, end: 115, text: "Legacy merged segment." }],
+      words: [{ speaker: 1, start: 0, end: .2, text: "Opening." }, { speaker: 1, start: .4, end: .55, text: "Continued." }],
+    }
+    await page.goto(`http://127.0.0.1:18997/?session=${meetingId}&tab=transcript`)
+    const stackedMeeting = page.locator(".meeting-transcript")
+    await stackedMeeting.locator('[data-turn="3"]').waitFor()
+    assert.equal(await stackedMeeting.locator(".speaker-turn").count(), 4)
+    assert.equal(await stackedMeeting.locator(".meeting-transcript-pause").allTextContents().then(rows => rows.join(" ")), "0:35 pause")
+    assert.equal(await stackedMeeting.locator(".turn-bubble").first().evaluate(p => getComputedStyle(p).backgroundColor), "rgba(0, 0, 0, 0)")
+    await button("Search transcript").click()
+    const findTranscript = page.getByRole("textbox", { name: "Search transcript" })
+    await findTranscript.fill("Opening. Continued.")
+    await page.getByRole("status", { name: "Match 1 of 1" }).waitFor()
+    assert.equal(await stackedMeeting.locator('mark[data-selected="true"]').count(), 3)
+    await findTranscript.fill("0:35 pause")
+    await page.getByRole("status", { name: "No matches" }).waitFor()
+    await button("Close search").click()
+    await stackedMeeting.getByRole("button", { name: "Continued.", exact: true }).click()
+    await page.waitForFunction(() => document.querySelector("audio")?.currentTime >= .35)
+    delete saved.meetingTurns
+    saved.transcript = originalTranscript
+    saved.audioUrl = originalAudio
     function publishMeeting(text, processed, status = "processing") {
       Object.assign(saved, { status, processed, finalizationPending: status !== "complete" })
       Object.assign(saved.transcript, { text, transcriptSource: status === "complete" ? "final" : "rolling",
@@ -1660,16 +2280,34 @@ async function run() {
       detail: { phase: "finished", session: id },
     })), annotationId)
     await annotationEntry.click()
-    const annotationPanel = page.getByRole("tabpanel", { name: "Annotation" })
-    await annotationPanel.getByRole("img", { name: /contact sheet/i }).waitFor()
+    const annotationPanel = page.getByRole("tabpanel", { name: "Overview" })
+    await annotationPanel.getByRole("button", { name: "Expand images", exact: true }).waitFor()
+    await annotationPanel.getByRole("button", { name: "Expand images", exact: true }).click()
+    const frame = annotationPanel.getByRole("button", { name: "Screen capture at 0:00", exact: true }).first()
+    await frame.click()
+    await page.getByRole("dialog", { name: "Screen capture at 0:00" }).getByRole("button", { name: "Close image" }).click()
+    await annotationPanel.getByRole("button", { name: /^Images/ }).click()
     assert.ok(Math.abs(await annotationPanel.evaluate(node => parseFloat(getComputedStyle(node).paddingBlockStart)) - notesPadding) < .1)
-    assert.equal(new URL(page.url()).searchParams.get("tab"), "annotation")
+    assert.equal(new URL(page.url()).searchParams.get("tab"), "overview")
     await annotationPanel.getByText("2 strokes", { exact: true }).waitFor()
     await annotationPanel.getByRole("button", { name: "Jump to 0:00.1", exact: true }).waitFor()
     const video = annotationPanel.locator("video")
     assert.equal(await video.getAttribute("src"), annotated.audioUrl)
     await annotationPanel.getByRole("button", { name: "Jump to 0:00.6", exact: true }).click()
     await page.waitForFunction(() => Math.abs(document.querySelector("video")?.currentTime - .6) < .05)
+    const savedVideo = annotated.audioUrl
+    const savedAnnotation = annotated.annotation
+    annotated.annotationStorageUnavailable = true
+    annotated.audioUrl = null
+    annotated.annotation = { ...savedAnnotation, manifestUrl: null, contactSheetUrl: null }
+    await page.evaluate(() => dispatchEvent(new Event("focus")))
+    await annotationPanel.getByText(/Reconnect the Annotations folder/).waitFor()
+    assert.equal(await video.count(), 0)
+    annotated.annotationStorageUnavailable = undefined
+    annotated.audioUrl = savedVideo
+    annotated.annotation = savedAnnotation
+    await page.evaluate(() => dispatchEvent(new Event("focus")))
+    await video.waitFor()
     await annotationPanel.getByRole("button", { name: "Save contact sheet" }).click()
     assert.deepEqual(await page.evaluate(() => window.lastExport), { id: annotationId, kind: "annotation-contact-sheet" })
     await annotationPanel.getByRole("button", { name: "Save strokes" }).click()
@@ -1680,11 +2318,96 @@ async function run() {
     await button("Paste into Last App").click()
     await page.getByText("Sent annotation to Fixture editor.", { exact: true }).waitFor()
     assert.deepEqual(await page.evaluate(() => window.pastedAnnotation), { id: annotationId })
-    await button("Send to OpenCode…").click()
+    const agentStack = button("Send to your agent")
+    const agentFan = page.getByRole("dialog", { name: "Send to your agent", exact: true })
+    assert.equal(await agentStack.getAttribute("aria-expanded"), "false")
+    assert.equal(await agentStack.locator("img").count(), 4)
+    assert.equal(await button("Send to Codex…").count(), 0)
+    await agentStack.hover()
+    await page.getByRole("tooltip").getByText("Send to your agent", { exact: true }).waitFor()
+    await agentStack.focus()
+    await page.keyboard.press("Enter")
+    await agentFan.waitFor()
+    await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Send to Claude Code…")
+    assert.notEqual(await agentFan.evaluate(node => getComputedStyle(node).animationName), "none")
+    await page.keyboard.press("Escape")
+    await agentFan.waitFor({ state: "hidden" })
+    await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Send to your agent")
+    assert.equal(await agentStack.getAttribute("aria-expanded"), "false")
+
+    const previousViewport = page.viewportSize()
+    await page.setViewportSize({ width: 390, height: 740 })
+    await page.emulateMedia({ reducedMotion: "reduce" })
+    await agentStack.scrollIntoViewIfNeeded()
+    const stackBounds = await agentStack.boundingBox()
+    await agentStack.click()
+    await agentFan.waitFor()
+    assert.equal(await agentFan.evaluate(node => getComputedStyle(node).animationName), "none")
+    assert.equal(await button("Send to Codex…").evaluate(node => getComputedStyle(node).animationName), "none")
+    const fanBounds = await agentFan.boundingBox()
+    assert(fanBounds.x >= 0 && fanBounds.x + fanBounds.width <= 390)
+    assert.equal((await agentStack.boundingBox()).x, stackBounds.x)
+    assert.equal((await agentStack.boundingBox()).width, stackBounds.width)
+    await page.keyboard.press("Escape")
+    await agentFan.waitFor({ state: "hidden" })
+    await page.setViewportSize(previousViewport)
+    await page.emulateMedia({ reducedMotion: "no-preference" })
+
+    async function chooseAgent(name) {
+      if (await agentStack.getAttribute("aria-expanded") === "false") await agentStack.click()
+      await agentFan.getByRole("button", { name: `Send to ${name}…`, exact: true }).click()
+    }
+    await agentStack.click()
+    async function visibleAgentLogos(colorScheme) {
+      await page.emulateMedia({ colorScheme })
+      return Promise.all(["Codex", "Claude Code", "OpenCode", "T3 Code"].map(name =>
+        button(`Send to ${name}…`).locator("img").evaluate(async image => {
+          await image.decode()
+          if (image.alt !== "" || image.offsetWidth !== 20 || image.offsetHeight !== 20 || !image.naturalWidth) {
+            throw new Error("Missing, mislabeled, or incorrectly sized send icon")
+          }
+          return image.currentSrc
+        })))
+    }
+    const lightLogos = await visibleAgentLogos("light")
+    const darkLogos = await visibleAgentLogos("dark")
+    assert.equal(new Set(lightLogos).size, 4)
+    assert.equal(new Set(darkLogos).size, 4)
+    assert.notEqual(darkLogos[0], lightLogos[0])
+    assert.equal(darkLogos[1], lightLogos[1])
+    assert.notEqual(darkLogos[2], lightLogos[2])
+    assert.equal(darkLogos[3], lightLogos[3])
+    await page.emulateMedia({ colorScheme: null })
+    await button("Send to Codex…").hover()
+    await page.getByRole("tooltip").getByText("Send to Codex", { exact: true }).waitFor()
+    await page.evaluate(() => { window.fixtureAgentUnavailable = true })
+    await chooseAgent("Claude Code")
+    const claudePicker = page.getByRole("dialog", { name: "Send to Claude Code" })
+    await claudePicker.getByRole("alert").getByText(/Install the Claude Code/).waitFor()
+    await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Search Claude Code sessions")
+    const modalBackgroundStack = page.getByRole("button", { name: "Send to your agent", exact: true, includeHidden: true })
+    assert.equal(await modalBackgroundStack.getAttribute("aria-expanded"), "false")
+    assert.equal(await claudePicker.getByRole("button", { name: "Send context" }).isDisabled(), true)
+    await page.keyboard.press("Escape")
+    await claudePicker.waitFor({ state: "hidden" })
+    await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Send to your agent")
+    assert.equal(await page.evaluate(() => window.sentToAgent), undefined)
+    await page.evaluate(() => { window.fixtureAgentUnavailable = false })
+    for (const [agent, name] of [["codex", "Codex"], ["claude", "Claude Code"], ["t3", "T3 Code"]]) {
+      await chooseAgent(name)
+      const picker = page.getByRole("dialog", { name: `Send to ${name}` })
+      await picker.getByRole("textbox", { name: `Search ${name} sessions` }).fill("agent")
+      await picker.getByRole("radio", { name: /Agent notes/ }).check()
+      assert.equal(await picker.getByRole("radio", { name: /Release planning/ }).count(), 0)
+      await picker.getByRole("button", { name: "Send context" }).click()
+      await page.getByRole("status").getByText(`Session context and image${agent === "t3" ? " links" : "s"} sent to Agent notes in ${name}.`).waitFor()
+      assert.deepEqual(await page.evaluate(() => window.sentToAgent), { id: annotationId, agent, target: "agent-notes", service: undefined, open: true })
+    }
+    await chooseAgent("OpenCode")
     const destinationPicker = page.getByRole("dialog", { name: "Send to OpenCode" })
     await destinationPicker.getByRole("radio", { name: /fixture release/i }).waitFor()
     await destinationPicker.getByText("Mentioned in the annotation", { exact: true }).waitFor()
-    assert.equal(await button("Send annotation").isDisabled(), true)
+    assert.equal(await button("Send context").isDisabled(), true)
     await destinationPicker.getByRole("textbox", { name: "Search OpenCode sessions" }).fill("notes")
     await destinationPicker.getByRole("radio", { name: /project notes/i }).check()
     assert.equal(await destinationPicker.getByRole("radio", { name: /fixture release/i }).count(), 0)
@@ -1700,20 +2423,46 @@ async function run() {
     await button("Forget").waitFor({ state: "detached" })
     assert.deepEqual(await page.evaluate(() => window.forgottenAnnotation), { id: annotationId, ruleId: "rule-fixture" })
     await destinationPicker.getByRole("radio", { name: /project notes/i }).check()
-    await button("Send annotation").click()
+    await button("Send context").click()
     const deliveryLog = page.getByRole("region", { name: "OpenCode deliveries" })
     await deliveryLog.getByText("Project notes", { exact: true }).first().waitFor()
     await deliveryLog.getByText(/^Queued/).waitFor()
     assert.deepEqual(await page.evaluate(() => window.sentAnnotation), {
-      id: annotationId, target: "ses_two", service: "fixture-service",
+      id: annotationId, agent: "opencode", target: "ses_two", service: "fixture-service", open: true,
     })
+    await page.evaluate(capture => {
+      const rows = JSON.parse(localStorage.getItem("annotationRoutingFixture"))
+      rows.push({ ...rows[0], deliveryId: "fixture-native-preview", session: { id: "ses_native", title: "Native preview destination" },
+        rememberedRule: { status: "saved", label: "example.test" } })
+      localStorage.setItem("annotationRoutingFixture", JSON.stringify(rows))
+      window.dispatchEvent(new CustomEvent("native-sdk:jard-annotation-delivery-changed", { detail: { capture } }))
+    }, annotationId)
+    await deliveryLog.getByText("Native preview destination", { exact: true }).waitFor()
+    await deliveryLog.getByText("Automatic destination saved · example.test", { exact: true }).waitFor()
+    await page.evaluate(capture => {
+      const rows = JSON.parse(localStorage.getItem("annotationRoutingFixture"))
+      localStorage.setItem("annotationRoutingFixture", JSON.stringify(rows.filter(row => row.deliveryId !== "fixture-native-preview")))
+      window.dispatchEvent(new CustomEvent("native-sdk:jard-annotation-delivery-changed", { detail: { capture } }))
+    }, annotationId)
+    await deliveryLog.getByText("Native preview destination", { exact: true }).waitFor({ state: "detached" })
+    annotated.audioRemovedAt = new Date().toISOString()
+    annotated.audioUrl = null
+    await page.evaluate(() => window.dispatchEvent(new Event("jard-annotation-retention")))
+    await video.waitFor({ state: "detached" })
+    await annotationPanel.getByText(/The video moved to Trash/).waitFor()
+    await annotationPanel.getByRole("button", { name: "Expand images", exact: true }).waitFor()
     annotated.status = "interrupted"
     annotated.transcript = { ...annotated.transcript, interruption: "Narration transcription was interrupted." }
     await page.evaluate(() => localStorage.setItem("managedRoutingFixture", "true"))
     await page.goto(`http://127.0.0.1:18997/?session=${annotationId}&tab=annotation`)
     await annotationPanel.getByText("OpenCode processing is managed by your organization.", { exact: true }).waitFor()
     await deliveryLog.getByText(/^Queued/).waitFor()
-    for (const label of ["Send to OpenCode…", "Undo send", "Restore files and undo…"]) {
+    await agentStack.click()
+    assert.equal(await agentFan.getByRole("button", { name: "Send to OpenCode…" }).isDisabled(), true)
+    assert.equal(await agentFan.getByRole("button", { name: "Send to Codex…" }).isEnabled(), true)
+    await page.keyboard.press("Escape")
+    await agentFan.waitFor({ state: "hidden" })
+    for (const label of ["Undo send", "Restore files and undo…"]) {
       assert.equal(await button(label).isDisabled(), true, label)
     }
     assert.ok((await deliveryLog.getByRole("button", { name: "Send correction…" }).all()).length)
@@ -1728,7 +2477,7 @@ async function run() {
     await page.getByText("Project notes · Automatic send cancelled.", { exact: true }).waitFor()
     await page.evaluate(() => localStorage.removeItem("managedRoutingFixture"))
     await page.goto(`http://127.0.0.1:18997/?session=${annotationId}&tab=annotation`)
-    await annotationPanel.getByRole("img", { name: /contact sheet/i }).waitFor()
+    await annotationPanel.getByRole("button", { name: "Expand images", exact: true }).waitFor()
     await page.getByText("Narration transcription was interrupted.", { exact: true }).waitFor()
     await deliveryLog.getByRole("button", { name: "Undo send" }).click()
     await deliveryLog.getByText(/^Withdrawn/).waitFor()
@@ -1768,16 +2517,41 @@ async function run() {
     await page.getByText(/Delivery unconfirmed\. Check OpenCode/).waitFor()
     assert.equal(await button("Cancel automatic send").count(), 0)
     assert.deepEqual(await page.evaluate(() => window.correctedAnnotation), { deliveryId: "fixture-received" })
-    assert.equal(await page.getByRole("tab", { name: "Overview" }).count(), 0)
+    assert.equal(await page.getByRole("tab", { name: "Annotation" }).count(), 0)
     await page.getByRole("tab", { name: "Transcript" }).click()
     assert.equal(new URL(page.url()).searchParams.get("tab"), "transcript")
-    await page.getByRole("tab", { name: "Annotation" }).click()
+    await page.getByRole("tab", { name: "Overview" }).click()
     await button("Save strokes").click()
-    assert.equal(new URL(page.url()).searchParams.get("tab"), "annotation")
+    assert.equal(new URL(page.url()).searchParams.get("tab"), "overview")
     assert.deepEqual(await page.evaluate(() => window.lastExport), { id: annotationId, kind: "annotation-manifest" })
+    const paintedAnnotation = annotated.annotation
+    annotated.audioUrl = savedVideo
+    annotated.audioRemovedAt = undefined
+    annotated.annotation = { ...paintedAnnotation, frames: [], contactSheetUrl: null, missingVideo: "noFrames" }
+    await page.goto(`http://127.0.0.1:18997/?session=${annotationId}&tab=annotation`)
+    await page.getByText("The screen recording produced no video frames.", { exact: true }).waitFor()
+    assert.equal(await page.getByLabel("Annotation recording").count(), 0)
+    await button("Open narration player").click()
+    await button("Close audio player").waitFor()
+    annotated.annotation = paintedAnnotation
     await page.goto(`http://127.0.0.1:18997/?session=${meetingId}&tab=annotation`)
     await page.getByRole("tabpanel", { name: "Overview" }).waitFor()
     assert.equal(new URL(page.url()).searchParams.get("tab"), "overview")
+    const meetingImages = page.getByRole("region", { name: "Session images" })
+    await meetingImages.locator('input[type="file"]').setInputFiles({
+      name: "reference.png", mimeType: "image/png",
+      buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jL1sAAAAASUVORK5CYII=", "base64"),
+    })
+    await meetingImages.getByRole("button", { name: "Image 1", exact: true }).click()
+    const imageViewer = page.getByRole("dialog", { name: "Image 1" })
+    await imageViewer.getByRole("img", { name: "Image 1" }).waitFor()
+    await imageViewer.getByRole("button", { name: "Close image" }).click()
+    await page.reload()
+    await meetingImages.getByRole("button", { name: "Expand images", exact: true }).click()
+    await meetingImages.getByRole("button", { name: "Image 1", exact: true }).click()
+    await imageViewer.getByRole("button", { name: "Remove image" }).click()
+    await imageViewer.waitFor({ state: "hidden" })
+    await meetingImages.getByText("No images attached.").waitFor()
     await page.evaluate(({ id, revision }) => sessionStorage.setItem(`jard.personalNotes.${id}`, JSON.stringify({
       revision, document: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Recovered fixture draft" }] }] },
     })), { id: meetingId, revision: personalNotes.revision })
@@ -1815,16 +2589,39 @@ async function run() {
     await heading(french.Settings).waitFor()
     assert.equal(await page.locator("html").getAttribute("lang"), "fr")
     assert.deepEqual(await page.evaluate(() => window.dictationFixture.languages), ["en"])
+    await page.getByRole("tablist", { name: french.Settings, exact: true }).getByRole("tab", { name: french.Dictation, exact: true }).click()
+    await button(french["Shortcut mode"]).click()
+    const frenchMode = page.getByRole("dialog", { name: french["Shortcut mode"] })
+    await frenchMode.getByRole("button", { name: new RegExp(french["Double-tap only"]) }).waitFor()
+    await frenchMode.getByText(french.Recording, { exact: true }).waitFor()
+    await frenchMode.getByRole("button", { name: french.Done }).click()
     await button(french.Back).click()
     await page.getByText("Recovered fixture draft", { exact: true }).waitFor()
     await page.evaluate(() => sessionStorage.removeItem("fixtureOnboarded"))
     await page.reload()
     await heading(french["Speak where you write."]).waitFor()
+    await button(french["Set up dictation"]).click()
+    const frenchAccess = page.getByRole("dialog", { name: french["Give Jard access"] })
+    await frenchAccess.getByRole("button", { name: french["Allow microphone"] }).waitFor()
+    assert.equal(await frenchAccess.getByText(french.Accessibility, { exact: true }).count(), 0)
     await button(french["Set up later"]).click()
     await button(french.Settings).click()
     await chooseLanguage("fr", "system")
     await heading("Settings").waitFor()
     assert.equal(await page.locator("html").getAttribute("lang"), "en")
+    const previousSpeechHints = await page.evaluate(() => {
+      const languages = window.dictationFixture.languages
+      window.dictationFixture.languages = ["es"]
+      return languages
+    })
+    await page.evaluate(detail => window.dispatchEvent(new CustomEvent("native-sdk:jard-interface-language", { detail })), {
+      selected: "en", resolved: "en", choices: interfaceCatalog.choices, messages: interfaceCatalog.messages.en ?? {},
+    })
+    await page.waitForFunction(() => document.querySelector('[data-setting-title="Interface language"] select')?.value === "en")
+    assert.equal(await page.locator("html").getAttribute("lang"), "en")
+    assert.deepEqual(await page.evaluate(() => window.dictationFixture.languages), ["es"])
+    await page.evaluate(languages => { window.dictationFixture.languages = languages }, previousSpeechHints)
+    await chooseLanguage("en", "system")
     await settingsTab("Dictation").click()
     await publishUpdate({ phase: "checking", manualCheck: true, openUpdateSettings: "first-menu-check" })
     await settingsAction("Looking for new versions…").waitFor()
@@ -1984,7 +2781,7 @@ async function run() {
       sessionStorage.removeItem("fixtureWindowNavigation")
     })
     await page.goto(`http://127.0.0.1:18997/?session=${annotationId}&tab=annotation`)
-    await annotationPanel.getByRole("img", { name: /contact sheet/i }).waitFor()
+    await annotationPanel.getByRole("button", { name: "Expand images", exact: true }).waitFor()
     await button("Copy for Agent").click()
     await page.getByText("Copied context and contact sheet for rich-text paste.", { exact: true }).waitFor()
     await button("Save strokes").click()
@@ -1995,7 +2792,8 @@ async function run() {
     for (const name of ["Choose Display…", "Choose Window…", "Choose Area…", "Wired iPhone or iPad"]) {
       assert.equal(await button(name).isDisabled(), true, name)
     }
-    assert.equal(await page.getByText(/With Accessibility enabled, press/).count(), 0)
+    assert.equal(await annotationSettings.getByRole("region", { name: "Shortcuts" }).count(), 0)
+    assert.equal(await screenAccess.count(), 0)
     await page.evaluate(() => localStorage.removeItem("managedAnnotationFixture"))
     await page.reload()
     if (!(await settingsTab("Annotate").isVisible())) await button("Settings").click()
@@ -2008,8 +2806,11 @@ async function run() {
     await page.evaluate(() => localStorage.setItem("managedMeetingsFixture", "true"))
     await page.goto(`http://127.0.0.1:18997/?session=${meetingId}&tab=overview`)
     await page.getByText("Meeting summaries and overviews are managed by your organization.", { exact: true }).waitFor()
-    assert.equal(await button("Regenerate summary").count(), 0)
-    assert.equal(await button("Summarize meeting").count(), 0)
+    assert.equal(await briefText.isVisible(), false)
+    await briefToggle.click()
+    await briefText.waitFor()
+    assert.equal(await button("Regenerate brief").count(), 0)
+    assert.equal(await button("Write quick brief").count(), 0)
     await page.getByRole("tab", { name: "Transcript", exact: true }).click()
     await page.getByRole("tabpanel", { name: "Transcript" }).getByText("Final meeting transcript", { exact: true }).waitFor()
     await button("Settings").click()
@@ -2033,8 +2834,11 @@ async function run() {
       }))
     }, { event, detail })
     const publishLiveTurns = count => {
-      const segments = Array.from({ length: count }, (_, i) => ({ start: i * 4, end: i * 4 + 4,
-        speaker: i % 2 + 1, text: `Meeting turn ${i + 1} discusses the schedule and assigns the next task.` }))
+      const segments = Array.from({ length: count }, (_, i) => {
+        const start = i * 4 + (i > 25 ? 35 : 0)
+        return { start, end: start + 4, speaker: i % 2 + 1,
+          text: `Meeting turn ${i + 1} discusses the schedule and assigns the next task.` }
+      })
       return capture("preview", { text: segments.map(turn => turn.text).join(" "), segments })
     }
     await capture("started", { mode: "both", microphone: "Fixture microphone", live: true })
@@ -2046,23 +2850,29 @@ async function run() {
       const area = document.querySelector("[data-live-transcript]")
       return area && area.scrollHeight > area.clientHeight + 100 && area.scrollHeight - area.clientHeight - area.scrollTop <= 2
     })
-    const scrollTo = (offset) => liveTranscript.evaluate(async (area, offset) => {
-      area.scrollTop = offset === "end" ? area.scrollHeight : offset
+    const livePosition = () => liveTranscript.evaluate(async area => {
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))
       return area.scrollTop
-    }, offset)
+    })
     await liveTurn(26).waitFor()
+    await liveTranscript.getByText("Speaker A", { exact: true }).first().waitFor()
+    await liveTranscript.getByText("Speaker B", { exact: true }).first().waitFor()
+    await liveTranscript.getByText("Listening…", { exact: true }).waitFor()
     await page.waitForFunction(() => document.activeElement?.hasAttribute("data-live-transcript"))
     await atLiveEnd()
     await publishLiveTurns(27)
     await liveTurn(27).waitFor()
+    await liveTranscript.getByText("0:35 pause", { exact: true }).waitFor()
     await atLiveEnd()
-    const reading = await scrollTo(120)
-    assert.ok(reading > 0)
+    const liveEnd = await livePosition()
+    await liveTranscript.press("PageUp")
+    const reading = await livePosition()
+    assert.ok(reading > 0 && reading < liveEnd)
     await publishLiveTurns(29)
     await liveTurn(29).waitFor()
     assert.ok(Math.abs(await liveTranscript.evaluate(area => area.scrollTop) - reading) <= 2)
-    await scrollTo("end")
+    await liveTranscript.press("End")
+    await atLiveEnd()
     await publishLiveTurns(30)
     await liveTurn(30).waitFor()
     await atLiveEnd()
@@ -2072,6 +2882,7 @@ async function run() {
       window.dispatchEvent(new CustomEvent("native-sdk:jard-meetings", { detail: { ...window.meetingsFixture } }))
     })
     await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    await liveTranscript.getByText("Listening…", { exact: true }).waitFor({ state: "hidden" })
     const stopping = await liveTranscript.evaluate(area => area.scrollTop)
     await publishLiveTurns(34)
     await liveTurn(34).waitFor()
@@ -2079,6 +2890,34 @@ async function run() {
     await capture("finished", { reason: "Stopped" })
     await capture("accepted", { id: meetingId })
     await page.getByRole("tabpanel", { name: "Transcript" }).getByText("Final meeting transcript", { exact: true }).waitFor()
+
+    saved.status = "interrupted"
+    saved.finalizationPending = true
+    saved.audioUrl = `/api/sessions/${meetingId}/audio`
+    delete saved.audioRemovedAt
+    saved.transcript = { ...saved.transcript, text: "Recovered meeting transcript", transcriptSource: "draft",
+      segments: [{ speaker: 2, start: 0, end: 2, text: "Recovered meeting transcript" }] }
+    await button("Meetings").click()
+    await meetingWorkspace.getByText(/Processing/).waitFor()
+    const recoveredCopy = meetingWorkspace.getByRole("button", { name: "Copy transcript" })
+    const recoveredTrash = meetingWorkspace.getByRole("button", { name: "Move meeting to Trash" })
+    assert.equal(await recoveredCopy.isEnabled(), false)
+    assert.equal(await recoveredTrash.isEnabled(), false)
+    saved.finalizationPending = false
+    await meetingWorkspace.getByText(/Interrupted/).waitFor()
+    await recoveredCopy.click()
+    await meetingWorkspace.getByRole("button", { name: "Copied" }).waitFor()
+    await meetingWorkspace.locator(".meeting-workspace-open").click()
+    await page.getByRole("tabpanel", { name: "Transcript" }).getByText("Recovered meeting transcript", { exact: true }).waitFor()
+    await button("Open audio player").waitFor()
+    await button("Meeting exports").click()
+    await page.getByRole("menuitem", { name: "Copy transcript" }).waitFor()
+    assert.equal(await page.getByRole("menuitem", { name: "Move meeting audio to Trash…" }).count(), 0)
+    await page.evaluate(() => { window.revealedRecording = null })
+    await page.getByRole("menuitem", { name: "Reveal files" }).click()
+    assert.equal(await page.evaluate(() => window.revealedRecording), meetingId)
+    await button("Copy transcript").click()
+    await button("Copied").waitFor()
 
     const savedMeetingName = meetingTitle ?? meetingBrief?.title ?? saved.name
     const trashMeeting = button(`Delete ${savedMeetingName}`)
@@ -2102,7 +2941,7 @@ async function run() {
     await page.setViewportSize({ width: 430, height: 730 })
     await page.waitForFunction(() => document.documentElement.scrollWidth <= innerWidth)
     assert.deepEqual(errors, [])
-    console.log("Dictation onboarding, named Output steps, updates, meetings, tab spacing and My Notes failure recovery passed in WebKit.")
+    console.log("Dictation, updates, meeting recovery, Annotate settings, tab spacing, and My Notes failure recovery passed in WebKit.")
   } finally {
     await browser.close()
   }

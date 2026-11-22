@@ -70,6 +70,8 @@ sessions.sql.*
 !/desktop/assets/dictation-sounds/**/*.wav
 *.m4a
 *.mp3
+!/desktop/assets/dictation-sounds/annotationSent.mp3
+!/desktop/assets/dictation-sounds/annotationUndo.mp3
 *.webm
 *.p12
 *.p8

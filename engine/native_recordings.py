@@ -1,5 +1,4 @@
 """Private draft WAV files produced by the Mac capture helper."""
-import fcntl
 import json
 import os
 import struct
@@ -94,6 +93,8 @@ def is_meeting_stage(path, metadata=None):
 
 
 def list_drafts(folder):
+    import fcntl
+
     drafts = []
     for marker in folder.glob("*.recording"):
         try:
@@ -120,6 +121,8 @@ def list_drafts(folder):
 
 
 def capture_active(folder):
+    import fcntl
+
     for pattern in ("*.recording", "*.dictation"):
         for marker in folder.glob(pattern):
             try:

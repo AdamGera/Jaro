@@ -3,6 +3,8 @@
 #import "jard_calendar.h"
 #import "jard_meeting_panel.h"
 #import "jard_meeting_delta.h"
+#import "jard_interface_language.h"
+#import "indicator/JardDictationMeter.h"
 #import <math.h>
 
 static NSString *const managedMessage = @"Meetings are managed by your organization.";
@@ -13,6 +15,29 @@ static NSString *const autoStopKey = @"JardMeetingAutoStop";
 static NSString *const indicatorKey = @"JardShowMeetingIndicator";
 static NSString *const cornerKey = @"JardMeetingIndicatorCorner";
 static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
+static const CGFloat recordingHeaderHeight = 40;
+static const CGFloat recordingRowHeight = 32;
+static const CGFloat recordingInitialWidth = 162;
+static const CGFloat recordingOpenWidth = 258;
+static const NSTimeInterval callSwitchHold = 4;
+static const NSTimeInterval callSwitchObservationGap = 10;
+static const NSTimeInterval callStopGrace = 30;
+static const NSTimeInterval meetingOfferLifetime = 20;
+static const NSTimeInterval offerStartingDelay = .18;
+
+static NSString *meetingClock(NSTimeInterval seconds) {
+    long elapsed = (long)MAX(0, seconds);
+    return [NSString stringWithFormat:@"%ld:%02ld", elapsed / 60, elapsed % 60];
+}
+
+static CGFloat recordingRowY(CGFloat height, BOOL top, NSUInteger index) {
+    CGFloat offset = index * recordingRowHeight;
+    return top ? height - recordingHeaderHeight - recordingRowHeight - offset : recordingHeaderHeight + offset;
+}
+
+static CGFloat meetingClockWidth(NSTextField *caption) {
+    return MAX(38, ceil([caption.stringValue sizeWithAttributes:@{NSFontAttributeName: caption.font}].width) + 12);
+}
 
 @interface JardMeetings ()
 @property(nonatomic, copy) JardMeetingStart beginCapture;
@@ -26,17 +51,37 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 @property(nonatomic, strong) NSDate *reminderExpires;
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic, strong) JardCall *offered, *activeCall;
+@property(nonatomic) BOOL offerChoicesOpen;
+@property(nonatomic) NSTimeInterval offerDepartureAt;
+@property(nonatomic) NSSize offerDepartureSize;
+@property(nonatomic) BOOL offerStartingVisible;
 @property(nonatomic, strong) JardCall *permissionCall;
 @property(nonatomic, copy) NSArray<NSString *> *activeLanguages;
 @property(nonatomic, strong) JardMeetingPanel *panel;
 @property(nonatomic, strong) NSTextField *caption;
+@property(nonatomic, strong) JardDictationMeter *recordingMeter;
+@property(nonatomic, strong) NSTimer *meterTimer;
+@property(nonatomic, copy) NSArray<NSButton *> *recordingActions;
+@property(nonatomic, weak) NSButton *recordingDisclosure;
+@property(nonatomic, weak) NSTextField *recordingNotice;
+@property(nonatomic, weak) NSTextField *recordingResultTitle;
+@property(nonatomic) CGFloat recordingExpansion;
+@property(nonatomic) NSTimeInterval recordingLayoutAt;
+@property(nonatomic) NSTimeInterval recordingResultAt;
+@property(nonatomic) NSSize recordingResultOrigin;
+@property(nonatomic) BOOL recordingHoverHeld, recordingPinned, waitingForCaptureEnd;
+@property(nonatomic) BOOL recordingControlsRevealed;
+@property(nonatomic) double recordingRMS;
+@property(nonatomic) NSTimeInterval recordingLevelAt;
 @property(nonatomic, weak) NSTextField *completionBody;
 @property(nonatomic, weak) NSButton *incrementalTextButton, *fullTextButton;
 @property(nonatomic, weak) NSButton *agentPromptButton;
 @property(nonatomic, copy) NSString *phase, *message, *recordingID, *sessionID, *lastSavedSessionID, *providerLabel;
 @property(nonatomic, copy) NSString *provisionalTitle, *meetingTitle;
 @property(nonatomic) BOOL microphoneSilent;
+@property(nonatomic) BOOL microphoneUnavailable;
 @property(nonatomic) BOOL systemAudioUnavailable;
+@property(nonatomic) BOOL captureUsesSharedMicrophone;
 @property(nonatomic, copy) NSString *microphoneName;
 @property(nonatomic, copy) NSString *completionSession;
 @property(nonatomic, copy) NSDictionary *completion;
@@ -47,7 +92,8 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 @property(nonatomic, strong) JardMeetingDelta *delta;
 @property(nonatomic, copy) NSString *textMeetingID, *exhaustedMeetingID, *emptyMeetingID;
 @property(nonatomic, copy) NSString *excerptFeedback;
-@property(nonatomic, copy) NSString *differentCall, *keptSwitch, *endedReason;
+@property(nonatomic, strong) JardCall *differentCall;
+@property(nonatomic, copy) NSString *keptSwitch, *endedReason;
 @property(nonatomic) BOOL copying;
 @property(nonatomic) BOOL detection, workspace, suspended, sampling, closed, endPromptAcknowledged;
 @property(nonatomic) BOOL autoStop, automaticRecording;
@@ -55,6 +101,7 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 @property(nonatomic) BOOL checkingLatest, waitingForRecoveredMeeting;
 @property(nonatomic) BOOL checkingCompletion;
 @property(nonatomic) NSTimeInterval offeredAt, lastPresent, seconds, automaticUntil, autoStopAt, differentSince, nextLatestCheck;
+@property(nonatomic) NSTimeInterval differentLastSeen;
 @property(nonatomic) NSTimeInterval completionDeadline;
 @property(nonatomic) NSUInteger liveCharacters, excerptGeneration, generation, excerptFeedbackGeneration;
 @property(nonatomic) NSUInteger completionGeneration;
@@ -101,6 +148,7 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 - (BOOL)keepsRunning { return self.busy || self.completionSession || self.detection || (self.calendar.connected && self.calendar.reminders); }
 
 - (BOOL)recording { return [@[@"recording", @"callEnded"] containsObject:self.phase]; }
+- (BOOL)sharesMicrophone { return self.recording && self.captureUsesSharedMicrophone; }
 - (BOOL)hasNewExcerpt {
     if (self.recordingID) return [self.delta unseenTurns:self.liveTurns meeting:self.textMeetingID].count > 0;
     return self.lastSavedSessionID && ![self.exhaustedMeetingID isEqual:self.lastSavedSessionID];
@@ -119,25 +167,47 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
         @"message": self.managed ? managedMessage : self.message ?: @"",
         @"title": self.meetingTitle ?: self.activeCalendar.title ?: self.provisionalTitle ?: @"",
         @"session": self.sessionID ?: @"", @"hasText": @(self.hasExcerpt),
+        @"hasSavedMeeting": @(self.lastSavedSessionID != nil),
         @"hasNewText": @(self.hasNewExcerpt), @"copying": @(self.copying), @"policies": self.policies.allValues,
         @"providerPolicies": [self providerPolicies],
-        @"microphoneSilent": @(self.recording && self.microphoneSilent),
+        @"microphoneSilent": @(self.recording && self.microphoneSilent && !self.microphoneUnavailable),
+        @"microphoneUnavailable": @(self.recording && self.microphoneUnavailable),
         @"systemAudioUnavailable": @(self.recording && self.systemAudioUnavailable),
-        @"microphone": self.recording ? self.microphoneName ?: @"" : @"",
+        @"microphone": self.recording && !self.microphoneUnavailable ? self.microphoneName ?: @"" : @"",
         @"autoStop": @(self.autoStop), @"autoStopSeconds": @(self.autoStopAt > 0 ? ceil(MAX(0, self.autoStopAt - NSProcessInfo.processInfo.systemUptime)) : 0),
         @"calendar": [self.calendar statusAt:NSDate.date] ?: @{}, @"showIndicator": @(self.showIndicator), @"indicatorCorner": self.panelCorner,
         @"permission": self.permissionSource ?: @"", @"recoveryAvailable": @(self.recoveryDraft != nil)};
 }
 
+- (void)announceMeetingStatus:(NSString *)message {
+    id target = (id)self.caption ?: NSApp;
+    if (message.length && target) NSAccessibilityPostNotificationWithUserInfo(target, NSAccessibilityAnnouncementRequestedNotification,
+        @{NSAccessibilityAnnouncementKey: message, NSAccessibilityPriorityKey: @(NSAccessibilityPriorityMedium)});
+}
+
 - (void)state:(NSString *)phase message:(NSString *)message {
-    BOOL announce = ![self.phase isEqual:phase] && message.length &&
-        [@[@"permission", @"interrupted", @"callEnded", @"finished"] containsObject:phase];
+    NSString *announcement = nil;
+    if ([phase isEqual:@"recording"] && [self.phase isEqual:@"starting"]) {
+        announcement = JardLocalized(@"Meeting recording started.");
+        if (self.microphoneUnavailable)
+            announcement = [announcement stringByAppendingFormat:@" %@", JardLocalized(@"Meeting microphone reconnecting.")];
+    } else if (![self.phase isEqual:phase] &&
+               [@[@"saving", @"permission", @"interrupted", @"callEnded", @"finished", @"error"] containsObject:phase]) {
+        announcement = [phase isEqual:@"saving"] && self.waitingForCaptureEnd
+            ? [NSString stringWithFormat:@"%@. %@", JardLocalized(@"Meetings"), JardLocalized(@"Saving…")]
+            : JardLocalized(message);
+    }
+    if (![phase isEqual:@"starting"]) {
+        if (!([phase isEqual:@"recording"] && [self.phase isEqual:@"starting"])) self.offerDepartureAt = 0;
+        self.offerStartingVisible = NO;
+    }
     self.phase = phase;
+    if (![phase isEqual:@"offered"]) self.offerChoicesOpen = NO;
+    if (![phase isEqual:@"saving"]) self.waitingForCaptureEnd = NO;
     self.message = message;
     if (![phase isEqual:@"finished"]) [self clearCompletion];
     [self renderPanel];
-    if (announce && (self.caption || NSApp)) NSAccessibilityPostNotificationWithUserInfo((id)self.caption ?: NSApp, NSAccessibilityAnnouncementRequestedNotification,
-        @{NSAccessibilityAnnouncementKey: message, NSAccessibilityPriorityKey: @(NSAccessibilityPriorityMedium)});
+    if (announcement.length) [self announceMeetingStatus:announcement];
     if (self.changed) self.changed([self status]);
 }
 
@@ -178,6 +248,7 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
     self.suspended = suspended;
     self.generation++;
     [self.presence resetObservations];
+    if (suspended) [self.presence clearRememberedSwitch];
     if (suspended && self.calendarOffer) [self closeCalendarOffer];
     if (suspended && self.offered && !self.busy) {
         self.offered = nil;
@@ -196,9 +267,9 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
     if (!self.detection || self.suspended || self.sampling) return;
     self.sampling = YES;
     NSUInteger generation = self.generation;
-    BOOL includeOutput = self.automaticRecording && self.autoStop;
+    NSString *outputApplication = self.automaticRecording && self.autoStop ? self.activeCall.application : nil;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSArray *calls = JardActiveCalls(includeOutput);
+        NSArray *calls = JardActiveCalls(outputApplication);
         dispatch_async(dispatch_get_main_queue(), ^{
             self.sampling = NO;
             if (calls && self.generation == generation && !self.closed && !self.suspended) [self observed:calls];
@@ -248,31 +319,49 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
         owner.completion = result;
         if (!owner.completionDeadline && ![status isEqual:@"processing"]) {
             owner.completionDeadline = NSProcessInfo.processInfo.systemUptime + 15;
-            NSAccessibilityPostNotificationWithUserInfo((id)owner.caption ?: NSApp, NSAccessibilityAnnouncementRequestedNotification,
-                @{NSAccessibilityAnnouncementKey: @"Meeting transcript is ready.", NSAccessibilityPriorityKey: @(NSAccessibilityPriorityMedium)});
+            NSString *announcement = [status isEqual:@"interrupted"] ? @"Meeting transcription was interrupted." :
+                [result[@"hasSpeech"] boolValue] ? @"Meeting transcript is ready." : @"Meeting saved. No speech was detected.";
+            [owner announceMeetingStatus:JardLocalized(announcement)];
         }
         [owner updateCompletionContent];
     });
 }
 
-- (void)observeCalls:(NSArray<JardCall *> *)calls now:(NSTimeInterval)now date:(NSDate *)date {
+- (void)observeCalls:(NSArray<JardCall *> *)observations now:(NSTimeInterval)now date:(NSDate *)date {
+    NSArray<JardCall *> *calls = [self.presence callsResolvingSwitch:observations now:now];
     JardCall *candidate = [self.presence offerFromCalls:calls now:now];
     if (self.busy) {
+        if ([self.phase isEqual:@"saving"]) {
+            for (JardCall *call in observations) {
+                if (call.inputActive && [self.activeCall.application isEqual:call.application]) {
+                    self.lastPresent = now;
+                    break;
+                }
+            }
+        }
         [self observeActiveCalls:calls now:now];
         return;
     }
     if (self.permissionSource || self.recoveryDraft) return;
 
     if (self.offered) {
-        BOOL present = [calls indexOfObjectPassingTest:^BOOL(JardCall *call, NSUInteger i, BOOL *stop) {
-            return [call.identity isEqual:self.offered.identity];
-        }] != NSNotFound;
-        if (present) self.lastPresent = now;
-        if (now - self.offeredAt < 20 && now - self.lastPresent < 3) return;
-        [self.presence snooze:self.offered absence:now - self.offeredAt >= 20 ? 3 : 1 now:now];
+        BOOL present = NO;
+        for (JardCall *call in calls) {
+            if (!call.inputActive || ![self.offered matchesOfferObservation:call]) continue;
+            present = YES;
+            self.lastPresent = now;
+            if (!self.offered.googleMeetCode && call.googleMeetCode && [self.offered.provider isEqual:call.provider])
+                self.offered = call;
+            break;
+        }
+        BOOL timedOut = !self.offerChoicesOpen && now - self.offeredAt >= meetingOfferLifetime;
+        BOOL replaced = candidate && !present && ![self.offered matchesOfferObservation:candidate];
+        if (!replaced && !timedOut && now - self.lastPresent < 3) return;
+        if (!timedOut || replaced) [self.presence snooze:self.offered absence:60 now:self.lastPresent];
+        else if (present) [self.presence snooze:self.offered absence:0 now:now];
         self.offered = nil;
         [self state:@"idle" message:@""];
-        return;
+        if (!replaced) return;
     }
     if (!candidate) return;
     if ([self snoozedCalendarCall:candidate date:date]) {
@@ -281,7 +370,7 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
     }
     NSString *policy = [self policyForCall:candidate];
     if ([policy isEqual:@"never"]) {
-        [self.presence snooze:candidate absence:3 now:now];
+        [self.presence deferOfferForCall:candidate now:now];
         return;
     }
     if (self.calendarOffer) {
@@ -306,28 +395,35 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 - (void)observeActiveCalls:(NSArray<JardCall *> *)calls now:(NSTimeInterval)now {
     if (!self.activeCall || !self.recording) return;
     BOOL automatic = self.automaticRecording && self.autoStop;
-    BOOL present = NO;
+    BOOL present = NO, confirmedCurrent = NO;
     JardCall *other = nil;
     for (JardCall *call in calls) {
         if (!call.inputActive && !automatic) continue;
-        if ([call.identity isEqual:self.activeCall.identity] || (call.unnamedBrowser &&
-            [call.application isEqual:self.activeCall.application])) present = YES;
-        else if (automatic && [self.activeCall.label isEqual:@"Google Meet"] && [call.provider isEqual:self.activeCall.provider] &&
-                 [call.application isEqual:self.activeCall.application]) other = call;
+        if ([self.activeCall matchesObservation:call]) {
+            present = YES;
+            if ([self.activeCall.identity isEqual:call.identity] || call.googleMeetCode) confirmedCurrent = YES;
+            if (!self.activeCall.googleMeetCode && call.googleMeetCode) self.activeCall = call;
+        } else if ([call.application isEqual:self.activeCall.application]) {
+            if (call.unnamedBrowser) present = YES;
+            else if ([self.keptSwitch isEqual:call.identity]) present = confirmedCurrent = YES;
+            else if (automatic && self.activeCall.googleMeetCode && call.googleMeetCode) other = call;
+        }
     }
-    if (present) other = nil;
-    if (![self.differentCall isEqual:other.identity]) {
-        self.differentCall = other.identity;
-        self.differentSince = now;
-    }
+    if (confirmedCurrent) other = nil;
+    BOOL absent = !present && !other && now - self.lastPresent >= 3;
+    if (other) {
+        if (![self.differentCall.identity isEqual:other.identity] ||
+            (now - self.differentLastSeen > callSwitchObservationGap && ![self.endedReason isEqual:@"switch"])) self.differentSince = now;
+        self.differentCall = other;
+        self.differentLastSeen = now;
+    } else if (confirmedCurrent || absent) self.differentCall = nil;
     if (present || other) {
         self.lastPresent = now;
         self.endPromptAcknowledged = NO;
     }
-    if (!other || ![other.identity isEqual:self.keptSwitch]) self.keptSwitch = nil;
-    BOOL switched = other && now - self.differentSince >= 4 && !self.keptSwitch;
-    NSString *reason = switched ? @"switch" : !present && !other && !self.endPromptAcknowledged &&
-        now - self.lastPresent >= 3 ? @"absence" : nil;
+    BOOL switched = automatic && self.differentCall &&
+        (other ? now - self.differentSince >= callSwitchHold : [self.endedReason isEqual:@"switch"]);
+    NSString *reason = switched ? @"switch" : absent && !self.endPromptAcknowledged ? @"absence" : nil;
     if (!reason) {
         self.autoStopAt = 0;
         self.endedReason = nil;
@@ -336,7 +432,7 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
     }
     if (![self.endedReason isEqual:reason]) {
         self.endedReason = reason;
-        self.autoStopAt = automatic ? now + 30 : 0;
+        self.autoStopAt = automatic ? now + callStopGrace : 0;
         NSString *message = automatic ? (switched ? @"A different call opened. Stopping in 30 seconds." :
             @"The call ended. Stopping in 30 seconds.") : @"The call may have ended.";
         [self state:@"callEnded" message:message];
@@ -500,17 +596,18 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 
 - (void)begin:(BOOL)prompt automatic:(BOOL)automatic languages:(NSArray<NSString *> *)languages
       calendar:(JardCalendarMeeting *)event reply:(JardDictationReply)reply {
-    [self begin:prompt automatic:automatic languages:languages calendar:event title:nil reply:reply];
+    [self begin:prompt automatic:automatic languages:languages calendar:event title:nil fromOffer:NO reply:reply];
 }
 
 - (void)begin:(BOOL)prompt automatic:(BOOL)automatic languages:(NSArray<NSString *> *)languages
-      calendar:(JardCalendarMeeting *)event title:(NSString *)title reply:(JardDictationReply)reply {
+      calendar:(JardCalendarMeeting *)event title:(NSString *)title fromOffer:(BOOL)fromOffer reply:(JardDictationReply)reply {
     if (self.managed) { if (reply) reply(nil, managedMessage); return; }
     if (self.closed || self.busy || self.suspended || self.recoveryDraft) {
         if (reply) reply(nil, @"Finish the active capture or update before starting a meeting.");
         return;
     }
     self.activeCall = self.offered;
+    self.keptSwitch = [self.presence takePreviousIdentityForCall:self.activeCall];
     self.activeCalendar = event;
     self.activeLanguages = languages;
     self.permissionSource = nil;
@@ -528,24 +625,31 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
     self.copying = NO;
     self.excerptFeedback = nil;
     self.seconds = 0;
+    self.recordingRMS = self.recordingLevelAt = 0;
     self.microphoneSilent = NO;
+    self.microphoneUnavailable = NO;
     self.systemAudioUnavailable = NO;
     self.microphoneName = nil;
     self.automaticRecording = automatic;
     self.autoStopAt = self.differentSince = 0;
-    self.differentCall = self.keptSwitch = self.endedReason = nil;
+    self.differentCall = nil;
+    self.endedReason = nil;
     self.automaticUntil = automatic ? NSProcessInfo.processInfo.systemUptime + 10 : 0;
     self.sessionID = nil;
     self.endPromptAcknowledged = NO;
     self.recordingID = NSUUID.UUID.UUIDString.lowercaseString;
     self.textMeetingID = self.recordingID;
     NSString *identifier = self.recordingID;
+    if (fromOffer && self.panel) {
+        self.offerDepartureAt = NSProcessInfo.processInfo.systemUptime;
+        self.offerDepartureSize = self.panel.frame.size;
+    }
     [self state:@"starting" message:automatic ? @"Starting automatically…" : @"Starting meeting recording…"];
     NSMutableDictionary *options = [@{@"meeting": identifier, @"meetingLabel": self.providerLabel, @"languages": languages,
         @"mode": @"both", @"live": @YES, @"diarization": @YES} mutableCopy];
     if (event) options[@"meetingCalendar"] = @{@"title": event.title, @"attendees": event.attendees};
     if (self.meetingTitle) options[@"meetingTitle"] = self.meetingTitle;
-    if (self.activeCall.application.length) options[@"meetingApplication"] = self.activeCall.application;
+    if (self.activeCall.captureApplication.length) options[@"meetingApplication"] = self.activeCall.captureApplication;
     self.beginCapture(options, prompt, ^(id result, NSString *error) {
         if (self.closed || ![self.recordingID isEqual:identifier]) {
             if (reply) reply(nil, @"The meeting audio helper disconnected.");
@@ -571,6 +675,7 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 - (void)finish:(NSString *)error session:(NSString *)session {
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
     if (self.activeCall && now - self.lastPresent < 3) [self.presence snooze:self.activeCall absence:3 now:self.lastPresent];
+    if (error || !session) [self.presence clearRememberedSwitch];
     [self clearCompletion];
     if (self.activeCalendar.title.length) self.provisionalTitle = self.activeCalendar.title;
     self.activeCall = nil;
@@ -599,6 +704,9 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
     if (!self.recordingID || ![capture[@"meeting"] isEqual:self.recordingID]) return;
     NSString *event = capture[@"event"];
     if ([event isEqual:@"started"]) {
+        if (![self.phase isEqual:@"starting"]) return;
+        self.captureUsesSharedMicrophone = [capture[@"warm"] isEqual:@YES];
+        self.microphoneUnavailable = [capture[@"microphoneAvailable"] isEqual:@NO];
         self.microphoneName = [capture[@"microphone"] isKindOfClass:NSString.class] ? capture[@"microphone"] : nil;
         NSString *session = capture[@"session"];
         if ([session isKindOfClass:NSString.class] && [[NSUUID alloc] initWithUUIDString:session]) {
@@ -614,23 +722,37 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
         [self updateCaption];
         if (self.changed) self.changed([self status]);
     } else if ([event isEqual:@"meetingMicWarning"] && self.recording) {
-        self.microphoneSilent = [capture[@"active"] boolValue];
+        BOOL silent = [capture[@"active"] boolValue];
+        if (silent == self.microphoneSilent) return;
+        self.microphoneSilent = silent;
         [self updateCaption];
+        if (silent && !self.microphoneUnavailable) [self announceMeetingStatus:JardLocalized(@"Meeting microphone is silent.")];
         if (self.changed) self.changed([self status]);
     } else if ([event isEqual:@"meetingSystemAudio"] && self.recording) {
         BOOL unavailable = ![capture[@"available"] boolValue];
         if (unavailable == self.systemAudioUnavailable) return;
         self.systemAudioUnavailable = unavailable;
         [self updateCaption];
+        [self announceMeetingStatus:JardLocalized(unavailable ? @"Mac audio reconnecting." : @"Mac audio reconnected.")];
         if (self.changed) self.changed([self status]);
     } else if ([event isEqual:@"sourceChanged"] && self.recording) {
         NSString *name = [capture[@"microphone"] isKindOfClass:NSString.class] ? capture[@"microphone"] : nil;
-        if (!name.length || [self.microphoneName isEqual:name]) return;
+        BOOL unavailable = capture[@"microphoneAvailable"] ? [capture[@"microphoneAvailable"] isEqual:@NO] : self.microphoneUnavailable;
+        if (!name.length || ([self.microphoneName isEqual:name] && self.microphoneUnavailable == unavailable)) return;
+        BOOL availabilityChanged = unavailable != self.microphoneUnavailable;
         self.microphoneName = name;
+        self.microphoneUnavailable = unavailable;
+        [self updateCaption];
+        if (availabilityChanged)
+            [self announceMeetingStatus:JardLocalized(unavailable ? @"Meeting microphone reconnecting." : @"Meeting microphone reconnected.")];
         if (self.changed) self.changed([self status]);
     } else if ([event isEqual:@"levels"]) {
+        if (!self.recording && !self.waitingForCaptureEnd) return;
         NSInteger before = (NSInteger)self.seconds;
         self.seconds = [capture[@"seconds"] doubleValue];
+        NSNumber *level = [capture[@"meetingRms"] isKindOfClass:NSNumber.class] ? capture[@"meetingRms"] : nil;
+        self.recordingRMS = isfinite(level.doubleValue) ? MIN(1, MAX(0, level.doubleValue)) : 0;
+        self.recordingLevelAt = NSProcessInfo.processInfo.systemUptime;
         [self updateCaption];
         if ((NSInteger)self.seconds != before && self.changed) self.changed([self status]);
     } else if ([event isEqual:@"preview"]) {
@@ -653,6 +775,10 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
         [self updateCopyControls];
         if (self.changed) self.changed([self status]);
     } else if ([event isEqual:@"finished"]) {
+        if (!self.recording && !self.waitingForCaptureEnd) return;
+        NSNumber *duration = [capture[@"seconds"] isKindOfClass:NSNumber.class] ? capture[@"seconds"] : nil;
+        if (duration && isfinite(duration.doubleValue) && duration.doubleValue >= 0) self.seconds = duration.doubleValue;
+        self.waitingForCaptureEnd = NO;
         [self state:@"saving" message:@"Saving and transcribing the full meeting…"];
     } else if ([event isEqual:@"accepted"]) {
         [self finish:nil session:capture[@"id"]];
@@ -666,6 +792,7 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 }
 
 - (void)blockForPermission:(NSString *)source {
+    [self.presence clearRememberedSwitch];
     self.permissionSource = source;
     self.permissionCall = self.activeCall;
     self.permissionCalendar = self.activeCalendar;
@@ -681,7 +808,8 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 - (void)retryPermission:(JardDictationReply)reply {
     if (!self.permissionSource) { if (reply) reply(nil, @"No recording is waiting for permission."); return; }
     self.offered = self.permissionCall;
-    [self begin:YES automatic:NO languages:self.activeLanguages ?: @[] calendar:self.permissionCalendar title:self.meetingTitle reply:reply];
+    [self begin:YES automatic:NO languages:self.activeLanguages ?: @[] calendar:self.permissionCalendar
+        title:self.meetingTitle fromOffer:NO reply:reply];
 }
 
 - (void)dismissPermission {
@@ -694,6 +822,7 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 }
 
 - (void)showRecovery:(NSString *)draft {
+    [self.presence clearRememberedSwitch];
     self.activeCall = nil;
     self.activeCalendar = nil;
     self.automaticRecording = NO;
@@ -767,7 +896,12 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
         return;
     }
     NSString *identifier = self.recordingID;
+    if ([self.endedReason isEqual:@"switch"] && self.activeCall && self.differentCall) {
+        [self.presence rememberSwitchFrom:self.activeCall to:self.differentCall
+            confirmedAt:self.autoStopAt - callStopGrace lastSeen:self.lastPresent];
+    }
     self.autoStopAt = 0;
+    self.waitingForCaptureEnd = YES;
     [self state:@"saving" message:@"Saving the meeting…"];
     self.send(@"jard.stopMeeting", @{@"meeting": identifier}, ^(id result, NSString *error) {
         if (error && [self.recordingID isEqual:identifier]) [self finish:error session:nil];
@@ -950,7 +1084,10 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
             self.autoStop = enabled.boolValue;
             [NSUserDefaults.standardUserDefaults setBool:self.autoStop forKey:autoStopKey];
             self.generation++;
-            if (!self.autoStop && self.autoStopAt) [self keepButton:nil];
+            if (!self.autoStop) {
+                [self.presence clearRememberedSwitch];
+                if (self.autoStopAt) [self keepButton:nil];
+            }
         }
     } else if ([action isEqual:@"detection"]) {
         NSNumber *enabled = request[@"enabled"];
@@ -961,8 +1098,11 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
         [NSUserDefaults.standardUserDefaults setBool:self.detection forKey:detectionKey];
         self.generation++;
         [self.presence resetObservations];
-        if (!self.detection && self.offered) [self dismissOffer];
-        if (!self.detection && [self.phase isEqual:@"callEnded"]) [self keepButton:nil];
+        if (!self.detection) {
+            [self.presence clearRememberedSwitch];
+            if (self.offered) [self dismissOffer];
+            if ([self.phase isEqual:@"callEnded"]) [self keepButton:nil];
+        }
     } else if ([action isEqual:@"copyAll"] || [action isEqual:@"copyNew"]) {
         [self copyNew:[action isEqual:@"copyNew"] to:NSPasteboard.generalPasteboard reply:reply];
         return;
@@ -989,19 +1129,36 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 
 - (void)startWithEstablishedPermissionsTitle:(NSString *)title reply:(JardDictationReply)reply {
     JardCalendarMeeting *calendar = [self calendarMeetingForCall:self.offered date:NSDate.date];
-    [self begin:NO automatic:NO languages:@[] calendar:calendar title:title reply:reply];
+    [self begin:NO automatic:NO languages:@[] calendar:calendar title:title fromOffer:NO reply:reply];
 }
 
 - (void)copyLatestTranscript:(JardDictationReply)reply {
-    if (!self.lastSavedSessionID) {
-        reply(nil, @"Record and save a meeting before copying its final transcript.");
-        return;
-    }
-    self.send(@"jard.meetingTranscript", @{@"session": self.lastSavedSessionID}, ^(id result, NSString *error) {
+    [self copyLatestTranscriptTo:NSPasteboard.generalPasteboard reply:reply];
+}
+
+- (void)copyLatestTranscriptTo:(NSPasteboard *)board reply:(JardDictationReply)reply {
+    [self copyTranscriptForMeeting:nil to:board reply:reply];
+}
+
+- (void)copySavedTranscript:(NSString *)identifier reply:(JardDictationReply)reply {
+    [self copyTranscriptForMeeting:identifier to:NSPasteboard.generalPasteboard reply:reply];
+}
+
+- (void)copyTranscriptForMeeting:(NSString *)identifier to:(NSPasteboard *)board reply:(JardDictationReply)reply {
+    NSInteger before = board.changeCount;
+    NSString *command = identifier ? @"jard.savedMeetingTranscript" : @"jard.latestMeetingTranscript";
+    NSDictionary *payload = identifier ? @{@"id": identifier} : @{};
+    self.send(command, payload, ^(id result, NSString *error) {
         if (error) { reply(nil, error); return; }
-        NSPasteboard *board = NSPasteboard.generalPasteboard;
+        NSString *text = [result isKindOfClass:NSDictionary.class] && [result[@"text"] isKindOfClass:NSString.class]
+            ? result[@"text"] : nil;
+        if (!text.length) { reply(nil, @"No meeting transcript is available to copy."); return; }
+        if (self.closed || board.changeCount != before) {
+            reply(nil, @"The clipboard changed while preparing the meeting transcript.");
+            return;
+        }
         [board clearContents];
-        if (![board setString:result[@"labeledText"] ?: result[@"text"] ?: @"" forType:NSPasteboardTypeString]) {
+        if (![board setString:text forType:NSPasteboardTypeString]) {
             reply(nil, @"Could not write the meeting transcript to the clipboard.");
             return;
         }
@@ -1016,8 +1173,32 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ [weak scanRecovery:YES]; });
 }
 
-- (void)recordButton:(id)sender { [self begin:YES automatic:NO languages:@[] reply:nil]; }
-- (void)dismissButton:(id)sender { [self dismissOffer]; }
+- (BOOL)currentOfferButton:(id)sender choices:(BOOL)choices {
+    return self.offered && [self.phase isEqual:@"offered"] && self.offerChoicesOpen == choices &&
+        self.panel && [sender isKindOfClass:NSButton.class] && [sender superview] == self.panel.contentView;
+}
+- (void)recordButton:(id)sender {
+    if ([self currentOfferButton:sender choices:NO]) [self startFromOffer];
+}
+- (void)startFromOffer {
+    JardCalendarMeeting *event = [self calendarMeetingForCall:self.offered date:NSDate.date];
+    [self begin:YES automatic:NO languages:@[] calendar:event title:nil fromOffer:YES reply:nil];
+}
+- (void)dismissButton:(id)sender {
+    if ([self currentOfferButton:sender choices:NO]) [self dismissOffer];
+}
+- (void)showOfferChoices:(id)sender {
+    if (![self currentOfferButton:sender choices:NO]) return;
+    self.offerChoicesOpen = YES;
+    [self renderPanel];
+}
+- (void)cancelOfferChoices:(id)sender {
+    if (![self currentOfferButton:sender choices:YES]) return;
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    if (now - self.offeredAt >= meetingOfferLifetime) self.offeredAt = now;
+    self.offerChoicesOpen = NO;
+    [self renderPanel];
+}
 - (void)copyAllButton:(id)sender { [self copyNew:NO to:NSPasteboard.generalPasteboard reply:nil]; }
 - (void)copyNewButton:(id)sender { [self copyNew:YES to:NSPasteboard.generalPasteboard reply:nil]; }
 - (void)copyCompletedMeeting:(BOOL)onlyNew to:(NSPasteboard *)board {
@@ -1049,11 +1230,31 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 - (void)copyCompletedAllButton:(id)sender { [self copyCompletedMeeting:NO to:NSPasteboard.generalPasteboard]; }
 - (void)copyMeetingAgentPrompt:(id)sender { [self copyMeetingAgentPromptTo:NSPasteboard.generalPasteboard]; }
 - (void)copyMeetingAgentPromptTo:(NSPasteboard *)board {
-    if (!self.completionSession || !self.completionDeadline) return;
-    NSString *prompt = [NSString stringWithFormat:@"Read this saved Jard meeting locally to answer my questions about it.\n\njardctl meetings show %@ --md",
-        self.completionSession];
+    BOOL live = self.recording;
+    NSString *meeting = live ? self.textMeetingID : self.completionDeadline ? self.completionSession : nil;
+    if (![[NSUUID alloc] initWithUUIDString:meeting ?: @""] || (live && [meeting isEqual:self.recordingID])) return;
+    NSString *helper = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Contents/Helpers/jardctl"];
+    NSString *command = [NSFileManager.defaultManager isExecutableFileAtPath:helper] ?
+        [NSString stringWithFormat:@"'%@'", [helper stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]] : @"jardctl";
+    NSString *read = [NSString stringWithFormat:@"%@ meetings show %@", command, meeting];
+    NSMutableString *prompt = [NSMutableString stringWithFormat:
+        @"Use the local Jaro transcript to answer my questions about this meeting. %@\n\nRead the transcript:\n  %@ --md\n",
+        live ? @"The meeting is still recording." : @"The meeting has been saved.", read];
+    id lastEnd = self.liveTurns.lastObject[@"end"];
+    if (live && [lastEnd isKindOfClass:NSNumber.class]) {
+        NSInteger through = (NSInteger)[lastEnd doubleValue];
+        [prompt appendFormat:@"\nCatch up from the last transcribed turn. The first turn may repeat.\n  %@ --from %ld:%02ld --md\n",
+            read, (long)through / 60, (long)through % 60];
+    }
+    [prompt appendFormat:@"\nSearch within this meeting, then read around the returned times:\n  %@ meetings search \"<topic>\" --meeting %@\n  %@ --from <mm:ss> --to <mm:ss> --md",
+        command, meeting, read];
     [board clearContents];
     if ([board setString:prompt forType:NSPasteboardTypeString]) {
+        NSButton *button = self.agentPromptButton;
+        button.title = @"Prompt Copied";
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            button.title = @"Copy Agent Prompt";
+        });
         NSAccessibilityPostNotificationWithUserInfo((id)self.caption ?: NSApp, NSAccessibilityAnnouncementRequestedNotification,
             @{NSAccessibilityAnnouncementKey: @"Meeting agent prompt copied.", NSAccessibilityPriorityKey: @(NSAccessibilityPriorityMedium)});
     }
@@ -1065,7 +1266,8 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 - (void)recoverButton:(id)sender { [self recoverMeeting:nil]; }
 - (void)dismissRecoveryButton:(id)sender { [self dismissRecovery]; }
 - (void)keepButton:(id)sender {
-    if ([self.endedReason isEqual:@"switch"]) self.keptSwitch = self.differentCall;
+    if ([self.endedReason isEqual:@"switch"]) self.keptSwitch = self.differentCall.identity;
+    self.differentCall = nil;
     self.endPromptAcknowledged = YES;
     self.endedReason = nil;
     self.autoStopAt = 0;
@@ -1105,14 +1307,14 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 - (void)calendarJoinRecord:(id)sender { [self answerCalendar:self.calendarOffer.identifier choice:@"joinRecord" reply:nil]; }
 - (void)calendarDismiss:(id)sender { [self answerCalendar:self.calendarOffer.identifier choice:@"dismiss" reply:nil]; }
 - (void)alwaysButton:(id)sender {
+    if (![self currentOfferButton:sender choices:YES] || self.offered.unnamedBrowser) return;
     JardCall *call = self.offered;
-    if (!call) return;
     [self setPolicy:@"auto" provider:call.provider label:call.label];
-    [self begin:YES automatic:NO languages:@[] reply:nil];
+    [self startFromOffer];
 }
 - (void)neverButton:(id)sender {
+    if (![self currentOfferButton:sender choices:YES]) return;
     JardCall *call = self.offered;
-    if (!call) return;
     [self setPolicy:@"never" provider:call.provider label:call.label];
     [self dismissOffer];
 }
@@ -1170,17 +1372,27 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
 }
 
 - (void)updateCaption {
-    if (!self.recording || !self.caption) return;
-    long elapsed = (long)MAX(0, self.seconds);
-    NSString *clock = [NSString stringWithFormat:@"%ld:%02ld", elapsed / 60, elapsed % 60];
+    if ((!self.recording && !self.waitingForCaptureEnd) || !self.caption) return;
+    NSString *clock = meetingClock(self.seconds);
     BOOL ended = [self.phase isEqual:@"callEnded"];
     self.caption.maximumNumberOfLines = ended ? 2 : 1;
     self.caption.lineBreakMode = ended ? NSLineBreakByWordWrapping : NSLineBreakByTruncatingTail;
+    NSString *notice = self.microphoneUnavailable && self.systemAudioUnavailable ? @"Audio inputs reconnecting" :
+        self.microphoneUnavailable ? @"Microphone reconnecting" : self.systemAudioUnavailable ? @"Mac audio reconnecting" :
+        self.microphoneSilent ? @"Microphone silent" :
+        NSProcessInfo.processInfo.systemUptime < self.automaticUntil ? @"Started automatically" : nil;
+    if (self.recordingDisclosure) {
+        NSString *title = self.meetingTitle ?: self.activeCalendar.title ?: self.provisionalTitle ?: self.providerLabel ?: @"Meeting";
+        self.recordingNotice.stringValue = notice ?: @"";
+        self.caption.stringValue = clock;
+        self.caption.toolTip = title;
+        [self.caption setAccessibilityLabel:[NSString stringWithFormat:@"Meeting recording. %@ · %@%@%@", title, clock,
+            notice.length ? @". " : @"", notice ?: @""]];
+        return;
+    }
     if (ended) self.caption.stringValue = self.message;
     else {
-        NSString *label = self.systemAudioUnavailable ? @"Mac audio reconnecting" : self.microphoneSilent ? @"Microphone silent" :
-            NSProcessInfo.processInfo.systemUptime < self.automaticUntil ? @"Started automatically" :
-            self.meetingTitle ?: self.activeCalendar.title ?: self.provisionalTitle ?: self.providerLabel;
+        NSString *label = notice ?: self.meetingTitle ?: self.activeCalendar.title ?: self.provisionalTitle ?: self.providerLabel;
         NSString *caption = [NSString stringWithFormat:@"%@ · %@", label, clock];
         if ([caption sizeWithAttributes:@{NSFontAttributeName: self.caption.font}].width > NSWidth(self.caption.bounds) - 6)
             caption = [NSString stringWithFormat:@"%@ · %@", clock, label];
@@ -1189,12 +1401,300 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
     [self.caption setAccessibilityLabel:[@"Meeting recording. " stringByAppendingString:self.caption.stringValue]];
 }
 
+- (void)updateRecordingMeterAt:(NSTimeInterval)now {
+    if (!self.panel.visible || !self.recordingMeter) return;
+    BOOL live = self.recording || self.waitingForCaptureEnd;
+    double rms = live && now - self.recordingLevelAt <= 0.30 ? self.recordingRMS : 0;
+    [self.recordingMeter advanceAt:now rms:rms];
+    if (self.recordingResultTitle && self.recordingMeter.settled) {
+        [self.recordingMeter removeFromSuperview];
+        self.recordingMeter = nil;
+    }
+}
+
+- (void)stopRecordingMeter {
+    [self.meterTimer invalidate];
+    self.meterTimer = nil;
+    self.recordingMeter = nil;
+    self.recordingActions = nil;
+    self.recordingDisclosure = nil;
+    self.recordingNotice = nil;
+    self.recordingResultTitle = nil;
+    self.recordingExpansion = 0;
+    self.recordingLayoutAt = 0;
+    self.recordingHoverHeld = self.recordingPinned = self.recordingControlsRevealed = NO;
+}
+
+- (CGFloat)offerDepartureFractionAt:(NSTimeInterval)now {
+    if (self.panel.reduceMotion) return 1;
+    double remaining = 1 - MAX(0, MIN(1, (now - self.offerDepartureAt) / offerStartingDelay));
+    return 1 - remaining * remaining * remaining;
+}
+
+- (void)layoutOfferDepartureAt:(NSTimeInterval)now {
+    if (self.closed || !self.panel || !self.offerDepartureAt || ![self.phase isEqual:@"starting"] || self.offerStartingVisible) return;
+    CGFloat fraction = [self offerDepartureFractionAt:now];
+    CGFloat width = recordingInitialWidth + (self.offerDepartureSize.width - recordingInitialWidth) * (1 - fraction);
+    CGFloat height = recordingHeaderHeight + (self.offerDepartureSize.height - recordingHeaderHeight) * (1 - fraction);
+    NSScreen *screen = self.panel.screen ?: [self indicatorScreen];
+    NSSize old = self.panel.frame.size;
+    NSRect frame = JardMeetingCornerFrame(screen.visibleFrame, NSMakeSize(width, height), self.panelCorner);
+    if (!NSEqualRects(self.panel.frame, frame)) [self.panel setFrame:frame display:NO];
+    NSView *surface = self.panel.contentView;
+    if (now - self.offerDepartureAt >= offerStartingDelay) {
+        for (NSView *view in surface.subviews.copy) [view removeFromSuperview];
+        self.caption = [JardMeetingCaption labelWithString:JardLocalized(@"Starting…")];
+        self.caption.alignment = NSTextAlignmentCenter;
+        self.caption.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+        self.caption.frame = NSMakeRect(8, 10, width - 16, 20);
+        [surface addSubview:self.caption];
+        self.offerStartingVisible = YES;
+        return;
+    }
+    CGFloat dx = [self.panelCorner hasSuffix:@"Right"] ? width - old.width : 0;
+    CGFloat dy = [self.panelCorner hasPrefix:@"top"] ? height - old.height : 0;
+    CGFloat opacity = MAX(0, 1 - fraction * 1.4);
+    for (NSView *view in surface.subviews) {
+        if (dx || dy) view.frame = NSOffsetRect(view.frame, dx, dy);
+        view.alphaValue = opacity;
+    }
+}
+
+- (void)layoutRecordingPanelAt:(NSTimeInterval)now pointer:(NSPoint)pointer pressed:(BOOL)pressed {
+    if (!self.recordingDisclosure || self.panel.dragging) return;
+    BOOL inside = NSPointInRect(pointer, self.panel.frame);
+    if (!inside && !pressed) self.recordingHoverHeld = NO;
+    BOOL open = self.waitingForCaptureEnd || self.recordingPinned ||
+        (!self.recordingHoverHeld && (inside || (pressed && self.recordingExpansion > 0)));
+    CGFloat target = open ? 1 : 0;
+    double dt = self.recordingLayoutAt > 0 ? MAX(0, MIN(.05, now - self.recordingLayoutAt)) : 0;
+    self.recordingLayoutAt = now;
+    CGFloat progress = self.recordingExpansion;
+    progress += (target - progress) * (1 - exp(-dt * 18));
+    if (self.panel.reduceMotion || fabs(progress - target) < .015) progress = target;
+    self.recordingExpansion = progress;
+
+    CGFloat clockWidth = meetingClockWidth(self.caption);
+    NSString *notice = self.recordingNotice.stringValue;
+    CGFloat noticeWidth = notice.length ? MIN(160, ceil([notice sizeWithAttributes:@{NSFontAttributeName: self.recordingNotice.font}].width) + 6) : 0;
+    CGFloat restWidth = 78 + clockWidth + 54 + noticeWidth;
+    CGFloat width = restWidth + (MAX(restWidth, recordingOpenWidth) - restWidth) * MIN(1, progress / .70);
+    CGFloat reveal = MAX(0, (progress - .12) / .88);
+    CGFloat body = (recordingRowHeight * self.recordingActions.count + 9) * reveal;
+    CGFloat height = recordingHeaderHeight + body;
+    if (self.offerDepartureAt) {
+        CGFloat arrival = [self offerDepartureFractionAt:now];
+        width += (self.offerDepartureSize.width - width) * (1 - arrival);
+        height += (self.offerDepartureSize.height - height) * (1 - arrival);
+        if (arrival >= 1) self.offerDepartureAt = 0;
+    }
+    NSString *corner = self.panelCorner;
+    NSScreen *screen = self.panel.screen ?: [self indicatorScreen];
+    NSRect frame = JardMeetingCornerFrame(screen.visibleFrame, NSMakeSize(width, height), corner);
+    if (!NSEqualRects(self.panel.frame, frame)) [self.panel setFrame:frame display:NO];
+
+    BOOL top = [corner hasPrefix:@"top"];
+    CGFloat header = top ? height - recordingHeaderHeight : 0;
+    CGFloat clockX = width - 34 - clockWidth;
+    self.caption.frame = NSMakeRect(clockX, header + 10, clockWidth, 20);
+    self.recordingDisclosure.frame = NSMakeRect(width - 32, header + 7, 25, 26);
+    BOOL reconnecting = self.microphoneUnavailable || self.systemAudioUnavailable;
+    CGFloat noticeSpace = noticeWidth * (reconnecting ? 1 : MAX(0, 1 - progress / .65));
+    self.recordingNotice.frame = NSMakeRect(clockX - noticeWidth - 4, header + 10, noticeWidth, 20);
+    self.recordingNotice.alphaValue = reconnecting ? 1 : MAX(0, 1 - progress / .55);
+    CGFloat meterWidth = MAX(26, clockX - noticeSpace - 20);
+    self.recordingMeter.frame = NSMakeRect(11, header + 7, meterWidth, 26);
+    [self.recordingMeter fitEmbeddedWidth:meterWidth anchorRight:[corner hasSuffix:@"Right"]];
+
+    for (NSUInteger index = 0; index < self.recordingActions.count; index++) {
+        NSButton *button = self.recordingActions[index];
+        CGFloat offset = (index + 1) * recordingRowHeight;
+        CGFloat y = recordingRowY(height, top, index);
+        CGFloat visible = MAX(0, MIN(1, (body - offset + recordingRowHeight) / recordingRowHeight));
+        button.hidden = visible == 0;
+        button.alphaValue = visible;
+        button.frame = NSMakeRect(8, y + 1, width - 16, recordingRowHeight - 2);
+    }
+    self.recordingActions.firstObject.enabled = open && reveal >= .24 && !self.waitingForCaptureEnd;
+    BOOL revealed = open && progress >= .94;
+    if (self.recordingControlsRevealed != revealed) {
+        self.recordingControlsRevealed = revealed;
+        [self updateCopyControls];
+        NSString *action = revealed ? @"Hide meeting controls" : @"Show meeting controls";
+        self.recordingDisclosure.toolTip = action;
+        [self.recordingDisclosure setAccessibilityLabel:action];
+        self.recordingDisclosure.image = [NSImage imageWithSystemSymbolName:revealed ? @"chevron.up" : @"chevron.down" accessibilityDescription:nil];
+    }
+}
+
+- (void)toggleRecordingControls:(id)sender {
+    BOOL close = self.recordingPinned || self.recordingControlsRevealed;
+    self.recordingPinned = !close;
+    self.recordingHoverHeld = close;
+}
+
+- (void)startRecordingPresentationTimer {
+    if (self.meterTimer) return;
+    __weak typeof(self) weak = self;
+    self.meterTimer = [NSTimer timerWithTimeInterval:1.0 / 30.0 repeats:YES block:^(NSTimer *timer) {
+        NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+        if (weak.offerDepartureAt && [weak.phase isEqual:@"starting"]) [weak layoutOfferDepartureAt:now];
+        else if (weak.recordingResultTitle) [weak layoutRecordingResultAt:now];
+        else [weak layoutRecordingPanelAt:now pointer:NSEvent.mouseLocation pressed:NSEvent.pressedMouseButtons != 0];
+        [weak updateRecordingMeterAt:now];
+    }];
+    self.meterTimer.tolerance = 0.007;
+    [NSRunLoop.mainRunLoop addTimer:self.meterTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)attachRecordingMeterTo:(JardMeetingSurface *)surface {
+    if (!self.recordingMeter) {
+        self.recordingMeter = [[JardDictationMeter alloc] initWithFrame:NSMakeRect(13, 53, 78, 26)];
+        self.recordingMeter.embedded = YES;
+        [self.recordingMeter setStage:JardIndicatorRecording label:@""];
+    }
+    [self startRecordingPresentationTimer];
+    [self.recordingMeter removeFromSuperview];
+    [surface addSubview:self.recordingMeter];
+}
+
+- (void)buildRecordingControlsIn:(JardMeetingSurface *)surface {
+    self.caption.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightSemibold];
+    self.caption.alignment = NSTextAlignmentRight;
+    self.caption.usesSingleLineMode = YES;
+    NSTextField *notice = [JardMeetingCaption labelWithString:@""];
+    notice.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    notice.textColor = NSColor.secondaryLabelColor;
+    notice.lineBreakMode = NSLineBreakByTruncatingTail;
+    [notice setAccessibilityElement:NO];
+    [surface addSubview:notice];
+    self.recordingNotice = notice;
+
+    NSButton *disclosure = [self button:@"" action:@selector(toggleRecordingControls:) area:NSZeroRect into:surface];
+    disclosure.bordered = NO;
+    disclosure.image = [NSImage imageWithSystemSymbolName:@"chevron.down" accessibilityDescription:nil];
+    disclosure.toolTip = @"Show meeting controls";
+    [disclosure setAccessibilityLabel:disclosure.toolTip];
+    self.recordingDisclosure = disclosure;
+    NSButton *stop = [self button:@"Stop & Save" action:@selector(stopButton:) area:NSZeroRect into:surface];
+    NSButton *newText = [self button:@"Copy New" action:@selector(copyNewButton:) area:NSZeroRect into:surface];
+    NSButton *all = [self button:@"Copy All" action:@selector(copyAllButton:) area:NSZeroRect into:surface];
+    NSButton *prompt = [self button:@"Copy Agent Prompt" action:@selector(copyMeetingAgentPrompt:) area:NSZeroRect into:surface];
+    self.recordingActions = @[stop, newText, all, prompt];
+    self.incrementalTextButton = newText;
+    self.fullTextButton = all;
+    self.agentPromptButton = prompt;
+    self.recordingHoverHeld = NSPointInRect(NSEvent.mouseLocation, self.panel.frame);
+    [self updateCaption];
+    [self updateCopyControls];
+    [self layoutRecordingPanelAt:NSProcessInfo.processInfo.systemUptime pointer:NSEvent.mouseLocation pressed:NO];
+}
+
+- (void)layoutRecordingResultAt:(NSTimeInterval)now {
+    if (self.panel.dragging) return;
+    BOOL ready = self.completionDeadline > 0;
+    CGFloat transition = self.panel.reduceMotion ? 1 : MAX(0, MIN(1, (now - self.recordingResultAt) / .24));
+    CGFloat width = MAX(recordingOpenWidth, self.recordingResultOrigin.width);
+    CGFloat bodyWidth = width - 32;
+    CGFloat bodyHeight = 0;
+    if (ready && self.completionBody.stringValue.length) {
+        NSRect bounds = [self.completionBody.stringValue boundingRectWithSize:NSMakeSize(bodyWidth - 6, CGFLOAT_MAX)
+            options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading
+            attributes:@{NSFontAttributeName: self.completionBody.font} context:nil];
+        bodyHeight = MIN(52, ceil(NSHeight(bounds)) + 6);
+    }
+    CGFloat resultHeight = recordingHeaderHeight + recordingRowHeight + 9;
+    if (ready) resultHeight += 3 * recordingRowHeight + bodyHeight;
+    CGFloat height = resultHeight;
+    if (!ready) {
+        CGFloat ease = transition * transition * (3 - 2 * transition);
+        height = self.recordingResultOrigin.height + (resultHeight - self.recordingResultOrigin.height) * ease;
+    }
+
+    NSScreen *screen = self.panel.screen ?: [self indicatorScreen];
+    NSString *corner = self.panelCorner;
+    NSRect frame = JardMeetingCornerFrame(screen.visibleFrame, NSMakeSize(width, height), corner);
+    if (!NSEqualRects(self.panel.frame, frame)) [self.panel setFrame:frame display:NO];
+    BOOL top = [corner hasPrefix:@"top"];
+    CGFloat header = top ? height - recordingHeaderHeight : 0;
+    CGFloat clockWidth = meetingClockWidth(self.caption);
+    CGFloat clockX = width - 34 - clockWidth;
+    self.caption.frame = NSMakeRect(clockX, header + 10, clockWidth, 20);
+    self.recordingDisclosure.frame = NSMakeRect(width - 32, header + 7, 25, 26);
+    self.recordingDisclosure.hidden = !ready;
+    self.recordingDisclosure.enabled = ready;
+    NSRect meter = self.recordingMeter.frame;
+    meter.origin.y = header + 7;
+    meter.size.width = MIN(NSWidth(meter), MAX(0, clockX - 20));
+    self.recordingMeter.frame = meter;
+
+    CGFloat stopY = recordingRowY(height, top, 0);
+    self.recordingResultTitle.frame = NSMakeRect(16, stopY, bodyWidth, recordingRowHeight);
+    self.recordingResultTitle.alphaValue = ready ? 1 : MAX(0, MIN(1, (transition - .46) / .54));
+    self.recordingResultTitle.hidden = !ready && transition <= .46;
+    self.completionBody.frame = NSMakeRect(16, top ? 7 : recordingHeaderHeight + 4 * recordingRowHeight + 2, bodyWidth, bodyHeight);
+    self.completionBody.hidden = !ready;
+    CGFloat outgoing = ready ? 0 : MAX(0, 1 - transition / .40);
+    for (NSUInteger index = 0; index < self.recordingActions.count; index++) {
+        NSButton *row = self.recordingActions[index];
+        if (ready && index > 0) {
+            row.hidden = NO;
+            row.alphaValue = 1;
+        } else {
+            row.alphaValue = MIN(row.alphaValue, outgoing);
+            row.hidden = row.hidden || outgoing == 0;
+        }
+        row.frame = NSMakeRect(8, recordingRowY(height, top, index) + 1, width - 16, recordingRowHeight - 2);
+    }
+    if ((ready || transition == 1) && !self.recordingMeter) {
+        [self.meterTimer invalidate];
+        self.meterTimer = nil;
+    }
+}
+
+- (void)beginRecordingResult {
+    if (self.recordingResultTitle) return;
+    self.recordingResultAt = NSProcessInfo.processInfo.systemUptime;
+    self.recordingResultOrigin = self.panel.frame.size;
+    [self.recordingMeter beginDismissal];
+    self.recordingNotice.hidden = YES;
+    self.caption.stringValue = meetingClock(self.seconds);
+    self.caption.accessibilityLabel = self.caption.stringValue;
+    for (NSButton *row in self.recordingActions) {
+        row.enabled = NO;
+        [row setAccessibilityElement:NO];
+    }
+    self.recordingDisclosure.action = @selector(dismissCompletion:);
+    self.recordingDisclosure.image = [NSImage imageWithSystemSymbolName:@"xmark" accessibilityDescription:nil];
+    self.recordingDisclosure.toolTip = @"Close meeting capsule";
+    [self.recordingDisclosure setAccessibilityLabel:self.recordingDisclosure.toolTip];
+    self.incrementalTextButton.action = @selector(copyCompletedNewButton:);
+    self.fullTextButton.action = @selector(copyCompletedAllButton:);
+
+    NSTextField *title = [JardMeetingCaption wrappingLabelWithString:JardLocalized(@"Transcribing…")];
+    title.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    title.maximumNumberOfLines = 2;
+    title.lineBreakMode = NSLineBreakByWordWrapping;
+    [self.panel.contentView addSubview:title];
+    self.recordingResultTitle = title;
+    NSTextField *body = [JardMeetingCaption wrappingLabelWithString:@""];
+    body.font = [NSFont systemFontOfSize:12];
+    body.maximumNumberOfLines = 3;
+    body.lineBreakMode = NSLineBreakByWordWrapping;
+    [self.panel.contentView addSubview:body];
+    self.completionBody = body;
+    [self layoutRecordingResultAt:self.recordingResultAt];
+}
+
 - (void)updateCopyControls {
     BOOL available = !self.completionSession || (self.completionDeadline && [self.completion[@"hasSpeech"] boolValue]);
     BOOL unused = !self.completionSession || ![self.exhaustedMeetingID isEqual:self.completionSession];
-    self.incrementalTextButton.enabled = !self.copying && available && unused;
-    self.fullTextButton.enabled = !self.copying && available;
-    self.agentPromptButton.enabled = self.completionDeadline > 0;
+    BOOL availableControls = self.recordingResultTitle ? self.completionDeadline > 0 :
+        !self.recordingDisclosure || (self.recordingControlsRevealed && !self.waitingForCaptureEnd);
+    self.incrementalTextButton.enabled = availableControls && !self.copying && available && unused;
+    self.fullTextButton.enabled = availableControls && !self.copying && available;
+    BOOL livePrompt = self.recording && self.textMeetingID && ![self.textMeetingID isEqual:self.recordingID];
+    self.agentPromptButton.enabled = availableControls && (livePrompt || self.completionDeadline > 0);
     self.incrementalTextButton.title = self.copying ? @"Preparing…" : self.excerptFeedback ?: @"Copy New";
     [self.incrementalTextButton setAccessibilityLabel:self.copying ? @"Preparing new meeting transcript" : @"Copy new meeting transcript"];
     [self.fullTextButton setAccessibilityLabel:@"Copy entire meeting transcript"];
@@ -1206,37 +1706,84 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
         self.meetingTitle ?: self.provisionalTitle ?: self.providerLabel ?: @"Meeting";
     NSInteger seconds = [self.completion[@"duration"] isKindOfClass:NSNumber.class] ?
         [self.completion[@"duration"] integerValue] : (NSInteger)self.seconds;
-    self.caption.stringValue = [NSString stringWithFormat:@"%ld:%02ld · %@", (long)seconds / 60, (long)seconds % 60, title];
-    self.caption.accessibilityLabel = self.caption.stringValue;
+    if (self.recordingResultTitle) {
+        if (self.completionDeadline) {
+            self.recordingResultTitle.stringValue = title;
+            self.recordingResultTitle.accessibilityLabel = title;
+            self.recordingResultTitle.toolTip = title;
+            for (NSUInteger index = 1; index < self.recordingActions.count; index++)
+                [self.recordingActions[index] setAccessibilityElement:YES];
+        }
+    } else {
+        self.caption.stringValue = [NSString stringWithFormat:@"%@ · %@", meetingClock(seconds), title];
+        self.caption.accessibilityLabel = self.caption.stringValue;
+    }
     NSString *summary = [self.completion[@"summary"] isKindOfClass:NSString.class] ? self.completion[@"summary"] : nil;
     NSString *error = [self.completion[@"error"] isKindOfClass:NSString.class] ? self.completion[@"error"] : nil;
     if (!self.completionDeadline) self.completionBody.stringValue = @"Transcribing the saved meeting…";
     else if ([self.completion[@"exportStatus"] isEqual:@"error"]) self.completionBody.stringValue = @"Markdown export failed. See the meeting in Sessions.";
     else if (summary.length) self.completionBody.stringValue = summary;
     else if (error.length) self.completionBody.stringValue = error;
+    else if ([self.completion[@"status"] isEqual:@"interrupted"]) self.completionBody.stringValue = @"Transcription was interrupted. Open the meeting in Sessions.";
     else if ([self.completion[@"summaryStatus"] isEqual:@"queued"]) self.completionBody.stringValue = @"Writing a title and summary with local Qwen…";
     else if ([self.completion[@"summaryStatus"] isEqual:@"error"]) self.completionBody.stringValue = @"Summary unavailable. Retry in Sessions.";
     else self.completionBody.stringValue = [self.completion[@"hasSpeech"] boolValue] ? self.message ?: @"Saved to Sessions." : @"Saved to Sessions. No speech was detected.";
     self.completionBody.accessibilityLabel = self.completionBody.stringValue;
     [self updateCopyControls];
+    if (self.recordingResultTitle) {
+        if (self.panel.dragging) [self startRecordingPresentationTimer];
+        else [self layoutRecordingResultAt:NSProcessInfo.processInfo.systemUptime];
+    }
 }
 
 - (void)renderPanel {
     BOOL offer = [self.phase isEqual:@"offered"], recording = self.recording;
+    BOOL live = recording || self.waitingForCaptureEnd;
+    BOOL compact = live && ![self.phase isEqual:@"callEnded"];
     BOOL completed = [self.phase isEqual:@"finished"] && self.completionSession;
     BOOL reminder = [self.phase isEqual:@"reminder"] && self.calendarOffer;
     BOOL progress = [@[@"starting", @"saving"] containsObject:self.phase];
     BOOL permission = [self.phase isEqual:@"permission"] && self.permissionSource;
     BOOL interrupted = [self.phase isEqual:@"interrupted"] && self.recoveryDraft;
-    BOOL hiddenRecording = !self.showIndicator && [@[@"recording", @"starting"] containsObject:self.phase];
-    if (self.closed || hiddenRecording || (!offer && !reminder && !recording && !progress && !permission && !interrupted && !completed)) {
+    BOOL startingFromOffer = self.offerDepartureAt > 0 && [self.phase isEqual:@"starting"] && self.panel;
+    BOOL hiddenRecording = !self.showIndicator && (compact || ([self.phase isEqual:@"starting"] && !startingFromOffer));
+    if (self.closed || hiddenRecording || (!offer && !reminder && !live && !progress && !permission && !interrupted && !completed)) {
+        if (hiddenRecording) self.offerDepartureAt = 0;
+        [self stopRecordingMeter];
         [self.panel orderOut:nil];
         self.panel = nil;
         self.caption = nil;
         return;
     }
+    if (startingFromOffer) {
+        [self.panel cancelDrag];
+        for (NSView *view in self.panel.contentView.subviews) {
+            if ([view isKindOfClass:NSButton.class]) ((NSButton *)view).enabled = NO;
+            [view setAccessibilityElement:NO];
+        }
+        [self startRecordingPresentationTimer];
+        return;
+    }
+    if (compact && self.recordingDisclosure) {
+        if (self.waitingForCaptureEnd) {
+            self.recordingActions.firstObject.title = @"Stopping…";
+            [self.recordingActions.firstObject setAccessibilityLabel:@"Stopping the meeting recording"];
+            self.recordingActions.firstObject.enabled = NO;
+            [self updateCopyControls];
+        }
+        return;
+    }
+    if (self.recordingDisclosure && (completed || [self.phase isEqual:@"saving"])) {
+        [self beginRecordingResult];
+        [self updateCompletionContent];
+        return;
+    }
     BOOL appearing = !self.panel;
-    NSSize size = completed ? NSMakeSize(388, 142) : NSMakeSize(360, 94);
+    NSSize size = compact ? NSMakeSize(recordingInitialWidth, recordingHeaderHeight) : completed ? NSMakeSize(388, 142) : NSMakeSize(360, 94);
+    if (compact && self.offerDepartureAt && self.panel) size = self.panel.frame.size;
+    if (offer) size = self.offerChoicesOpen ? NSMakeSize(self.offered.unnamedBrowser ? 330 : 448, 96) : NSMakeSize(330, 73);
+    BOOL changingOfferLayout = offer && [self.panel.contentView.identifier isEqual:@"meeting-offer"] &&
+        !NSEqualSizes(self.panel.frame.size, size);
     if (appearing) {
         NSScreen *screen = [self indicatorScreen];
         NSRect frame = JardMeetingCornerFrame(screen.visibleFrame, size, self.panelCorner);
@@ -1254,10 +1801,12 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
     [self.panel cancelDrag];
     if (!NSEqualSizes(self.panel.frame.size, size)) {
         NSScreen *screen = self.panel.screen ?: [self indicatorScreen];
-        [self.panel setFrame:JardMeetingCornerFrame(screen.visibleFrame, size, self.panelCorner) display:YES];
+        [self.panel setFrame:JardMeetingCornerFrame(screen.visibleFrame, size, self.panelCorner) display:YES
+            animate:changingOfferLayout && !self.panel.reduceMotion];
     }
-    self.panel.appearance = completed ? [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua] : nil;
-    NSVisualEffectView *surface = [[JardMeetingSurface alloc] initWithFrame:NSMakeRect(0, 0, size.width, size.height)];
+    if (!compact) [self stopRecordingMeter];
+    self.panel.appearance = (live || completed) ? [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua] : nil;
+    JardMeetingSurface *surface = [[JardMeetingSurface alloc] initWithFrame:NSMakeRect(0, 0, size.width, size.height)];
     surface.material = NSVisualEffectMaterialHUDWindow;
     surface.blendingMode = NSVisualEffectBlendingModeBehindWindow;
     surface.state = NSVisualEffectStateActive;
@@ -1311,35 +1860,55 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
                 area:NSMakeRect(186, 10, 146, 28) into:surface];
         }
     } else if (offer) {
-        [self button:@"Record" action:@selector(recordButton:) area:NSMakeRect(12, 10, 76, 28) into:surface];
-        [self button:@"Not Now" action:@selector(dismissButton:) area:NSMakeRect(93, 10, 85, 28) into:surface];
-        NSPopUpButton *policy = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(184, 10, 162, 28) pullsDown:YES];
-        [policy addItemWithTitle:@"Provider Options"];
-        if (!self.offered.unnamedBrowser) {
-            [policy addItemWithTitle:@"Always Record"];
-            policy.lastItem.target = self;
-            policy.lastItem.action = @selector(alwaysButton:);
-        }
-        [policy addItemWithTitle:@"Never Offer"];
-        policy.lastItem.target = self;
-        policy.lastItem.action = @selector(neverButton:);
-        [surface addSubview:policy];
-    } else if (recording) {
-        [self updateCaption];
-        if ([self.phase isEqual:@"callEnded"]) {
-            [self button:@"Keep Recording" action:@selector(keepButton:) area:NSMakeRect(12, 10, 136, 28) into:surface];
+        surface.identifier = @"meeting-offer";
+        self.caption.frame = NSMakeRect(14, size.height - 30, size.width - 28, 19);
+        self.caption.maximumNumberOfLines = 1;
+        self.caption.lineBreakMode = NSLineBreakByTruncatingTail;
+        if (self.offerChoicesOpen) {
+            self.caption.stringValue = self.offered.label;
+            self.caption.accessibilityLabel = self.offered.label;
+            NSTextField *detail = [JardMeetingCaption wrappingLabelWithString:JardLocalized(@"You can change this in Settings.")];
+            detail.font = [NSFont systemFontOfSize:12];
+            detail.textColor = NSColor.secondaryLabelColor;
+            detail.frame = NSMakeRect(14, 43, size.width - 28, 18);
+            [surface addSubview:detail];
+            CGFloat edge = size.width - 12;
+            if (!self.offered.unnamedBrowser) {
+                edge -= 142;
+                [self button:JardLocalized(@"Always record") action:@selector(alwaysButton:) area:NSMakeRect(edge, 9, 142, 28) into:surface];
+                edge -= 6;
+            }
+            edge -= 152;
+            [self button:JardLocalized(@"Never offer") action:@selector(neverButton:) area:NSMakeRect(edge, 9, 152, 28) into:surface];
+            [self button:JardLocalized(@"Cancel") action:@selector(cancelOfferChoices:) area:NSMakeRect(edge - 94, 9, 88, 28) into:surface];
         } else {
-            self.incrementalTextButton = [self button:@"Copy New" action:@selector(copyNewButton:)
-                area:NSMakeRect(12, 10, 102, 28) into:surface];
-            self.fullTextButton = [self button:@"Copy All" action:@selector(copyAllButton:)
-                area:NSMakeRect(118, 10, 100, 28) into:surface];
-            [self updateCopyControls];
+            NSButton *more = [self button:@"…" action:@selector(showOfferChoices:) area:NSMakeRect(12, 8, 36, 28) into:surface];
+            more.toolTip = JardLocalized(@"Meeting recording options");
+            more.accessibilityLabel = more.toolTip;
+            [self button:JardLocalized(@"Not Now") action:@selector(dismissButton:) area:NSMakeRect(96, 8, 112, 28) into:surface];
+            NSButton *record = [self button:JardLocalized(@"Record") action:@selector(recordButton:)
+                area:NSMakeRect(216, 8, 102, 28) into:surface];
+            record.font = [NSFont systemFontOfSize:NSFont.systemFontSize weight:NSFontWeightSemibold];
         }
-        [self button:@"Stop & Save" action:@selector(stopButton:) area:NSMakeRect(225, 10, 120, 28) into:surface];
+    } else if (live) {
+        [self attachRecordingMeterTo:surface];
+        if (compact) {
+            [self buildRecordingControlsIn:surface];
+            if (self.waitingForCaptureEnd) {
+                self.recordingActions.firstObject.title = @"Stopping…";
+                [self.recordingActions.firstObject setAccessibilityLabel:@"Stopping the meeting recording"];
+            }
+        } else {
+            self.caption.frame = NSMakeRect(100, 49, 246, 32);
+            [self updateCaption];
+            [self button:@"Keep Recording" action:@selector(keepButton:) area:NSMakeRect(12, 10, 136, 28) into:surface];
+            [self button:@"Stop & Save" action:@selector(stopButton:) area:NSMakeRect(225, 10, 120, 28) into:surface];
+        }
     }
-    if (appearing) self.panel.alphaValue = 0;
+    BOOL fade = appearing || (changingOfferLayout && self.panel.reduceMotion);
+    if (fade) self.panel.alphaValue = 0;
     [self.panel orderFrontRegardless];
-    if (appearing) [NSAnimationContext runAnimationGroup:^(NSAnimationContext *animation) {
+    if (fade) [NSAnimationContext runAnimationGroup:^(NSAnimationContext *animation) {
         animation.duration = self.panel.reduceMotion ? 0.08 : 0.16;
         self.panel.animator.alphaValue = 1;
     }];
@@ -1351,6 +1920,7 @@ static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
     [self.calendar shutdown];
     [self.timer invalidate];
     self.timer = nil;
+    [self stopRecordingMeter];
     [self.panel orderOut:nil];
     self.panel = nil;
 }

@@ -41,6 +41,15 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(.01)
         return self.routes.status(capture)
 
+    async def wait_confirmation(self, capture, after=None):
+        async with asyncio.timeout(3):
+            while True:
+                for event in reversed(self.events):
+                    nonce = event.get("nonce")
+                    if event["capture"] == capture and nonce and nonce != after:
+                        return nonce
+                await asyncio.sleep(.01)
+
     async def test_visible_offer_held_then_sent_once(self):
         await self.routes.enqueue("demo", self.origin, time())
         await self.wait_phase("demo", "offer")
@@ -50,9 +59,29 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.sent)
         self.routes.routes["demo"].remaining = .01
         await self.routes.panel_action("demo", "resume")
+        first = await self.wait_confirmation("demo")
+        self.assertTrue(self.routes.confirm_from_panel("demo", first, "held"))
+        await self.wait_phase("demo", "held")
+        self.assertFalse(self.sent)
+        await self.routes.panel_action("demo", "resume")
+        second = await self.wait_confirmation("demo", first)
+        self.assertFalse(self.routes.confirm_from_panel("demo", first, "ready"))
+        self.assertFalse(self.routes.confirm_from_panel("different", second, "ready"))
+        self.assertTrue(self.routes.confirm_from_panel("demo", second, "ready"))
+        self.assertFalse(self.routes.confirm_from_panel("demo", second, "ready"))
         await self.wait_phase("demo", "sent")
         await self.routes.panel_action("demo", "resume")
         self.assertEqual(self.sent, [("demo", "ses_test", "bound")])
+        self.assertEqual(self.events[-1]["receiptStatus"], "queued")
+        self.assertGreater(self.events[-1]["undoUntil"], time() * 1000)
+        automatic = self.routes.automatic_receipt("demo")
+        manual = self.routes.receipts.begin("demo", "different", {"id": "ses_other", "title": "Other"}, False)
+        self.assertNotEqual(automatic["deliveryId"], manual)
+        self.assertEqual(self.routes.automatic_receipt("demo"), automatic)
+        self.routes.receipts.change(automatic["deliveryId"], "withdrawal-unconfirmed")
+        status = await self.routes.query("demo")
+        self.assertEqual(status["receiptStatus"], "withdrawal-unconfirmed")
+        self.assertNotIn("undoUntil", status)
 
     async def test_headless_or_cancelled_never_sends(self):
         with patch("desktop.annotation_automation.OFFER_TIMEOUT", .05):
@@ -63,6 +92,23 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         await self.routes.panel_action("visible", "shown")
         self.assertTrue(await self.routes.cancel("visible"))
         await self.wait_phase("visible", "cancelled")
+        self.assertFalse(self.sent)
+
+    async def test_missing_or_unavailable_confirmation_never_claims_a_send(self):
+        with patch("desktop.annotation_automation.CONFIRMATION_TIMEOUT", .12):
+            for capture in ("gone", "locked", "closed"):
+                await self.routes.enqueue(capture, self.origin, time())
+                await self.wait_phase(capture, "offer")
+                self.routes.routes[capture].remaining = .01
+                await self.routes.panel_action(capture, "shown")
+                nonce = await self.wait_confirmation(capture)
+                if capture == "locked":
+                    self.assertTrue(self.routes.confirm_from_panel(capture, nonce, "unavailable"))
+                elif capture == "closed":
+                    self.assertTrue(await self.routes.cancel(capture))
+                    self.assertFalse(self.routes.confirm_from_panel(capture, nonce, "ready"))
+                await self.wait_phase(capture, "cancelled")
+                self.assertEqual(self.routes.receipts.recent(capture), [])
         self.assertFalse(self.sent)
 
     async def test_provenance_and_rule_replacement_prevent_send(self):
@@ -77,6 +123,7 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.routes.receipts.remember_rule(self.scope, "Other", "ses_other", "service.json", True)
         self.routes.routes["replaced"].remaining = .02
         await self.routes.panel_action("replaced", "shown")
+        self.assertTrue(self.routes.confirm_from_panel("replaced", await self.wait_confirmation("replaced"), "ready"))
         self.assertIn("changed", (await self.wait_phase("replaced", "failed"))["message"])
         self.assertFalse(self.sent)
 
@@ -99,6 +146,7 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent, [])
         self.routes.routes["restart"].remaining = .01
         await self.routes.panel_action("restart", "shown")
+        self.assertTrue(self.routes.confirm_from_panel("restart", await self.wait_confirmation("restart"), "ready"))
         await self.wait_phase("restart", "sent")
         self.assertEqual(self.sent, [("restart", "ses_test", "bound")])
 
@@ -145,6 +193,7 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent, [])
         self.routes.routes["resume"].remaining = .01
         await self.routes.panel_action("resume", "shown")
+        self.assertTrue(self.routes.confirm_from_panel("resume", await self.wait_confirmation("resume"), "ready"))
         await self.wait_phase("resume", "sent")
         self.assertEqual(self.sent, [("resume", "ses_test", "bound")])
 
@@ -154,6 +203,9 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         scopes = route_scopes({"origin": self.origin})
         rule = store.preferred_rule(scopes)
         store.enqueue_route("in-flight", self.origin, rule, 16)
+        with self.assertRaisesRegex(ReceiptError, "confirmation expired"):
+            store.claim_route("in-flight", scopes, rule["id"], "bound", {"id": "ses_test"}, False, confirmed_before=0)
+        self.assertFalse(store.recent("in-flight"))
         store.claim_route("in-flight", scopes, rule["id"], "bound", {"id": "ses_test"}, False)
         other = AnnotationAutomation(self.folder.name, self.load, self.deliver, self.events.append)
         self.addAsyncCleanup(other.close)

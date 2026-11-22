@@ -5,6 +5,8 @@ import os
 
 RATE = 48_000
 MAX_LINE = 1024 * 1024
+MIXED_SPEAKERS = "mixed"
+SOURCE_LABELS = {"1": "You", "2": "Them"}
 
 
 def rolling_path(source):
@@ -78,12 +80,15 @@ def midpoint(turn):
 
 
 def valid_record(row, *, text):
-    if not isinstance(row, dict) or not {"start", "end", "speaker"} <= row.keys() or row["speaker"] not in (1, 2):
+    if not isinstance(row, dict) or not {"start", "end", "speaker"} <= row.keys():
+        return False
+    speaker = row["speaker"]
+    if speaker is not None and (type(speaker) is not int or not 1 <= speaker <= 8):
         return False
     if text:
         return isinstance(row.get("text"), str) and all(
             row[key] is None or type(row[key]) in (int, float) and math.isfinite(row[key]) for key in ("start", "end"))
-    return midpoint(row) is not None
+    return speaker is not None and midpoint(row) is not None
 
 
 def trim_chunks(chunks, keep):
@@ -137,6 +142,17 @@ def trim_chunks(chunks, keep):
 def word_turn(turn, group):
     return {**turn, "start": group[0]["start"], "end": group[-1]["end"],
             "text": "".join(word["text"] + word.get("separator", " ") for word in group).strip()}
+
+
+def mixed_speaker_timeline(final, rolling, processed):
+    if not final:
+        return rolling
+    # The live and final diarization passes can assign different IDs to a voice.
+    # Only final IDs are shown once the final pass has written a prefix.
+    tail = trim_chunks(rolling, lambda _, point: point is not None and point >= processed)
+    return [*final, *[{**chunk, "activity": [],
+                      **{key: [{**row, "speaker": None} for row in chunk[key]] for key in ("segments", "words")}}
+                     for chunk in tail]]
 
 
 def timeline_chunks(final, rolling, *, mixed=False):

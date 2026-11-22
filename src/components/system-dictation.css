@@ -48,6 +48,80 @@
 .dictation-tour-scene > p { max-width: 48ch; margin: 0; color: var(--muted-foreground); line-height: 1.55; font-size: .9rem; }
 .dictation-tour-scene > p.dictation-tour-hint { margin: 12px 0; font-size: .79rem; }
 
+.shortcut-mode-dialog {
+  width: min(550px, calc(100vw - 28px));
+  padding: clamp(14px, 3vw, 24px);
+  gap: 14px;
+}
+.shortcut-mode-dialog h2 { font-size: 1.1rem; font-weight: 650; }
+.shortcut-mode-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  font-size: .75rem;
+  color: var(--muted-foreground);
+}
+.shortcut-mode-legend kbd {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--muted);
+  color: var(--foreground);
+}
+.shortcut-mode-legend > span { display: inline-flex; align-items: center; gap: 5px; }
+.shortcut-mode-legend i { width: 9px; height: 5px; border-radius: 2px; background: var(--muted-foreground); }
+.shortcut-mode-legend > span:last-child i { background: var(--primary); }
+.shortcut-mode-options { display: grid; gap: 6px; }
+.shortcut-mode-choice {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(72px, 1fr) 15px;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 58px;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--foreground);
+  text-align: start;
+}
+.shortcut-mode-choice:hover { background: var(--muted); }
+.shortcut-mode-choice[aria-pressed="true"] { border-color: var(--primary); }
+.shortcut-mode-choice:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+.shortcut-mode-label { display: grid; gap: 2px; }
+.shortcut-mode-label strong { font-size: .82rem; font-weight: 650; }
+.shortcut-mode-label small { font-size: .73rem; line-height: 1.35; color: var(--muted-foreground); }
+.shortcut-mode-check { width: 15px; height: 15px; visibility: hidden; color: var(--primary); }
+.shortcut-mode-choice[aria-pressed="true"] .shortcut-mode-check { visibility: visible; }
+.shortcut-timeline {
+  position: relative;
+  display: grid;
+  gap: 5px;
+  padding-block: 3px;
+  overflow: hidden;
+}
+.shortcut-timeline-lane { position: relative; height: 5px; border-radius: 2px; background: var(--muted); }
+.shortcut-timeline-lane > span {
+  position: absolute;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--muted-foreground);
+}
+.shortcut-timeline-lane:nth-child(2) > span { background: var(--primary); }
+.shortcut-timeline-playhead {
+  position: absolute;
+  inset: 0;
+  border-inline-start: 1px solid var(--foreground);
+  animation: shortcut-mode-progress 3.8s linear infinite;
+}
+.shortcut-mode-footer { display: flex; justify-content: flex-end; }
+@keyframes shortcut-mode-progress { from { transform: translateX(0); } to { transform: translateX(100%); } }
+@media (prefers-reduced-motion: reduce) {
+  .shortcut-timeline-playhead { display: none; }
+}
+
 .dictation-demo {
   display: grid;
   justify-content: center;
@@ -98,6 +172,11 @@
 [data-ready="true"] .dictation-granted { color: light-dark(#23684f, #91cfb6); }
 .dictation-practice { padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--card); }
 .dictation-practice label { display: block; font-weight: 600; font-size: .8rem; margin-bottom: 7px; }
+.dictation-microphone-control { display: inline-flex; gap: .45rem; align-items: center; min-width: 0; }
+.dictation-microphone-control select { min-width: 0; }
+.dictation-microphone-level { display: inline-flex; min-width: 14px; height: 15px; align-items: center; justify-content: center; gap: 2px; color: var(--quiet); opacity: .4; }
+.dictation-microphone-level[data-receiving="true"] { color: var(--foreground); opacity: 1; }
+.dictation-microphone-level > span { flex: 0 0 2px; border-radius: 1px; background: currentColor; }
 .dictation-practice textarea, .dictation-rule textarea, .dictation-history input, .dictation-option select {
   background: var(--background);
   color: var(--foreground);
@@ -240,7 +319,7 @@
 }
 .dictation-setting-label strong { font-size: .86rem; }
 .dictation-setting-label small { margin-top: 2px; color: var(--quiet); }
-.dictation-setting-row > select {
+:is(.dictation-setting-row, .dictation-microphone-control) > select {
   appearance: none;
   min-height: 32px;
   max-width: min(51%, 17rem);
@@ -257,9 +336,11 @@
   background-position: top 50% right 13px, top 50% right 9px;
   background-repeat: no-repeat;
 }
-.dictation-setting-row > select:enabled { cursor: pointer; }
-.dictation-setting-row > select:enabled:hover { border-color: var(--quiet); }
-.dictation-setting-row > select:disabled { opacity: .57; }
+:is(.dictation-setting-row, .dictation-microphone-control) > select:enabled { cursor: pointer; }
+:is(.dictation-setting-row, .dictation-microphone-control) > select:enabled:hover { border-color: var(--quiet); }
+:is(.dictation-setting-row, .dictation-microphone-control) > select:disabled { opacity: .57; }
+.dictation-microphone-control { max-width: min(60%, 18rem); }
+.dictation-microphone-control > select { max-width: 100%; }
 .dictation-setting-row > input[type="number"] {
   width: 4.5rem;
   min-height: 32px;
@@ -616,8 +697,8 @@
   .dictation-history-results, .dictation-history-detail-body { overscroll-behavior: contain; }
 }
 @container (max-width: 360px) {
-  .dictation-setting-row:has(> select) { align-items: start; flex-direction: column; gap: 6px; }
-  .dictation-setting-row > select { width: 100%; max-width: none; }
+  .dictation-setting-row:has(> select, > .dictation-microphone-control) { align-items: start; flex-direction: column; gap: 6px; }
+  .dictation-setting-row > select, .dictation-microphone-control { width: 100%; max-width: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   .dictation-preferences input[role="switch"], .dictation-preferences input[role="switch"]::before { transition: none; }
@@ -629,7 +710,6 @@
 .meetings-settings .meeting-status.dictation-error { margin: 0; }
 .update-settings-feedback { border-top: 1px solid var(--line); }
 .update-settings-feedback p { margin: .45rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
-.desktop-application-settings { margin-top: 20px; }
 .meeting-upcoming { padding: 12px var(--setting-inset); border-top: 1px solid var(--line); }
 .meeting-upcoming h4 { margin: 0 0 5px; font-size: .85rem; font-weight: 620; }
 .meeting-calendar-event small, .meeting-calendar-empty { color: var(--quiet); font-size: .76rem; }
@@ -641,3 +721,22 @@
 .meetings-settings .dictation-setting-label small { overflow-wrap: anywhere; }
 .meetings-settings .dictation-row-actions { flex-wrap: wrap; min-width: 0; max-width: 100%; }
 .meetings-settings .dictation-row-actions > button { height: auto; min-height: 32px; white-space: normal; }
+.annotation-settings .dictation-setting-row { min-height: 58px; flex-wrap: wrap; }
+.annotation-settings .dictation-setting-label { flex: 1 1 9rem; }
+.annotation-settings .dictation-setting-label small { overflow-wrap: anywhere; }
+.annotation-settings .dictation-row-actions { flex-wrap: wrap; max-width: 100%; }
+.annotation-access-error { display: block; margin-top: 4px; color: light-dark(#912f28, #f7a699); }
+.annotation-settings .dictation-setting-row button { min-height: 32px; height: auto; white-space: normal; }
+.annotation-status {
+  margin: 0;
+  padding: 10px var(--setting-inset);
+  border-bottom: 1px solid var(--line);
+  color: var(--quiet);
+  font-size: .79rem;
+}
+.annotation-status[role="alert"] { color: light-dark(#912f28, #f7a699); }
+@container (max-width: 360px) {
+  .annotation-settings .dictation-setting-row { align-items: flex-start; row-gap: 8px; }
+  .annotation-settings .dictation-setting-label { flex-basis: 100%; }
+  .annotation-settings .dictation-setting-row > :is(button, .dictation-row-actions) { margin-inline-start: 27px; }
+}

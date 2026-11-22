@@ -41,7 +41,8 @@ NSURL *JardWebContextURL(id value) {
     return url.URL;
 }
 
-NSURL *JardBrowserTabURL(NSRunningApplication *browser, NSTimeInterval timeout) {
+NSURL *JardBrowserTabURL(NSRunningApplication *browser, NSTimeInterval timeout, BOOL *readAddress) {
+    if (readAddress) *readAddress = NO;
     OSType tabKey = currentTabProperty(browser.bundleIdentifier);
     if (!tabKey || browser.terminated || browser.processIdentifier <= 0 || timeout <= 0) return nil;
     NSAppleEventDescriptor *window = specifier(cWindow, NSAppleEventDescriptor.nullDescriptor,
@@ -57,7 +58,9 @@ NSURL *JardBrowserTabURL(NSRunningApplication *browser, NSTimeInterval timeout) 
     NSAppleEventDescriptor *reply = [event sendEventWithOptions:NSAppleEventSendWaitForReply |
         NSAppleEventSendNeverInteract | kAEDoNotPromptForUserConsent timeout:timeout error:nil];
     if (!reply || [reply paramDescriptorForKeyword:keyErrorNumber].int32Value) return nil;
-    return JardWebContextURL([reply paramDescriptorForKeyword:keyDirectObject].stringValue);
+    NSString *value = [reply paramDescriptorForKeyword:keyDirectObject].stringValue;
+    if (readAddress) *readAddress = value.length > 0;
+    return JardWebContextURL(value);
 }
 
 BOOL JardRequestBrowserTabAccess(NSRunningApplication *browser) {

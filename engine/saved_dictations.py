@@ -6,14 +6,17 @@ from pathlib import Path
 import plistlib
 import re
 import stat
+from unicodedata import category, normalize
 from xml.parsers.expat import ExpatError
 
+from dictation_output import MAX_VOCABULARY
 from meeting_search import TOKEN, meeting_passages
 from saved_meetings import date_bound
 
 DEFAULT_BUNDLE_ID = "local.jardaudio.desktop"
 RETENTION_LABELS = {0: "off", 1: "day", 7: "week", 30: "month"}
-HISTORY_LIMIT = 250
+HISTORY_LIMIT = 10_000
+HISTORY_TEXT_BUDGET = 16 * 1024 * 1024
 
 
 def preferences_path():
@@ -23,7 +26,7 @@ def preferences_path():
     return Path.home() / "Library" / "Preferences" / (identifier + ".plist")
 
 
-def _read_preferences(path):
+def read_private_history_plist(path):
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -43,6 +46,61 @@ def _read_preferences(path):
     return result
 
 
+def _vocabulary_key(word):
+    return normalize("NFC", word).casefold()
+
+
+def _vocabulary_text(word):
+    return (isinstance(word, str) and bool(word)
+            and not any(category(character) in ("Cc", "Cs") for character in word)
+            and len(word.encode("utf-16-le")) <= 160)
+
+
+def _vocabulary_settings(snapshot=None, path=None):
+    if snapshot is None:
+        try:
+            snapshot = read_private_history_plist(path if path is not None else preferences_path())
+        except (OSError, ValueError):
+            return {}
+    settings = snapshot.get("JardSystemDictation")
+    return settings if isinstance(settings, dict) else {}
+
+
+def _preferred_terms(settings):
+    vocabulary = settings.get("vocabulary")
+    if not isinstance(vocabulary, str):
+        return ()
+    terms = {}
+    for line in vocabulary.splitlines():
+        word = line.strip()
+        if _vocabulary_text(word):
+            terms.setdefault(_vocabulary_key(word), word)
+            if len(terms) == MAX_VOCABULARY:
+                break
+    return tuple(terms.values())
+
+
+def shared_vocabulary():
+    """Return preferred terms from the current user's private preference snapshot."""
+    if os.name == "nt":
+        return ()
+    return _preferred_terms(_vocabulary_settings())
+
+
+def search_vocabulary(snapshot=None, *, path=None):
+    settings = _vocabulary_settings(snapshot, path)
+    aliases = settings.get("vocabularySoundsLike")
+    indexed = {}
+    if isinstance(aliases, dict):
+        indexed = {_vocabulary_key(key): value for key, value in aliases.items() if isinstance(value, list)}
+    entries = []
+    for term in _preferred_terms(settings):
+        spellings = indexed.get(_vocabulary_key(term), ())[:8]
+        cleaned = tuple(alias.strip() for alias in spellings if _vocabulary_text(alias) and len(alias.strip()) >= 2)
+        entries.append((term, cleaned))
+    return tuple(entries)
+
+
 def _saved_history(snapshot, now):
     settings = snapshot.get("JardSystemDictation", {})
     if not isinstance(settings, dict):
@@ -58,7 +116,10 @@ def _saved_history(snapshot, now):
         raise ValueError("The saved Jard dictation history is invalid.")
     expires_before = now.timestamp() - (retention or previous_retention) * 86_400
     entries = []
-    for entry in history[:HISTORY_LIMIT]:
+    total_bytes = 0
+    for entry in history:
+        if len(entries) == HISTORY_LIMIT:
+            break
         if not isinstance(entry, dict):
             raise ValueError("A saved Jard dictation entry is invalid.")
         identifier, text, timestamp = entry.get("id"), entry.get("text"), entry.get("time")
@@ -69,8 +130,12 @@ def _saved_history(snapshot, now):
             ) or ("seconds" in entry and not _number(entry["seconds"]))
         ):
             raise ValueError("A saved Jard dictation entry is invalid.")
-        if timestamp >= expires_before:
-            entries.append(entry)
+        if timestamp < expires_before:
+            continue
+        total_bytes += len(text.encode()) + len(entry.get("raw", "").encode())
+        if total_bytes > HISTORY_TEXT_BUDGET:
+            break
+        entries.append(entry)
     return entries, RETENTION_LABELS[retention]
 
 
@@ -78,7 +143,7 @@ def _number(value):
     return type(value) in (int, float) and 0 <= value < 253_402_300_800
 
 
-def _rank(entries, query):
+def _rank(entries, query, vocabulary):
     passages = []
     by_id = {}
     for entry in entries:
@@ -88,14 +153,14 @@ def _rank(entries, query):
         if entry.get("raw") and entry["raw"] != entry["text"]:
             passages.append({"id": key, "text": entry["raw"]})
     ranked = {}
-    for hit in meeting_passages(passages, query, len(passages), True, stem_phrases=True):
+    for hit in meeting_passages(passages, query, len(passages), True, stem_phrases=True, vocabulary=vocabulary):
         ranked.setdefault(hit["id"], {**by_id[hit["id"]], "score": hit["score"], "snippet": hit["snippet"]})
     return list(ranked.values())
 
 
 def history_page(path, *, since=None, until=None, app=None, grep=None, search=None, oldest_first=False,
                  query=None, offset=0, limit=50, raw=False, legacy=False, now=None, snapshot=None):
-    if not 1 <= limit <= 10_000:
+    if not 1 <= limit <= HISTORY_LIMIT:
         raise ValueError("Use a history limit from 1 to 10,000.")
     if search is not None and oldest_first:
         raise ValueError("Use either ranked search or oldest-first order.")
@@ -103,7 +168,8 @@ def history_page(path, *, since=None, until=None, app=None, grep=None, search=No
     lower, upper = date_bound(since, now), date_bound(until, now, through=True)
     if lower is not None and upper is not None and lower >= upper:
         raise ValueError("The history start must be before its end.")
-    entries, retention = _saved_history(_read_preferences(path) if snapshot is None else snapshot, now)
+    source = read_private_history_plist(path) if snapshot is None else snapshot
+    entries, retention = _saved_history(source, now)
     first = lower.timestamp() if lower is not None else -math.inf
     last = upper.timestamp() if upper is not None else math.inf
     app_folded, literal, old_query = (value.casefold() if value is not None else None for value in (app, grep, query))
@@ -122,7 +188,9 @@ def history_page(path, *, since=None, until=None, app=None, grep=None, search=No
         filtered.append(entry)
     filtered.sort(key=lambda entry: (entry["time"], entry["id"]), reverse=not oldest_first)
     if search is not None:
-        filtered = _rank(filtered, search)
+        # Older hosts provided retention and History but no vocabulary in the live snapshot.
+        vocabulary_source = source if snapshot is None or "vocabulary" in _vocabulary_settings(source) else None
+        filtered = _rank(filtered, search, search_vocabulary(vocabulary_source, path=path))
     offset = max(0, offset)
     page = filtered[offset:offset + limit]
     if legacy:

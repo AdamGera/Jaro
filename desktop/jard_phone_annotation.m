@@ -69,14 +69,13 @@ static BOOL portHasMedia(AVCaptureInputPort *port, AVMediaType type, CMMediaType
         CMFormatDescriptionGetMediaType(port.formatDescription) == formatType);
 }
 
-static BOOL configureNarration(AVCaptureMovieFileOutput *output, AVCaptureDeviceInput *phone, AVCaptureDeviceInput *mic) {
-    BOOL macAudio = NO, phoneVideo = NO;
+static BOOL configurePhoneVideo(AVCaptureMovieFileOutput *output, AVCaptureDeviceInput *phone) {
+    BOOL phoneVideo = NO;
     for (AVCaptureConnection *connection in output.connections) {
-        BOOL phoneInput = NO, micInput = NO;
+        BOOL phoneInput = NO;
         BOOL audio = connection.audioChannels.count > 0, video = NO;
         for (AVCaptureInputPort *port in connection.inputPorts) {
             phoneInput |= port.input == phone;
-            micInput |= port.input == mic;
             video |= portHasMedia(port, AVMediaTypeVideo, kCMMediaType_Video);
             audio |= portHasMedia(port, AVMediaTypeAudio, kCMMediaType_Audio);
         }
@@ -84,19 +83,17 @@ static BOOL configureNarration(AVCaptureMovieFileOutput *output, AVCaptureDevice
             if (video) return NO;
             connection.enabled = NO;
         }
-        macAudio |= micInput && audio && connection.enabled;
         phoneVideo |= phoneInput && video && connection.enabled;
     }
-    return phoneVideo && macAudio;
+    return phoneVideo;
 }
 
 @interface JardPhoneAnnotation () <AVCaptureFileOutputRecordingDelegate, NSWindowDelegate>
 @property(nonatomic, strong) NSURL *movie;
-@property(nonatomic, copy) NSString *microphone;
 @property(nonatomic, readwrite, strong) NSPanel *panel;
 @property(nonatomic, strong) AVCaptureSession *session;
 @property(nonatomic, strong) AVCaptureMovieFileOutput *output;
-@property(nonatomic, strong) AVCaptureDeviceInput *videoInput, *audioInput;
+@property(nonatomic, strong) AVCaptureDeviceInput *videoInput;
 @property(nonatomic, strong) AVCaptureVideoPreviewLayer *preview;
 @property(nonatomic, strong) dispatch_queue_t queue;
 @property(nonatomic) NSSize pixels;
@@ -105,10 +102,9 @@ static BOOL configureNarration(AVCaptureMovieFileOutput *output, AVCaptureDevice
 
 @implementation JardPhoneAnnotation
 
-- (instancetype)initWithMovie:(NSURL *)movie microphone:(NSString *)microphone {
+- (instancetype)initWithMovie:(NSURL *)movie {
     if (!(self = [super init])) return nil;
     _movie = movie;
-    _microphone = [microphone copy];
     _session = AVCaptureSession.new;
     _output = AVCaptureMovieFileOutput.new;
     _queue = dispatch_queue_create("com.jard.annotation.phone", DISPATCH_QUEUE_SERIAL);
@@ -134,18 +130,6 @@ static BOOL configureNarration(AVCaptureMovieFileOutput *output, AVCaptureDevice
     });
 }
 
-- (AVCaptureDeviceInput *)microphoneInput {
-    if (self.microphone.length) {
-        AVCaptureDevice *device = [AVCaptureDevice deviceWithUniqueID:self.microphone];
-        if ([device hasMediaType:AVMediaTypeAudio]) {
-            AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:device error:nil];
-            if (input) return input;
-        }
-    }
-    AVCaptureDevice *fallback = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-    return fallback ? [AVCaptureDeviceInput deviceInputWithDevice:fallback error:nil] : nil;
-}
-
 - (void)attach:(AVCaptureDevice *)phone {
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     [center addObserver:self selector:@selector(deviceDisconnected:) name:AVCaptureDeviceWasDisconnectedNotification object:phone];
@@ -153,15 +137,12 @@ static BOOL configureNarration(AVCaptureMovieFileOutput *output, AVCaptureDevice
     dispatch_async(self.queue, ^{
         NSError *error = nil;
         AVCaptureDeviceInput *video = [AVCaptureDeviceInput deviceInputWithDevice:phone error:&error];
-        AVCaptureDeviceInput *mic = [self microphoneInput];
         AVCaptureSession *session = self.session;
         AVCaptureMovieFileOutput *output = self.output;
         [session beginConfiguration];
         if (video && [session canAddInput:video]) [session addInput:video];
-        if (mic && [session canAddInput:mic]) [session addInput:mic];
         if ([session canAddOutput:output]) [session addOutput:output];
-        BOOL ready = video && [session.inputs containsObject:video] && mic && [session.inputs containsObject:mic] &&
-            [session.outputs containsObject:output];
+        BOOL ready = video && [session.inputs containsObject:video] && [session.outputs containsObject:output];
         [session commitConfiguration];
         if (ready) [session startRunning];
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -171,7 +152,6 @@ static BOOL configureNarration(AVCaptureMovieFileOutput *output, AVCaptureDevice
                 return;
             }
             self.videoInput = video;
-            self.audioInput = mic;
             [self showPreview:phone];
             [self waitForPictureUntil:NSProcessInfo.processInfo.systemUptime + 8];
         });
@@ -244,14 +224,14 @@ static BOOL configureNarration(AVCaptureMovieFileOutput *output, AVCaptureDevice
     self.pixels = [self videoSize];
     if (self.pixels.width > 0) {
         self.requested = YES;
-        AVCaptureDeviceInput *video = self.videoInput, *mic = self.audioInput;
+        AVCaptureDeviceInput *video = self.videoInput;
         dispatch_async(self.queue, ^{
-            if (configureNarration(self.output, video, mic)) {
+            if (configurePhoneVideo(self.output, video)) {
                 [self.output startRecordingToOutputFileURL:self.movie recordingDelegate:self];
                 return;
             }
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self finish:NO error:@"Could not record the wired screen with a separate Mac microphone."];
+                [self finish:NO error:@"Could not record the wired screen."];
             });
         });
         __weak typeof(self) weak = self;

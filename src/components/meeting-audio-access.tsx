@@ -57,7 +57,7 @@ export function MeetingAudioAccess({ native, busy }: { native: DesktopBridge; bu
   }
 
   const allowed = status?.authorization === "granted"
-  const requesting = pending || status?.busy
+  const requesting = pending || !!status?.busy
   const detail = allowed ? "Jaro can record Mac audio on its own." : status?.screen
     ? "Screen Recording is allowed as a fallback. You can also allow audio-only access."
     : status?.authorization === "denied" || status?.authorization === "unknown"
@@ -72,7 +72,7 @@ export function MeetingAudioAccess({ native, busy }: { native: DesktopBridge; bu
             {requesting && <i className="thinking-dot meeting-audio-wait" aria-hidden="true" />}
             {t(requesting ? "Waiting for macOS…" : status.authorization === "request" ? "Allow Mac audio" : "Open System Settings")}
           </Button>
-          {status.canRepair && <Button size="sm" variant="ghost" disabled={busy || requesting} onClick={() => void change("repair")}>
+          {!!status.canRepair && <Button size="sm" variant="ghost" disabled={busy || requesting} onClick={() => void change("repair")}>
             {t("Reset Mac audio access")}
           </Button>}
         </div>}

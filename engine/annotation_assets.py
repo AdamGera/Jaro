@@ -10,6 +10,11 @@ ASSETS = {
     "contact-sheet": ("contact-sheet.png", ".annotation.png", "image/png", 12 * 1024 * 1024),
 }
 MAX_TIMELINE_SECONDS = 3 * 60 * 60 + 2
+MISSING_VIDEO_REASONS = {
+    "noFrames": "The screen recording produced no video frames.",
+    "permissionDenied": "macOS declined Screen Recording access.",
+    "screenInterrupted": "The video source stopped before it saved a usable picture.",
+}
 
 
 def staged_annotation_paths(source):
@@ -96,6 +101,9 @@ def read_staged_annotation(source):
     events, frames = manifest.get("events"), manifest.get("frames")
     if not isinstance(events, list) or len(events) > 100_000 or not isinstance(frames, list) or len(frames) > 6:
         raise ValueError("Invalid annotation timeline.")
+    reason = manifest.get("missingVideo")
+    if "missingVideo" in manifest and (not isinstance(reason, str) or reason not in MISSING_VIDEO_REASONS or frames):
+        raise ValueError("Invalid missing video state.")
     last = 0
     strokes = set()
     for event in events:
@@ -107,6 +115,8 @@ def read_staged_annotation(source):
         stroke = event.get("stroke")
         if not point(event.get("from")) or not point(event.get("to")) or type(stroke) is not int or not 0 <= stroke <= 2**53 - 1:
             raise ValueError("Invalid annotation stroke.")
+        if "liftedAt" in event and not number(event["liftedAt"], event["time"], MAX_TIMELINE_SECONDS):
+            raise ValueError("Invalid annotation stroke release time.")
         strokes.add(stroke)
     if any(not number(frame, 0, MAX_TIMELINE_SECONDS) for frame in frames) or any(a >= b for a, b in zip(frames, frames[1:])):
         raise ValueError("Invalid annotation frame times.")
@@ -119,6 +129,8 @@ def read_staged_annotation(source):
         if not 0 < width <= 872 or not 0 < height <= 846:
             raise ValueError("Invalid annotation contact sheet size.")
     result = {"version": 1, "source": manifest["source"], "strokeCount": len(strokes), "frames": frames}
+    if reason:
+        result["missingVideo"] = reason
     if origin := annotation_origin(manifest.get("origin")):
         result["origin"] = origin
     return result

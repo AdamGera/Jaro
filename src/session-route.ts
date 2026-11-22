@@ -5,8 +5,8 @@ const sessionId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const tabs = new Set(["overview", "timeline", "transcript", "notes", "analytics", "annotation"])
 
 export function sessionTab(session: SavedSession, wanted: string) {
-  if (session.status !== "complete") return session.annotation && wanted !== "transcript" ? "annotation" : "transcript"
-  return wanted === "annotation" && !session.annotation ? "overview" : wanted
+  if (session.status !== "complete") return session.annotation && wanted !== "transcript" ? "overview" : "transcript"
+  return wanted === "annotation" ? "overview" : wanted
 }
 
 const desktopLocation = "jard.lastSession"

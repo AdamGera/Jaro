@@ -135,6 +135,49 @@ class InsightsTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                 validate({**summary, "anchor1": {**summary["anchor1"], field: value}})
 
+    async def test_detailed_meeting_overview_keeps_cited_followups_and_open_questions(self):
+        with self.store.connection() as db:
+            db.execute("UPDATE sessions SET options=json_set(options,'$.meeting',1) WHERE id=?", (self.key,))
+        outcomes = [
+            ("Release date", "The release is Friday. Mei will check that the build is ready by Thursday."),
+            ("Support coverage", "Pavel will draft the support rotation. Saturday coverage is still open."),
+            ("Cost estimate", "The finance team needs a revised hosting estimate before approving the budget."),
+        ]
+        discussion = [
+            "The release team still needs to run the full build on the supported Mac versions. The release announcement "
+            "will go out Friday morning once the build check is complete.",
+            "Support needs one person on call each morning and one each afternoon. The team reviewed the current "
+            "rotation and will ask the weekend team for availability.",
+            "The earlier estimate only included storage. Finance also needs the expected compute charges and data "
+            "transfer fees, with separate estimates for peak and ordinary usage.",
+        ]
+        rows = [{"id": i, "start": start, "text": f"{detail} {context}"}
+                for i, ((_, detail), context, start) in enumerate(zip(outcomes, discussion, (12, 48, 84)), 1)]
+
+        def respond(instruction, source, schema, limit, **kwargs):
+            fields = schema["properties"]
+            if "writerPrompt" in fields:
+                return {name: "Cover launch logistics." if name == "writerPrompt" else spec["enum"][0]
+                        for name, spec in fields.items()}
+            self.assertIn("comprehensive, topic-by-topic meeting overview", instruction)
+            self.assertIn("deadlines, next steps and open questions", instruction)
+            self.assertEqual(source, excerpts(rows))
+            self.assertEqual(limit, 3600)
+            value = {"lead": "The team reviewed launch logistics."}
+            for i, (heading, detail) in enumerate(outcomes, 1):
+                field = f"anchor{i}"
+                proof = fields[field]["properties"]["evidence"]["enum"][0]
+                value[field] = {"heading": heading, "detail": detail, "evidence": proof}
+            check_structure(value, schema)
+            kwargs["validate"](value)
+            return value
+
+        self.insights.model.structured.side_effect = respond
+        note = await self.insights.write_overview(self.key, rows, "English", self.expected)
+        self.assertIn("## Release date\n\n" + outcomes[0][1] + " ⟦12⟧", note["markdown"])
+        self.assertIn("## Support coverage\n\n" + outcomes[1][1] + " ⟦48⟧", note["markdown"])
+        self.assertIn("## Cost estimate\n\n" + outcomes[2][1] + " ⟦84⟧", note["markdown"])
+
     async def test_mixed_language_overview_streams_and_checkpoints_raw_writer(self):
         import note_stream
         from insights import SUMMARY

@@ -1,5 +1,7 @@
 """Exercise Jard's startup and activation handlers in an isolated AppKit bundle."""
 
+from contextlib import ExitStack
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -9,13 +11,23 @@ import socket
 import subprocess
 import sys
 import tempfile
+from threading import Thread
 import time
 from uuid import uuid4
 
 
 SETUP = Path(__file__).resolve().parents[1] / "setup.html"
 INTERFACE_LANGUAGES = SETUP.with_name("interface-languages.json")
-HELPER = """#!/usr/bin/env python3
+SETTINGS_PAGE = b"""<!doctype html><script>
+window.settingsEvents = [];
+for (const event of ['jard-interface-language', 'jard-dock-icon']) {
+    window.addEventListener('native-sdk:' + event, ({detail}) => {
+        window.settingsEvents.push(event === 'jard-interface-language'
+            ? {language: detail.selected, resolved: detail.resolved} : {dock: detail.enabled});
+    });
+}
+</script><title>Application settings fixture</title>"""
+HELPER = r"""#!/usr/bin/env python3
 import json, os, sys
 for line in sys.stdin:
     request = json.loads(line)
@@ -29,6 +41,10 @@ for line in sys.stdin:
             response["result"] = {"ready": False}
         else:
             response.update(ok=False, error={"message": "Fixture engine failed to start."})
+    elif request["command"] == "jard.latestMeeting" and os.environ["JARD_WINDOW_FIXTURE_SCENARIO"] == "normal":
+        response["result"] = {"session": "3196de0c-cd84-4211-9367-98b5d859c20a"}
+    elif request["command"] == "jard.latestMeetingTranscript":
+        response["result"] = {"text": "**00:07 · Them**  \nShip the release."}
     print(json.dumps({"response": response}), flush=True)
 """
 
@@ -46,8 +62,70 @@ def read(path):
     return json.loads(path.read_text()) if path.exists() else None
 
 
+class SettingsPage(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(SETTINGS_PAGE)))
+        self.end_headers()
+        self.wfile.write(SETTINGS_PAGE)
+
+
+def offline_preferences(target, changes, *, succeeds):
+    process = subprocess.run([target, "--settings-apply-offline"], input=json.dumps(changes),
+                             text=True, capture_output=True, timeout=10)
+    result = json.loads(process.stdout)
+    if succeeds:
+        assert not process.returncode and result == changes, result
+    else:
+        assert process.returncode and result.get("error"), result
+    return result
+
+
+def verify_application_settings(root, invoke, target):
+    def settings(action, **payload):
+        (root / "settings.json").write_text(json.dumps({"action": "settings-" + action, **payload}))
+        return invoke("application-settings")
+
+    wait_for(lambda: invoke("settings-events")["events"] is not None, "The settings event listener did not load.")
+    initial = settings("list")
+    catalog = initial["result"]
+    assert {"system", "fr", "zh-Hant"} <= set(catalog["ui_language"]["choices"])
+    assert catalog["show_dock_icon"]["type"] == "boolean"
+    assert initial["language"] == "fr" and initial["frenchMenu"] and initial["dock"]["enabled"], initial
+    assert settings("get", key="dictation.languages")["result"] == {"dictation.languages": ["es"]}
+    assert "Close Jard" in offline_preferences(target, {"ui_language": "ja"}, succeeds=False)["error"]
+
+    rejected = settings("apply", changes={"ui_language": "ja", "show_dock_icon": 0, "dictation.languages": ["de"]})
+    assert rejected["error"] and rejected["language"] == "fr" and rejected["dock"]["enabled"], rejected
+    assert settings("get", key="dictation.languages")["result"] == {"dictation.languages": ["es"]}
+
+    applied = settings("apply", changes={"ui_language": "ZH-hant", "show_dock_icon": False, "dictation.languages": ["de"]})
+    assert applied["error"] is None and applied["language"] == "zh-Hant" and not applied["dock"]["enabled"], applied
+    wait_for(lambda: {"language": "zh-Hant", "resolved": "zh-Hant"} in invoke("settings-events")["events"],
+             "The workspace did not receive the selected language.")
+    wait_for(lambda: {"dock": False} in invoke("settings-events")["events"],
+             "The workspace did not receive the Dock preference.")
+
+    system = settings("apply", changes={"ui_language": None})["resolved"]
+    wait_for(lambda: {"language": "system", "resolved": system} in invoke("settings-events")["events"],
+             "The workspace did not receive the System selection.")
+    same_language = settings("apply", changes={"ui_language": system})
+    assert same_language["language"] == same_language["resolved"] == system, same_language
+    wait_for(lambda: {"language": system, "resolved": system} in invoke("settings-events")["events"],
+             "The workspace missed a selection change with the same resolved language.")
+    assert settings("get", key="ui_lang")["result"] == {"ui_language": system}
+    assert settings("get", key="show_dock_icon")["result"] == {"show_dock_icon": False}
+    assert settings("get", key="dictation.languages")["result"] == {"dictation.languages": ["de"]}
+    hidden = invoke("close")
+    assert not hidden["visible"] and not hidden["dockVisible"] and hidden["quitAvailable"], hidden
+
+
 def run_case(executable, scenario, prepare):
-    with tempfile.TemporaryDirectory(prefix="jard-window-") as folder:
+    with tempfile.TemporaryDirectory(prefix="jard-window-") as folder, ExitStack() as resources_to_close:
         root = Path(folder)
         identifier = "local.jardaudio.window-fixture." + uuid4().hex
         contents = root / "Jard Window Fixture.app/Contents"
@@ -62,16 +140,28 @@ def run_case(executable, scenario, prepare):
             "CFBundleDisplayName": "Jard Window Fixture", "CFBundlePackageType": "APPL",
             "CFBundleVersion": "1", "NSMicrophoneUsageDescription": "Fixture microphone status only.",
         }
-        if scenario in {"dock-updates", "managed-updates"}:
-            info["JardUpdates"] = {"feed_url": "https://127.0.0.1:9/update.json", "check_on_start": scenario == "managed-updates",
+        if scenario in {"dock-updates", "managed-updates", "launch-update", "focus-update", "update-restart", "quit-capture"}:
+            info["JardUpdates"] = {"feed_url": "https://127.0.0.1:9/update.json",
+                                   "check_on_start": scenario in {"managed-updates", "launch-update"},
                                    "public_key": "dxMjVxu9nD8oMW/Cx+DNTJ2sYv8JS8z95lJkz63hBMM="}
+        if scenario == "focus-update":
+            info["JardUpdates"].update(channel="dev", development={
+                "feed_url": "https://127.0.0.1:9/development.json",
+                "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            })
         (contents / "Info.plist").write_bytes(plistlib.dumps(info))
         helper = root / "prepare-helper"
         helper.write_text(HELPER)
         helper.chmod(0o700)
-        with socket.socket() as listener:
-            listener.bind(("127.0.0.1", 0))
-            port = listener.getsockname()[1]
+        if scenario == "application-settings":
+            server = resources_to_close.enter_context(ThreadingHTTPServer(("127.0.0.1", 0), SettingsPage))
+            Thread(target=server.serve_forever, daemon=True).start()
+            resources_to_close.callback(server.shutdown)
+            port = server.server_port
+        else:
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
         env = {
             **os.environ, "JARD_WINDOW_FIXTURE_ROOT": str(root), "JARD_WINDOW_FIXTURE_SCENARIO": scenario,
             "JARD_WINDOW_FIXTURE_PREPARE": prepare, "JARD_TEST_HELPER": str(helper), "JARD_TEST_SETUP": str(SETUP),
@@ -82,14 +172,21 @@ def run_case(executable, scenario, prepare):
                         "enabled", "-bool", "NO" if scenario in {"dock-setting", "dock-unavailable"} else "YES",
                         "onboarding", "welcome" if scenario == "login-setup" else "done"],
                        check=True)
-        if scenario in {"dock-login", "dock-unavailable", "dock-updates"}:
+        if scenario in {"dock-login", "dock-unavailable", "dock-updates"} or scenario.startswith("dock-cold-"):
             subprocess.run(["defaults", "write", identifier, "JardShowDockIcon", "-bool", "NO"], check=True)
         if scenario == "managed-updates":
             subprocess.run(["defaults", "write", identifier, "DisableUpdates", "-bool", "YES"], check=True)
         if scenario == "locale-preselected":
             subprocess.run(["defaults", "write", identifier, "JardInterfaceLanguage", "-string", "fr"], check=True)
+        if scenario == "application-settings":
+            offline_preferences(target, {"ui_language": "fr", "show_dock_icon": True,
+                                        "dictation.languages": ["es"]}, succeeds=True)
+            offline_preferences(target, {"ui_language": "invalid", "show_dock_icon": False,
+                                        "dictation.languages": ["de"]}, succeeds=False)
+        launch_args = [target, "--hidden"] if scenario.startswith("hidden-") else [target]
         try:
-            with (root / "host.log").open("wb") as log, subprocess.Popen([target], env=env, stderr=log) as process:
+            start = time.monotonic()
+            with (root / "host.log").open("wb") as log, subprocess.Popen(launch_args, env=env, stderr=log) as process:
                 def invoke(command):
                     reply = root / "reply.json"
                     reply.unlink(missing_ok=True)
@@ -102,26 +199,43 @@ def run_case(executable, scenario, prepare):
                     initial = wait_for(lambda: read(root / "launched.json"), f"{scenario}: AppKit did not launch.")
                     assert initial == {"visibleBeforeLaunch": False,
                                        "visible": scenario in {"normal", "annotation-managed", "managed-updates", "login-setup", "dock-setting",
-                                                               "dock-unavailable", "locale-preselected"}}, initial
+                                                               "dock-unavailable", "hidden-unavailable", "locale-preselected",
+                                                               "launch-update", "focus-update", "update-restart", "quit-capture", "application-settings"}}, initial
                     if prepare == "ready":
                         wait_for(lambda: invoke("status")["ready"], "The hidden workspace did not finish preparing.")
                     elif prepare == "missing":
                         title = "Configurer sur ce Mac" if scenario == "locale-preselected" else "Set up on this Mac"
                         wait_for(lambda: invoke("setup-title")["title"] == title, "Model setup did not open.")
-                        assert invoke("status")["visible"]
+                        assert invoke("status")["visible"] == (scenario != "hidden-missing")
                     elif prepare == "error":
                         wait_for(lambda: invoke("setup-title")["title"] == "Couldn’t open the workspace", "Engine error did not open.")
                         assert invoke("status")["visible"]
 
                     if scenario == "normal":
+                        assert invoke("input-device-events") == {"events": 1, "registered": True}
                         paste_menu = invoke("paste-menu")
                         assert paste_menu == {"title": "Paste Last Dictation", "shortcut": "v",
                             "shown": True, "enabled": False, "dockVisible": True}, paste_menu
                         policy = invoke("annotation-policy")
                         assert policy["shortcutRegistered"] and not policy["state"]["managed"], policy
+                        assert policy["permissionFailures"] == dict.fromkeys(
+                            ("allow", "repair", "restart"), "Finish the current recording or update first."), policy
+                        toggle = invoke("annotation-toggle")
+                        assert toggle["off"] is False and toggle["status"] is False and toggle["on"] is True, toggle
+                        assert toggle["start"] == "Annotate is turned off in Settings.", toggle
+                        shared = invoke("annotation-shared-meeting")
+                        assert shared == {"pickerBlocked": True, "sharedReady": True}, shared
+                        concurrent = invoke("annotation-start-over-shared-microphone")
+                        assert concurrent == dict.fromkeys(("sharedMeetingAllowed", "otherMeetingBlocked", "sharedDictationAllowed",
+                                                           "otherDictationBlocked", "pickerPreserved"), True), concurrent
                         live_meeting = invoke("menu-live-meeting")
                         assert live_meeting == {"idleFailure": "There is no live meeting transcript.", "pane": "live-meeting",
                                                 "recording": True, "visible": True}, live_meeting
+                        copy = invoke("menu-copy-latest")
+                        assert copy == {"available": True, "title": "Copy Last Meeting Transcript"}, copy
+                        result = wait_for(lambda: read(root / "latest-meeting-copy.json"), "The menu did not copy the saved transcript.")
+                        assert result == {"text": "**00:07 · Them**  \nShip the release.", "error": "", "copied": True}, result
+                        assert invoke("menu-copy-label-fr") == {"title": "Copier la transcription de la dernière réunion"}
                     elif scenario == "annotation-managed":
                         policy = invoke("annotation-policy")
                         message = "Screen annotation is managed by your organization."
@@ -129,6 +243,7 @@ def run_case(executable, scenario, prepare):
                         assert policy["state"]["message"] == message and not policy["state"]["busy"], policy
                         assert not policy["shortcutRegistered"] and not policy["canStart"], policy
                         assert policy["startFailures"] == dict.fromkeys(("display", "window", "area", "phone"), message), policy
+                        assert policy["permissionFailures"] == dict.fromkeys(("status", "allow", "repair", "restart"), message), policy
                     elif scenario == "managed-updates":
                         policy = invoke("update-policy")
                         message = "Updates managed by your organization"
@@ -164,6 +279,7 @@ def run_case(executable, scenario, prepare):
                         changed = invoke("dock-off")
                         assert changed["dockVisible"] and changed["quitAvailable"]
                         assert changed["dockSetting"] == {"enabled": False, "menuBarAvailable": True}
+                        assert invoke("record-menu") == {"shown": True, "enabled": True}
                         assert invoke("preview-active")["soundPreview"]
                         invoke("minimize")
                         minimized = wait_for(lambda: (state if (state := invoke("status"))["minimized"] else None),
@@ -200,8 +316,38 @@ def run_case(executable, scenario, prepare):
                         assert not invoke("status")["dockVisible"]
                         opened = invoke("menu-open")
                         assert opened["visible"] and opened["dockVisible"]
+                    elif scenario == "login-menu-unavailable":
+                        fallback = invoke("status")
+                        assert fallback["visible"] and fallback["dockVisible"] and not fallback["dockSetting"]["menuBarAvailable"], fallback
+                    elif scenario in {"dock-cold-ready", "hidden-ready", "hidden-missing"}:
+                        quiet = invoke("status")
+                        assert not quiet["visible"] and not quiet["dockVisible"] and quiet["quitAvailable"], quiet
+                        assert quiet["dockSetting"]["menuBarAvailable"], quiet
+                        assert not invoke("activate")["visible"]
+                        opened = invoke("dock" if scenario == "hidden-ready" else "menu-open")
+                        assert opened["visible"] and opened["dockVisible"], opened
+                    elif scenario == "dock-cold-input":
+                        assert invoke("status")["visible"]
+                    elif scenario == "hidden-unavailable":
+                        fallback = invoke("status")
+                        assert fallback["visible"] and fallback["dockVisible"] and not fallback["dockSetting"]["menuBarAvailable"], fallback
+                    elif scenario == "launch-update":
+                        assert invoke("update-status")["update"]["phase"] == "idle"
+                        wait_for(lambda: invoke("update-status")["update"]["phase"] == "error",
+                                 "The launch update check did not run.")
+                        assert time.monotonic() - start >= 10
+                        assert not invoke("update-status")["update"]["manualCheck"]
+                    elif scenario == "focus-update":
+                        assert invoke("focus-update") == {"disabled": "idle", "other": "idle", "workspace": "checking"}
+                    elif scenario == "update-restart":
+                        assert invoke("restart-transaction") == {"passed": True}
+                    elif scenario == "quit-capture":
+                        assert invoke("quit-capture") == {"passed": True}
+                    elif scenario == "application-settings":
+                        verify_application_settings(root, invoke, target)
                     elif scenario == "dock-updates":
                         assert not invoke("status")["dockVisible"]
+                        assert invoke("meeting-input-status") == {"passed": True}
                         assert invoke("update-status")["statusMenuTitle"] == "Check for Updates…"
                         assert invoke("status-check")["visible"]
 
@@ -254,13 +400,20 @@ def run_case(executable, scenario, prepare):
 
 if __name__ == "__main__":
     for launch, outcome in [("normal", "ready"), ("annotation-managed", "ready"), ("managed-updates", "ready"), ("login-setup", "ready"), ("login", "ready"),
-                            ("login-idle", "ready"), ("login-input", "ready"),
+                            ("login-idle", "ready"), ("login-input", "ready"), ("login-menu-unavailable", "ready"),
                             ("login-model", "missing"), ("login-error", "error"), ("dock-setting", "ready"),
                             ("dock-login", "ready"), ("dock-updates", "ready"),
-                            ("dock-unavailable", "ready"), ("locale-preselected", "missing")]:
+                            ("launch-update", "ready"), ("focus-update", "ready"), ("update-restart", "ready"), ("quit-capture", "ready"),
+                            ("application-settings", "ready"),
+                            ("dock-unavailable", "ready"), ("locale-preselected", "missing"),
+                            ("dock-cold-ready", "ready"), ("dock-cold-input", "ready"), ("dock-cold-missing", "missing"),
+                            ("hidden-ready", "ready"), ("hidden-missing", "missing"), ("hidden-unavailable", "ready")]:
         run_case(Path(sys.argv[1]).resolve(), launch, outcome)
     print("AppKit verified quiet login, setup recovery, Dock and menu bar reopen, overlay focus, minimization, and the missing-item fallback.")
+    print("AppKit verified menu-only launch for a ready Dock-hidden app, explicit hidden launch before setup, and both startup fallbacks.")
     print("AppKit verified persisted interface language, System tag resolution, inline setup, and live native menu labels.")
     print("AppKit checked updates from both menus, opened a hidden workspace, and separated the next background result.")
+    print("AppKit verified the launch delay, the automatic update preference, and Development checks on workspace focus.")
     print("AppKit verified a native capture hold on a staged update during a background check.")
+    print("AppKit verified a recording can defer restart and a failed restart waits for the engine to reopen.")
     print("AppKit verified managed update actions and the managed Annotate capture and shortcut restrictions.")

@@ -4,6 +4,8 @@ BOOL JardVerifyUpdateBundle(NSURL *current, NSURL *candidate, NSString *version,
 BOOL JardSwapUpdateBundles(NSURL *current, NSURL *candidate, NSString **reason);
 NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason);
 
+typedef void (^JardUpdateInstallReply)(BOOL applied, NSString *reason);
+
 @interface JardUpdater : NSObject
 - (instancetype)initWithConfiguration:(NSDictionary *)configuration bundle:(NSBundle *)bundle
                          stateChanged:(void (^)(NSDictionary *))changed;
@@ -15,10 +17,11 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason);
 - (void)openRelease;
 - (BOOL)openStagedReleaseNotesForVersion:(NSString *)version channel:(NSString *)channel reason:(NSString **)reason;
 - (void)checkBeforeRestart:(void (^)(void))completion;
-- (BOOL)restoreStagedUpdate;
+- (void)restoreStagedUpdateWithCompletion:(void (^)(BOOL restored))completion;
 - (BOOL)canInstallStagedUpdate;
 - (BOOL)prepareToInstallOnQuit;
-- (BOOL)restart:(NSString **)reason;
-- (BOOL)installOnQuit:(NSString **)reason;
+- (void)resumeAfterCancelledQuit;
+- (void)restartWithCompletion:(JardUpdateInstallReply)completion;
+- (void)installOnQuitWithCompletion:(JardUpdateInstallReply)completion;
 - (void)cancel;
 @end

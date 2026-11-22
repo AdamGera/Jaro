@@ -1,14 +1,16 @@
 import asyncio
+import fcntl
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
 from desktop.mac_bridge import Capture, MacBridge
 from meeting_brief import LiveTitlePlan, clean_title, set_automatic
-from native_recordings import read_meeting_title, write_meeting_title
+from meeting_rolling import MIXED_SPEAKERS, RATE, append_rolling
+from native_recordings import read_meeting_title, recording_marker, write_meeting_title, write_recording_metadata
 from session_store import SessionStore
 
 
@@ -147,6 +149,44 @@ class BridgeLiveTitleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status_code, 499)
         self.assertFalse(model.lock.locked())
         self.assertFalse(state.jobs)
+
+    async def test_engine_uses_the_language_of_spoken_turns_within_the_requested_window(self):
+        import server
+
+        available = asyncio.Event()
+        available.set()
+        model = SimpleNamespace(ready=AsyncMock(), available=available, lock=asyncio.Lock(),
+                                structured=AsyncMock(return_value={"title": "مراجعة الإطلاق"}))
+        key = uuid4()
+        state = SimpleNamespace(draining=False, submitting=set(), insights=SimpleNamespace(model=model),
+                                staging=self.path.parent, native_token="fixture", jobs=set(),
+                                library=SessionStore(self.path.parent / "library"))
+        request = SimpleNamespace(app=SimpleNamespace(state=state), headers={"x-jard-token": "fixture"},
+                                  is_disconnected=AsyncMock(return_value=False))
+        path = state.staging / str(key)
+        path.touch()
+        for index, (language, text) in enumerate((
+            ("English", ""), ("Arabic", "قرر الفريق إطلاق المنتج يوم الثلاثاء."),
+            ("Hebrew", "הצוות דן במועד ההשקה."),
+        )):
+            segments = [{"speaker": 1, "start": index, "end": index + 1, "text": text}] if text else []
+            append_rolling(path, index * RATE, (index + 1) * RATE,
+                           {"language": language, "text": text, "segments": segments, "words": [], "activity": [],
+                            "meetingSpeakerMode": MIXED_SPEAKERS})
+        with recording_marker(path).open("w+b") as marker:
+            fcntl.flock(marker, fcntl.LOCK_EX)
+            write_recording_metadata(marker, {"meetingProvider": "Fixture"})
+            result = await server.write_staged_meeting_title(request, key, through=2 * RATE)
+            self.assertEqual(result, {"title": "مراجعة الإطلاق"})
+            instructions, speech = model.structured.call_args.args[:2]
+            self.assertIn("response text in Arabic.", instructions)
+            self.assertIn("Speaker 1: قرر الفريق", speech)
+            self.assertNotIn("הצוות", speech)
+            await server.write_staged_meeting_title(request, key, through=3 * RATE)
+            instructions, speech = model.structured.call_args.args[:2]
+            self.assertIn("Keep the original language.", instructions)
+            self.assertNotIn("Write the response text in", instructions)
+            self.assertIn("Speaker 1: הצוות", speech)
 
     async def test_engine_discards_a_title_if_automatic_notes_change_during_generation(self):
         import server

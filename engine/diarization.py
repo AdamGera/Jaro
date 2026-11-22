@@ -12,10 +12,10 @@ from speaker_alignment import word_records
 
 
 class Diarizer:
-    def __init__(self):
+    def __init__(self, device):
         self.model = AutoModelForAudioFrameClassification.from_pretrained(
             DIARIZATION_DIR, local_files_only=True,
-        ).to("mps").eval()
+        ).to(device).eval()
         self.live = AutoProcessor.from_pretrained(DIARIZATION_DIR, local_files_only=True)
         self.final = AutoProcessor.from_pretrained(DIARIZATION_DIR, local_files_only=True)
         config = self.model.config

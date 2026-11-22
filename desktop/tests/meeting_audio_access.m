@@ -119,6 +119,18 @@ int main(void) {
         [fixture checkBackendWithPrompt:NO screenRequest:nil reply:^(NSString *backend) { assert(!backend); }];
         [fixture checkBackendWithPrompt:YES screenRequest:^(void (^reply)(BOOL)) { reply(YES); }
                                  reply:^(NSString *backend) { assert([backend isEqual:@"screen"]); }];
-        puts("Meeting audio permission checked without prompts, shared a consent request, repaired only audio consent, and preserved the screen fallback.");
+
+        AudioAccessFixture *visit = AudioAccessFixture.new;
+        NSMutableArray<NSNumber *> *settingsEvents = NSMutableArray.new;
+        visit.settingsVisitChanged = ^(BOOL granted) { [settingsEvents addObject:@(granted)]; };
+        visit.tap = 1;
+        visit.screen = YES;
+        assert([visit showSettings] && [visit pollSettingsVisit]);
+        assert([settingsEvents isEqual:@[@NO]]); // Screen fallback alone does not authorize the audio tap.
+        visit.tap = 0;
+        assert(![visit pollSettingsVisit] && ([settingsEvents isEqual:@[@NO, @YES]]));
+        assert([visit showSettings] && ![visit pollSettingsVisit]);
+        assert(settingsEvents.count == 2);
+        puts("Meeting audio verified consent repair, screen fallback, and one grant event for an audio-only System Settings visit.");
     }
 }

@@ -4,6 +4,7 @@ import { AudioLines, Plus, Search, UsersRound } from "lucide-react"
 import { Dialog } from "radix-ui"
 import { useSessionList } from "@/session-list"
 import { clock } from "@/speaker-activity"
+import { pagedSearchIndex } from "./search-list"
 import "@/session-search.css"
 
 type SearchProps = {
@@ -35,6 +36,7 @@ function SearchContent({ onChoose }: { onChoose: (id: string) => void }) {
   const [highlight, setHighlight] = useState("")
   const [meetingsOnly, setMeetingsOnly] = useState(false)
   const input = useRef<HTMLInputElement>(null)
+  const scroll = useRef<HTMLDivElement>(null)
   const list = useId()
   const { rows, loading, error, refresh } = useSessionList(true, query, "", meetingsOnly)
   const recent = !query.trim() && !meetingsOnly
@@ -56,6 +58,9 @@ function SearchContent({ onChoose }: { onChoose: (id: string) => void }) {
       event.preventDefault()
       const step = event.key === "ArrowDown" ? 1 : -1
       setHighlight(enabled[(enabled.indexOf(active) + step + enabled.length) % enabled.length])
+    } else {
+      const index = pagedSearchIndex(event, scroll.current, enabled.indexOf(active))
+      if (index !== undefined) setHighlight(enabled[index])
     }
   }
 
@@ -85,7 +90,7 @@ function SearchContent({ onChoose }: { onChoose: (id: string) => void }) {
     </div>
     <label className="session-search-filter"><input type="checkbox" checked={meetingsOnly}
       onChange={event => { setHighlight(""); setMeetingsOnly(event.target.checked) }} />Meetings only</label>
-    <div className="session-search-results">
+    <div ref={scroll} className="session-search-results">
       <div id={list} role="listbox" aria-label={t("Sessions")} aria-busy={loading}>
         {recent && <div className="session-search-option" {...option(newSession)}>
           <Plus aria-hidden="true" /><span>{t("New session")}</span>

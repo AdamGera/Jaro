@@ -1,7 +1,7 @@
 import { useInterfaceLanguage } from "@/interface-language"
 import { Component, lazy, Suspense, useCallback, useDeferredValue, useMemo, useEffect, useRef, useState, type ReactNode, type RefObject } from "react"
-import { AudioLines, CalendarDays, ChartNoAxesColumnIncreasing, Check, ChevronUp, Clock3, Copy, Download, FileText, LayoutDashboard, ListTree, Pencil, RotateCw, ScanLine, StickyNote, UsersRound } from "lucide-react"
-import type { MeetingBrief, MeetingExport, SavedSession, Transcript } from "@/audio"
+import { AudioLines, CalendarDays, ChartNoAxesColumnIncreasing, Check, ChevronUp, Clock3, Copy, Download, FileText, LayoutDashboard, ListTree, Pencil, RotateCw, StickyNote, UsersRound } from "lucide-react"
+import { isSettledMeeting, type MeetingBrief, type MeetingExport, type SavedSession, type Transcript } from "@/audio"
 import { clock } from "@/speaker-activity"
 import { useOverview, type EditableOverview } from "@/overview"
 import { AudioPlayer, usePlayback } from "./audio-player"
@@ -9,8 +9,9 @@ import { OverviewLanguage, languageName } from "./overview-language"
 import { transcriptMatches } from "@/transcript-search"
 import { TranscriptFind } from "./transcript-find"
 import { LiveTranscriptScroll } from "./live-transcript-scroll"
+import { meetingSegments } from "./transcript-turns"
 import { desktopBridge } from "@/desktop"
-import { AnnotationDestinationPicker, AnnotationDeliveryLog } from "./annotation-destinations"
+import { SessionImages } from "./session-images"
 import { Button } from "./ui/button"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./ui/tabs"
 
@@ -25,7 +26,7 @@ type Props = {
   result: Transcript; session?: SavedSession; source: Blob | string | null
   tab: string; onTab: (tab: string) => void
   jump?: number
-  working: boolean; recording: boolean; followLive: boolean; emptyText: string; progress: ReactNode
+  working: boolean; recording: boolean; liveMeeting: boolean; followLive: boolean; emptyText: string; progress: ReactNode
   copied: boolean; onCopy: () => void
   dictationEnabled: boolean; onDictationBusy: (busy: boolean) => void
   onMeetingRenamed: (id: string, title: string, exported: MeetingExport | null) => void
@@ -53,29 +54,22 @@ function annotationTime(seconds: number) {
   return `${clock(Math.floor(tenths / 10))}.${tenths % 10}`
 }
 
-function AnnotationPanel({ id, annotation, movie, video, onPlay }: {
+const missingAnnotationVideo = {
+  noFrames: "The screen recording produced no video frames.",
+  permissionDenied: "macOS declined Screen Recording access.",
+  screenInterrupted: "The video source stopped before it saved a usable picture.",
+} as const
+
+function AnnotationPanel({ id, annotation, movie, videoExpired, unavailable, video, onPlay, onListen }: {
   id: string; annotation: NonNullable<SavedSession["annotation"]>; movie: string | null
-  video: RefObject<HTMLVideoElement | null>; onPlay: () => void
+  videoExpired: boolean; unavailable: boolean; video: RefObject<HTMLVideoElement | null>; onPlay: () => void; onListen?: () => void
 }) {
+  const { t } = useInterfaceLanguage()
   const [busy, setBusy] = useState(false)
   const [canSeek, setCanSeek] = useState(false)
   const [error, setError] = useState("")
   const [shareStatus, setShareStatus] = useState("")
-  const [deliveryRevision, setDeliveryRevision] = useState(0)
-  const [routingManaged, setRoutingManaged] = useState<boolean>()
-  const [routingError, setRoutingError] = useState(false)
   const native = desktopBridge()
-
-  useEffect(() => {
-    if (!native) return
-    let current = true
-    void native.request("annotationRoutingPolicy").then(({ managed }) => {
-      if (current) setRoutingManaged(managed)
-    }).catch(() => {
-      if (current) setRoutingError(true)
-    })
-    return () => { current = false }
-  }, [native])
 
   async function save(kind: "annotation-manifest" | "annotation-contact-sheet") {
     if (!native) return
@@ -112,10 +106,12 @@ function AnnotationPanel({ id, annotation, movie, video, onPlay }: {
   return <div className="annotation-review">
     {movie && <video ref={video} src={movie} controls playsInline preload="metadata" aria-label="Annotation recording"
       onPlay={onPlay} onLoadedMetadata={() => setCanSeek(true)} />}
-    {annotation.contactSheetUrl && <figure>
-      <img src={annotation.contactSheetUrl} alt="Contact sheet showing sampled moments from the annotation recording" />
-      <figcaption>Contact sheet</figcaption>
-    </figure>}
+    {annotation.missingVideo && <p className="annotation-interruption">{t(missingAnnotationVideo[annotation.missingVideo])}</p>}
+    {onListen && <div><Button variant="outline" size="sm" onClick={onListen}>{t("Open narration player")}</Button></div>}
+    {videoExpired && <p className="annotation-interruption">{t(annotation.missingVideo
+      ? "The narration audio moved to Trash. The transcript and strokes are still available."
+      : "The video moved to Trash. Narration and annotation details are still available.")}</p>}
+    {unavailable && <p role="status" className="annotation-interruption">{t("Reconnect the Annotations folder to play or export the recording and images.")}</p>}
     {!!annotation.frames.length && movie && <div className="annotation-frame-links" aria-label="Contact sheet timestamps" role="group">
       {annotation.frames.map(position => {
         const time = annotationTime(position)
@@ -130,18 +126,11 @@ function AnnotationPanel({ id, annotation, movie, video, onPlay }: {
       {native && <>
         <Button variant="outline" size="sm" disabled={busy} onClick={() => void shareAnnotation("copyAnnotation")}><Copy />Copy for Agent</Button>
         <Button variant="outline" size="sm" disabled={busy} onClick={() => void shareAnnotation("pasteAnnotation")}>Paste into Last App</Button>
-        <AnnotationDestinationPicker native={native} id={id} disabled={busy || routingManaged !== false} onChanged={() => {
-          setShareStatus("")
-          setDeliveryRevision(revision => revision + 1)
-        }} />
       </>}
       {assets.map(({ kind, url, name, label }) => url && (native
         ? <Button key={kind} variant="outline" size="sm" disabled={busy} onClick={() => void save(kind)}><Download />{label}</Button>
         : <Button key={kind} asChild variant="outline" size="sm"><a href={url} download={name}><Download />{label}</a></Button>))}
     </div>
-    {routingManaged && <p role="status">OpenCode processing is managed by your organization.</p>}
-    {routingError && <p role="alert">Could not check whether OpenCode routing is available.</p>}
-    {native && <AnnotationDeliveryLog native={native} id={id} revision={deliveryRevision} remoteEnabled={routingManaged === false} />}
     {shareStatus && <p role="status">{shareStatus}</p>}
     {error && <p role="alert">{error}</p>}
   </div>
@@ -201,6 +190,26 @@ function useMeetingBrief(id?: string, initial?: MeetingBrief | null) {
   }
 
   return { brief, summarize, pending: queued || !!(action && !action.error), error: action?.error || brief?.error }
+}
+
+function CopyMeetingText({ text, kind }: { text: string; kind: "overview" | "brief" }) {
+  const { t } = useInterfaceLanguage()
+  const [outcome, setOutcome] = useState<"copied" | "error">()
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(text)
+      setOutcome("copied")
+    } catch {
+      setOutcome("error")
+    }
+  }
+  return <>
+    <Button type="button" size="sm" variant="ghost" onClick={() => void copy()}>
+      {outcome === "copied" ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+      <span aria-live="polite">{outcome === "copied" ? t("Copied") : t(kind === "overview" ? "Copy overview" : "Copy quick brief")}</span>
+    </Button>
+    {outcome === "error" && <span role="alert">{t(kind === "overview" ? "Could not copy the overview." : "Could not copy the brief.")}</span>}
+  </>
 }
 
 function MeetingTitle({ id, title, onRenamed }: { id: string; title: string; onRenamed: Props["onMeetingRenamed"] }) {
@@ -307,16 +316,18 @@ function ManagedMeetingExport({ id, initial, title }: { id: string; initial: Mee
   </>
 }
 
-export function ResultsPanel({ result, session, source, tab, onTab, jump, working, recording, followLive, emptyText, progress, copied, onCopy, dictationEnabled, onDictationBusy, onMeetingRenamed }: Props) {
+export function ResultsPanel({ result, session, source, tab, onTab, jump, working, recording, liveMeeting, followLive, emptyText, progress, copied, onCopy, dictationEnabled, onDictationBusy, onMeetingRenamed }: Props) {
   const { t } = useInterfaceLanguage()
   const complete = session?.status === "complete"
-  const reviewable = complete || !!session?.annotation
+  const reviewable = complete || !!session?.annotation || isSettledMeeting(session)
   const meetingsManaged = !!session?.meetingsManaged
-  const summaryMeeting = complete && session.meeting && result.text.trim() ? session.id : undefined
-  const meetingSummary = useMeetingBrief(meetingsManaged ? undefined : summaryMeeting, session?.meetingBrief)
+  const briefMeeting = complete && session.meeting && result.text.trim() ? session.id : undefined
+  const meetingBrief = useMeetingBrief(meetingsManaged ? undefined : briefMeeting, session?.meetingBrief)
   const overview = useOverview(complete ? session.id : undefined, session?.overview, tab === "overview" || tab === "timeline", meetingsManaged)
   const writing = overview.value
   const version = overview.version
+  const overviewText = version && [version.summary, version.markdown].filter(Boolean).join("\n\n")
+    .replace(/⟦(\d+(?:\.\d+)?)⟧/g, (_, seconds) => `(${clock(Number(seconds))})`)
   const editRevision = writing?.editRevision
   const [editing, setEditing] = useState<EditableOverview | null>(null)
   const [citation, setCitation] = useState<{ seconds: number } | null>(null)
@@ -335,8 +346,13 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
   const [findOpen, setFindOpen] = useState(false)
   const [query, setQuery] = useState("")
   const [matchIndex, setMatchIndex] = useState(0)
+  const meeting = !!session?.meeting || liveMeeting
+  const originalTurns = session?.meetingTurns
+  const transcript = useMemo(() => meeting ? {
+    ...result, segments: meetingSegments(originalTurns?.length ? originalTurns : result.segments),
+  } : result, [meeting, originalTurns, result])
   const search = useDeferredValue(findOpen && tab === "transcript" ? query : "")
-  const matches = useMemo(() => transcriptMatches(result, search), [result, search])
+  const matches = useMemo(() => transcriptMatches(transcript, search), [transcript, search])
   const currentMatch = Math.min(matches.length - 1, matchIndex)
   function changeQuery(text: string) { setQuery(text); setMatchIndex(0) }
   function toggleFind(open: boolean) {
@@ -416,7 +432,8 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
   </div> : null
   const transcriptContent = result.text ? (
     <Suspense fallback={null}>
-      <TimedTranscript result={result} time={player.time} ready={ready} seek={player.seek}
+      <TimedTranscript result={transcript} meeting={meeting} listening={meeting && followLive}
+        time={player.time} ready={ready} seek={player.seek}
         citation={citation ?? linkedPassage} matches={matches} activeMatch={currentMatch} />
     </Suspense>
   ) : (
@@ -437,7 +454,7 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
     {source && <AudioPlayer player={player} />}
   </section>
 
-  const meetingTitle = session.meetingTitle || session.meetingCalendar?.title || meetingSummary.brief?.title ||
+  const meetingTitle = session.meetingTitle || session.meetingCalendar?.title || meetingBrief.brief?.title ||
     session.provisionalTitle || draft?.title || version?.title || session.name
   return <div className="session-sheet">
     <header className="session-heading">
@@ -445,7 +462,7 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
         <h1 dir="auto">{meetingTitle}</h1>}
       <div className="session-meta">
         {session.meeting && <span><UsersRound aria-hidden="true" />{session.meetingProvider || "Meeting"}</span>}
-        {!!session.meetingRetentionDays && <span>Moves to Trash after {session.meetingRetentionDays === 1 ? t("24 hours") : `${session.meetingRetentionDays} days`}</span>}
+        {complete && !!session.meetingRetentionDays && <span>Moves to Trash after {session.meetingRetentionDays === 1 ? t("24 hours") : `${session.meetingRetentionDays} days`}</span>}
         {session.audioRemovedAt && <span>Audio removed</span>}
         <span><CalendarDays aria-hidden="true" />{date.format(new Date(session.created))}</span>
         <span><Clock3 aria-hidden="true" /><bdi>{clock(result.durationSeconds ?? 0)}</bdi></span>
@@ -456,6 +473,8 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
           aria-label={`Regenerate ${writingTab}`} title={`Regenerate ${writingTab}`}
           disabled={!!editing || writing.status === "queued" || overview.requesting}
           onClick={() => overview.regenerate(writingTab)}><RotateCw aria-hidden="true" /><span>Regenerate</span></Button>}
+        {tab === "overview" && session.meeting && overviewText && !editing &&
+          <CopyMeetingText key={overviewText} text={overviewText} kind="overview" />}
         {tab === "overview" && version && editRevision && !editing &&
           <Button ref={editTrigger} size="sm" variant="ghost" className="regenerate-note"
             aria-label="Edit overview" title="Edit overview"
@@ -470,11 +489,10 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
     <Tabs className="transcript-panel" data-finding={findOpen && tab === "transcript"} value={tab} onValueChange={changeTab}>
       <div className="panel-heading" data-scrolled={scrolled}>
         <TabsList ref={tabList} aria-label="Recording results">
-          {complete && <TabsTrigger value="overview"><LayoutDashboard aria-hidden="true" className="size-3.5" />{t("Overview")}</TabsTrigger>}
+          {(complete || session.annotation) && <TabsTrigger value="overview"><LayoutDashboard aria-hidden="true" className="size-3.5" />{t("Overview")}</TabsTrigger>}
           {complete && <TabsTrigger value="notes"><StickyNote aria-hidden="true" className="size-3.5" />{t("My Notes")}</TabsTrigger>}
           <TabsTrigger value="transcript"><FileText aria-hidden="true" className="size-3.5" />{t("Transcript")}</TabsTrigger>
           {complete && <TabsTrigger value="timeline"><ListTree aria-hidden="true" className="size-3.5" />{t("Timeline")}</TabsTrigger>}
-          {session.annotation && <TabsTrigger value="annotation"><ScanLine aria-hidden="true" className="size-3.5" />{t("Annotation")}</TabsTrigger>}
           {complete && <TabsTrigger value="analytics" disabled={working || recording}>
             <ChartNoAxesColumnIncreasing aria-hidden="true" className="size-3.5" />{t("Speaker analytics")}
           </TabsTrigger>}
@@ -489,18 +507,20 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
       </div>
       <TabsContent value="overview" forceMount={editing ? true : undefined} hidden={tab !== "overview"}
         className="note-body" onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
-        {summaryMeeting && <section className="meeting-summary" aria-label="Meeting summary">
-          <div className="meeting-summary-heading">
-            <h2>{t("Summary")}</h2>
-            {!meetingsManaged && <Button size="sm" variant="outline" disabled={meetingSummary.pending} onClick={() => void meetingSummary.summarize()}>
-              {meetingSummary.pending ? t("Summarizing…") : meetingSummary.brief?.summary ? t("Regenerate summary") : "Summarize meeting"}
-            </Button>}
+        {!editing && briefMeeting && (!meetingsManaged || meetingBrief.brief?.summary) && <details className="meeting-quick-brief">
+          <summary>{t("Quick brief")}</summary>
+          <div className="meeting-quick-brief-body">
+            {meetingBrief.brief?.summary && <p dir="auto">{meetingBrief.brief.summary}</p>}
+            <div className="meeting-quick-brief-actions">
+              {meetingBrief.brief?.summary && <CopyMeetingText key={meetingBrief.brief.summary} text={meetingBrief.brief.summary} kind="brief" />}
+              {!meetingsManaged && <Button size="sm" variant="ghost" disabled={meetingBrief.pending}
+                onClick={() => void meetingBrief.summarize()}>
+                {t(meetingBrief.pending ? "Writing brief…" : meetingBrief.brief?.summary ? "Regenerate brief" : "Write quick brief")}
+              </Button>}
+            </div>
+            {meetingBrief.error && <p role="alert">{meetingBrief.error}</p>}
           </div>
-          {meetingSummary.brief?.title && meetingTitle !== meetingSummary.brief.title &&
-            <p dir="auto"><strong>{meetingSummary.brief.title}</strong></p>}
-          {meetingSummary.brief?.summary && <p dir="auto">{meetingSummary.brief.summary}</p>}
-          {meetingSummary.error && <p role="alert">{meetingSummary.error}</p>}
-        </section>}
+        </details>}
         {noteStatus}
         {editing ? <Suspense fallback={null}>
           <OverviewEditor version={editing} onSave={overview.saveEdit} onClose={() => {
@@ -513,6 +533,13 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
             <NoteMarkdown text={note.markdown} ready={ready} cite={seconds => seek(seconds, true)} />
           </Suspense>}
         </div>}
+        {!editing && <SessionImages key={session.id} session={session}>
+          {session.annotation && <AnnotationPanel id={session.id} annotation={session.annotation}
+            movie={session.annotation.missingVideo ? null : session.audioUrl}
+            onListen={session.annotation.missingVideo && session.audioUrl ? openPlayer : undefined}
+            videoExpired={!!session.audioRemovedAt} unavailable={!!session.annotationStorageUnavailable} video={video}
+            onPlay={() => player.audio.current?.pause()} />}
+        </SessionImages>}
       </TabsContent>
       <TabsContent value="timeline" className="note-body timeline-body" onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
         {noteStatus}
@@ -545,16 +572,12 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
       <TabsContent value="analytics" className="analytics-body" onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
         <Suspense fallback={null}><SpeakerAnalytics result={result} time={player.time} ready={ready} seek={player.seek} /></Suspense>
       </TabsContent>
-      {session.annotation && <TabsContent value="annotation" className="note-body" onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
-        <AnnotationPanel key={session.id} id={session.id} annotation={session.annotation} movie={session.audioUrl} video={video}
-          onPlay={() => player.audio.current?.pause()} />
-      </TabsContent>}
-      {working && (result.text || tab === "annotation") && <div className="processing-footer">{progress}</div>}
+      {working && (result.text || session.annotation) && <div className="processing-footer">{progress}</div>}
     </Tabs>
     <footer className="session-dock" aria-label="Recording tools">
       {source && <>
         <div id="session-audio-player" className="audio-popover" hidden={dock !== "audio"}>
-          {tracks?.mic && tracks.system && <label className="session-audio-source">Playback source
+          {(tracks?.mic || tracks?.system) && <label className="session-audio-source">Playback source
             <select value={track} onChange={event => {
               const next = event.target.value as typeof track
               const target = next === "mix" ? source : tracks[next]
@@ -562,7 +585,11 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
                 player.prepareSwitch(target)
                 setTrack(next)
               }
-            }}><option value="mix">Both</option><option value="mic">{t("Microphone")}</option><option value="system">Mac audio</option></select>
+            }}>
+              <option value="mix">{t("Combined audio")}</option>
+              {tracks?.mic && <option value="mic">{t("Microphone")}</option>}
+              {tracks?.system && <option value="system">{t("Computer audio")}</option>}
+            </select>
           </label>}
           <AudioPlayer player={player} />
         </div>

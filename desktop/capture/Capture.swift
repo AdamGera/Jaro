@@ -557,7 +557,28 @@ struct MeetingInputRoute {
     }
 }
 
-private func microphoneUsers(_ application: String, device: AudioDeviceID) -> (callInputs: [String], owners: Set<pid_t>?)? {
+private let zoomInputBundles = ["us.zoom.xos", "us.zoom.cpthost", "us.zoom.caphost", "us.zoom.aomhost",
+                                "us.zoom.zoomcefhelper", "us.zoom.zccimeetinghost", "us.zoom.zoomphone", "us.zoom.zoomhybridconf"]
+private let faceTimeInputBundles = ["com.apple.facetime", "com.apple.avconferenced", "com.apple.telephonyutilities.callservicesd"]
+private let browserInputVariants = ["com.google.chrome.canary", "com.google.chrome.beta", "com.google.chrome.dev",
+                                    "com.brave.browser.beta", "com.brave.browser.nightly"]
+
+func meetingInputMatches(_ application: String, bundle: String, processName: String?) -> Bool {
+    let identifier = bundle.lowercased()
+    func matches(_ candidate: String) -> Bool { identifier == candidate || identifier.hasPrefix(candidate + ".") }
+    if let variant = browserInputVariants.first(where: matches) { return application == variant }
+    if matches(application) { return true }
+    if zoomInputBundles.contains(application) { return zoomInputBundles.contains(where: matches) }
+    if faceTimeInputBundles.contains(application) { return faceTimeInputBundles.contains(where: matches) }
+    if application == "org.mozilla.firefox" && matches("org.mozilla.plugincontainer") { return true }
+    if application == "app.zen-browser.zen" && matches("app.zen-browser.plugincontainer") { return true }
+    if identifier == "com.apple.webkit.gpu", let name = processName?.lowercased(), name.hasPrefix("safari") {
+        return application == (name.hasPrefix("safari technology preview") ? "com.apple.safaritechnologypreview" : "com.apple.safari")
+    }
+    return false
+}
+
+func microphoneUsers(_ application: String, device: AudioDeviceID) -> (callInputs: [String], owners: Set<pid_t>?)? {
     func read(_ selector: AudioObjectPropertySelector, of object: AudioObjectID, scope: AudioObjectPropertyScope,
               into data: UnsafeMutableRawPointer, bytes: inout UInt32) -> Bool {
         var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
@@ -580,19 +601,26 @@ private func microphoneUsers(_ application: String, device: AudioDeviceID) -> (c
     let global = kAudioObjectPropertyScopeGlobal
     func belongsToCall(_ pid: pid_t, object: AudioObjectID) -> Bool {
         var host = pid
+        var processName: String?
         for _ in 0..<6 {
             guard host > 1 else { break }
-            if NSRunningApplication(processIdentifier: host)?.bundleIdentifier?.lowercased() == application { return true }
+            let running = NSRunningApplication(processIdentifier: host)
+            if host == pid { processName = running?.localizedName }
+            if let bundle = running?.bundleIdentifier, meetingInputMatches(application, bundle: bundle, processName: running?.localizedName) {
+                return true
+            }
             var process = proc_bsdinfo()
             let width = Int32(MemoryLayout.size(ofValue: process))
             guard proc_pidinfo(host, PROC_PIDTBSDINFO, 0, &process, width) == width else { break }
-            host = pid_t(process.pbi_ppid)
+            let parent = pid_t(process.pbi_ppid)
+            if parent == host { break }
+            host = parent
         }
         var bundle: Unmanaged<CFString>?
         var bytes = UInt32(MemoryLayout.size(ofValue: bundle))
         guard read(kAudioProcessPropertyBundleID, of: object, scope: global, into: &bundle, bytes: &bytes),
-              let reported = (bundle?.takeRetainedValue() as String?)?.lowercased() else { return false }
-        return reported == application || reported.hasPrefix(application + ".")
+              let reported = bundle?.takeRetainedValue() as String? else { return false }
+        return meetingInputMatches(application, bundle: reported, processName: processName)
     }
     guard let processes = identifiers(kAudioHardwarePropertyProcessObjectList, of: AudioObjectID(kAudioObjectSystemObject),
                                       scope: global) else { return nil }
@@ -657,6 +685,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private let inputUID: String?
     private let avoidBluetooth: Bool
     private let externalMicrophone: Bool
+    private let sharedMeetingID: UUID?
     private let retainSources: Bool
     private let callApplication: String?
     private let detailedMeter: Bool
@@ -665,7 +694,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var engine: AVAudioEngine?
     private var systemStream: SCStream?
     private var meetingSystemTask: Task<Void, Never>?
+    private var meetingSystemStopped: DispatchSemaphore?
     private let meetingSystemMode: MeetingSystemAudioMode
+    private let meetingInputsChanged: (([String]) -> Void)?
     private let hostPID: pid_t?
     private var observer: NSObjectProtocol?
     // Accessed on micControl only. Retiring an old observer before installing its
@@ -687,6 +718,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var microphoneInterruption: MicrophoneInterruption?
     private var accepting = false
     private var levels = [Source: Float]()
+    private var meetingLevel = MeetingAudioLevel()
     private var micEnergy = 0.0
     private var micFrames = 0
     private var firstLiveSignalFrame: Int?
@@ -712,7 +744,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     init(mode: CaptureMode, path: String, stopReason: AsyncStream<String>.Continuation,
          inputUID: String? = nil, avoidBluetooth: Bool = false, externalMicrophone: Bool = false, retainSources: Bool = false,
          detailedMeter: Bool = false, recoverColdOpen: Bool = false, callApplication: String? = nil,
-         meetingSystemMode: MeetingSystemAudioMode = .screen, hostPID: pid_t? = nil) {
+         meetingSystemMode: MeetingSystemAudioMode = .screen, hostPID: pid_t? = nil,
+         sharedMeetingID: UUID? = nil, meetingInputsChanged: (([String]) -> Void)? = nil) {
         self.mode = mode
         self.path = path
         self.stopReason = stopReason
@@ -720,6 +753,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         self.meetingSavedUID = inputUID
         self.avoidBluetooth = avoidBluetooth
         self.externalMicrophone = externalMicrophone
+        self.sharedMeetingID = sharedMeetingID
+        self.meetingInputsChanged = meetingInputsChanged
         self.meetingSystemMode = meetingSystemMode
         self.hostPID = hostPID
         self.retainSources = retainSources
@@ -730,7 +765,17 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         self.timeline = Timeline(mode: mode)
     }
 
-    func start() async throws {
+    private func emitCapture(_ fields: [String: Any]) {
+        if let sharedMeetingID {
+            var event = fields
+            event["sharedMeeting"] = sharedMeetingID.uuidString.lowercased()
+            emit(event)
+        } else {
+            emit(fields)
+        }
+    }
+
+    func start(sharedInput: InputDevice? = nil) async throws {
         if mode != .system {
             if !isDictationMicrophone && !retainSources && input.id == 0 {
                 throw MicrophoneOpenError("The selected microphone is unavailable. Choose another input.")
@@ -745,7 +790,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 throw RecordingPermissionError(source: .system)
             }
         }
-        if mode != .system {
+        if mode != .system && !externalMicrophone {
             do {
                 if recoverColdOpen {
                     let result = try await openColdMicrophone(
@@ -786,18 +831,24 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 throw MicrophoneOpenError(error.localizedDescription)
             }
         }
-        try beginWriting()
-        if retainSources {
-            meetingSystemTask = Task { [weak self, meetingSystemMode, hostPID] in
-                await superviseMeetingSystemAudio(mode: meetingSystemMode, hostPID: hostPID, receive: { id, samples, time in
-                    self?.enqueue(samples, at: time, from: .system, systemID: id)
-                }, change: { available, backend in
-                    guard let self, self.isWriting else { return }
-                    var event: [String: Any] = ["event": "meetingSystemAudio", "available": available]
-                    if let backend { event["backend"] = backend.rawValue }
-                    emit(event)
-                })
-            }
+        try beginWriting(input: sharedInput)
+        if retainSources { startMeetingSystemAudio() }
+    }
+
+    func startMeetingSystemAudio(open: @escaping MeetingSystemAudioOpener = openMeetingSystemAudio,
+                                 openTimeout: Duration = .seconds(3)) {
+        let stopped = DispatchSemaphore(value: 0)
+        meetingSystemStopped = stopped
+        meetingSystemTask = Task { [weak self, meetingSystemMode, hostPID] in
+            defer { stopped.signal() }
+            await superviseMeetingSystemAudio(mode: meetingSystemMode, hostPID: hostPID, receive: { id, samples, time in
+                self?.enqueue(samples, at: time, from: .system, systemID: id)
+            }, change: { available, backend in
+                guard let self, self.isWriting else { return }
+                var event: [String: Any] = ["event": "meetingSystemAudio", "available": available]
+                if let backend { event["backend"] = backend.rawValue }
+                self.emitCapture(event)
+            }, open: open, openTimeout: openTimeout)
         }
     }
 
@@ -822,11 +873,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.pendingReleaseTime = nil
                 beginReleaseTail(at: pendingReleaseTime)
             }
-            return ["event": "started", "mode": mode.rawValue, "microphone": input.name,
-                    "openedAt": now, "usingDefaultMicrophone": usingDefaultFallback]
+            var started: [String: Any] = ["event": "started", "mode": mode.rawValue, "microphone": input.name,
+                                         "openedAt": now, "usingDefaultMicrophone": usingDefaultFallback]
+            if retainSources { started["microphoneAvailable"] = input.id != 0 }
+            return started
         }
         guard let event else { abandonColdOpen(); return }
-        emit(event)
+        emitCapture(event)
         let clock = DispatchSource.makeTimerSource(queue: queue)
         let meterInterval = detailedMeter ? 0.05 : 0.25
         clock.schedule(deadline: .now() + meterInterval, repeating: meterInterval, leeway: .milliseconds(detailedMeter ? 5 : 15))
@@ -916,12 +969,12 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         let previous = meetingSilence.warning
         change(&meetingSilence)
         if meetingSilence.warning != previous {
-            emit(["event": "meetingMicWarning", "active": meetingSilence.warning])
+            emitCapture(["event": "meetingMicWarning", "active": meetingSilence.warning])
         }
     }
 
     func selectMeetingInput(_ uid: String?) {
-        guard retainSources else { return }
+        guard retainSources && !externalMicrophone else { return }
         micControl.async {
             guard self.meetingSavedUID != uid else { return }
             self.meetingSavedUID = uid
@@ -932,25 +985,63 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    func sharedMeetingInput(_ device: InputDevice, generation: Int?, unavailable: String? = nil) {
+        guard sharedMeetingID != nil else { return }
+        queue.async {
+            guard self.accepting else { return }
+            let previous = self.input
+            self.input = device
+            if self.micObservationGeneration != generation {
+                self.micObservationGeneration = generation
+                self.meetingHandoffFrame = max(self.timeline.micEnd, self.timeline.cursor)
+                self.updateMeetingWarning {
+                    if previous != device { $0.changeDevice() }
+                    else { $0.breakStream() }
+                }
+            }
+            if previous != device {
+                self.emitCapture(["event": "sourceChanged", "microphone": device.name,
+                    "microphoneAvailable": device.id != 0,
+                    "message": unavailable ?? "Recording from " + device.name])
+            }
+        }
+    }
+
+    // The recording queue owns the displayed route and the capture event order.
+    private func publishMeetingMicrophone(_ device: InputDevice, message: String) {
+        queue.sync {
+            guard accepting, !stopRequested else { return }
+            if device.id == 0 {
+                guard input.id != 0 else { return }
+                input = device
+            }
+            emitCapture(["event": "sourceChanged", "microphone": device.name,
+                         "microphoneAvailable": device.id != 0, "message": message])
+        }
+    }
+
     // The control queue owns the route, and each candidate can fail independently.
     private func openMeetingMicrophone(reopenCurrent: Bool = false) throws {
         let now = hostSeconds()
+        let lidClosed = MicrophoneLid.closed
         let candidates = meetingInputRoute.candidates(savedUID: meetingSavedUID, available: InputDevice.available(),
                                                      system: InputDevice.current())
-        guard meetingInputRoute.canOpen(candidates, at: now, needsInput: reopenCurrent || engine == nil) else { return }
+            .filter { !(lidClosed && $0.isInternalMicrophone) }
         let previous = queue.sync { input }
+        if engine != nil && (reopenCurrent || (lidClosed && previous.isInternalMicrophone)) { detachMic() }
+        guard meetingInputRoute.canOpen(candidates, at: now, needsInput: engine == nil) else {
+            if engine == nil { throw CaptureError("Waiting for the meeting microphone.") }
+            return
+        }
         var failure: Error?
         for candidate in candidates {
-            if candidate.id == previous.id && candidate.uid == previous.uid && engine != nil {
-                if !reopenCurrent { break }
-                detachMic()
-            }
+            if candidate.id == previous.id && candidate.uid == previous.uid && engine != nil { break }
             do {
                 try startMic(candidate)
-                if queue.sync(execute: { accepting }) {
-                    emit(["event": "sourceChanged", "microphone": candidate.name, "message": "Recording from " + candidate.name])
-                }
-                break
+                if failure != nil { meetingInputRoute.retry(after: now, hasWorkingInput: true) }
+                else { meetingInputRoute.resetRetry() }
+                publishMeetingMicrophone(candidate, message: "Recording from " + candidate.name)
+                return
             } catch {
                 failure = error
             }
@@ -965,7 +1056,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         guard micEnabled, active else { return }
         do { try openMeetingMicrophone(reopenCurrent: reopenCurrent) }
         catch {
-            emit(["event": "sourceChanged", "microphone": "Unavailable", "message": error.localizedDescription])
+            publishMeetingMicrophone(.unavailable, message: error.localizedDescription)
         }
     }
 
@@ -976,9 +1067,13 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         let previous = input
         micControl.async {
             let usage = self.callApplication.flatMap { microphoneUsers($0, device: previous.id) }
-            if let usage { self.meetingInputRoute.observeCall(usage.callInputs) }
-            let stalled = self.queue.sync { hostSeconds() - self.lastMicCallback > 1 }
-            self.refreshMeetingMicrophone(reopenCurrent: stalled)
+            if !self.externalMicrophone {
+                if let usage { self.meetingInputRoute.observeCall(usage.callInputs) }
+                let stalled = self.queue.sync { hostSeconds() - self.lastMicCallback > 1 }
+                self.refreshMeetingMicrophone(reopenCurrent: stalled)
+            } else if let usage {
+                self.meetingInputsChanged?(usage.callInputs)
+            }
             self.queue.async {
                 self.callInputPollInFlight = false
                 guard self.accepting, !self.stopRequested, self.input.id == previous.id, self.input.uid == previous.uid,
@@ -991,7 +1086,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 if self.meetingMicRequest == nil, let recovery {
                     let id = UUID()
                     self.meetingMicRequest = MeetingMicRequest(id: id, recovery: recovery, generation: self.meetingSilence.generation)
-                    emit(["event": "meetingMicRecoveryRequest", "id": id.uuidString.lowercased()])
+                    self.emitCapture(["event": "meetingMicRecoveryRequest", "id": id.uuidString.lowercased()])
                 }
             }
         }
@@ -1000,41 +1095,50 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     func respondToMeetingMicRecovery(_ id: UUID, allowed: Bool) {
         micControl.async {
             defer {
-                if allowed { emit(["event": "meetingMicRecoveryDone", "id": id.uuidString.lowercased()]) }
+                if allowed { self.emitCapture(["event": "meetingMicRecoveryDone", "id": id.uuidString.lowercased()]) }
             }
-            let selected: InputDevice? = self.queue.sync {
-                guard let request = self.meetingMicRequest, request.id == id else { return nil }
-                self.meetingMicRequest = nil
-                let now = hostSeconds()
-                guard self.accepting, !self.stopRequested, self.micEnabled, self.meetingSilence.generation == request.generation,
-                      self.meetingSilence.ready(at: now) else { return nil }
-                if !allowed {
-                    self.updateMeetingWarning { $0.deferRecovery(request.recovery) }
-                    return nil
-                }
-                self.meetingSilence.beginRecovery(request.recovery, at: now)
-                self.lastMicCallback = now
-                self.retryAfter = now + 0.75
-                return self.input
-            }
-            guard let selected else { return }
+            guard self.micEnabled, let selected = self.claimMeetingMicRecovery(id, allowed: allowed) else { return }
             self.detachMic()
             let result = resetMicrophoneClock(selected, allowActiveDevice: true)
-            emit(["event": "microphoneClockReset", "result": result.rawValue])
+            self.emitCapture(["event": "microphoneClockReset", "result": result.rawValue])
             self.reopenMicrophone(selected, afterSilenceRecovery: true)
         }
+    }
+
+    func claimMeetingMicRecovery(_ id: UUID, allowed: Bool) -> InputDevice? {
+        queue.sync {
+            guard let request = meetingMicRequest, request.id == id else { return nil }
+            meetingMicRequest = nil
+            let now = hostSeconds()
+            guard accepting, !stopRequested, meetingSilence.generation == request.generation,
+                  meetingSilence.ready(at: now) else { return nil }
+            guard allowed else {
+                updateMeetingWarning { $0.deferRecovery(request.recovery) }
+                return nil
+            }
+            meetingSilence.beginRecovery(request.recovery, at: now)
+            lastMicCallback = now
+            retryAfter = now + 0.75
+            return input
+        }
+    }
+
+    func reportMeetingMicRecoveryFailure() {
+        queue.async { self.updateMeetingWarning { $0.reportFailedOpen() } }
     }
 
     private func reopenMicrophone(_ selected: InputDevice, afterSilenceRecovery: Bool = false) {
         do {
             try startMic(selected)
-            emit(["event": "sourceChanged", "microphone": selected.name, "message": "Recording from " + selected.name])
+            if retainSources { publishMeetingMicrophone(selected, message: "Recording from " + selected.name) }
+            else { emitCapture(["event": "sourceChanged", "microphone": selected.name, "message": "Recording from " + selected.name]) }
         } catch {
             detachMic()
             if afterSilenceRecovery {
                 queue.sync { updateMeetingWarning { $0.reportFailedOpen() } }
             }
-            emit(["event": "sourceChanged", "microphone": "Unavailable", "message": error.localizedDescription])
+            if retainSources { publishMeetingMicrophone(.unavailable, message: error.localizedDescription) }
+            else { emitCapture(["event": "sourceChanged", "microphone": "Unavailable", "message": error.localizedDescription]) }
         }
     }
 
@@ -1167,6 +1271,12 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                     return
                 }
                 self.lastMicCallback = hostSeconds()
+                if self.sharedMeetingID != nil {
+                    let to = self.epoch + Double(frame + samples.count) / Double(Timeline.rate)
+                    let from = self.epoch + Double(frame) / Double(Timeline.rate)
+                    let signal = samples.lastIndex { $0 != 0 }.map { from + Double($0 + 1) / Double(Timeline.rate) }
+                    self.updateMeetingWarning { $0.observe(from: from, to: to, lastSignalEnd: signal) }
+                }
                 if self.detailedMeter {
                     self.micEnergy += samples.reduce(0.0) { $0 + Double($1 * $1) }
                     self.micFrames += samples.count
@@ -1183,6 +1293,10 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.checkReleaseTail()
             }
             self.levels[source] = max(self.levels[source] ?? 0, samples.reduce(0) { max($0, abs($1)) })
+            if self.retainSources {
+                let end = self.epoch + Double(frame + samples.count) / Double(Timeline.rate)
+                self.meetingLevel.observe(samples, from: source, endingAt: end)
+            }
         }
     }
 
@@ -1210,14 +1324,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func abandonColdOpen() {
-        emit(["event": "openingAbandoned"])
+        emitCapture(["event": "openingAbandoned"])
         stopReason.yield("Stopped")
     }
 
     private func beginReleaseTail(at releasedAt: Double) {
         let now = hostSeconds()
         if releasedAt < epoch {
-            if externalMicrophone { emit(["event": "openingAbandoned"]) }
+            if externalMicrophone { emitCapture(["event": "openingAbandoned"]) }
             releaseFrame = 0
             releaseCutoff = 0
             stopReason.yield("Stopped")
@@ -1285,7 +1399,8 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             micEnergy = 0
             micFrames = 0
         }
-        emit(meter)
+        if retainSources { meter["meetingRms"] = meetingLevel.rms(at: now) }
+        emitCapture(meter)
         levels.removeAll(keepingCapacity: true)
     }
 
@@ -1308,7 +1423,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             // after the margin for callbacks from the two independent audio sources.
             let elapsed = max(0, pressed - epoch)
             let frame = min(Timeline.limit, Int(elapsed * Double(Timeline.rate)))
-            emit(["event": "meetingCopy", "request": request.uuidString.lowercased(), "frame": frame])
+            emitCapture(["event": "meetingCopy", "request": request.uuidString.lowercased(), "frame": frame])
         }
     }
 
@@ -1319,10 +1434,18 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             micEnabled = false
             detachMic()
         }
-        if let meetingSystemTask {
-            meetingSystemTask.cancel()
-            await meetingSystemTask.value
-            self.meetingSystemTask = nil
+        meetingSystemTask?.cancel()
+        meetingSystemTask = nil
+        if let stopped = meetingSystemStopped {
+            meetingSystemStopped = nil
+            // A synchronous Core Audio open may be waiting for the system.
+            // Drain ordinary stops briefly, then finish the tracks on our clock.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    _ = stopped.wait(timeout: .now() + .milliseconds(500))
+                    continuation.resume()
+                }
+            }
         }
         if let systemStream {
             try? await systemStream.stopCapture()
@@ -1343,7 +1466,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 wrote = false
                 finalReason = "Recording stopped after a storage error. " + error.localizedDescription
             }
-            if externalMicrophone {
+            if externalMicrophone && detailedMeter {
                 let liveEnd = min(end, timeline.micEnd, releaseFrame ?? end)
                 if interruption != nil {
                     warmRecovery = .reopen
@@ -1363,7 +1486,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 event["capturedThrough"] = epoch + Double(sink.frames) / Double(Timeline.rate)
                 event["hasLiveAudio"] = sink.frames > startFrame
             }
-            emit(event)
+            emitCapture(event)
         }
     }
 }

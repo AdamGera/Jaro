@@ -3,6 +3,7 @@ import { useEffect, useEffectEvent, useId, useRef, useState, type KeyboardEvent 
 import { Search } from "lucide-react"
 import { Dialog } from "radix-ui"
 import { Button } from "./ui/button"
+import { pagedSearchIndex } from "./search-list"
 import "@/session-search.css"
 
 type Setting = { row: HTMLElement; title: string; description: string; path: string }
@@ -12,6 +13,15 @@ function controlFor(row: HTMLElement) {
   const control = row.querySelector<HTMLElement>("[data-setting-control]") ??
     row.querySelector<HTMLElement>("input:not([type=hidden]), select, textarea, button, summary")
   return control && !control.matches(":disabled, [aria-disabled=true]") ? control : null
+}
+
+export function revealSetting(row: HTMLElement, scope: HTMLElement, control = controlFor(row) ?? row) {
+  for (let node = row.parentElement; node && scope.contains(node); node = node.parentElement) {
+    if (node instanceof HTMLDetailsElement) node.open = true
+  }
+  control.scrollIntoView({ block: "center" })
+  control.focus({ preventScroll: true })
+  return control
 }
 
 function indexSettings(scope: HTMLElement): Setting[] {
@@ -94,13 +104,10 @@ export function SettingsSearch({ scope, localFind = true, onReveal }: Props) {
         destination.current = null
         if (!entry) { restoreFocus(); return }
         requestAnimationFrame(() => {
-          const control = scope.current?.contains(entry.row) ? controlFor(entry.row) : null
-          if (!control) { restoreFocus(); return }
-          for (let node = entry.row.parentElement; node && scope.current?.contains(node); node = node.parentElement) {
-            if (node instanceof HTMLDetailsElement) node.open = true
-          }
-          control.scrollIntoView({ block: "center" })
-          control.focus({ preventScroll: true })
+          const container = scope.current
+          const control = container?.contains(entry.row) ? controlFor(entry.row) : null
+          if (!container || !control) { restoreFocus(); return }
+          revealSetting(entry.row, container, control)
         })
       }} />}
     </Dialog.Portal>
@@ -131,6 +138,9 @@ function SettingResults({ entries, choose, onClose }: { entries: Setting[]; choo
       event.preventDefault()
       const step = event.key === "ArrowDown" ? 1 : -1
       setHighlight((highlight + step + results.length) % results.length)
+    } else {
+      const index = pagedSearchIndex(event, scroll.current, highlight)
+      if (index !== undefined) setHighlight(index)
     }
   }
 

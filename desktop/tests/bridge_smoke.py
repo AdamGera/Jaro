@@ -2,9 +2,11 @@
 import asyncio
 import base64
 import contextlib
+from datetime import datetime
 import json
 import os
 from pathlib import Path
+import plistlib
 import socket
 import subprocess
 import sys
@@ -16,6 +18,7 @@ from uuid import uuid4
 import httpx
 import numpy as np
 
+from annotation_agent_fixture import install_agent_fixtures
 from opencode_fixture import local_opencode
 
 
@@ -34,8 +37,12 @@ async def smoke(root):
     if transform_helper:
         (root / "jaro-transforms").symlink_to(Path(transform_helper).resolve())
     env["PATH"] = str(root) + os.pathsep + os.environ.get("PATH", os.defpath)
+    agent_targets = install_agent_fixtures(root, env)
     base = f"http://127.0.0.1:{port}"
     audio = root/"review.wav"
+    external_fixture = Path(os.environ.get("JARD_TEST_ANNOTATION_STORAGE", root)).resolve()
+    annotation_storage = external_fixture / ("Disposable Jaro captures " + uuid4().hex)
+    annotation_storage.mkdir(mode=0o700)
     subprocess.run(["say","-o",root/"speech.aiff","The library approved twelve history books. The books will arrive on Monday."],check=True)
     subprocess.run(["ffmpeg","-v","error","-i",root/"speech.aiff","-ar","48000","-ac","1","-af","apad=pad_dur=1","-fflags","+bitexact",audio],check=True)
     env["FIXTURE_AUDIO"] = str(audio)
@@ -46,7 +53,7 @@ async def smoke(root):
         stream.writeframes(samples.tobytes())
     env["FIXTURE_NOISE"] = str(noise)
     local = root / "local.wav"
-    subprocess.run(["say", "-o", root / "local.aiff", "Send a copy to Rachel on Friday."], check=True)
+    subprocess.run(["say", "-v", "Daniel", "-o", root / "local.aiff", "Send a copy to Rachel on Friday."], check=True)
     subprocess.run(["ffmpeg", "-v", "error", "-i", root / "local.aiff", "-ar", "48000", "-ac", "1", local], check=True)
     env["FIXTURE_LOCAL_AUDIO"] = str(local)
     with wave.open(str(audio)) as stream:
@@ -106,6 +113,18 @@ else:
     capture.write_text("#!/usr/bin/env python3\n"+"""import json,shutil,sys,os,time,wave
 from threading import Thread
 from pathlib import Path
+
+def write_dictation(path):
+    if "FixtureSilent" in sys.argv:
+        with wave.open(path, "wb") as stream:
+            stream.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
+            stream.writeframes((1000).to_bytes(2, "little", signed=True) * 48_000)
+        return
+    fixture = next((name for option, name in (("FixtureNoise", "FIXTURE_NOISE"), ("FixtureLocalSpeech", "FIXTURE_LOCAL_AUDIO"),
+                   ("FixtureTailOnly", "FIXTURE_LATE_SPEECH"), ("FixtureLongTake", "FIXTURE_LONG_TAKE")) if option in sys.argv),
+                   "FIXTURE_AUDIO")
+    shutil.copyfile(os.environ[fixture], path)
+
 if sys.argv[1]=="devices":
     print(json.dumps({"microphone":"Fixture microphone"}),flush=True)
 elif sys.argv[1]=="warm":
@@ -124,42 +143,133 @@ elif sys.argv[1]=="warm":
         Thread(target=publish_fallback, daemon=True).start()
     elif "FixtureWarmReady" in sys.argv:
         print(json.dumps({"event":"warmAvailability","phase":"ready","microphone":"Fixture saved","message":""}), flush=True)
+    stage = None
+    meeting_stage = None
+    meeting_app = None
+    answered_copy = False
+    demand = "--on-demand" in sys.argv
     for line in sys.stdin:
-        request=json.loads(line)
-        stage=request["start"]
-        shutil.copyfile(os.environ["FIXTURE_AUDIO"],stage)
-        name = "Warm fixture" if "queuedAt" not in request else "Warm queued " + str(request["queuedAt"])
-        using_fallback = "--input" in sys.argv and sys.argv[sys.argv.index("--input")+1] == "Saved microphone"
-        print(json.dumps({"event":"started","microphone":name,"usingDefaultMicrophone":using_fallback}),flush=True)
-        command = sys.stdin.readline().split()
-        if "FixtureSlowWarm" in sys.argv:
+        if line.startswith("{"):
+            request = json.loads(line)
+            if "annotation" in request:
+                if request["action"] == "start":
+                    shutil.copyfile(os.environ["FIXTURE_AUDIO"],request["path"])
+                print(json.dumps({"event":"warmAnnotation","request":request["annotation"]}),flush=True)
+                continue
+            if "meeting" in request:
+                meeting = request["meeting"]
+                def meeting_event(event, **fields):
+                    print(json.dumps({"event": event, "sharedMeeting": meeting, **fields}), flush=True)
+
+                recovery_id = "79640d31-cbcd-4202-beda-49a3a94cbdcf"
+                if "start" in request:
+                    meeting_stage = request["start"]
+                    meeting_app = request.get("callApplication")
+                    answered_copy = False
+                    for suffix, fixture in (("", "MIX"), (".mic.wav", "MIC"), (".system.wav", "SYSTEM")):
+                        shutil.copyfile(os.environ["MEETING_"+fixture], meeting_stage+suffix)
+                    meeting_event("started", microphone="Shared fixture microphone", microphoneAvailable=True)
+                    print(json.dumps({"event":"warmAvailability","phase":"ready","microphone":"Shared fixture microphone","message":""}), flush=True)
+                    if meeting_app:
+                        meeting_event("meetingMicRecoveryRequest", id=recovery_id)
+                    if meeting_app == "us.zoom.xos":
+                        assert request["inputDevice"] == "Saved microphone" and request["systemAudio"] == "tapAndScreen" and request["hostPID"] > 1
+                        meeting_event("meetingSystemAudio", available=False)
+                        meeting_event("meetingMicWarning", active=True)
+                        meeting_event("sourceChanged", microphone="Shared fixture microphone", microphoneAvailable=False,
+                                      message="Reconnecting the microphone")
+                    meeting_event("levels", seconds=4.5, mic=.2, system=.3, microphone="Shared fixture microphone", meetingRms=.15)
+                    if meeting_app == "us.zoom.xos":
+                        meeting_event("meetingMicWarning", active=False)
+                        meeting_event("sourceChanged", microphone="Shared fixture microphone", microphoneAvailable=True,
+                                      message="Recording from Shared fixture microphone")
+                    meeting_event("meetingSystemAudio", available=True, backend="screen")
+                elif request["command"].startswith("copy "):
+                    if not answered_copy:
+                        answered_copy = True
+                        frame = (Path(meeting_stage).stat().st_size - 44) // 2 - 1200 if meeting_app else 192000
+                        meeting_event("meetingCopy", request=request["command"][5:], frame=frame)
+                elif request["command"].startswith("input "):
+                    source = json.loads(request["command"][6:]) or "System default"
+                    meeting_event("sourceChanged", microphone=source, message="Recording from " + source)
+                elif meeting_app and request["command"] in ("recover-mic " + recovery_id, "defer-mic " + recovery_id):
+                    verb = request["command"].split()[0]
+                    if verb == "recover-mic":
+                        meeting_event("meetingMicRecoveryDone", id=recovery_id)
+                    Path(os.environ["FIXTURE_AUDIO"]).with_name(meeting_app + ".mic-recovery").write_text(verb)
+                elif request["command"]=="stop":
+                    assert meeting_stage is not None
+                    meeting_event("finished", reason="Stopped")
+                    meeting_event("takeEnded")
+                    meeting_stage = None
+                continue
+            if "meter" in request:
+                print(json.dumps({"event":"warmMeter","request":request["meter"],"peak":None}),flush=True)
+                continue
+            stage = request["start"]
+            if demand and "FixtureFailedOpen" in sys.argv:
+                print(json.dumps({"event":"error", "message":"Fixture microphone failed to open.",
+                                  "interruption":"microphone", "failedAt":123.22}),flush=True)
+                print(json.dumps({"event":"takeEnded"}),flush=True)
+                stage = None
+                continue
+            if demand and "FixtureAbandonedOpen" in sys.argv:
+                continue
+            write_dictation(stage)
+            name = "Warm fixture" if "queuedAt" not in request else "Warm queued " + str(request["queuedAt"])
+            using_fallback = "--input" in sys.argv and sys.argv[sys.argv.index("--input")+1] == "Saved microphone"
+            started = {"event":"started", "microphone":name, "usingDefaultMicrophone":using_fallback}
+            if demand:
+                started.update(microphone="Fixture microphone", openedAt=123.34)
+                if "FixtureFallback" in sys.argv:
+                    assert "--avoid-bluetooth" in sys.argv and request["preRoll"] is False
+                    started.update(microphone="System fixture input", usingDefaultMicrophone=True)
+            print(json.dumps(started),flush=True)
+            if demand:
+                print(json.dumps({"event":"levels","seconds":4.5,"mic":0.2,"system":0.3,
+                                  "microphone":started["microphone"]}),flush=True)
+            continue
+        if stage is None:
+            continue
+        command = line.split()
+        if "FixtureSlowWarm" in sys.argv or "FixtureAbandonedOpen" in sys.argv:
             print(json.dumps({"event": "openingAbandoned"}), flush=True)
         result = {"event":"finished","reason":"Stopped"}
-        if len(command) == 2 and command[0] == "finish":
+        if "FixtureAbandonedOpen" in sys.argv:
+            assert command[0] == "finish" and len(command) == 2
+        elif "FixtureTailOnly" in sys.argv:
+            assert float(command[1]) > 0
+            result["releaseFrame"] = 3 * 48_000
+        elif "FixtureInterrupted" in sys.argv:
+            result.update(reason="Fixture microphone disconnected.", interruption="microphone",
+                          capturedThrough=123.75, failedAt=123.79, hasLiveAudio=True)
+        elif len(command) == 2 and command[0] == "finish":
             assert float(command[1]) > 0
             with wave.open(stage, "rb") as stream:
                 result["releaseFrame"] = stream.getnframes() - 24_000
         print(json.dumps(result),flush=True)
         print(json.dumps({"event":"takeEnded"}),flush=True)
+        stage = None
     if report_status:
         print(json.dumps({"event":"warmAvailability","phase":"unavailable","microphone":"","message":"Retired worker event."}), flush=True)
 elif Path(sys.argv[sys.argv.index("--output")+1]).parent.name.startswith("capture-"):
     path = Path(sys.argv[sys.argv.index("--output")+1])
     assert "--meter" in sys.argv and "--input" in sys.argv and "--cold-recovery" not in sys.argv
     uid = sys.argv[sys.argv.index("--input")+1]
-    assert uid in ("FixtureMic", "FixtureLost")
+    assert uid in ("FixtureMic", "FixtureLost", "FixtureEmpty")
     with wave.open(os.environ["FIXTURE_AUDIO"], "rb") as source, wave.open(str(path), "wb") as destination:
         destination.setparams(source.getparams())
-        destination.writeframes(source.readframes(source.getnframes()))
+        if uid != "FixtureEmpty":
+            destination.writeframes(source.readframes(source.getnframes()))
     print(json.dumps({"event":"started","microphone":uid}),flush=True)
     print(json.dumps({"event":"levels","seconds":4.5,"mic":0.2,"micRms":0.1}),flush=True)
-    if uid == "FixtureLost":
+    if uid != "FixtureMic":
         print(json.dumps({"event":"error","message":"Microphone disconnected"}),flush=True)
         sys.exit(1)
     sys.stdin.readline()
     print(json.dumps({"event":"finished","reason":"Stopped"}),flush=True)
 elif ("--mode" in sys.argv and sys.argv[sys.argv.index("--mode")+1] in ("mic","system")
-      and not Path(sys.argv[sys.argv.index("--output")+1]).with_suffix(".dictation").exists()):
+      and Path(__file__).with_name("deny-recording-permissions").exists()):
     source = sys.argv[sys.argv.index("--mode")+1]
     print(json.dumps({"event":"error","permission":source,"message":"macOS declined capture"}),flush=True)
     sys.exit(1)
@@ -176,20 +286,7 @@ else:
         print(json.dumps({"event":"error", "message":"Fixture cold microphone failed to open.",
                           "interruption":"microphone", "failedAt":123.22}),flush=True)
         sys.exit(1)
-    elif "FixtureSilent" in sys.argv:
-        with wave.open(output, "wb") as stream:
-            stream.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
-            stream.writeframes((1000).to_bytes(2, "little", signed=True) * 48_000)
-    elif "FixtureNoise" in sys.argv:
-        shutil.copyfile(os.environ["FIXTURE_NOISE"],output)
-    elif "FixtureLocalSpeech" in sys.argv:
-        shutil.copyfile(os.environ["FIXTURE_LOCAL_AUDIO"],output)
-    elif "FixtureTailOnly" in sys.argv:
-        shutil.copyfile(os.environ["FIXTURE_LATE_SPEECH"],output)
-    elif "FixtureLongTake" in sys.argv:
-        shutil.copyfile(os.environ["FIXTURE_LONG_TAKE"],output)
-    else:
-        shutil.copyfile(os.environ["FIXTURE_AUDIO"],output)
+    write_dictation(output)
     if "--separate-tracks" in sys.argv:
         for name in ("mic", "system"):
             sidecar = Path(output + "." + name + ".wav")
@@ -211,7 +308,12 @@ else:
         assert sys.argv[index+1:index+3] == ["tapAndScreen", "--host-pid"] and int(sys.argv[index+3]) > 1
         print(json.dumps({"event":"meetingSystemAudio","available":False}),flush=True)
         print(json.dumps({"event":"meetingMicWarning","active":True}),flush=True)
-    print(json.dumps({"event":"levels","seconds":4.5,"mic":0.2,"system":0.3,"microphone":"Fixture microphone"}),flush=True)
+    mode = sys.argv[sys.argv.index("--mode") + 1]
+    levels = {"event":"levels","seconds":4.5,"mic":0.2,"system":0 if mode == "mic" else 0.3,
+              "microphone":"Fixture microphone"}
+    if "--separate-tracks" in sys.argv:
+        levels["meetingRms"] = 0.15
+    print(json.dumps(levels),flush=True)
     if call_application == "us.zoom.xos":
         print(json.dumps({"event":"meetingMicWarning","active":False}),flush=True)
         print(json.dumps({"event":"meetingSystemAudio","available":True,"backend":"screen"}),flush=True)
@@ -305,6 +407,7 @@ else:
             assert (root / "logs" / "live.ndjson").stat().st_mode & 0o777 == 0o600
             assert (root / "logs" / "server.log").stat().st_mode & 0o777 == 0o600
             assert (await rpc("devices"))["microphone"]=="Fixture microphone"
+            assert await rpc("inputDevices") == {"microphone": "Fixture microphone", "inputs": []}
             async with asyncio.timeout(90):
                 while (await web.get("/api/status")).json()["status"]=="loading":
                     await asyncio.sleep(.25)
@@ -315,7 +418,8 @@ else:
                     request = value.get("nativeRequest", {})
                     if request.get("action") == "sdk-start":
                         sequence += 1
-                        decision = {"ok": True, "result": {"inputDevice": "FixtureLost" if sequence == 4 else "FixtureMic",
+                        input_device = {4: "FixtureLost", 6: "FixtureEmpty", 7: "FixtureLost", 8: "FixtureLost"}.get(sequence, "FixtureMic")
+                        decision = {"ok": True, "result": {"inputDevice": input_device,
                                                             "languages": ["en"], "avoidBluetooth": False}}
                         await push("controlReply", id=request["id"], response=decision)
 
@@ -354,7 +458,21 @@ const discarded = await client.dictation.start()
 await discarded.cancel()
 await assert.rejects(discarded.finish(), { code: "dictation-cancelled" })
 const interrupted = await client.dictation.start()
+for await (const page of interrupted.audio) assert.ok(page.length)
+const replacement = await client.dictation.start()
+assert.notEqual(replacement.id, interrupted.id)
 assert.match((await interrupted.finish()).transcript, /history books/i)
+assert.equal((await replacement.levels.next()).done, false)
+assert.match((await replacement.finish()).transcript, /history books/i)
+const empty = await client.dictation.start()
+await assert.rejects(empty.finish(), { code: "microphone-lost" })
+const olderLoss = await client.dictation.start()
+for await (const page of olderLoss.audio) assert.ok(page.length)
+const newerLoss = await client.dictation.start()
+for await (const page of newerLoss.audio) assert.ok(page.length)
+await assert.rejects(olderLoss.finish(), { code: "microphone-lost" })
+await newerLoss.cancel()
+await assert.rejects(newerLoss.finish(), { code: "dictation-cancelled" })
 const abandoned = await (await fetch(endpoint, { method: "POST", headers: auth })).json()
 const owner = { ...auth, "X-Jard-Dictation-Token": abandoned.ownerToken }
 assert.equal((await fetch(endpoint + "/" + abandoned.id + "/levels", { headers: owner })).status, 200)
@@ -373,7 +491,7 @@ assert.equal(status.phase, "cancelled")
             pointer = (root/"library"/".native-control").read_text().strip()
             assert not list(Path(pointer).parent.glob("capture-*"))
             assert not (await web.get("/api/sessions")).json()
-            print("SDK microphone ownership, lease renewal and expiry, levels, PCM, cancellation, and partial Rumble2 Flash output passed.", flush=True)
+            print("SDK microphone ownership, leases, levels, PCM, and cancellation passed. A lost recording released the mic, let the next take start, and kept partial Rumble2 Flash output for its owner.", flush=True)
             async def completed(key):
                 async with asyncio.timeout(120):
                     while True:
@@ -761,13 +879,16 @@ assert.equal(status.phase, "cancelled")
             out, err=await tool.communicate()
             assert tool.returncode == 0, err
             assert json.loads(out)["desktop"]["listener"]
-            async def desktop_command(arguments, action, options, response, *, json_output=True, exit_code=0, expected=None):
+            async def desktop_command(arguments, action, options, response, *, json_output=True, exit_code=0, expected=None,
+                                      environment=None):
                 seen.clear()
                 tool = await asyncio.create_subprocess_exec(sys.executable, ENGINE / "jardctl.py", *(("--json",) if json_output else ()), *arguments,
-                            cwd=ROOT, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                            cwd=ROOT, env=environment or env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 while not any("nativeRequest" in row for row in seen):
                     await event()
                 request = next(row["nativeRequest"] for row in seen if "nativeRequest" in row)
+                if callable(options):
+                    options = options(request)
                 assert request == {"id": request["id"], "action": action, **options}
                 await rpc("controlReply", id=request["id"], response={"ok": True, "result": response})
                 out, err = await tool.communicate()
@@ -798,10 +919,29 @@ assert.equal(status.phase, "cancelled")
             assert tool.returncode == 1 and not out and "Pass --yes" in json.loads(err)["error"]
             await desktop_command(["history", "clear", "--yes"], "history-clear", {}, {"removed": 3, "changed": True})
             await desktop_command(["history", "clear", "--yes"], "history-clear", {}, {"removed": 0, "changed": False})
-            await desktop_command(["history", "--query", "cleared"], "history-snapshot", {}, {
-                "bundleId": "local.jardaudio.desktop", "JardSystemDictation": {"retention": 7, "previousRetention": 7},
-                "JardSystemDictationHistory": [],
-            }, expected={"entries": [], "total": 0, "words": 0, "seconds": 0})
+            history_home = root / "history-home"
+            history_file = history_home / "Library/Preferences/local.jardaudio.history-fixture.plist"
+            history_file.parent.mkdir(parents=True)
+            rows = [{"id": str(i), "time": time.time() - i, "text": f"History entry {i}."} for i in range(300)]
+            history_file.write_bytes(plistlib.dumps({"JardSystemDictationHistory": rows[:250]}))
+            history_file.chmod(0o600)
+            history_env = {**env, "HOME": str(history_home), "JARD_DESKTOP_BUNDLE_ID": history_file.stem}
+            before_history = history_file.stat().st_mtime_ns
+            def history_snapshot(request):
+                nonlocal snapshot_file
+                snapshot_file = Path(socket_path).with_name(f"history-{request['id']}.plist")
+                assert request["path"] == str(snapshot_file)
+                snapshot_file.write_bytes(plistlib.dumps({
+                    "bundleId": history_file.stem, "JardSystemDictationHistory": rows,
+                }))
+                snapshot_file.chmod(0o600)
+                return {"path": str(snapshot_file)}
+            snapshot_file = None
+            await desktop_command(["history", "--query", "entry", "--offset", "290"], "history-checkpoint", history_snapshot,
+                True, environment=history_env, expected={"entries": rows[290:], "total": 300, "words": 900, "seconds": 0})
+            assert snapshot_file and not snapshot_file.exists()
+            assert history_file.stat().st_mtime_ns == before_history
+            print("Live CLI paginated a large private history snapshot, removed it, and left offline preferences intact.", flush=True)
             await desktop_command(["window", "show"], "window-show", {"pane": "settings"},
                                   {"windowVisible": True, "requestedPane": "settings"})
             await desktop_command(["window", "show", "history"], "window-show", {"pane": "history"},
@@ -819,6 +959,8 @@ assert.equal(status.phase, "cancelled")
                                   {"title": "Design Review"}, {"phase": "starting", "title": "Design Review"})
             await desktop_command(["meetings", "record", "--title", "  "], "meeting-record", {}, {"phase": "starting"})
             annotation_request = str(uuid4())
+            await desktop_command(["annotate", "start"], "annotation-start", {},
+                                  {"phase": "starting", "capture": annotation_request, "changed": True})
             await desktop_command(["capture", "start", "--source", "area", "--language", "en"], "annotation-start",
                                   {"source": "area", "languages": ["en"]},
                                   {"phase": "picking", "capture": annotation_request, "changed": True})
@@ -868,15 +1010,20 @@ assert.equal(status.phase, "cancelled")
             assert exported["modelRevision"]==saved["modelRevision"] and exported["source"]==audio.name
             print("Authenticated bridge, staged import, real Metal models, timed speaker transcript and both native exports passed.",flush=True)
 
-            for source in ("mic", "system"):
-                seen.clear()
-                await rpc("record", mode=source, live=False, **opts)
-                denied = await wait_event("error")
-                assert denied["permission"] == source and not (await rpc("devices"))["drafts"]
+            deny_recording = root / "deny-recording-permissions"
+            deny_recording.touch()
+            try:
+                for source in ("mic", "system"):
+                    seen.clear()
+                    await rpc("record", mode=source, live=False, **opts)
+                    denied = await wait_event("error")
+                    assert denied["permission"] == source and not (await rpc("devices"))["drafts"]
+            finally:
+                deny_recording.unlink()
             print("Typed microphone and system audio denials reach the UI and remove empty staging files.", flush=True)
             await rpc("record",mode="both",live=True,**opts)
             await wait_event("started")
-            await wait_event("levels")
+            assert "meetingRms" not in await wait_event("levels")
             await rpc("live",enabled=False)
             await rpc("stop")
             detail=await wait_event("accepted")
@@ -891,6 +1038,7 @@ assert.equal(status.phase, "cancelled")
                       inputDevice="Saved microphone", live=True, **opts)
             started = await wait_event("started")
             assert started["meeting"] == meeting and started["live"] and started["mode"] == "both"
+            assert started["microphoneAvailable"] is True
             while len(warnings := [row["detail"]["active"] for row in seen
                                    if row.get("detail", {}).get("event") == "meetingMicWarning"]) < 2:
                 await event()
@@ -899,6 +1047,9 @@ assert.equal(status.phase, "cancelled")
                                  if row.get("detail", {}).get("event") == "meetingSystemAudio"]) < 2:
                 await event()
             assert system == [False, True]
+            mic_states = [row["detail"]["microphoneAvailable"] for row in seen
+                          if row.get("detail", {}).get("event") == "sourceChanged"]
+            assert mic_states == [False, True], mic_states
             async with asyncio.timeout(5):
                 while not (mic_recovery := root / "us.zoom.xos.mic-recovery").exists():
                     await asyncio.sleep(.05)
@@ -913,14 +1064,14 @@ assert.equal(status.phase, "cancelled")
             assert "already active" in await rpc("record", mode="mic", expect_error=True)
             preview = await wait_event("preview")
             assert preview["meeting"] == meeting and preview["delta"] == preview["text"] and preview["delta"]
-            assert {segment["speaker"] for segment in preview["deltaSegments"]} == {2}, preview
+            assert preview["deltaSegments"][0]["speaker"] > 0, preview
 
-            async def agent(*arguments, request=None):
+            async def agent(*arguments, request=None, markdown=False):
                 tool = await asyncio.create_subprocess_exec(sys.executable, ENGINE / "jardctl.py", *arguments, cwd=ROOT, env=env,
                             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 out, err = await asyncio.wait_for(tool.communicate(request), timeout=10)
                 assert tool.returncode == 0, err
-                return json.loads(out)
+                return out.decode() if markdown else json.loads(out)
 
             live = await agent("meetings", "list", "--since", "1h", "--json")
             assert len(live) == 1 and live[0]["status"] == "recording" and live[0]["meetingProvider"] == "Zoom", live
@@ -933,10 +1084,17 @@ assert.equal(status.phase, "cancelled")
             rolling_bytes = journal.read_bytes()
             window = json.loads(rolling_bytes.splitlines()[0])
             assert window[:2] == [0, 4 * 48000] and "history books" in window[2]["text"].lower(), window
-            assert window[2]["meetingCoverage"] == {"1": [[0.0, 4.0]], "2": [[0.0, 4.0]]}, window[2]
+            assert window[2]["meetingSpeakerMode"] == "mixed", window[2]
             readings = await agent("meetings", "show", live_id[:8], "--json")
-            assert readings["transcriptSource"] == "rolling" and readings["turns"][0]["speaker"] == "Them", readings
+            assert readings["transcriptSource"] == "rolling" and readings["turns"][0]["speaker"].startswith("Speaker "), readings
             assert readings["microphoneWarning"] == "digitalSilence"
+            live_markdown = await agent("meetings", "show", live_id, "--from", "0:00", "--md", markdown=True)
+            assert "history books" in live_markdown.lower() and "Speaker " in live_markdown
+            assert "- **Range:** 00:00–end" in live_markdown
+            assert "- **Status:** Recording · rolling transcript" in live_markdown
+            excerpt = await agent("meetings", "show", live_id, "--to", "3.25s", "--json")
+            assert excerpt["range"] == {"from_ms": 0, "to_ms": 3250}
+            assert excerpt["turns"] == [turn for turn in readings["turns"] if round(turn["start"] * 1000) < 3250]
             mcp_request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_transcripts",
                            "arguments": {"meeting_id": "latest", "query": '"history books"', "since": "1h"}}}
             mcp = await agent("mcp", request=(json.dumps(mcp_request) + "\n").encode())
@@ -947,9 +1105,13 @@ assert.equal(status.phase, "cancelled")
             assert snapshot == {"through": count - 1200, "complete": True}, snapshot
             excerpts = [row["detail"] for row in seen if row.get("detail", {}).get("meeting") == meeting
                         and row["detail"].get("event") == "preview"]
+            assert any(row.get("detail", {}).get("meeting") == meeting
+                       and row["detail"].get("meetingRms") == .15 for row in seen)
             assert excerpts[-1]["through"] <= snapshot["through"], excerpts[-1]["through"]
             assert "rachel" in " ".join(row["delta"] for row in excerpts).lower(), excerpts
             native_headers = {"X-Jard-Token": (root / "library" / ".native-token").read_text().strip()}
+            assert (await web.put("/api/native/meeting-clock/24")).status_code == 403
+            await rpc("meetingClock", hours="24")
             title_route = f"/api/native/staging/{live_id}/meeting-title"
             title_params = {"through": excerpts[-1]["through"]}
             assert (await web.post(title_route, params=title_params)).status_code == 403
@@ -968,13 +1130,20 @@ assert.equal(status.phase, "cancelled")
             live_title.write_text(title, encoding="utf8")
             fallback = await rpc("copyMeeting", meeting=meeting)
             assert fallback == {"through": snapshot["through"], "complete": False}, fallback
+            joined = str(uuid4())
+            folder = root / ("jard-annotation-" + joined)
+            folder.mkdir(mode=0o700)
+            joined_narration = folder / "Narration.wav"
+            assert started["warm"] and (await rpc("annotationLease", id=joined, active=True))["active"]
+            assert (await rpc("annotationAudio", id=joined, action="prepare", path=str(joined_narration), inputDevice="Different input"))["ready"]
+            assert (await rpc("annotationAudio", id=joined, action="start", at=time.monotonic()))["ready"]
             capture = str(uuid4())
             await rpc("record", dictation=capture.upper(), **{"global": True, "keep": True})
             while not any(row.get("detail", {}).get("event") == "started" and
                           row["detail"].get("dictation") == capture for row in seen):
                 await event()
             take = next(row["detail"] for row in seen if row.get("detail", {}).get("dictation") == capture)
-            assert take["microphone"] == "Warm fixture" and take["mode"] == "mic", take
+            assert take["microphone"] == "Fixture microphone" and take["mode"] == "mic" and take["warm"], take
             assert (await rpc("devices"))["capture"]["meeting"] == meeting
             assert "already active" in await rpc("record", dictation=str(uuid4()), **{"global": True}, expect_error=True)
             assert "Finish your recording" in await rpc("updateQuiesce", expect_error=True)
@@ -997,8 +1166,13 @@ assert.equal(status.phase, "cancelled")
                 assert stream.status_code == 200 and "text/event-stream" in stream.headers["content-type"]
                 assert (await web.get(event_path, headers=event_headers)).status_code == 409
                 await rpc("stopMeeting", meeting=meeting.upper())
+                finished = await wait_event("finished")
+                assert finished["meeting"] == meeting and finished["seconds"] == count / 48_000, finished
                 detail = await wait_event("accepted")
                 assert detail["id"] == live_id
+                assert (await rpc("annotationAudio", id=joined, action="stop", at=time.monotonic()))["ready"]
+                assert joined_narration.read_bytes() == audio.read_bytes()
+                assert not (await rpc("annotationLease", id=joined, active=False))["active"]
                 async with asyncio.timeout(30):
                     async for line in stream.aiter_lines():
                         if line.startswith("data: "):
@@ -1023,23 +1197,30 @@ assert.equal(status.phase, "cancelled")
             assert saved_meeting["recording"] and saved_meeting["audioName"].startswith("Zoom meeting ")
             assert saved_meeting["meeting"] and saved_meeting["meetingProvider"] == "Zoom"
             assert saved_meeting["meetingStartedAt"] == live[0]["meetingStartedAt"]
+            start_time = datetime.fromisoformat(saved_meeting["meetingStartedAt"]).astimezone()
+            date_line = f"- **Date:** {start_time:%Y-%m-%d}, {start_time:%H:%M}"
+            assert date_line in (await web.get(f"/api/sessions/{live_id}/export?kind=notes")).raise_for_status().text
+            assert date_line in await agent("meetings", "show", live_id, "--md", markdown=True)
+            await rpc("meetingClock", hours="12")
             assert saved_meeting["meetingMicrophoneWarning"] == "digitalSilence"
             assert (await agent("meetings", "show", live_id, "--json"))["microphoneWarning"] == "digitalSilence"
             assert not journal.exists()
             transcript = saved_meeting["transcript"]
             assert transcript["text"].lower().count("history books") == 1, transcript
             assert "rachel" in transcript["text"].lower()
-            assert transcript["speakerNames"] == {"1": "You", "2": "Them"}
-            assert {segment["speaker"] for segment in transcript["segments"]} == {1, 2}
-            assert transcript["echoSuppressedUtterances"] > 0
-            copied = await rpc("meetingTranscript", session=detail["id"])
-            assert copied["text"] == transcript["text"].strip()
-            assert copied["labeledText"].startswith("Them: ") and "\nYou: " in copied["labeledText"]
+            assert "speakerNames" not in transcript and saved_meeting["diarization"] and transcript["speakerActivity"]
+            copied = await rpc("latestMeetingTranscript")
+            assert copied["session"] == live_id and "history books" in copied["text"].lower()
+            assert " · Speaker " in copied["text"]
+            picked = await rpc("savedMeetingTranscript", id=live_id)
+            assert "history books" in picked["text"].lower() and " · Speaker " in picked["text"]
+            assert picked["text"] == (await web.get(f"/api/sessions/{live_id}/transcript-clipboard")).raise_for_status().text
+            assert "no longer available" in await rpc("savedMeetingTranscript", id=str(uuid4()), expect_error=True)
             assert (await web.get(f"/api/native/meetings/{live_id}/excerpt")).status_code == 403
             excerpt = await rpc("meetingExcerpt", session=live_id)
             assert (await rpc("latestMeeting"))["session"] == live_id
-            assert excerpt["available"] and excerpt["settled"] and excerpt["labels"] == {"1": "You", "2": "Them"}
-            assert {turn["speaker"] for turn in excerpt["turns"]} == {1, 2}
+            assert excerpt["available"] and excerpt["settled"] and excerpt["labels"] == {}
+            assert {turn["speaker"] for turn in excerpt["turns"]} == {turn["speaker"] for turn in transcript["segments"]}
             assert all(0 <= turn["start"] <= turn["end"] for turn in excerpt["turns"])
             assert await rpc("meetingExcerpt", session=str(uuid4())) == {"available": False, "settled": True, "turns": []}
             assert set(saved_meeting["recordingTracks"]) == {"mic", "system"}
@@ -1072,6 +1253,38 @@ assert.equal(status.phase, "cancelled")
             assert [row["id"] for row in result] == [key]
             revision = (await web.put(f"/api/sessions/{key}/personal-notes", json={"revision": 0, "document": document})).raise_for_status().json()
             assert revision["revision"] == 1
+            image = subprocess.check_output(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=red:size=16x16",
+                                             "-frames:v", "1", "-f", "image2pipe", "-c:v", "mjpeg", "-"])
+            images_path = f"/api/sessions/{key}/images"
+            upload_headers = {"Content-Type": "image/jpeg", "Origin": base}
+            assert (await web.post(images_path, content=b"not an image", headers=upload_headers)).status_code == 422
+            assert (await web.post(images_path, content=bytes(512 * 1024 + 1), headers=upload_headers)).status_code == 413
+            asset = (await web.post(images_path, content=image, headers=upload_headers)).raise_for_status().json()
+            assert (await web.get(images_path)).raise_for_status().json() == [asset]
+            response = (await web.get(asset["url"])).raise_for_status()
+            assert response.content == image and response.headers["content-type"] == "image/jpeg"
+            for provider, target in agent_targets.items():
+                result = await rpc("sendSessionToAgent", id=key, agent=provider, target=target)
+                wire = json.loads((root / f"{provider}-annotation.json").read_text())
+                context = wire if provider == "t3" else wire[0]["text"]
+                assert brief["summary"] in context and "## My Notes" in context and "Ask about paperback pricing." in context
+                assert "## Transcript" in context and "**00:" in context
+                if provider == "t3":
+                    assert result == {"images": "references", "opened": False} and base + asset["url"] in context
+                else:
+                    assert result == {"images": "attached", "opened": False}
+                    encoded = wire[1]["url"].split(",", 1)[1] if provider == "codex" else wire[1]["source"]["data"]
+                    assert base64.b64decode(encoded) == image
+            with local_opencode(Path(env["XDG_STATE_HOME"]) / "opencode") as (_, _, prompts, _):
+                choice = await rpc("annotationDestinations", query="")
+                result = await rpc("sendSessionToAgent", id=key, agent="opencode", target="ses_project", service=choice["service"])
+                assert result == {"images": "attached", "opened": False}
+                path, body = prompts[-1]
+                assert path == "/api/session/ses_project/prompt" and "Ask about paperback pricing." in body["text"]
+                assert base64.b64decode(body["files"][0]["uri"].split(",", 1)[1]) == image
+            (await web.delete(asset["url"], headers={"Origin": base})).raise_for_status()
+            assert (await web.get(asset["url"])).status_code == 404
+            print("Overview sharing preserved a saved meeting brief, timed transcript, My Notes, and image attachments across all four agent transports.", flush=True)
             for kind, expected in (("notes", "Ask about paperback pricing."), ("md", "**"), ("srt", " --> "), ("vtt", "WEBVTT")):
                 result = (await web.get(f"/api/sessions/{key}/export", params={"kind": kind})).raise_for_status()
                 assert expected in result.text and "attachment" in result.headers["content-disposition"]
@@ -1090,7 +1303,7 @@ assert.equal(status.phase, "cancelled")
             archived = (await web.get(f"/api/sessions/{key}")).raise_for_status().json()
             assert archived["audioRemovedAt"] == removed and archived["audioUrl"] is None
             assert archived["transcript"] == transcript and archived["personalNotes"]["revision"] == 1
-            assert (await rpc("meetingTranscript", session=key))["text"] == copied["text"]
+            assert await rpc("latestMeetingTranscript") == copied
             assert not list((root/"library"/"staging").glob("*.wav"))
             print("Dual-source meeting recording, Rumble2 Flash copy-through-now and timeout fallback, and saved session passed.", flush=True)
             seen.clear()
@@ -1203,45 +1416,125 @@ assert.equal(status.phase, "cancelled")
             assert recovered_session["meetingMicrophoneWarning"] == "digitalSilence"
             assert recovered_session["provisionalTitle"] == title and not recovered_title.exists()
             assert "history books" in recovered_session["transcript"]["text"].lower()
-            assert recovered_session["transcript"]["speakerNames"] == {"1": "You", "2": "Them"}
+            assert recovered_session["diarization"] and "speakerNames" not in recovered_session["transcript"]
             assert recovered_session["transcript"]["text"].lower().count("history books") == 1
             assert not recovered_rolling.exists()
             assert not await rpc("meetingDrafts")
             await rpc("discard", id=regular_stage["id"])
             print("The local Qwen title route and Rumble2 recording import preserved provisional titles across normal and interrupted saves.", flush=True)
             annotation = str(uuid4())
+            assert not (await agent("annotate", "storage"))["custom"]
+            configured = await agent("annotate", "storage", "--folder", str(annotation_storage))
+            assert configured["custom"] and configured["available"] and configured["folder"] == str(annotation_storage)
+            assert not (await rpc("warm", keep=False))["warm"]
+            seen.clear()
+            earlier_dictation = str(uuid4())
+            await rpc("record", dictation=earlier_dictation, keep=False, inputDevice="FixtureWarmReady", **{"global": True})
+            started = await wait_event("started")
+            assert started["dictation"] == earlier_dictation and started["warm"]
             assert (await rpc("annotationLease", id=annotation, active=True))["active"]
+            assert "Finish the active annotation" in await rpc("annotationStorage", action="reset", expect_error=True)
             assert "screen annotation" in await rpc("record", mode="both", expect_error=True)
             folder = root / ("jard-annotation-" + annotation)
             folder.mkdir(mode=0o700)
+            narration = folder / "Narration.wav"
+            assert (await rpc("annotationAudio", id=annotation, action="prepare", path=str(narration), inputDevice="Do not switch during dictation"))["ready"]
+            assert (await rpc("annotationAudio", id=annotation, action="start", at=time.monotonic()))["ready"]
+            assert not any(row.get("detail", {}).get("event") == "dictationReady" for row in seen)
+            await rpc("dictation", action="stop", id=earlier_dictation)
+            recorded = await wait_event("dictationReady")
+            assert recorded["dictation"] == earlier_dictation
+            spoken = await rpc("dictation", action="transcribe", id=recorded["id"], languages=["en"], cleanupOnFailure=True)
+            assert "history books" in spoken["text"].lower()
+            seen.clear()
+            shared_meeting = str(uuid4())
+            await rpc("record", mode="both", meeting=shared_meeting, meetingLabel="Shared meeting", live=True, languages=["en"])
+            started = await wait_event("started")
+            assert started["meeting"] == shared_meeting and started["microphone"] == "Shared fixture microphone" and started["warm"]
+            assert (await wait_event("meetingSystemAudio"))["available"]
+            assert (await rpc("annotationAudio", id=annotation, action="stop", at=time.monotonic()))["ready"]
+            assert not (await rpc("annotationLease", id=annotation, active=False))["active"]
+            await rpc("warm", keep=False)
+            annotation = str(uuid4())
+            folder = root / ("jard-annotation-" + annotation)
+            folder.mkdir(mode=0o700)
+            narration = folder / "Narration.wav"
+            assert (await rpc("annotationLease", id=annotation, active=True))["active"]
+            assert (await rpc("annotationAudio", id=annotation, action="prepare", path=str(narration), inputDevice="Do not switch during meeting"))["ready"]
+            assert (await rpc("annotationAudio", id=annotation, action="start", at=time.monotonic()))["ready"]
+            assert json.loads((root / "warm-options").read_text()) == ["--on-demand", "--input", "FixtureWarmReady"]
+            await rpc("meetingInput", inputDevice="Fixture shared input")
+            assert (await wait_event("sourceChanged"))["microphone"] == "Fixture shared input"
+            assert (await wait_event("preview"))["meeting"] == shared_meeting
+            assert (await rpc("copyMeeting", meeting=shared_meeting))["complete"]
+            seen.clear()
+            overlapping = str(uuid4())
+            await rpc("record", dictation=overlapping, keep=False, **{"global": True})
+            shared = await wait_event("started")
+            assert shared["dictation"] == overlapping and shared["microphone"] == "Fixture microphone" and shared["warm"]
+            await rpc("stopMeeting", meeting=shared_meeting)
+            shared_record = await wait_event("accepted")
+            saved_shared = await completed(shared_record["id"])
+            assert set(saved_shared["recordingTracks"]) == {"mic", "system"} and "history books" in saved_shared["transcript"]["text"].lower()
+            assert not any(row.get("detail", {}).get("event") == "dictationReady" for row in seen)
+            await rpc("dictation", action="stop", id=overlapping)
+            recorded = await wait_event("dictationReady")
+            assert recorded["dictation"] == overlapping
+            spoken = await rpc("dictation", action="transcribe", id=recorded["id"], languages=["en"], cleanupOnFailure=True)
+            assert "history books" in spoken["text"].lower()
+            seen.clear()
+            overlapping = str(uuid4())
+            await rpc("record", dictation=overlapping, keep=False, **{"global": True})
+            assert (await wait_event("started"))["dictation"] == overlapping
+            assert (await rpc("annotationAudio", id=annotation, action="stop", at=time.monotonic()))["ready"]
+            assert not any(row.get("detail", {}).get("event") == "dictationReady" for row in seen)
+            await rpc("dictation", action="stop", id=overlapping)
+            recorded = await wait_event("dictationReady")
+            assert recorded["dictation"] == overlapping
+            await rpc("dictation", action="transcribe", id=recorded["id"], languages=["en"], cleanupOnFailure=True)
             movie = folder / "Screen annotation.mp4"
             renderer = os.environ.get("JARD_TEST_WINDOW_RENDER")
             phone_fixture = bool(renderer and os.environ.get("JARD_TEST_PHONE_ANNOTATION"))
             capture_name = "Raw fixture.mov" if phone_fixture else "Raw fixture.mp4"
             captured = folder / capture_name if renderer else movie
             dimensions = "90x160" if phone_fixture else "160x90"
+            with wave.open(str(audio), "rb") as fixture_narration:
+                seconds = fixture_narration.getnframes() / fixture_narration.getframerate()
             subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"color=c=gray:s={dimensions}:r=12",
-                            "-i", audio, "-shortest", "-c:v", "mpeg4", "-c:a", "aac", captured], check=True)
+                            "-t", str(seconds), "-an", "-c:v", "mpeg4", captured], check=True)
             if renderer:
                 subprocess.run([renderer, captured, movie], check=True)
             manifest_file = folder / "annotation.json"
             sheet = folder / "contact-sheet.png"
             if not renderer:
                 manifest_file.write_text(json.dumps({"version": 1, "source": "display", "coordinateSpace": "normalized-bottom-left",
-                    "events": [{"time": .3, "stroke": 1, "from": [.2, .3], "to": [.7, .5]}, {"time": 1.2, "clear": True}],
+                    "events": [{"time": .3, "stroke": 1, "from": [.2, .3], "to": [.7, .5], "liftedAt": .45},
+                               {"time": 1.2, "clear": True}],
                     "frames": [.25, 1.3], "origin": {"app": "com.fixture.Browser", "name": "Jard", "site": "example.test"}}))
                 sheet.write_bytes(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jL1sAAAAASUVORK5CYII="))
             manifest_bytes = manifest_file.read_bytes()
             invalid = json.loads(manifest_bytes)
+            assert invalid["events"][0]["liftedAt"] >= invalid["events"][0]["time"]
+            invalid["events"][0]["liftedAt"] = .01
+            manifest_file.write_text(json.dumps(invalid))
+            assert "Invalid annotation stroke release time" in await rpc(
+                "importAnnotation", id=annotation, path=str(movie), narration=str(narration), assets=True, expect_error=True)
+            invalid = json.loads(manifest_bytes)
             invalid["events"][0]["from"] = [2, 1]
             manifest_file.write_text(json.dumps(invalid))
-            assert "Invalid annotation stroke" in await rpc("importAnnotation", id=annotation, path=str(movie), assets=True, expect_error=True)
+            assert "Invalid annotation stroke" in await rpc("importAnnotation", id=annotation, path=str(movie), narration=str(narration),
+                                                           assets=True, expect_error=True)
             manifest_file.write_bytes(manifest_bytes)
-            picked = await rpc("importAnnotation", id=annotation, path=str(movie), languages=["en"], assets=True)
+            picked = await rpc("importAnnotation", id=annotation, path=str(movie), narration=str(narration), languages=["en"], assets=True)
             assert picked["id"] == annotation
+            ready_handoff = await rpc("annotationHandoff", id=picked["id"], waitForNarration=True)
+            assert "history books" in ready_handoff["markdown"].lower()
             assert "already been saved" in await rpc("importAnnotation", id=annotation, path=str(movie), assets=True, expect_error=True)
             screen_session = await completed(picked["id"])
             assert screen_session["audioName"] == movie.name
+            assert screen_session["annotationCustomStorage"] and screen_session["audioPath"] is None
+            saved_movie = (await web.get(screen_session["audioUrl"])).raise_for_status().content
+            assert saved_movie and saved_movie != movie.read_bytes()
             assert "history books" in screen_session["transcript"]["text"].lower()
             assets = screen_session["annotation"]
             assert assets["source"] == ("phone" if phone_fixture else "window" if renderer else "display")
@@ -1254,12 +1547,101 @@ assert.equal(status.phase, "cancelled")
             assert (root / "export-Screen annotation-contact-sheet.png").read_bytes() == sheet.read_bytes()
             detail = await agent("annotate", "show", "latest")
             assert detail["id"] == picked["id"] and "history books" in detail["transcript"].lower()
-            assert Path(detail["videoPath"]).is_file() and Path(detail["manifestPath"]).read_bytes() == manifest_bytes
+            assert Path(detail["videoPath"]).parents[1] == annotation_storage
+            tracks = json.loads(subprocess.check_output(["ffprobe", "-v", "error", "-show_entries",
+                "stream=codec_type,start_time,duration", "-of", "json", detail["videoPath"]]))["streams"]
+            assert {track["codec_type"] for track in tracks} == {"audio", "video"}
+            assert all(abs(float(track["start_time"])) < .04 for track in tracks)
+            assert abs(float(tracks[0]["duration"]) - float(tracks[1]["duration"])) < .15
+            assert Path(detail["manifestPath"]).read_bytes() == manifest_bytes
             assert Path(detail["contactSheetPath"]).read_bytes() == sheet.read_bytes() and detail["frames"] == assets["frames"]
             handoff = await rpc("annotationHandoff", id=picked["id"])
             assert "history books" in handoff["markdown"].lower() and "Contact sheet times" in handoff["markdown"]
+            assert ready_handoff == handoff
             assert Path(handoff["imagePath"]).read_bytes() == sheet.read_bytes()
+            assert await rpc("annotationReview", id=picked["id"]) == {"imagePath": handoff["imagePath"]}
+            for backend, target in agent_targets.items():
+                rows = (await rpc("annotationAgentDestinations", agent=backend, query="agent"))["sessions"]
+                assert rows == [{"id": target, "title": "Disposable agent chat", "directory": str(root)}]
+                delivery = await rpc("sendAnnotationToAgent", id=annotation, agent=backend, target=target)
+                wire = json.loads((root / (backend + "-annotation.json")).read_text())
+                if backend == "t3":
+                    assert delivery["contactSheet"] == "reference"
+                    assert handoff["markdown"] in wire and json.dumps(handoff["imagePath"]) in wire
+                else:
+                    assert delivery["contactSheet"] == "attached" and wire[0]["text"] == handoff["markdown"]
+                    inline = wire[1]["url"].split(",", 1)[1] if backend == "codex" else wire[1]["source"]["data"]
+                    assert base64.b64decode(inline) == sheet.read_bytes()
+            full_annotation = await rpc("sendSessionToAgent", id=annotation, agent="codex", target=agent_targets["codex"])
+            assert full_annotation["images"] == "attached"
+            context, attachment = json.loads((root / "codex-annotation.json").read_text())
+            assert "## Screen annotation" in context["text"] and "Contact sheet times" in context["text"]
+            assert base64.b64decode(attachment["url"].split(",", 1)[1]) == sheet.read_bytes()
+            assert "Codex declined" in await rpc("sendAnnotationToAgent", id=annotation, agent="codex",
+                                                 target=str(uuid4()), expect_error=True)
+            print("Explicit agent handoff sent the selected chat the saved narration and included its contact sheet.", flush=True)
+            assert "contact sheet is unavailable" in await rpc("annotationReview", id=str(uuid4()), expect_error=True)
             assert (await agent("annotate", "context", picked["id"], "--json"))["markdown"] == handoff["markdown"]
+            assert (await rpc("export", id=picked["id"], kind="audio"))["saved"]
+            assert (root / "export-Screen annotation.mp4").read_bytes() == saved_movie
+            assert not (await rpc("annotationLease", id=annotation, active=False))["active"]
+            assert not (await rpc("warm", keep=False))["warm"]
+            detached = annotation_storage.with_name(annotation_storage.name + " detached")
+            annotation_storage.rename(detached)
+            try:
+                assert not (await agent("annotate", "storage"))["available"]
+                assert "Annotations folder is unavailable" in await rpc("annotationLease", id=str(uuid4()), active=True, expect_error=True)
+                unavailable = (await web.get(f"/api/sessions/{annotation}")).raise_for_status().json()
+                assert unavailable["annotationStorageUnavailable"] and unavailable["audioUrl"] is None
+                assert unavailable["transcript"]["text"] == screen_session["transcript"]["text"]
+                fallback = await rpc("annotationHandoff", id=annotation)
+                assert fallback["imagePath"] is None and fallback["markdown"] == handoff["markdown"]
+                assert "contact sheet is unavailable" in await rpc("annotationReview", id=annotation, expect_error=True)
+                assert not (await agent("annotate", "storage", "--default"))["custom"]
+            finally:
+                detached.rename(annotation_storage)
+            assert (await agent("annotate", "show", annotation))["videoPath"] == detail["videoPath"]
+            print("Annotation and dictation shared one warm helper and stopped independently. The remuxed narration transcribed and survived reconnect.", flush=True)
+            no_picture = str(uuid4())
+            folder = root / ("jard-annotation-" + no_picture)
+            folder.mkdir(mode=0o700)
+            narration = folder / "Narration.wav"
+            assert (await rpc("annotationLease", id=no_picture, active=True))["active"]
+            await rpc("annotationAudio", id=no_picture, action="prepare", path=str(narration), inputDevice="FixtureWarmReady")
+            await rpc("annotationAudio", id=no_picture, action="start", at=time.monotonic())
+            await rpc("annotationAudio", id=no_picture, action="stop", at=time.monotonic())
+            (folder / "annotation.json").write_text(json.dumps({"version": 1, "source": "display",
+                "coordinateSpace": "normalized-bottom-left", "missingVideo": "noFrames", "frames": [],
+                "events": [{"time": .3, "stroke": 1, "from": [.2, .3], "to": [.7, .5]}]}))
+            voice = await rpc("importAnnotation", id=no_picture, path=str(narration), narrationOnly=True, assets=True, languages=["en"])
+            assert not (await rpc("annotationLease", id=no_picture, active=False))["active"]
+            voice_session = await completed(voice["id"])
+            assert voice_session["annotation"]["missingVideo"] == "noFrames" and voice_session["annotation"]["strokeCount"] == 1
+            assert not voice_session["annotation"]["frames"] and voice_session["annotation"]["contactSheetUrl"] is None
+            assert "history books" in voice_session["transcript"]["text"].lower()
+            assert (await web.get(voice_session["audioUrl"])).raise_for_status().content == narration.read_bytes()
+            voice_detail = await agent("annotate", "show", no_picture)
+            assert voice_detail["videoPath"] is None and Path(voice_detail["audioPath"]).is_file()
+            voice_handoff = await rpc("annotationHandoff", id=no_picture)
+            assert voice_handoff["imagePath"] is None and "produced no video frames" in voice_handoff["markdown"]
+            (await web.delete(f"/api/sessions/{no_picture}")).raise_for_status()
+            print("Annotation without video saved its narration WAV and strokes, transcribed with Rumble2 Flash, and shared context without images.", flush=True)
+            seen.clear()
+            await rpc("record", mode="mic", live=True, **opts)
+            started = await wait_event("started")
+            assert started["mode"] == "mic" and started["microphone"] == "Fixture microphone"
+            assert "meeting" not in started and "warm" not in started
+            levels = await wait_event("levels")
+            assert levels["mic"] > 0 and levels["system"] == 0 and "meetingRms" not in levels
+            await rpc("stop")
+            mic_session = await completed((await wait_event("accepted"))["id"])
+            assert mic_session["recording"] and not mic_session.get("meeting") and mic_session["diarization"]
+            assert "recordingTracks" not in mic_session
+            assert "history books" in mic_session["transcript"]["text"].lower()
+            assert mic_session["transcript"]["speakerActivity"]
+            assert (await web.get(mic_session["audioUrl"])).raise_for_status().content == audio.read_bytes()
+            (await web.delete(f"/api/sessions/{mic_session['id']}")).raise_for_status()
+            print("A microphone-only session after the shared meeting captured, transcribed, and diarized its original audio.", flush=True)
             state = Path(env["XDG_STATE_HOME"]) / "opencode"
             assert "running locally" in await rpc("annotationDestinations", expect_error=True, query="")
             with local_opencode(state) as (registration, requests, posted, outcome):
@@ -1294,6 +1676,7 @@ assert.equal(status.phase, "cancelled")
                     outcome["retired_session"] = True
                     offline_rule = await rpc("annotationDestinations", id=annotation)
                     assert offline_rule["rule"]["id"] == app_rule["id"] and not offline_rule["rule"]["available"]
+                    outcome["retired_session"] = False
                     registration.chmod(0o644)
                     disconnected = await rpc("annotationDestinations", id=annotation)
                     assert disconnected["warning"] and disconnected["service"] is None
@@ -1402,18 +1785,23 @@ assert.equal(status.phase, "cancelled")
                     assert rule["automatic"]
                     await rpc("annotationLease", id=annotation, active=False)
 
-                    async def new_automatic_capture(origin=detail["origin"]):
+                    async def new_capture(origin=detail["origin"], *, automatic=True):
                         capture = str(uuid4())
                         assert (await rpc("annotationLease", id=capture, active=True))["active"]
                         native_folder = root / ("jard-annotation-" + capture)
                         native_folder.mkdir(mode=0o700)
-                        for asset in (movie, manifest_file, sheet):
+                        (native_folder / movie.name).write_bytes(saved_movie)
+                        for asset in (manifest_file, sheet):
                             (native_folder / asset.name).write_bytes(asset.read_bytes())
                         native_manifest = native_folder / manifest_file.name
                         native_manifest.write_text(json.dumps({**json.loads(native_manifest.read_text()), "origin": origin}))
                         staging = await rpc("importAnnotation", id=capture, path=str(native_folder / movie.name), assets=True,
                                             languages=["en"], routeOrigin=origin)
                         assert staging["id"] == capture
+                        if automatic:
+                            assert staging["routing"]["capture"] == capture and staging["routing"]["phase"] == "transcribing"
+                        else:
+                            assert "routing" not in staging
                         await rpc("annotationLease", id=capture, active=False)
                         return capture
 
@@ -1424,41 +1812,80 @@ assert.equal(status.phase, "cancelled")
                         while not any(matches(row) for row in seen):
                             await event()
 
+                    async def route_confirmation(capture):
+                        while True:
+                            for row in seen:
+                                if row.get("event") == "jard-annotation-confirmation" and row["detail"]["capture"] == capture:
+                                    return row["detail"]["nonce"]
+                            await event()
+
                     manual = len(posted)
-                    cancelled = await new_automatic_capture()
+                    cancelled = await new_capture()
                     await route_phase(cancelled, "offer")
                     assert len(posted) == manual
                     await rpc("annotationRoutePanel", capture=cancelled, action="shown", held=True)
                     status = await agent("annotate", "route", cancelled)
                     assert status["phase"] == "held" and len(posted) == manual
-                    assert (await agent("annotate", "route", cancelled, "--cancel"))["phase"] == "cancelled"
+                    assert "automatic delivery is pending" in await rpc("annotationPanelSend", id=cancelled, target="ses_project", service=service, expect_error=True)
+                    assert "Automatic delivery is pending" in await rpc("annotationHandoff", id=cancelled, waitForNarration=True, expect_error=True)
+                    await rpc("annotationRoutePanel", capture=cancelled, action="resume")
+                    nonce = await route_confirmation(cancelled)
+                    assert (await rpc("annotationRouteConfirm", capture=cancelled, nonce=nonce, state="unavailable")) == {"accepted": True}
+                    await route_phase(cancelled, "cancelled")
+                    assert len(posted) == manual
+                    assert (await rpc("annotationRoute", id=cancelled, action="cancel"))["phase"] == "cancelled"
+                    assert "could not be found" in await rpc("annotationRouteUndo", id=cancelled, expect_error=True)
+                    assert "history books" in (await rpc("annotationHandoff", id=cancelled, waitForNarration=True))["markdown"].lower()
 
                     registration.chmod(0o644)
-                    capture = await new_automatic_capture()
+                    capture = await new_capture()
                     await route_phase(capture, "waiting")
                     assert len(posted) == manual
                     assert (await rpc("desktopQuiesce"))["ready"]
                     paused = await agent("annotate", "route", capture)
                     assert paused["phase"] == "waiting"
+                    assert "Automatic delivery is pending" in await rpc("annotationHandoff", id=capture, waitForNarration=True, expect_error=True)
                     registration.chmod(0o600)
                     assert (await rpc("updateAbort"))["ready"]
                     await route_phase(capture, "offer")
                     assert len(posted) == manual
                     await rpc("annotationRoutePanel", capture=capture, action="shown", held=True)
                     await rpc("annotationRoutePanel", capture=capture, action="resume")
+                    nonce = await route_confirmation(capture)
+                    assert (await rpc("annotationRouteConfirm", capture=capture, nonce=str(uuid4()), state="ready")) == {"accepted": False}
+                    assert len(posted) == manual
+                    assert (await rpc("annotationRouteConfirm", capture=capture, nonce=nonce, state="ready")) == {"accepted": True}
                     await route_phase(capture, "sent")
                     assert len(posted) == manual + 1
                     assert capture in posted[-1][1]["text"] and "history books" in posted[-1][1]["text"].lower()
-                    assert (await agent("annotate", "deliveries", capture))["deliveries"][0]["status"] == "queued"
+                    assert "already been attempted" in await rpc("annotationHandoff", id=capture, waitForNarration=True, expect_error=True)
+                    assert (await rpc("annotationReview", id=capture))["imagePath"]
+                    receipt = (await agent("annotate", "deliveries", capture))["deliveries"][0]
+                    assert receipt["status"] == "queued"
+                    route_status = await rpc("annotationRoute", id=capture)
+                    assert route_status["receiptStatus"] == "queued" and route_status["undoUntil"] == receipt["undoUntil"]
+                    assert any(row.get("detail", {}).get("capture") == capture and row["detail"].get("undoUntil") == receipt["undoUntil"]
+                               for row in seen if row.get("event") == "jard-annotation-routing")
+                    messages = list(outcome["inbox"])
+                    before_undo = len(requests)
+                    undone = await rpc("annotationRouteUndo", id=capture)
+                    assert undone["receiptStatus"] == "withdrawn" and "undoUntil" not in undone
+                    assert receipt["message"] in messages
+                    messages.remove(receipt["message"])
+                    assert outcome["inbox"] == messages
+                    assert await rpc("annotationRouteUndo", id=capture) == undone
+                    assert [row for row in requests[before_undo:] if row[0] == "DELETE"] == [
+                        ("DELETE", "/api/session/ses_project/inbox/" + receipt["message"])]
+                    assert (await agent("annotate", "deliveries", capture))["deliveries"][0]["status"] == "withdrawn"
                     assert (await agent("annotate", "forget", annotation, "--rule", rule["id"]))["forgotten"]
                     (await web.delete(f"/api/sessions/{cancelled}")).raise_for_status()
                     (await web.delete(f"/api/sessions/{capture}")).raise_for_status()
-                    print("Pending automatic routing survived an unavailable service and quiescence, waited for a fresh offer, and sent once.", flush=True)
+                    print("Automatic routing sent once after recovery, and panel Undo withdrew only the matching inbox item without reposting.", flush=True)
                     terminal_origin = {"app": "com.mitchellh.ghostty", "name": "Ghostty", "terminal": {
                         "folder": "/fixture/Jard/src", "project": "/fixture/Jard",
                         "title": "Release review", "session": "ses_later",
                     }}
-                    terminal_capture = await new_automatic_capture(terminal_origin)
+                    terminal_capture = await new_capture(terminal_origin, automatic=False)
                     await completed(terminal_capture)
                     terminal_destinations = await agent("annotate", "destinations", "--capture", terminal_capture)
                     assert terminal_destinations["scopes"] == [{"kind": "terminal", "key": "/fixture/Jard", "label": "Jard"}]
@@ -1471,8 +1898,44 @@ assert.equal(status.phase, "cancelled")
                     assert (await agent("annotate", "forget", terminal_capture, "--rule", terminal_rule["id"]))["forgotten"]
                     assert (await agent("annotate", "route", terminal_capture))["phase"] == "idle"
                     assert len(posted) == manual + 1
+
+                    listed = await rpc("annotationDestinations", id=terminal_capture, query="Release")
+                    assert listed["service"] == service and [row["id"] for row in listed["sessions"]] == ["ses_project"]
+                    prior = await agent("annotate", "remember", terminal_capture, "--scope", "terminal", "--to", "ses_later", "--service", service)
+                    assert prior["target"] == "ses_later" and not prior["automatic"]
+                    assert "Refresh" in await rpc("annotationPanelSend", id=terminal_capture, target="ses_project", expect_error=True)
+                    assert "does not have that captured" in await rpc("annotationPanelSend", id=terminal_capture,
+                        target="ses_project", service=service, rememberScope="app", expect_error=True)
+                    result = await rpc("annotationPanelSend", id=terminal_capture, target="ses_project", service=listed["service"], rememberScope="terminal")
+                    assert result["phase"] == "sent" and result["receiptStatus"] == "queued" and result["undoUntil"] > time.time() * 1000
+                    assert result["rememberedRule"] == {"status": "saved", "label": "Jard"}
+                    installed_rule = (await rpc("annotationDestinations", id=terminal_capture))["rule"]
+                    assert installed_rule["target"] == "ses_project" and installed_rule["automatic"]
+                    assert terminal_capture in posted[-1][1]["text"] and len(posted) == manual + 2
+                    next_capture = await new_capture(terminal_origin)
+                    await route_phase(next_capture, "offer")
+                    assert (await rpc("annotationRoute", id=next_capture, action="cancel"))["phase"] == "cancelled"
+                    assert len(posted) == manual + 2
+                    (await web.delete(f"/api/sessions/{next_capture}")).raise_for_status()
+                    assert "already attempted" in await rpc("annotationPanelSend", id=terminal_capture, target="ses_project", service=service, expect_error=True)
+                    assert "does not belong" in await rpc("annotationPanelUndo", id=cancelled, deliveryId=result["deliveryId"], expect_error=True)
+                    back = await rpc("annotationPanelUndo", id=terminal_capture, deliveryId=result["deliveryId"])
+                    assert back["receiptStatus"] == "withdrawn" and "undoUntil" not in back
+                    assert back["rememberedRule"]["status"] == "restored"
+                    restored_rule = (await rpc("annotationDestinations", id=terminal_capture))["rule"]
+                    assert restored_rule["target"] == prior["target"] and restored_rule["automatic"] == prior["automatic"]
+                    assert restored_rule["id"] != prior["id"]
+                    assert any(row.get("event") == "jard-annotation-delivery-changed" and row["detail"]["capture"] == terminal_capture for row in seen)
+                    outcome["status"] = 503
+                    uncertain = await rpc("annotationPanelSend", id=terminal_capture, target="ses_project", service=service, rememberScope="terminal")
+                    assert uncertain["phase"] == "unconfirmed" and len(posted) == manual + 3
+                    assert (await rpc("annotationDestinations", id=terminal_capture))["rule"]["id"] == restored_rule["id"]
+                    assert "already attempted" in await rpc("annotationPanelSend", id=terminal_capture, target="ses_later", service=service, expect_error=True)
+                    assert len(posted) == manual + 3
+                    outcome["status"] = 200
                     (await web.delete(f"/api/sessions/{terminal_capture}")).raise_for_status()
                     print("Terminal provenance resolved the visible OpenCode conversation and scoped rules to its project.", flush=True)
+                    print("The preview sent and remembered the exact OpenCode destination, restored the prior rule on Undo, and kept it after an uncertain send.", flush=True)
             print("OpenCode search, receipts, exact-item withdrawal, targeted corrections, races, and unknown outcomes passed through the workspace and CLI.", flush=True)
             (await web.delete(f"/api/sessions/{picked['id']}")).raise_for_status()
             assert (await web.get(assets["manifestUrl"])).status_code == (await web.get(assets["contactSheetUrl"])).status_code == 404

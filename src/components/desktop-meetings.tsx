@@ -2,40 +2,15 @@ import { useInterfaceLanguage } from "@/interface-language"
 import { useEffect, useState } from "react"
 import { AudioLines, Bell, BookOpen, CalendarDays, Clock, FileText, Folder, HardDrive, History, Monitor, Pencil, Phone, SlidersHorizontal, Sparkles, Square, Video } from "lucide-react"
 import { AlertDialog } from "radix-ui"
-import type { DesktopBridge, DesktopMeeting, DesktopMeetingAction, DesktopMeetingCalendar, MeetingIndicatorCorner, MeetingRecordingPolicy } from "@/desktop"
+import { meetingAudioWarning, meetingTimeFormat, useDesktopMeeting } from "@/desktop-meeting"
+import type { DesktopBridge, DesktopMeetingAction, DesktopMeetingCalendar, MeetingIndicatorCorner, MeetingRecordingPolicy } from "@/desktop"
 import { MeetingAudioAccess } from "./meeting-audio-access"
 import { SettingDisclosure, SettingGroup, SettingRow } from "./settings-rows"
 import { Button } from "./ui/button"
 
 export function DesktopMeetingControls({ native, busy, languages }: { native: DesktopBridge; busy: boolean; languages: string[] }) {
   const { t } = useInterfaceLanguage()
-  const [meeting, setMeeting] = useState<DesktopMeeting>()
-  const [pending, setPending] = useState(false)
-  const [feedback, setFeedback] = useState("")
-
-  useEffect(() => {
-    let active = true
-    const receive = (event: WindowEventMap["native-sdk:jard-meetings"]) => setMeeting(event.detail)
-    window.addEventListener("native-sdk:jard-meetings", receive)
-    void native.request("meetings", { action: "status" }).then(result => { if (active) setMeeting(result) }).catch(() => {})
-    return () => { active = false; window.removeEventListener("native-sdk:jard-meetings", receive) }
-  }, [native])
-
-  async function act(request: DesktopMeetingAction) {
-    setFeedback("")
-    setPending(true)
-    try {
-      const updated = await native.request("meetings", request)
-      setMeeting(updated)
-      if (request.action === "copyAll" || request.action === "copyNew") {
-        setFeedback(updated.copyPartial ? "Copied the transcript available so far." : "Copied meeting transcript.")
-      }
-    } catch (error) {
-      setFeedback(error instanceof Error ? error.message : "Could not update the meeting.")
-    } finally {
-      setPending(false)
-    }
-  }
+  const { meeting, pending, feedback, act } = useDesktopMeeting(native)
 
   if (!meeting?.phase) return null
   if (meeting.managed) return <section className="dictation-settings dictation-preferences meetings-settings" data-setting-group="Meetings">
@@ -44,6 +19,7 @@ export function DesktopMeetingControls({ native, busy, languages }: { native: De
     </SettingGroup>
   </section>
   const recording = meeting.phase === "recording" || meeting.phase === "callEnded"
+  const audioWarning = meetingAudioWarning(meeting)
   return <section className="dictation-settings dictation-preferences meetings-settings" aria-labelledby="meetings-title" data-setting-group="Meetings">
     <h2 id="meetings-title" className="sr-only">{t("Meetings")}</h2>
     <SettingGroup id="meeting-recording-title" title={t("Recording")}>
@@ -57,16 +33,11 @@ export function DesktopMeetingControls({ native, busy, languages }: { native: De
         </Button>
       </SettingRow>
       <MeetingAudioAccess native={native} busy={pending || busy || meeting.busy} />
-      {recording && meeting.microphone && <p className="meeting-status">
+      {recording && !meeting.microphoneUnavailable && meeting.microphone && <p className="meeting-status">
         {t("Microphone")} · <bdi>{meeting.microphone}</bdi>
       </p>}
       {(feedback || meeting.message) && <p className="meeting-status" role="status">{feedback || meeting.message}</p>}
-      {recording && meeting.microphoneSilent && <p className="meeting-status" role="alert">
-        {t(meeting.systemAudioUnavailable ? "Microphone silent." : "Microphone silent. Mac audio is still recording.")}
-      </p>}
-      {recording && meeting.systemAudioUnavailable && <p className="meeting-status" role="alert">
-        {t("Mac audio is reconnecting.")}
-      </p>}
+      {audioWarning && <p className="meeting-status" role="alert">{t(audioWarning)}</p>}
       {meeting.permission && <SettingRow icon={Monitor} title={t("Recording permission")} label={false}>
         <div className="dictation-row-actions">
           <Button size="sm" variant="outline" disabled={pending} onClick={() => void act({ action: "recordingPrivacy" })}>
@@ -76,13 +47,13 @@ export function DesktopMeetingControls({ native, busy, languages }: { native: De
           <Button size="sm" variant="ghost" disabled={pending} onClick={() => void act({ action: "dismissPermission" })}>{t("Not Now")}</Button>
         </div>
       </SettingRow>}
-      {meeting.recoveryAvailable && !meeting.busy && <SettingRow icon={History} title={t("Interrupted meeting")} label={false}>
+      {!!meeting.recoveryAvailable && !meeting.busy && <SettingRow icon={History} title={t("Interrupted meeting")} label={false}>
         <div className="dictation-row-actions">
           <Button size="sm" variant="outline" disabled={pending || busy} onClick={() => void act({ action: "recoverMeeting" })}>{t("Recover Meeting")}</Button>
           <Button size="sm" variant="ghost" disabled={pending} onClick={() => void act({ action: "dismissRecovery" })}>{t("Not Now")}</Button>
         </div>
       </SettingRow>}
-      {(recording || meeting.hasText) && <SettingRow icon={FileText} title={t("Meeting transcript")} label={false}
+      {(recording || !!meeting.hasText) && <SettingRow icon={FileText} title={t("Meeting transcript")} label={false}
         detail={recording ? t("Paste new text with {shortcut}", { shortcut: "⌥⌃V" }) : undefined}>
         <div className="dictation-row-actions dictation-media-actions">
           {recording && <Button size="sm" variant="outline" disabled={pending}
@@ -105,36 +76,46 @@ export function DesktopMeetingControls({ native, busy, languages }: { native: De
     {meeting.calendar && <MeetingCalendar calendar={meeting.calendar} act={act} pending={pending} busy={busy || meeting.busy} />}
     <SettingGroup id="meeting-detection-title" title={t("Detected calls")}>
       <SettingRow icon={Phone} title="Offer to record detected calls" find="Automatically detect meetings">
-        <input type="checkbox" role="switch" checked={meeting.detection} disabled={pending}
-          onChange={event => void act({ action: "detection", enabled: event.target.checked })} />
+        {labels => (
+          <input {...labels} type="checkbox" role="switch" checked={meeting.detection} disabled={pending}
+            onChange={event => void act({ action: "detection", enabled: event.target.checked })} />
+        )}
       </SettingRow>
       <SettingRow icon={Clock} title="Stop automatically when a call ends" detail="Automatically started recordings keep going for 30 seconds after a call ends.">
-        <input type="checkbox" role="switch" checked={meeting.autoStop ?? false} disabled={pending}
-          onChange={event => void act({ action: "autoStop", enabled: event.target.checked })} />
+        {labels => (
+          <input {...labels} type="checkbox" role="switch" checked={meeting.autoStop ?? false} disabled={pending}
+            onChange={event => void act({ action: "autoStop", enabled: event.target.checked })} />
+        )}
       </SettingRow>
       {meeting.providerPolicies.map(({ provider, label, scope, policy, canAlwaysRecord }) => <SettingRow key={provider}
-        icon={Phone} title={t(label)} detail={scope} find={scope}>
-        <select value={policy} disabled={pending}
-          onChange={event => void act({ action: "setPolicy", provider, policy: event.target.value as MeetingRecordingPolicy })}>
-          <option value="ask">{t("Ask")}</option>
-          {canAlwaysRecord && <option value="auto">{t("Always record")}</option>}
-          <option value="never">{t("Never offer")}</option>
-        </select>
+        icon={Phone} title={t(label)} context={scope} find={scope}>
+        {labels => (
+          <select {...labels} value={policy} disabled={pending}
+            onChange={event => void act({ action: "setPolicy", provider, policy: event.target.value as MeetingRecordingPolicy })}>
+            <option value="ask">{t("Ask")}</option>
+            {!!canAlwaysRecord && <option value="auto">{t("Always record")}</option>}
+            <option value="never">{t("Never offer")}</option>
+          </select>
+        )}
       </SettingRow>)}
     </SettingGroup>
     <section className="dictation-preference-section dictation-advanced" aria-labelledby="meeting-advanced-title" data-setting-group={t("Advanced")}>
       <h3 id="meeting-advanced-title">{t("Advanced")}</h3>
       <SettingDisclosure icon={SlidersHorizontal} title={t("Indicator and recovery")}>
         <SettingRow icon={Monitor} title={t("Show recording indicator")} detail="Use the floating controls to copy transcript text or stop recording.">
-          <input type="checkbox" role="switch" checked={meeting.showIndicator ?? true} disabled={pending}
-            onChange={event => void act({ action: "indicator", enabled: event.target.checked })} />
+          {labels => (
+            <input {...labels} type="checkbox" role="switch" checked={meeting.showIndicator ?? true} disabled={pending}
+              onChange={event => void act({ action: "indicator", enabled: event.target.checked })} />
+          )}
         </SettingRow>
         <SettingRow icon={Monitor} title="Indicator corner">
-          <select value={meeting.indicatorCorner ?? "topRight"} disabled={pending}
-            onChange={event => void act({ action: "indicatorCorner", corner: event.target.value as MeetingIndicatorCorner })}>
-            <option value="topLeft">Top left</option><option value="topRight">Top right</option>
-            <option value="bottomLeft">Bottom left</option><option value="bottomRight">Bottom right</option>
-          </select>
+          {labels => (
+            <select {...labels} value={meeting.indicatorCorner ?? "topRight"} disabled={pending}
+              onChange={event => void act({ action: "indicatorCorner", corner: event.target.value as MeetingIndicatorCorner })}>
+              <option value="topLeft">Top left</option><option value="topRight">Top right</option>
+              <option value="bottomLeft">Bottom left</option><option value="bottomRight">Bottom right</option>
+            </select>
+          )}
         </SettingRow>
         {!meeting.recoveryAvailable && <SettingRow icon={History} title="Interrupted meetings" label={false} find="Check for interrupted meetings">
           <Button size="sm" variant="outline" disabled={pending || busy || meeting.busy}
@@ -145,12 +126,11 @@ export function DesktopMeetingControls({ native, busy, languages }: { native: De
   </section>
 }
 
-const eventTime = new Intl.DateTimeFormat(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" })
-
 function MeetingCalendar({ calendar, act, pending, busy }: {
   calendar: DesktopMeetingCalendar; act: (action: DesktopMeetingAction) => Promise<void>; pending: boolean; busy: boolean
 }) {
-  const { t } = useInterfaceLanguage()
+  const { t, locale } = useInterfaceLanguage()
+  const eventTime = meetingTimeFormat(locale, "short")
   return <SettingGroup id="meeting-calendar-title" title={t("Calendar")}>
     <SettingRow icon={CalendarDays} title="Mac calendar" label={false} detail={calendar.connected ? "Connected" :
       calendar.access === "denied" ? "Allow full calendar access in System Settings." : "Connect your calendar for upcoming meetings and reminders."}>
@@ -159,20 +139,26 @@ function MeetingCalendar({ calendar, act, pending, busy }: {
         {calendar.connected ? "Disconnect" : calendar.access === "denied" ? "Open Calendar Settings" : t("Connect Calendar")}
       </Button>
     </SettingRow>
-    {calendar.connected && <>
+    {!!calendar.connected && <>
       <SettingRow icon={Bell} title={t("Remind me before meetings")}>
-        <input type="checkbox" role="switch" checked={calendar.reminders} disabled={pending}
-          onChange={event => void act({ action: "calendarReminders", enabled: event.target.checked })} />
+        {labels => (
+          <input {...labels} type="checkbox" role="switch" checked={calendar.reminders} disabled={pending}
+            onChange={event => void act({ action: "calendarReminders", enabled: event.target.checked })} />
+        )}
       </SettingRow>
-      {calendar.reminders && <SettingRow icon={Clock} title="Reminder time">
-        <select value={calendar.lead} disabled={pending} onChange={event => void act({ action: "calendarLead", minutes: Number(event.target.value) })}>
-          <option value={0}>{t("At start")}</option><option value={1}>1 minute before</option><option value={2}>2 minutes before</option><option value={5}>5 minutes before</option>
-        </select>
+      {!!calendar.reminders && <SettingRow icon={Clock} title="Reminder time">
+        {labels => (
+          <select {...labels} value={calendar.lead} disabled={pending} onChange={event => void act({ action: "calendarLead", minutes: Number(event.target.value) })}>
+            <option value={0}>{t("At start")}</option><option value={1}>1 minute before</option><option value={2}>2 minutes before</option><option value={5}>5 minutes before</option>
+          </select>
+        )}
       </SettingRow>}
       {calendar.calendars.length > 0 && <SettingDisclosure icon={CalendarDays} title={`Calendars (${calendar.calendars.filter(item => item.included).length} of ${calendar.calendars.length})`}>
-        {calendar.calendars.map(item => <SettingRow icon={CalendarDays} title={item.title} detail={item.source} key={item.id} find={false}>
-          <input type="checkbox" role="switch" checked={item.included} disabled={pending}
-            onChange={event => void act({ action: "calendarInclude", id: item.id, enabled: event.target.checked })} />
+        {calendar.calendars.map(item => <SettingRow icon={CalendarDays} title={item.title} context={item.source} key={item.id} find={false}>
+          {labels => (
+            <input {...labels} type="checkbox" role="switch" checked={item.included} disabled={pending}
+              onChange={event => void act({ action: "calendarInclude", id: item.id, enabled: event.target.checked })} />
+          )}
         </SettingRow>)}
       </SettingDisclosure>}
       <section className="meeting-upcoming" aria-labelledby="meeting-upcoming-title">
@@ -181,7 +167,7 @@ function MeetingCalendar({ calendar, act, pending, busy }: {
           <div><strong dir="auto">{event.title}</strong>
             <small>{eventTime.format(event.start * 1000)}{event.provider && ` · ${event.provider}`}</small></div>
           <div className="dictation-row-actions">
-            {event.canJoin && <Button size="sm" variant="outline" disabled={pending}
+            {!!event.canJoin && <Button size="sm" variant="outline" disabled={pending}
               onClick={() => void act({ action: "calendarEvent", id: event.id, choice: "join" })}>{t("Join")}</Button>}
             <Button size="sm" variant="ghost" disabled={pending || busy}
               onClick={() => void act({ action: "calendarEvent", id: event.id, choice: event.canJoin ? "joinRecord" : "record" })}>
@@ -245,12 +231,16 @@ function MeetingExportPreference({ native }: { native: DesktopBridge }) {
       </div>
     </SettingRow>
     <SettingRow icon={Pencil} title={t("Descriptive meeting filenames")} detail="Update exported filenames when a meeting’s title changes. Keep the date and time.">
-      <input type="checkbox" role="switch" checked={descriptiveNames} disabled={folder === undefined || pending}
-        onChange={event => void change({ action: "descriptiveNames", enabled: event.target.checked })} />
+      {labels => (
+        <input {...labels} type="checkbox" role="switch" checked={descriptiveNames} disabled={folder === undefined || pending}
+          onChange={event => void change({ action: "descriptiveNames", enabled: event.target.checked })} />
+      )}
     </SettingRow>
     <SettingRow icon={BookOpen} title={t("Separate notes file")} detail="Save a separate Markdown notes file with a link to the transcript when a summary is ready.">
-      <input type="checkbox" role="switch" checked={separateNotes} disabled={folder === undefined || pending}
-        onChange={event => void change({ action: "separateNotes", enabled: event.target.checked })} />
+      {labels => (
+        <input {...labels} type="checkbox" role="switch" checked={separateNotes} disabled={folder === undefined || pending}
+          onChange={event => void change({ action: "separateNotes", enabled: event.target.checked })} />
+      )}
     </SettingRow>
     {error && <p className="dictation-error meeting-status" role="alert">{error}</p>}
   </>
@@ -292,8 +282,10 @@ function MeetingWritingPreference() {
 
   return <>
     <SettingRow icon={Sparkles} title="Automatic titles and summaries" detail="Write a live title and short meeting summary with local Qwen.">
-      <input type="checkbox" role="switch" checked={enabled ?? false} disabled={enabled === undefined || pending}
-        onChange={event => void change(event.target.checked)} />
+      {labels => (
+        <input {...labels} type="checkbox" role="switch" checked={enabled ?? false} disabled={enabled === undefined || pending}
+          onChange={event => void change(event.target.checked)} />
+      )}
     </SettingRow>
     {error && <p className="dictation-error meeting-status" role="alert">{error}</p>}
   </>
@@ -341,16 +333,18 @@ function RetentionPreference({ kind }: { kind: "meeting" | "audio" }) {
     <SettingRow icon={audio ? HardDrive : FileText} title={audio ? "Keep meeting audio" : t("Keep meetings")} find="Meeting retention and expiry"
       detail={audio ? "Move expired audio to Trash. Transcripts and notes remain until the meeting expires."
         : "Expired meetings move to the macOS Trash with their audio, transcripts, and notes."}>
-      <select value={days ?? (audio ? 0 : "default")} disabled={pending} onChange={event => {
-        const next = Number(event.target.value)
-        if (next <= 0 || (days != null && days > 0 && next > days)) void change(next)
-        else setChoice(next)
-      }}>
-        {!audio && days === null && <option value="default" disabled>24 hours for new meetings</option>}
-        <option value={0}>{audio ? t("Same as meetings") : t("Forever")}</option>
-        <option value={1}>{t("24 hours")}</option><option value={7}>{t("7 days")}</option><option value={30}>{t("30 days")}</option>
-        {audio && <option value={-1}>{t("Forever")}</option>}
-      </select>
+      {labels => (
+        <select {...labels} value={days ?? (audio ? 0 : "default")} disabled={pending} onChange={event => {
+          const next = Number(event.target.value)
+          if (next <= 0 || (days != null && days > 0 && next > days)) void change(next)
+          else setChoice(next)
+        }}>
+          {!audio && days === null && <option value="default" disabled>24 hours for new meetings</option>}
+          <option value={0}>{audio ? t("Same as meetings") : t("Forever")}</option>
+          <option value={1}>{t("24 hours")}</option><option value={7}>{t("7 days")}</option><option value={30}>{t("30 days")}</option>
+          {audio && <option value={-1}>{t("Forever")}</option>}
+        </select>
+      )}
     </SettingRow>
     {error && <p className="dictation-error meeting-status" role="alert">{error}</p>}
     <AlertDialog.Root open={choice !== undefined} onOpenChange={open => { if (!open && !pending) setChoice(undefined) }}>

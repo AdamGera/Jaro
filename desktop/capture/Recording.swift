@@ -2,6 +2,23 @@ import Foundation
 import Darwin
 
 enum Source: String { case mic, system }
+
+struct MeetingAudioLevel {
+    private var latest = [Source: (end: Double, rms: Double)]()
+
+    mutating func observe(_ samples: [Float], from source: Source, endingAt end: Double) {
+        guard !samples.isEmpty, end >= (latest[source]?.end ?? -.infinity) else { return }
+        let energy = samples.reduce(0.0) { $0 + Double($1) * Double($1) }
+        let rms = sqrt(energy / Double(samples.count))
+        latest[source] = (end, rms.isFinite ? min(1, rms) : 0)
+    }
+
+    func rms(at now: Double) -> Double {
+        latest.values.reduce(0) { level, sample in
+            now - sample.end <= 0.30 ? max(level, sample.rms) : level
+        }
+    }
+}
 enum CaptureMode: String { case mic, system, both }
 typealias MicrophonePacket = (samples: [Float], time: Double)
 
@@ -245,5 +262,61 @@ final class WaveSink {
         try checkpoint()
         try file.synchronize()
         try file.close()
+    }
+}
+
+/// Writes a second view of the microphone timeline without making the audio tap
+/// wait for disk. Discarded packets leave silence at the corresponding times.
+final class AnnotationNarration: @unchecked Sendable {
+    private let start: Double
+    private let writer = DispatchQueue(label: "jaro.annotation.narration", qos: .utility)
+    private let slots = DispatchSemaphore(value: 24)
+    private let sink: WaveSink
+    private var timeline = Timeline(mode: .mic)
+    private var failure: Error?
+
+    init(path: String, start: Double) throws {
+        self.start = start
+        self.sink = try WaveSink(path: path)
+    }
+
+    func enqueue(_ samples: [Float], at time: Double) {
+        guard time.isFinite, slots.wait(timeout: .now()) == .success else { return }
+        writer.async { [self] in
+            defer { slots.signal() }
+            guard failure == nil else { return }
+            let frame = frames(at: time)
+            guard frame < Timeline.limit else { return }
+            timeline.add(samples, at: frame, from: .mic)
+            // Leave room to align adjacent packets and trim the display's tail.
+            do { try flush(through: frame - Timeline.rate / 4) }
+            catch { failure = error }
+        }
+    }
+
+    private func frames(at time: Double) -> Int {
+        Int(max(-Double(Timeline.limit), min(Double(Timeline.limit), (time - start) * Double(Timeline.rate))).rounded())
+    }
+
+    private func flush(through frame: Int) throws {
+        while timeline.cursor < frame {
+            let next = min(frame, timeline.cursor + Timeline.rate)
+            try sink.append(timeline.render(through: next))
+        }
+    }
+
+    func finish(at end: Double?) async throws {
+        try await withCheckedThrowingContinuation { (done: CheckedContinuation<Void, Error>) in
+            writer.async { [self] in
+                do {
+                    if let failure { throw failure }
+                    if let end { try flush(through: max(1, frames(at: end))) }
+                    try sink.finish()
+                    done.resume()
+                } catch {
+                    done.resume(throwing: error)
+                }
+            }
+        }
     }
 }

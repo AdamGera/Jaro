@@ -1,0 +1,16 @@
+{
+  "id": "local.jardaudio.desktop",
+  "name": "jaro",
+  "display_name": "Jaro",
+  "description": "Local recordings and transcripts.",
+  "version": "0.0.8",
+  "platforms": ["windows", "linux"],
+  "icons": ["assets/icon.png"],
+  "web_engine": "system",
+  "capabilities": ["webview"],
+  "permissions": ["view"],
+  "security": { "navigation": { "external_links": { "action": "deny" } } },
+  "windows": [
+    { "label": "main", "title": "Jaro", "width": 1050, "height": 760, "restore_state": true }
+  ]
+}

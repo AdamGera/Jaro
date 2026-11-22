@@ -30,30 +30,53 @@ static WKWebView *fixtureWebView(NSView *view, NSNumber *port) {
         NSTimer *poll = [NSTimer timerWithTimeInterval:.05 repeats:YES block:^(NSTimer *timer) {
             NSString *operation = [NSString stringWithContentsOfURL:request encoding:NSUTF8StringEncoding error:nil];
             BOOL reopenSetup = [operation isEqual:@"setup-reopen"];
-            BOOL checkRestartGuard = [operation isEqual:@"restart-guard"];
-            if (reopenSetup || checkRestartGuard || [operation isEqual:@"setup-status"]) {
+            BOOL dismissSetup = [operation isEqual:@"setup-dismiss"];
+            BOOL sidebarRestart = [operation isEqual:@"sidebar-restart"];
+            BOOL settingsRestart = [operation isEqual:@"settings-restart"];
+            BOOL guard = [operation isEqual:@"restart-guard"];
+            if (reopenSetup || dismissSetup || sidebarRestart || settingsRestart || guard || [operation isEqual:@"setup-status"]) {
                 if (evaluating) return;
                 for (NSWindow *window in NSApp.windows) {
                     WKWebView *web = fixtureWebView(window.contentView, port);
                     if (!web) continue;
                     evaluating = YES;
                     NSString *script;
+                    NSDictionary *arguments = nil;
                     if (reopenSetup) {
                         script = @"const desktop = window.jardDesktop; if (!desktop) return null;\n"
                                   "desktop.request('systemDictation', {action:'set', key:'onboarding', value:'access'})\n"
                                   "  .then(() => desktop.request('systemDictation', {action:'reopen'}));\n"
                                   "return 'Reopen Jard';";
-                    } else if (checkRestartGuard) {
-                        script = @"const desktop = window.jardDesktop; if (!desktop) return null;\n"
-                                  "try { await desktop.request('update', {action:'restart'}); }\n"
-                                  "catch (error) { return error.message; }\n"
-                                  "return 'Restart was unexpectedly accepted.';";
+                    } else if (dismissSetup) {
+                        script = @"if (!window.jardDesktop) return null;\n"
+                                  "const status = await jardDesktop.request('systemDictation', {action:'set', key:'onboarding', value:'later'});\n"
+                                  "return status.onboarding;";
+                    } else if (sidebarRestart || settingsRestart || guard) {
+                        arguments = @{@"selector": settingsRestart ? @"#desktop-app-updates button" : @".sidebar-update button.update-ready",
+                                      @"guard": @(guard), @"settings": @(settingsRestart)};
+                        script = @"if (document.querySelector('[aria-modal=true]')) return null;\n"
+                                  "if (settings && !document.querySelector('.workspace-settings[data-pane=settings]')) {\n"
+                                  "  document.querySelector('.sidebar-settings')?.click(); return null;\n"
+                                  "}\n"
+                                  "const button = document.querySelector(selector);\n"
+                                  "if (!button || button.disabled || !button.getClientRects().length) return null;\n"
+                                  "const label = button.textContent.trim();\n"
+                                  "if (label !== 'Restart to Update') return null;\n"
+                                  "button.click();\n"
+                                  "if (!guard) return label;\n"
+                                  "const expected = 'Close other Jard windows or browser tabs before restarting.';\n"
+                                  "for (let attempt = 0; attempt < 200; attempt++) {\n"
+                                  "  const feedback = document.querySelector('.sidebar-update small')?.textContent.trim();\n"
+                                  "  if (feedback === expected) return feedback;\n"
+                                  "  await new Promise(resolve => setTimeout(resolve, 50));\n"
+                                  "}\n"
+                                  "return 'The sidebar did not display the connected-browser guard.';";
                     } else {
                         script = @"const desktop = window.jardDesktop; if (!desktop) return null;\n"
                                   "const status = await desktop.request('systemDictation', {action:'status'});\n"
                                   "return status.onboarding;";
                     }
-                    [web callAsyncJavaScript:script arguments:nil inFrame:nil inContentWorld:WKContentWorld.pageWorld
+                    [web callAsyncJavaScript:script arguments:arguments inFrame:nil inContentWorld:WKContentWorld.pageWorld
                             completionHandler:^(id value, NSError *error) {
                         evaluating = NO;
                         if (![value isKindOfClass:NSString.class]) return;

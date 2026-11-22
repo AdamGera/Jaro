@@ -22,7 +22,36 @@ private func checkMix() throws {
     }
 }
 
+private func checkMeetingAudioLevel() throws {
+    var level = MeetingAudioLevel()
+    try check(level.rms(at: 1) == 0, "the meeting starts without an audio level")
+    level.observe([1, 0, 0, 0], from: .system, endingAt: 1)
+    level.observe([0.25, -0.25], from: .mic, endingAt: 1.2)
+    try check(level.rms(at: 1.25) == 0.5, "use the louder RMS rather than the peak or combined signal")
+    try check(level.rms(at: 1.31) == 0.25, "the fresh microphone remains when Mac audio goes stale")
+    level.observe([1], from: .system, endingAt: 0.95)
+    try check(level.rms(at: 1.31) == 0.25, "a late buffer never replaces a newer level")
+    try check(level.rms(at: 1.51) == 0, "the meter goes quiet when both sources have stopped")
+    level.observe([0.75], from: .system, endingAt: 2)
+    try check(level.rms(at: 2) == 0.75, "Mac audio alone restarts the level")
+}
+
 private func checkMeetingInputRoute() throws {
+    try check(meetingInputMatches("com.google.chrome.canary", bundle: "com.google.Chrome.Canary.helper", processName: nil),
+              "the browser helper belongs to its actual browser variant")
+    try check(!meetingInputMatches("com.google.chrome.canary", bundle: "com.google.Chrome.helper", processName: nil),
+              "a Chromium variant does not adopt another browser's microphone")
+    try check(!meetingInputMatches("com.google.chrome", bundle: "com.google.Chrome.Canary.helper", processName: nil),
+              "the stable browser does not adopt a variant's microphone")
+    try check(meetingInputMatches("com.apple.safari", bundle: "com.apple.WebKit.GPU", processName: "Safari Graphics and Media"),
+              "Safari can follow its named WebKit input")
+    try check(!meetingInputMatches("com.apple.safari", bundle: "com.apple.WebKit.GPU", processName: "Mail Graphics and Media"),
+              "a different WebKit client is not Safari")
+    try check(meetingInputMatches("us.zoom.xos", bundle: "us.zoom.CptHost", processName: nil) &&
+              meetingInputMatches("us.zoom.caphost", bundle: "us.zoom.ZoomCefHelper", processName: nil),
+              "the Zoom input follows its call helpers")
+    try check(meetingInputMatches("com.apple.facetime", bundle: "com.apple.avconferenced", processName: nil),
+              "an established FaceTime recording can follow its audio service")
     let builtIn = InputDevice(id: 1, name: "Built-in", uid: "internal", transport: 0)
     let saved = InputDevice(id: 2, name: "Saved", uid: "saved", transport: 0)
     let headset = InputDevice(id: 3, name: "Headset", uid: "headset", transport: 0)
@@ -54,9 +83,29 @@ private func checkMeetingInputRoute() throws {
 }
 
 private struct FixtureSystemAudio: MeetingSystemAudioConnection {
-    var usable: Bool
-    let closed: () -> Void
-    func stop() async { closed() }
+    let read: () -> MeetingSystemAudioReadiness
+    var readiness: MeetingSystemAudioReadiness { read() }
+    let closed: () async -> Void
+    func stop() async { await closed() }
+}
+
+private func checkMeetingSystemAudioReadiness() throws {
+    var tap = MeetingSystemAudioHealth(openedAt: 100)
+    try check(tap.readiness(for: .tap, at: 102) == .waiting, "opening a tap does not establish audio delivery")
+    try check(!tap.receive(frames: 0, timestamp: 102, at: 102), "an empty buffer does not establish contact")
+    try check(tap.readiness(for: .tap, at: 103) == .failed, "empty callbacks do not extend the startup deadline")
+
+    tap = MeetingSystemAudioHealth(openedAt: 100)
+    let silence = [Float](repeating: 0, count: 512)
+    try check(tap.receive(frames: silence.count, timestamp: 102, at: 102), "silent PCM is valid")
+    try check(tap.readiness(for: .tap, at: 104) == .ready, "a real buffer brings the tap online")
+    try check(!tap.receive(frames: 0, timestamp: 104, at: 104), "empty buffers do not confirm ongoing delivery")
+    try check(tap.readiness(for: .tap, at: 105) == .failed, "the running tap detects stalled audio")
+
+    var screen = MeetingSystemAudioHealth(openedAt: 100)
+    try check(screen.readiness(for: .screen, at: 150) == .ready, "ScreenCaptureKit is allowed to remain quiet")
+    try check(!screen.receive(frames: 128, timestamp: .nan, at: 150), "invalid timing rejects the audio")
+    try check(screen.readiness(for: .screen, at: 150) == .failed, "invalid timing needs recovery on ScreenCaptureKit too")
 }
 
 private func checkMeetingSystemAudioSupervisor() async throws {
@@ -64,28 +113,179 @@ private func checkMeetingSystemAudioSupervisor() async throws {
     var availability = [Bool]()
     var delays = [Duration]()
     var closed = 0
+    var firstScreenPoll = true
+    let closeLock = NSLock()
+    let (retirement, didRetire) = AsyncStream<Void>.makeStream()
+    var retirements = retirement.makeAsyncIterator()
     await superviseMeetingSystemAudio(mode: .tapAndScreen, hostPID: nil, receive: { _, _, _ in },
                                     change: { available, _ in availability.append(available) },
                                     open: { backend, _, _ in
         attempts.append(backend)
-        if backend == .tap || attempts.count > 2 { throw CaptureError("The fixture backend could not open.") }
-        return FixtureSystemAudio(usable: false) { closed += 1 }
+        if backend == .tap { throw CaptureError("The fixture backend could not open.") }
+        return FixtureSystemAudio(read: {
+            defer { firstScreenPoll = false }
+            return firstScreenPoll ? .ready : .failed
+        }) { didRetire.yield(()) }
     }, pause: { duration in
         delays.append(duration)
-        return delays.count < 2
+        return true
+    }, waitForRetry: { duration, _ in
+        delays.append(duration)
+        try? await Task.sleep(for: .milliseconds(25))
+        return .cancelled
     })
-    try check(attempts == [.tap, .screen, .tap, .screen], "prefer a tap and fall back only when authorized")
-    try check(availability == [true, false] && closed == 1, "close the failed source and report a single outage")
-    try check(delays == [.seconds(1), .seconds(2)], "failed system audio restarts back off")
+    _ = await retirements.next()
+    try check(attempts == [.tap, .screen], "prefer a tap and fall back only when authorized")
+    try check(availability == [false, true, false], "publish outages and a confirmed fallback in order")
+    try check(delays == [.milliseconds(250), .seconds(1)], "close the failed source and back off")
 
     attempts.removeAll()
     closed = 0
-    await superviseMeetingSystemAudio(mode: .tap, hostPID: nil, receive: { _, _, _ in }, change: { _, _ in },
+    var status = [String]()
+    var poll = 0
+    let (tapMayClose, closeTap) = AsyncStream<Void>.makeStream()
+    await superviseMeetingSystemAudio(mode: .tapAndScreen, hostPID: nil, receive: { _, _, _ in },
+                                    change: { available, backend in status.append(available ? backend?.rawValue ?? "" : "unavailable") },
                                     open: { backend, _, _ in
         attempts.append(backend)
-        return FixtureSystemAudio(usable: true) { closed += 1 }
+        return FixtureSystemAudio(read: {
+            if backend == .screen { return .ready }
+            poll += 1
+            return poll < 3 ? .waiting : .failed
+        }) {
+            if backend == .tap {
+                var gate = tapMayClose.makeAsyncIterator()
+                _ = await gate.next()
+            }
+            closeLock.withLock { closed += 1 }
+            didRetire.yield(())
+        }
+    }, pause: { _ in attempts.count == 1 })
+    try check(closeLock.withLock { closed == 1 }, "fallback can run while the retired tap is still closing")
+    closeTap.yield(())
+    _ = await retirements.next()
+    _ = await retirements.next()
+    try check(attempts == [.tap, .screen] && closeLock.withLock { closed == 2 },
+              "a tap without valid buffers yields to the authorized screen backend")
+    try check(status == ["unavailable", "screen"], "a stalled tap never clears the recovery notice")
+
+    attempts.removeAll()
+    closeLock.withLock { closed = 0 }
+    availability.removeAll()
+    await superviseMeetingSystemAudio(mode: .tap, hostPID: nil, receive: { _, _, _ in },
+                                    change: { ready, _ in availability.append(ready) },
+                                    open: { backend, _, _ in
+        attempts.append(backend)
+        return FixtureSystemAudio(read: { .waiting }) { closeLock.withLock { closed += 1 } }
     }, pause: { _ in false })
-    try check(attempts == [.tap] && closed == 1, "stopping closes the current tap without opening ScreenCaptureKit")
+    try check(attempts == [.tap] && closed == 1 && availability.isEmpty,
+              "stopping during the startup wait closes the tap without publishing readiness or opening ScreenCaptureKit")
+}
+
+private func checkMeetingSystemAudioOpenTimeout() async throws {
+    let (resumeOpen, opener) = AsyncStream<Void>.makeStream()
+    let (closed, didClose) = AsyncStream<Void>.makeStream()
+    let (packets, audio) = AsyncStream<Void>.makeStream()
+    var starts = 0
+    var availability = [Bool]()
+    var delays = [Duration]()
+    await superviseMeetingSystemAudio(mode: .tap, hostPID: nil, receive: { _, _, _ in audio.yield(()) },
+                                    change: { ready, _ in availability.append(ready) },
+                                    open: { _, _, forward in
+        starts += 1
+        forward([0.75], hostSeconds())
+        var wait = resumeOpen.makeAsyncIterator()
+        _ = await wait.next()
+        forward([0.75], hostSeconds())
+        return FixtureSystemAudio(read: { .ready }) { didClose.yield(()) }
+    }, openTimeout: .milliseconds(200), waitForRetry: { duration, _ in
+        delays.append(duration)
+        return delays.count == 1 ? .elapsed : .cancelled
+    })
+    try check(starts == 1 && availability == [false] && delays == [.seconds(1), .seconds(2)],
+              "retry does not start a second copy of a timed-out backend")
+    var replacementStarts = 0
+    await superviseMeetingSystemAudio(mode: .tap, hostPID: nil, receive: { _, _, _ in }, change: { _, _ in },
+                                    open: { _, _, _ in
+        replacementStarts += 1
+        throw CaptureError("The timed-out tap should still hold its slot.")
+    }, waitForRetry: { _, _ in .cancelled })
+    try check(replacementStarts == 0, "a new meeting in the same recorder cannot duplicate an unresolved tap")
+
+    var recovered = [Bool]()
+    var reopened = false
+    await superviseMeetingSystemAudio(mode: .tap, hostPID: nil, receive: { _, _, _ in },
+                                    change: { ready, _ in recovered.append(ready) },
+                                    open: { _, _, _ in
+        reopened = true
+        return FixtureSystemAudio(read: { .ready }) {}
+    }, pause: { _ in false }, consoleAvailable: { true }, waitForRetry: { _, available in
+        opener.yield(())
+        let result = await waitForMeetingSystemAudioRetry(.seconds(2), becameAvailable: available)
+        return result == .available ? .available : .cancelled
+    })
+    try check(reopened && recovered == [false, true], "slot cleanup wakes a waiting meeting before its backoff expires")
+    var cleanup = closed.makeAsyncIterator()
+    _ = await cleanup.next()
+    audio.finish()
+    var delivered = packets.makeAsyncIterator()
+    let packet: Void? = await delivered.next()
+    try check(packet == nil, "an abandoned backend cannot deliver packets before or after its open returns")
+
+    let (openStarted, didStart) = AsyncStream<Void>.makeStream()
+    let (continueCancelled, releaseCancelled) = AsyncStream<Void>.makeStream()
+    let (closedCancelled, didCloseCancelled) = AsyncStream<Void>.makeStream()
+    let supervisor = Task {
+        await superviseMeetingSystemAudio(mode: .screen, hostPID: nil, receive: { _, _, _ in },
+                                        change: { _, _ in preconditionFailure("Cancelled open reported a status") },
+                                        open: { _, _, _ in
+            didStart.yield(())
+            var wait = continueCancelled.makeAsyncIterator()
+            _ = await wait.next()
+            return FixtureSystemAudio(read: { .ready }) { didCloseCancelled.yield(()) }
+        })
+    }
+    var starting = openStarted.makeAsyncIterator()
+    _ = await starting.next()
+    supervisor.cancel()
+    await supervisor.value
+    releaseCancelled.yield(())
+    var cancelledCleanup = closedCancelled.makeAsyncIterator()
+    _ = await cancelledCleanup.next()
+}
+
+private func checkMeetingSystemAudioConsoleRecovery() async throws {
+    var console = false
+    var delays = [Duration]()
+    var woken = false
+    await superviseMeetingSystemAudio(mode: .tap, hostPID: nil, receive: { _, _, _ in }, change: { _, _ in },
+                                    open: { _, _, _ in throw CaptureError("The fixture has no audio.") },
+                                    consoleAvailable: { console }, waitForRetry: { delay, available in
+        delays.append(delay)
+        if delays.count == 3 {
+            console = true
+            woken = available()
+            return woken ? .available : .cancelled
+        }
+        return delays.count < 3 ? .elapsed : .cancelled
+    })
+    try check(woken && delays == [.seconds(1), .seconds(2), .seconds(4), .seconds(1)],
+              "console recovery advances the retry and resets only the accumulated delay")
+
+    console = false
+    var opened = [MeetingSystemAudioMode]()
+    var polls = 0
+    await superviseMeetingSystemAudio(mode: .tapAndScreen, hostPID: nil, receive: { _, _, _ in }, change: { _, _ in },
+                                    open: { backend, _, _ in
+        opened.append(backend)
+        if backend == .tap { throw CaptureError("The fixture tap is unavailable.") }
+        return FixtureSystemAudio(read: { .ready }) {}
+    }, pause: { _ in
+        polls += 1
+        console = true
+        return polls == 1
+    }, consoleAvailable: { console }, waitForRetry: { _, _ in .cancelled })
+    try check(opened == [.tap, .screen] && polls == 2, "unlock leaves a healthy fallback recording")
 }
 
 private func checkMeetingMicrophoneSilence() throws {
@@ -571,8 +771,12 @@ private func checkWarmMicrophoneRetry() throws {
         try check(isSystemCaptureDenial(denial) && isSystemCaptureDenial(multiple), "recognize direct and wrapped TCC denial")
         try check(!isSystemCaptureDenial(NSError(domain: SCStreamErrorDomain, code: SCStreamError.Code.failedToStart.rawValue)), "unrelated stream failures stay distinct")
         try checkMix()
+        try checkMeetingAudioLevel()
         try checkMeetingInputRoute()
+        try checkMeetingSystemAudioReadiness()
         try await checkMeetingSystemAudioSupervisor()
+        try await checkMeetingSystemAudioOpenTimeout()
+        try await checkMeetingSystemAudioConsoleRecovery()
         try checkMeetingMicrophoneSilence()
         try checkDictationReleaseTail()
         let packets: [MicrophonePacket] = [([0, 1, 2, 3], 0), ([4, 5], 4.0 / Double(Timeline.rate))]

@@ -1,8 +1,10 @@
 #import <AppKit/AppKit.h>
 #import <Carbon/Carbon.h>
+#import <CoreAudio/CoreAudio.h>
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
 #import "../jard_interface_language.h"
+#import "../jard_meetings.h"
 #import "../jard_updater.h"
 #import "../system_dictation.h"
 
@@ -15,18 +17,32 @@
 @property(nonatomic, readonly) JardUpdater *updater;
 @property(nonatomic, readonly) JardSystemDictation *systemDictation;
 @property(nonatomic, readonly) BOOL annotationManaged;
+@property(nonatomic, readonly) AudioObjectPropertyListenerBlock inputDeviceListener;
+@property(nonatomic, readonly) NSUInteger inputDeviceNotifications;
 - (void)completeWindowLaunch:(NSAppleEventDescriptor *)event;
 - (void)setShowDockIcon:(BOOL)enabled;
 @property(nonatomic, readonly) NSDictionary *windowNavigation;
 - (void)controlWindowAction:(NSString *)action pane:(NSString *)pane reply:(void (^)(id result, NSString *error))reply;
 - (NSDictionary *)dockIconStatus;
 - (void)refreshInterfaceLanguage;
+- (void)applyControlSettings:(NSDictionary *)request reply:(JardDictationReply)reply;
 - (NSDictionary *)workspaceUpdateStatus:(NSDictionary *)status;
 - (void)performUpdateAction:(NSString *)action payload:(NSDictionary *)payload reply:(JardDictationReply)reply;
+- (void)sendToHelper:(NSString *)command payload:(NSDictionary *)payload request:(NSString *)request completion:(JardDictationReply)completion;
 - (void)refreshMeetingAvailability;
+- (void)quitApp:(id)sender;
+- (void)showUpdateNotice:(NSString *)title detail:(NSString *)message;
+- (void)waitForMenuQuitUntil:(NSTimeInterval)deadline meeting:(BOOL)meeting annotation:(BOOL)annotation
+               stagedUpdate:(BOOL)staged;
 - (void)updateChanged:(NSDictionary *)status;
+- (void)updateMeetingMenu:(NSDictionary *)status;
 - (BOOL)canStartAnnotation;
 - (void)controlAnnotation:(NSString *)action parameters:(NSDictionary *)parameters reply:(JardDictationReply)reply;
+- (void)controlAnnotationAccess:(NSString *)action reply:(JardDictationReply)reply;
+@end
+
+@interface JardMeetings (WindowFixture)
+- (void)copyLatestTranscriptTo:(NSPasteboard *)board reply:(JardDictationReply)reply;
 @end
 
 static NSString *scenario;
@@ -36,14 +52,162 @@ static void (*normalLaunch)(JardHost *, SEL, NSNotification *);
 static void (*normalMeetingMenu)(JardHost *, SEL);
 static NSDictionary *(*normalUpdateStatus)(JardUpdater *, SEL);
 static BOOL stagedRefresh;
+static dispatch_block_t finalUpdateCheck;
+static JardDictationReply updateDrain, updateReopen;
+static JardUpdateInstallReply updateInstall;
+static NSUInteger meetingStopsOnQuit, menuQuitTerminations;
+static NSString *menuQuitNotice;
+static NSMutableArray<NSNumber *> *systemQuitReplies;
+static void (*normalSend)(JardHost *, SEL, NSString *, NSDictionary *, NSString *, JardDictationReply);
 
 static NSDictionary *fixtureUpdateStatus(JardUpdater *updater, SEL selector) {
+    if ([scenario isEqual:@"update-restart"] || [scenario isEqual:@"quit-capture"])
+        return @{@"phase": @"ready", @"staged": @YES, @"version": @"2"};
     if (stagedRefresh) return @{@"phase": @"checking", @"staged": @YES, @"version": @"2"};
     return normalUpdateStatus(updater, selector);
 }
 
+static BOOL fixtureCanInstall(JardUpdater *updater, SEL selector) { return YES; }
+
+static void fixtureFinalUpdateCheck(JardUpdater *updater, SEL selector, dispatch_block_t finish) {
+    finalUpdateCheck = finish;
+}
+
+static void fixtureRestart(JardUpdater *updater, SEL selector, JardUpdateInstallReply completion) {
+    updateInstall = completion;
+}
+
+static void fixtureSend(JardHost *host, SEL selector, NSString *command, NSDictionary *payload, NSString *request,
+                        JardDictationReply completion) {
+    if ([command isEqual:@"jard.updateQuiesce"]) updateDrain = completion;
+    else if ([command isEqual:@"jard.updateAbort"]) updateReopen = completion;
+    else if ([scenario isEqual:@"quit-capture"] && [command isEqual:@"jard.stopMeeting"]) {
+        meetingStopsOnQuit++;
+        completion(@{}, nil);
+    }
+    else normalSend(host, selector, command, payload, request, completion);
+}
+
+static void fixtureMenuQuitNotice(JardHost *host, SEL selector, NSString *title, NSString *message) {
+    menuQuitNotice = message;
+}
+
+static void fixtureMenuTerminate(NSApplication *app, SEL selector, id sender) {
+    menuQuitTerminations++;
+}
+
+static void fixtureSystemQuitReply(NSApplication *app, SEL selector, BOOL terminate) {
+    [systemQuitReplies addObject:@(terminate)];
+}
+
+static void verifyQuitDuringCapture(JardHost *host) {
+    JardMeetings *meeting = [host valueForKey:@"meetings"];
+    id annotation = [host valueForKey:@"annotation"];
+    NSString *identifier = NSUUID.UUID.UUIDString;
+    id<NSApplicationDelegate> delegate = NSApp.delegate;
+    assert([delegate respondsToSelector:@selector(applicationShouldHandleReopen:hasVisibleWindows:)]);
+    systemQuitReplies = NSMutableArray.new;
+
+    [host setValue:identifier forKey:@"sdkCaptureID"];
+    assert([delegate applicationShouldTerminate:NSApp] == NSTerminateCancel);
+    [host setValue:nil forKey:@"sdkCaptureID"];
+
+    [meeting setValue:identifier forKey:@"recordingID"];
+    [meeting setValue:@"saving" forKey:@"phase"];
+    assert([delegate applicationShouldTerminate:NSApp] == NSTerminateLater);
+    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.05]];
+    assert([[host valueForKey:@"menuQuitPending"] boolValue] && !updateDrain);
+    [host waitForMenuQuitUntil:0 meeting:YES annotation:NO stagedUpdate:YES];
+    assert(![[host valueForKey:@"updating"] boolValue] && [menuQuitNotice containsString:@"finish saving"]);
+    assert(![[host.updater valueForKey:@"quitting"] boolValue] && !updateDrain);
+    assert([systemQuitReplies isEqual:@[@NO]]);
+    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.15]];
+    [meeting setValue:nil forKey:@"recordingID"];
+    [meeting setValue:@"idle" forKey:@"phase"];
+    menuQuitNotice = nil;
+
+    [meeting setValue:identifier forKey:@"recordingID"];
+    [meeting setValue:@"saving" forKey:@"phase"];
+    [host quitApp:nil];
+    [meeting handleCapture:@{@"event": @"error", @"meeting": identifier, @"message": @"Fixture could not save the meeting."}];
+    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.15]];
+    assert([menuQuitNotice isEqual:@"Fixture could not save the meeting."] && !updateDrain);
+    assert(![[host valueForKey:@"updating"] boolValue] && ![[host.updater valueForKey:@"quitting"] boolValue]);
+    menuQuitNotice = nil;
+
+    __block BOOL superseded = NO;
+    [host performUpdateAction:@"restart" payload:@{} reply:^(id result, NSString *error) { superseded = result && !error; }];
+    assert(finalUpdateCheck && !superseded);
+    [meeting setValue:identifier forKey:@"recordingID"];
+    [meeting setValue:@"starting" forKey:@"phase"];
+    [annotation setValue:NSUUID.UUID.UUIDString forKey:@"identifier"];
+    [annotation setValue:@"saving" forKey:@"phase"];
+    [host quitApp:nil];
+    assert(superseded && !updateDrain && !meetingStopsOnQuit);
+    assert([delegate applicationShouldTerminate:NSApp] == NSTerminateLater);
+    assert([delegate applicationShouldTerminate:NSApp] == NSTerminateLater);
+    finalUpdateCheck();
+    [meeting handleCapture:@{@"event": @"started", @"meeting": identifier}];
+    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.15]];
+    assert(meetingStopsOnQuit == 1 && !meeting.recording && meeting.busy && !updateDrain);
+    [host quitApp:nil];
+    assert(meetingStopsOnQuit == 1);
+    [meeting handleCapture:@{@"event": @"accepted", @"meeting": identifier, @"id": NSUUID.UUID.UUIDString}];
+    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.15]];
+    assert(!meeting.busy && !updateDrain);
+    [annotation setValue:nil forKey:@"identifier"];
+    [annotation setValue:@"finished" forKey:@"phase"];
+    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.15]];
+    assert(updateDrain && !updateInstall && !menuQuitTerminations && !menuQuitNotice);
+    updateDrain(@{@"ready": @YES}, nil);
+    assert(updateInstall && !menuQuitTerminations);
+    updateInstall(YES, nil);
+    assert(!menuQuitTerminations && ([systemQuitReplies isEqual:@[@NO, @YES]]));
+    assert([delegate applicationShouldTerminate:NSApp] == NSTerminateNow);
+}
+
+static void verifyRestartTransaction(JardHost *host) {
+    NSMenuItem *menu = host.meetingMenuItems[@"update"];
+    __block NSString *failure;
+    JardDictationReply completed = ^(id result, NSString *error) { assert(!result); failure = error; };
+
+    [host performUpdateAction:@"restart" payload:@{} reply:completed];
+    assert(finalUpdateCheck && !failure && !menu.enabled && [menu.title isEqual:@"Restarting…"]);
+    assert([[[host workspaceUpdateStatus:host.updater.status] objectForKey:@"restartInProgress"] boolValue]);
+    [host setValue:@YES forKey:@"otherRecording"];
+    finalUpdateCheck();
+    NSDictionary *state = [host workspaceUpdateStatus:host.updater.status];
+    assert([failure containsString:@"recording"] && !updateDrain);
+    assert([state[@"restartBlocked"] boolValue] && ![state[@"restartInProgress"] boolValue]);
+    [host setValue:@NO forKey:@"otherRecording"];
+
+    failure = nil;
+    [host performUpdateAction:@"restart" payload:@{} reply:completed];
+    assert(!failure && finalUpdateCheck);
+    finalUpdateCheck();
+    assert(updateDrain && !failure);
+    updateDrain(@{@"ready": @YES}, nil);
+    assert(updateInstall && !updateReopen && !failure && !menu.enabled);
+    assert([[host.systemDictation valueForKey:@"updatePaused"] boolValue]);
+    updateInstall(NO, @"Fixture could not replace the application.");
+    assert(updateReopen && !failure && !menu.enabled);
+    assert([[host.systemDictation valueForKey:@"updatePaused"] boolValue]);
+    assert([[[host workspaceUpdateStatus:host.updater.status] objectForKey:@"restartInProgress"] boolValue]);
+    [host performUpdateAction:@"restart" payload:@{} reply:^(id result, NSString *error) { assert(!result && error); }];
+    updateReopen(@{@"ready": @YES}, nil);
+    state = [host workspaceUpdateStatus:host.updater.status];
+    assert([failure isEqual:@"Fixture could not replace the application."] && [state[@"restartError"] isEqual:failure]);
+    assert([state[@"staged"] boolValue] && ![state[@"restartInProgress"] boolValue] && menu.enabled);
+    assert(![[host.systemDictation valueForKey:@"updatePaused"] boolValue]);
+    finalUpdateCheck = nil;
+    updateDrain = nil;
+    updateReopen = nil;
+    updateInstall = nil;
+}
+
 static void fixtureMeetingMenu(JardHost *host, SEL selector) {
-    if (![scenario isEqual:@"dock-unavailable"]) normalMeetingMenu(host, selector);
+    if ([scenario hasSuffix:@"-unavailable"]) return;
+    normalMeetingMenu(host, selector);
 }
 
 static void report(NSString *name, NSDictionary *value) {
@@ -64,7 +228,10 @@ static void fixtureLaunch(JardHost *host, SEL selector, NSNotification *notifica
     fixtureHost = host;
     BOOL visibleBeforeLaunch = host.window.visible;
     if ([scenario isEqual:@"normal"] || [scenario isEqual:@"annotation-managed"] || [scenario isEqual:@"managed-updates"] ||
-        [scenario hasPrefix:@"locale-"] || [scenario isEqual:@"dock-setting"] || [scenario isEqual:@"dock-unavailable"]) {
+        [scenario isEqual:@"launch-update"] || [scenario isEqual:@"focus-update"] || [scenario isEqual:@"update-restart"] ||
+        [scenario isEqual:@"application-settings"] || [scenario isEqual:@"quit-capture"] ||
+        [scenario hasPrefix:@"locale-"] || [scenario hasPrefix:@"dock-cold-"] || [scenario hasPrefix:@"hidden-"] ||
+        [scenario isEqual:@"dock-setting"] || [scenario isEqual:@"dock-unavailable"]) {
         normalLaunch(host, selector, notification);
     } else {
         NSAppleEventDescriptor *event = [NSAppleEventDescriptor appleEventWithEventClass:kCoreEventClass
@@ -81,10 +248,21 @@ static void fixtureLaunch(JardHost *host, SEL selector, NSNotification *notifica
 }
 
 static BOOL fixtureQuietAtLogin(id self, SEL selector) {
-    return ![scenario isEqual:@"login-input"] || ![[self valueForKey:@"workspace"] boolValue];
+    BOOL badListener = [scenario isEqual:@"login-input"] || [scenario isEqual:@"dock-cold-input"];
+    return !badListener || ![[self valueForKey:@"workspace"] boolValue];
 }
 
 static BOOL fixtureAnnotationManaged(id self, SEL selector) { return YES; }
+
+static void fixtureCopyLatestTranscript(JardMeetings *meeting, SEL selector, JardDictationReply reply) {
+    NSPasteboard *board = NSPasteboard.pasteboardWithUniqueName;
+    [meeting copyLatestTranscriptTo:board reply:^(id result, NSString *error) {
+        report(@"latest-meeting-copy.json", @{@"text": [board stringForType:NSPasteboardTypeString] ?: @"",
+            @"error": error ?: @"", @"copied": result[@"copied"] ?: @NO});
+        [board releaseGlobally];
+        reply(result, error);
+    }];
+}
 
 @interface JardWindowFixture : NSObject
 @end
@@ -104,13 +282,32 @@ static BOOL fixtureAnnotationManaged(id self, SEL selector) { return YES; }
         Method policy = class_getInstanceMethod(NSClassFromString(@"JardHost"), @selector(annotationManaged));
         method_setImplementation(policy, (IMP)fixtureAnnotationManaged);
     }
-    if ([scenario isEqual:@"dock-unavailable"]) {
+    if ([scenario isEqual:@"normal"]) {
+        Method copy = class_getInstanceMethod(JardMeetings.class, @selector(copyLatestTranscript:));
+        method_setImplementation(copy, (IMP)fixtureCopyLatestTranscript);
+    }
+    if ([scenario hasSuffix:@"-unavailable"]) {
         Method menu = class_getInstanceMethod(NSClassFromString(@"JardHost"), NSSelectorFromString(@"createMeetingMenu"));
         normalMeetingMenu = (void (*)(JardHost *, SEL))method_setImplementation(menu, (IMP)fixtureMeetingMenu);
     }
-    if ([scenario isEqual:@"dock-updates"]) {
+    if ([@[@"dock-updates", @"update-restart", @"quit-capture"] containsObject:scenario]) {
         Method status = class_getInstanceMethod(JardUpdater.class, @selector(status));
         normalUpdateStatus = (NSDictionary *(*)(JardUpdater *, SEL))method_setImplementation(status, (IMP)fixtureUpdateStatus);
+    }
+    if ([@[@"update-restart", @"quit-capture"] containsObject:scenario]) {
+        Class host = NSClassFromString(@"JardHost");
+        Method send = class_getInstanceMethod(host, @selector(sendToHelper:payload:request:completion:));
+        normalSend = (void (*)(JardHost *, SEL, NSString *, NSDictionary *, NSString *, JardDictationReply))
+            method_setImplementation(send, (IMP)fixtureSend);
+        method_setImplementation(class_getInstanceMethod(JardUpdater.class, @selector(canInstallStagedUpdate)), (IMP)fixtureCanInstall);
+        method_setImplementation(class_getInstanceMethod(JardUpdater.class, @selector(checkBeforeRestart:)), (IMP)fixtureFinalUpdateCheck);
+        method_setImplementation(class_getInstanceMethod(JardUpdater.class, @selector(restartWithCompletion:)), (IMP)fixtureRestart);
+        if ([scenario isEqual:@"quit-capture"]) {
+            method_setImplementation(class_getInstanceMethod(JardUpdater.class, @selector(installOnQuitWithCompletion:)), (IMP)fixtureRestart);
+            method_setImplementation(class_getInstanceMethod(host, @selector(showUpdateNotice:detail:)), (IMP)fixtureMenuQuitNotice);
+            method_setImplementation(class_getInstanceMethod(NSApplication.class, @selector(terminate:)), (IMP)fixtureMenuTerminate);
+            method_setImplementation(class_getInstanceMethod(NSApplication.class, @selector(replyToApplicationShouldTerminate:)), (IMP)fixtureSystemQuitReply);
+        }
     }
     if (![scenario isEqual:@"login-setup"]) {
         Method quiet = class_getInstanceMethod(NSClassFromString(@"JardSystemDictation"), NSSelectorFromString(@"quietAtLogin"));
@@ -135,6 +332,20 @@ static BOOL fixtureAnnotationManaged(id self, SEL selector) { return YES; }
             else if ([command isEqual:@"dock-on"]) [host setShowDockIcon:YES];
             else if ([command isEqual:@"menu-off"]) host.meetingStatusItem.visible = NO;
             else if ([command isEqual:@"menu-on"]) host.meetingStatusItem.visible = YES;
+            else if ([command isEqual:@"menu-copy-label-fr"]) {
+                assert(JardSetInterfaceLanguage(@"fr"));
+                [host refreshInterfaceLanguage];
+                report(@"reply.json", @{@"title": host.meetingMenuItems[@"copyLatest"].title ?: @""});
+                return;
+            }
+            else if ([command isEqual:@"menu-copy-latest"]) {
+                NSMenuItem *item = host.meetingMenuItems[@"copyLatest"];
+                NSInteger index = [item.menu indexOfItem:item];
+                BOOL available = item && !item.hidden && item.enabled && index >= 0;
+                if (available) [item.menu performActionForItemAtIndex:index];
+                report(@"reply.json", @{@"available": @(available), @"title": item.title ?: @""});
+                return;
+            }
             else if ([command isEqual:@"menu-live-meeting"]) {
                 __block NSString *idleFailure = nil;
                 [host controlWindowAction:@"window-show" pane:@"live-meeting" reply:^(id result, NSString *error) { idleFailure = error; }];
@@ -158,8 +369,34 @@ static BOOL fixtureAnnotationManaged(id self, SEL selector) { return YES; }
                 [menu update];
                 NSInteger index = item && menu ? [menu indexOfItem:item] : -1;
                 if (index >= 0 && !item.hidden && item.enabled) [menu performActionForItemAtIndex:index];
+            } else if ([command isEqual:@"annotation-toggle"]) {
+                NSMutableDictionary *observed = NSMutableDictionary.dictionary;
+                [host.systemDictation request:@{@"action": @"setAnnotationEnabled", @"enabled": @NO} reply:^(id state, NSString *error) {
+                    observed[@"off"] = error ?: state[@"annotationEnabled"];
+                }];
+                [host controlAnnotation:@"start" parameters:@{@"source": @"display"} reply:^(id state, NSString *error) {
+                    observed[@"start"] = error ?: @"Unexpected capture";
+                }];
+                [host controlAnnotation:@"status" parameters:@{} reply:^(id state, NSString *error) {
+                    observed[@"status"] = error ?: state[@"enabled"];
+                }];
+                [host.systemDictation request:@{@"action": @"setAnnotationEnabled", @"enabled": @YES} reply:^(id state, NSString *error) {
+                    observed[@"on"] = error ?: state[@"annotationEnabled"];
+                }];
+                report(@"reply.json", observed);
+                return;
             } else if ([command isEqual:@"annotation-policy"]) {
                 NSMutableDictionary *failures = NSMutableDictionary.dictionary;
+                NSMutableDictionary *permissionFailures = NSMutableDictionary.dictionary;
+                if (!host.annotationManaged) [host setValue:@YES forKey:@"otherRecording"];
+                for (NSString *action in @[@"status", @"allow", @"repair", @"restart"]) {
+                    [host controlAnnotationAccess:action reply:^(id state, NSString *error) {
+                        if (error) permissionFailures[action] = error;
+                        else if (![action isEqual:@"status"] || ![state[@"authorization"] isEqual:@"checking"])
+                            permissionFailures[action] = @"Permission command changed state unexpectedly";
+                    }];
+                }
+                if (!host.annotationManaged) [host setValue:@NO forKey:@"otherRecording"];
                 if (host.annotationManaged) {
                     for (NSString *source in @[@"display", @"window", @"area", @"phone"]) {
                         [host controlAnnotation:@"start" parameters:@{@"source": source} reply:^(id state, NSString *error) {
@@ -169,6 +406,7 @@ static BOOL fixtureAnnotationManaged(id self, SEL selector) { return YES; }
                 }
                 [host controlAnnotation:@"status" parameters:@{} reply:^(id state, NSString *error) {
                     report(@"reply.json", @{@"state": state ?: @{}, @"startFailures": failures,
+                        @"permissionFailures": permissionFailures,
                         @"shortcutRegistered": @([host.systemDictation valueForKey:@"annotationEvents"] != nil),
                         @"canStart": @([host canStartAnnotation])});
                 }];
@@ -180,8 +418,68 @@ static BOOL fixtureAnnotationManaged(id self, SEL selector) { return YES; }
                     @"shown": @(item && !item.hidden), @"enabled": @(item.enabled),
                     @"dockVisible": @(NSApp.activationPolicy == NSApplicationActivationPolicyRegular)});
                 return;
+            } else if ([command isEqual:@"record-menu"]) {
+                NSMenuItem *item = host.meetingMenuItems[@"start"];
+                report(@"reply.json", @{@"shown": @(item && !item.hidden), @"enabled": @(item.enabled)});
+                return;
+            } else if ([command isEqual:@"annotation-shared-meeting"]) {
+                id annotation = [host valueForKey:@"annotation"];
+                id meeting = [host valueForKey:@"meetings"];
+                [annotation setValue:NSUUID.UUID.UUIDString forKey:@"identifier"];
+                [annotation setValue:@"picking" forKey:@"phase"];
+                [host refreshMeetingAvailability];
+                BOOL pickerBlocked = !host.meetingMenuItems[@"start"].enabled && [[meeting valueForKey:@"suspended"] boolValue];
+                [annotation setValue:@"recording" forKey:@"phase"];
+                [annotation setValue:@YES forKey:@"narrationStarted"];
+                [host refreshMeetingAvailability];
+                BOOL sharedReady = host.meetingMenuItems[@"start"].enabled && ![[meeting valueForKey:@"suspended"] boolValue];
+                [annotation setValue:@NO forKey:@"narrationStarted"];
+                [annotation setValue:nil forKey:@"identifier"];
+                [annotation setValue:@"idle" forKey:@"phase"];
+                [host refreshMeetingAvailability];
+                report(@"reply.json", @{@"pickerBlocked": @(pickerBlocked), @"sharedReady": @(sharedReady)});
+                return;
+            } else if ([command isEqual:@"annotation-start-over-shared-microphone"]) {
+                JardMeetings *meeting = [host valueForKey:@"meetings"];
+                JardSystemDictation *dictation = [host valueForKey:@"systemDictation"];
+                NSString *identifier = NSUUID.UUID.UUIDString;
+                [meeting setValue:identifier forKey:@"recordingID"];
+                [meeting setValue:@"starting" forKey:@"phase"];
+                [meeting handleCapture:@{@"meeting": identifier, @"event": @"started", @"warm": @YES}];
+                BOOL sharedMeetingAllowed = [host canStartAnnotation];
+                [meeting setValue:@NO forKey:@"captureUsesSharedMicrophone"];
+                BOOL otherMeetingBlocked = ![host canStartAnnotation];
+                [meeting setValue:nil forKey:@"recordingID"];
+                [meeting setValue:@"idle" forKey:@"phase"];
+                [dictation setValue:identifier forKey:@"captureID"];
+                [dictation setValue:@YES forKey:@"captureMicReady"];
+                [dictation setValue:@YES forKey:@"captureUsesSharedMicrophone"];
+                BOOL sharedDictationAllowed = [host canStartAnnotation];
+                [dictation setAnnotationActive:YES microphoneShared:NO];
+                BOOL pickerPreserved = [[dictation valueForKey:@"annotationPreservesDictation"] boolValue] &&
+                    [[dictation valueForKey:@"captureID"] isEqual:identifier];
+                [dictation setAnnotationActive:NO microphoneShared:NO];
+                [dictation setValue:@NO forKey:@"captureUsesSharedMicrophone"];
+                BOOL otherDictationBlocked = ![host canStartAnnotation];
+                [dictation setValue:nil forKey:@"captureID"];
+                [dictation setValue:@NO forKey:@"captureMicReady"];
+                [host refreshMeetingAvailability];
+                report(@"reply.json", @{@"sharedMeetingAllowed": @(sharedMeetingAllowed), @"otherMeetingBlocked": @(otherMeetingBlocked),
+                    @"sharedDictationAllowed": @(sharedDictationAllowed), @"otherDictationBlocked": @(otherDictationBlocked),
+                    @"pickerPreserved": @(pickerPreserved)});
+                return;
             } else if ([command isEqual:@"background-check"]) {
                 [host.updater check];
+            } else if ([command isEqual:@"focus-update"]) {
+                NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+                [center postNotificationName:NSWindowDidBecomeKeyNotification object:window];
+                NSString *disabled = host.updater.status[@"phase"];
+                [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"JardCheckForUpdatesOnLaunch"];
+                [center postNotificationName:NSWindowDidBecomeKeyNotification object:NSWindow.new];
+                NSString *other = host.updater.status[@"phase"];
+                [center postNotificationName:NSWindowDidBecomeKeyNotification object:window];
+                report(@"reply.json", @{@"disabled": disabled, @"other": other, @"workspace": host.updater.status[@"phase"]});
+                return;
             } else if ([command isEqual:@"cli-hide"] || [command isEqual:@"cli-show"]) {
                 BOOL hide = [command isEqual:@"cli-hide"];
                 [host controlWindowAction:hide ? @"window-hide" : @"window-show" pane:hide ? nil : @"history"
@@ -209,6 +507,38 @@ static BOOL fixtureAnnotationManaged(id self, SEL selector) { return YES; }
                 report(@"reply.json", @{@"updaterCreated": @(host.updater != nil), @"update": [host workspaceUpdateStatus:host.updater.status],
                     @"statusMenuTitle": item.title ?: @"", @"statusMenuShown": @(item && !item.hidden),
                     @"statusMenuEnabled": @(item.enabled), @"visibleActions": @(visibleActions), @"failures": failures});
+                return;
+            } else if ([command isEqual:@"meeting-input-status"]) {
+                JardMeetings *meetings = [host valueForKey:@"meetings"];
+                NSString *previousPhase = [meetings valueForKey:@"phase"];
+                NSDictionary *previousStatus = [host valueForKey:@"meetingMenuStatus"];
+                [meetings setValue:@"recording" forKey:@"phase"];
+                NSMutableDictionary *status = [@{@"busy": @YES, @"seconds": @17, @"title": @"Test call",
+                    @"microphoneUnavailable": @YES} mutableCopy];
+                [host updateMeetingMenu:status];
+                assert([host.meetingStatusItem.button.toolTip isEqual:@"Microphone is reconnecting."]);
+                assert([host.meetingStatusItem.button.accessibilityLabel containsString:@"0:17, Microphone is reconnecting."]);
+                status[@"systemAudioUnavailable"] = @YES;
+                [host updateMeetingMenu:status];
+                assert([host.meetingStatusItem.button.toolTip isEqual:@"Microphone and Mac audio are reconnecting."]);
+                assert(!host.meetingMenuItems[@"stop"].hidden);
+                status[@"microphoneUnavailable"] = @NO;
+                [host updateMeetingMenu:status];
+                assert([host.meetingStatusItem.button.toolTip isEqual:@"Mac audio is reconnecting."]);
+                status[@"systemAudioUnavailable"] = @NO;
+                [host updateMeetingMenu:status];
+                assert([host.meetingStatusItem.button.toolTip isEqual:@"Test call"]);
+                [meetings setValue:previousPhase forKey:@"phase"];
+                [host updateMeetingMenu:previousStatus ?: @{}];
+                report(@"reply.json", @{@"passed": @YES});
+                return;
+            } else if ([command isEqual:@"restart-transaction"]) {
+                verifyRestartTransaction(host);
+                report(@"reply.json", @{@"passed": @YES});
+                return;
+            } else if ([command isEqual:@"quit-capture"]) {
+                verifyQuitDuringCapture(host);
+                report(@"reply.json", @{@"passed": @YES});
                 return;
             } else if ([command isEqual:@"update-hold"] || [command isEqual:@"update-unhold"]) {
                 if (!stagedRefresh) {
@@ -242,6 +572,24 @@ static BOOL fixtureAnnotationManaged(id self, SEL selector) { return YES; }
                         report(@"reply.json", [result isKindOfClass:NSDictionary.class] ? result : @{@"title": @""});
                     }];
                 return;
+            } else if ([command isEqual:@"input-device-events"]) {
+                WKWebView *web = webView(window.contentView);
+                [web evaluateJavaScript:@"window.inputEvents = 0; window.addEventListener('native-sdk:jard-input-devices', () => ++window.inputEvents); 0"
+                       completionHandler:^(id result, NSError *error) {
+                    assert(!error && host.inputDeviceListener && (host.inputDeviceNotifications & 3) == 3);
+                    const AudioObjectPropertyAddress properties[] = {
+                        {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+                        {kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+                        {kAudioHardwarePropertyServiceRestarted, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+                    };
+                    for (NSUInteger i = 0; i < 3; i++) host.inputDeviceListener(1, &properties[i]);
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+                        [web evaluateJavaScript:@"window.inputEvents" completionHandler:^(id count, NSError *readError) {
+                            report(@"reply.json", @{@"events": count ?: NSNull.null, @"registered": @((host.inputDeviceNotifications & 3) == 3)});
+                        }];
+                    });
+                }];
+                return;
             } else if ([command isEqual:@"locale-test"]) {
                 NSDictionary *status = JardInterfaceLanguageStatus(), *choices = status[@"choices"];
                 NSArray *tags = @[@"zz-YY", @"pl-PL", @"zh_TW.UTF-8", @"zh-Hans-HK", @"zh-Hant", @"pt-PT"];
@@ -254,6 +602,22 @@ static BOOL fixtureAnnotationManaged(id self, SEL selector) { return YES; }
                 report(@"reply.json", @{@"frMenu": @(frenchMenu), @"jaMenu": @([NSApp.mainMenu itemWithTitle:@"ファイル"] != nil),
                     @"resolved": resolved, @"invalidRejected": @(invalidRejected), @"accepted": @(japaneseAccepted),
                     @"selected": JardInterfaceLanguageStatus()[@"selected"]});
+                return;
+            } else if ([command isEqual:@"application-settings"]) {
+                NSData *payload = [NSData dataWithContentsOfURL:[fixtureRoot URLByAppendingPathComponent:@"settings.json"]];
+                NSDictionary *request = [NSJSONSerialization JSONObjectWithData:payload options:0 error:nil];
+                [host applyControlSettings:request reply:^(id result, NSString *error) {
+                    NSDictionary *language = JardInterfaceLanguageStatus();
+                    report(@"reply.json", @{@"result": result ?: NSNull.null, @"error": error ?: NSNull.null,
+                        @"language": language[@"selected"], @"resolved": language[@"resolved"],
+                        @"frenchMenu": @([NSApp.mainMenu itemWithTitle:@"Fichier"] != nil), @"dock": [host dockIconStatus]});
+                }];
+                return;
+            } else if ([command isEqual:@"settings-events"]) {
+                [webView(window.contentView) evaluateJavaScript:@"window.settingsEvents ?? null"
+                    completionHandler:^(id result, NSError *error) {
+                        report(@"reply.json", @{@"events": [result isKindOfClass:NSArray.class] ? result : NSNull.null});
+                    }];
                 return;
             }
             report(@"reply.json", @{@"visible": @(window.visible), @"ready": @(host.showingApp),

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import ssl
 import subprocess
@@ -21,6 +22,11 @@ CACHE = DESKTOP / ".build"
 OUT = DESKTOP / "out"
 PUBLISHER = Path.home() / ".config/jard/soundfolio-local/macos-publisher"
 MACH = {bytes.fromhex(x) for x in ("cffaedfe", "feedfacf", "cafebabe", "bebafeca", "cafebabf")}
+DEV_NOTES_NAME = "Jaro-development-notes.json"
+DEV_NOTES_LIMIT = 128 * 1024
+DEV_NOTES_BUILDS = 40
+DEV_NOTES_CHANGES = 40
+ROLLOUT_FEED_NAME = "native-update-v2.json"
 
 
 def run(*args, cwd=REPO):
@@ -92,11 +98,12 @@ def copy_engine(resources):
     for name in (
         "audio_file.py", "chat_context.py", "diarization.py", "diagnostics.py", "engine_lifecycle.py", "engine_paths.py",
         "insights.py", "local_qwen.py", "meeting_transcript.py", "model_installation.py", "native_recordings.py", "note_stream.py", "overview_exchanges.py", "place_hints.py",
-        "personal_notes.py", "rumble_model.py", "annotation_assets.py", "annotation_deliveries.py", "annotation_routing.py",
-        "annotation_rollback.py", "saved_annotations.py", "dictation_output.py", "dictation_settings.py", "output_transform_catalog.py", "output_transform_network.py", "output_transform_policy.py", "output_transform_operations.py", "output_transform_runtime.py", "output_transform_workspace.py", "jardctl.py", "server.py", "session_notes.py", "session_store.py",
+        "personal_notes.py", "rumble_model.py", "annotation_assets.py", "annotation_deliveries.py", "annotation_retention.py", "annotation_routing.py",
+        "annotation_storage.py",
+        "annotation_rollback.py", "saved_annotations.py", "dictation_output.py", "dictation_settings.py", "output_transform_catalog.py", "output_transform_network.py", "output_transform_policy.py", "output_transform_operations.py", "output_transform_runtime.py", "output_transform_workspace.py", "jardctl.py", "server.py", "session_images.py", "session_notes.py", "session_store.py",
         "meeting_mcp.py", "meeting_brief.py", "meeting_exports.py", "meeting_retention.py", "meeting_rolling.py", "meeting_search.py", "saved_dictations.py", "saved_meetings.py",
-        "managed_preferences.py", "sdk_discovery.py", "sdk_embedded.py", "speaker_alignment.py", "transcription_pieces.py", "title_words.py", "writing_api.py", "writing_cache.py",
-        "overview_autonyms.json", "overview_languages.json", "place_names.json",
+        "linux_capture.py", "managed_preferences.py", "portable_capture.py", "portable_workspace.py", "sdk_discovery.py", "sdk_embedded.py", "speaker_alignment.py", "transcription_pieces.py", "title_words.py", "writing_api.py", "writing_cache.py",
+        "overview_autonyms.json", "overview_languages.json", "place_names.json", "windows_job.py",
     ):
         shutil.copy2(ENGINE / name, target)
     shutil.copytree(REPO / "dist", target / "dist")
@@ -115,37 +122,105 @@ def copy_engine(resources):
     shutil.copy2(TOOLS / "build-codecs.sh", resources / "licenses")
     shutil.copy2(Path(os.environ["NATIVE_SDK_PATH"]) / "LICENSE", resources / "licenses/Native-SDK-LICENSE")
     (target / "desktop/build-tools").mkdir(parents=True)
-    for name in ("mac_bridge.py", "sdk_capture.py", "annotation_automation.py"):
+    for name in ("mac_bridge.py", "sdk_capture.py", "annotation_automation.py", "annotation_agents.py"):
         shutil.copy2(DESKTOP / name, target / "desktop" / name)
     for name in ("helper.py", "model_setup.py", "models.json"):
         shutil.copy2(TOOLS / name, target / "desktop/build-tools")
 
 
-def update_configuration(channel, development):
+def update_url(address):
+    url = urlsplit(address) if isinstance(address, str) and address else None
+    return url and url.scheme == "https" and url.hostname and url.username is None and url.password is None
+
+
+def update_configuration(channel, development, stable_rollout_url=None):
     stable = json.loads((DESKTOP / "app.json").read_bytes())["updates"]
     updates = {**stable, "channel": channel}
+    suffix = "/releases/latest/download/native-update.json"
+    if stable_rollout_url is None and urlsplit(stable["feed_url"]).hostname == "github.com" and stable["feed_url"].endswith(suffix):
+        repository = stable["feed_url"].removesuffix(suffix)
+        stable_rollout_url = f"{repository}/releases/download/stable-rollout/{ROLLOUT_FEED_NAME}"
+    if stable_rollout_url is not None:
+        if not update_url(stable_rollout_url) or stable_rollout_url == stable["feed_url"]:
+            raise ValueError("Stable rollout needs a separate HTTPS feed URL.")
+        updates["rollout_url"] = stable_rollout_url
     if development is None:
         if channel == "dev":
             raise ValueError("A Development build needs --dev-updates with its signed feed configuration.")
         return updates
     dev = json.loads(development.expanduser().read_bytes())
     if not isinstance(dev, dict):
-        raise ValueError("Provide a JSON object with feed_url, public_key, and an optional release_url.")
-    for key in ("feed_url", "release_url"):
-        if key == "release_url" and key not in dev:
+        raise ValueError("Provide a JSON object with feed_url, public_key, and optional release_url and rollout_url.")
+    for key in ("feed_url", "release_url", "rollout_url"):
+        if key != "feed_url" and key not in dev:
             continue
-        address = dev.get(key)
-        url = urlsplit(address) if isinstance(address, str) and address else None
-        if not url or url.scheme != "https" or not url.hostname or url.username is not None or url.password is not None:
+        if not update_url(dev.get(key)):
             raise ValueError(f"Development {key} must be an HTTPS URL.")
+    if "rollout_url" in dev and dev["rollout_url"] in (dev["feed_url"], stable["feed_url"], stable_rollout_url):
+        raise ValueError("Development rollout needs a separate HTTPS feed URL.")
     try:
         key = b64decode(dev.get("public_key", ""), validate=True)
     except (TypeError, ValueError) as error:
         raise ValueError("Development public_key must be Base64 for a 32-byte Ed25519 public key.") from error
-    if len(key) != 32 or key == b64decode(stable["public_key"]) or dev["feed_url"] == stable["feed_url"]:
+    if len(key) != 32 or key == b64decode(stable["public_key"]) or dev["feed_url"] in (stable["feed_url"], stable_rollout_url):
         raise ValueError("Development needs its own feed URL and a distinct 32-byte Ed25519 public key.")
-    updates["development"] = {field: dev[field] for field in ("feed_url", "public_key", "release_url") if field in dev}
+    updates["development"] = {field: dev[field] for field in ("feed_url", "public_key", "release_url", "rollout_url") if field in dev}
     return updates
+
+
+def sign_rollout_feed(feed, output, key, channel, percentage, required):
+    executable = output.parent / "sign-update-rollout"
+    run("xcrun", "swiftc", "-O", DESKTOP / "update/UpdateRollout.swift",
+        TOOLS / "sign-update-rollout.swift", "-o", executable)
+    run(executable, feed, output, key, channel, percentage, str(required).lower())
+
+
+def development_version(version):
+    if not isinstance(version, str) or not re.fullmatch(r"(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){2}", version):
+        raise ValueError("Development release notes need a version in major.minor.patch form.")
+    return tuple(int(part) for part in version.split("."))
+
+
+def development_release_notes(version, notes, previous):
+    current = development_version(version)
+    changes = []
+    for line in notes.splitlines():
+        title = "".join(character for character in line if ord(character) >= 32 and ord(character) != 127)
+        title = title.strip().removeprefix("- ").removeprefix("* ").removeprefix("• ").strip()[:160]
+        if title and title not in changes and len(changes) < DEV_NOTES_CHANGES:
+            changes.append(title)
+    builds = [{"version": version, "changes": changes}]
+    if previous is not None:
+        with previous.expanduser().open("rb") as stream:
+            data = stream.read(DEV_NOTES_LIMIT + 1)
+        if len(data) > DEV_NOTES_LIMIT:
+            raise ValueError("The previous Development notes file is too large.")
+        index = json.loads(data)
+        if (not isinstance(index, dict) or type(index.get("schema")) is not int or index["schema"] != 1
+                or not isinstance(index.get("builds"), list) or not 1 <= len(index["builds"]) <= DEV_NOTES_BUILDS):
+            raise ValueError("The previous Development notes file has an unsupported format.")
+        last = current
+        for index_position, build in enumerate(index["builds"]):
+            if not isinstance(build, dict):
+                raise ValueError("The previous Development notes contain an invalid build.")
+            build_version = development_version(build.get("version"))
+            build_changes = build.get("changes")
+            if (not isinstance(build_changes, list) or len(build_changes) > DEV_NOTES_CHANGES or
+                    any(not isinstance(item, str) or not item or len(item) > 160 or
+                        any(ord(char) < 32 or ord(char) == 127 for char in item) for item in build_changes)):
+                raise ValueError("The previous Development notes contain an invalid change.")
+            if index_position == 0 and build_version == current:
+                continue  # A rebuild replaces this revision's notes.
+            if build_version >= last:
+                raise ValueError("Previous Development releases must appear newest first and precede this build.")
+            last = build_version
+            builds.append({"version": build["version"], "changes": build_changes})
+    del builds[DEV_NOTES_BUILDS:]
+    while True:
+        data = json.dumps({"schema": 1, "builds": builds}, ensure_ascii=False, separators=(",", ":")).encode()
+        if len(data) <= DEV_NOTES_LIMIT:
+            return data
+        builds.pop()
 
 
 def assemble(app, updates, transforms):
@@ -269,12 +344,28 @@ def main():
     parser.add_argument("--update-key", type=Path, help="Sign an installable update ZIP and feed with an external Ed25519 seed")
     parser.add_argument("--channel", choices=("stable", "dev"), default="stable", help="Release channel stamped into the signed app")
     parser.add_argument("--dev-updates", type=Path, help="JSON with the Development feed URL and distinct public key")
+    parser.add_argument("--stable-rollout-url", help="Override the Stable rollout feed URL")
+    parser.add_argument("--rollout-percent", type=int, help="Offer the signed rollout to this percentage of installs (0–100)")
+    parser.add_argument("--rollout-required", action="store_true", help="Offer the signed release to all eligible installs")
+    parser.add_argument("--previous-dev-notes", type=Path, help="Rolling notes JSON from the last Development release")
     parser.add_argument("--notes", default="", help="Release notes shown in the native update prompt")
     opts = parser.parse_args()
+    dev_notes = None
     try:
-        updates = update_configuration(opts.channel, opts.dev_updates)
+        updates = update_configuration(opts.channel, opts.dev_updates, opts.stable_rollout_url)
+        if opts.channel == "dev":
+            version = json.loads((DESKTOP / "app.json").read_bytes())["version"]
+            dev_notes = development_release_notes(version, opts.notes, opts.previous_dev_notes)
+        elif opts.previous_dev_notes:
+            raise ValueError("--previous-dev-notes applies to the Development channel.")
     except (ValueError, OSError) as error:
         parser.error(str(error))
+    release_settings = updates["development"] if opts.channel == "dev" else updates
+    rollout_percent = 100 if opts.rollout_percent is None else opts.rollout_percent
+    if not 0 <= rollout_percent <= 100:
+        parser.error("--rollout-percent must be between 0 and 100.")
+    if (opts.rollout_percent is not None or opts.rollout_required) and (not opts.update_key or not release_settings.get("rollout_url")):
+        parser.error("Rollout controls require --update-key and a rollout feed URL for this channel.")
     if opts.identity is None and opts.publisher_identity is None and (PUBLISHER.exists() or opts.update_key):
         opts.publisher_identity = PUBLISHER
     if opts.update_key and opts.identity == "-":
@@ -303,6 +394,9 @@ def main():
         app = stage / "Jaro.app"
         run("native", "package", "--target", "macos", "--signing", "none", "--binary", DESKTOP / "zig-out/bin/jard-soundfolio-local", "--output", app, cwd=DESKTOP)
         assemble(app, updates, transforms)
+        if dev_notes is not None:
+            (app / "Contents/Resources" / DEV_NOTES_NAME).write_bytes(dev_notes)
+            (stage / DEV_NOTES_NAME).write_bytes(dev_notes)
         if opts.publisher_identity:
             sign_with_publisher(app, opts.publisher_identity.expanduser().resolve(), release=bool(opts.update_key))
         else:
@@ -327,6 +421,9 @@ def main():
             run("native", "update", "sign", "--manifest", release_manifest,
                 "--target", "macos-aarch64", "--archive", archive, "--url", url,
                 "--notes", opts.notes, "--private-key", opts.update_key, "--output", feed)
+            if release_settings.get("rollout_url"):
+                sign_rollout_feed(feed, stage / ROLLOUT_FEED_NAME, opts.update_key, opts.channel,
+                                  rollout_percent, opts.rollout_required)
         if opts.dmg or opts.notary_profile:
             image_root = stage / "image"
             image_root.mkdir()
@@ -348,6 +445,13 @@ def main():
         if opts.update_key:
             archive.replace(OUT / archive.name)
             feed.replace(OUT / feed.name)
+            rollout = stage / ROLLOUT_FEED_NAME
+            if rollout.exists():
+                rollout.replace(OUT / rollout.name)
+            else:
+                (OUT / ROLLOUT_FEED_NAME).unlink(missing_ok=True)
+        if dev_notes is not None:
+            (stage / DEV_NOTES_NAME).replace(OUT / DEV_NOTES_NAME)
         print(output)
 
 

@@ -29,6 +29,7 @@ async function run() {
       window.zero = { invoke: async (command, args) => {
         log.push([command, args])
         if (command === "jard.devices") return { microphone: "Fixture Mac input", drafts: [] }
+        if (command === "jard.update") return { phase: "current", currentVersion: "0.0.8" }
         if (command === "jard.permission") {
           if (args.prompt) state[args.source] = answer[args.source]
           return { status: state[args.source] }
@@ -109,6 +110,31 @@ async function run() {
     await button("Recording access").waitFor({state:"hidden"})
     await button("Settings").click()
     await settingsSection.getByText("Allowed", {exact:true}).nth(1).waitFor()
+    const groups = ["Updates", "Application", "Recording access"].map(name => page.getByRole("region", {name, exact:true}))
+    const cards = groups.map(group => group.locator(":scope > .dictation-preference-group"))
+    const headings = groups.map(group => group.getByRole("heading", {level:3}))
+    const boxes = await Promise.all(cards.map(card => card.boundingBox()))
+    const headingBoxes = await Promise.all(headings.map(heading => heading.boundingBox()))
+    for (let index = 1; index < boxes.length; index++) {
+      assert.equal(boxes[index].x, boxes[0].x)
+      assert.equal(boxes[index].width, boxes[0].width)
+      assert.equal(headingBoxes[index].x, headingBoxes[0].x)
+    }
+    assert.equal(headingBoxes[1].y - boxes[0].y - boxes[0].height, headingBoxes[2].y - boxes[1].y - boxes[1].height)
+    assert.equal(await settingsSection.locator(".dictation-setting-row").count(), 2)
+    await page.setViewportSize({width:430, height:720})
+    await settingsSection.scrollIntoViewIfNeeded()
+    const narrowCard = await cards[2].boundingBox()
+    assert(narrowCard.width <= 430)
+    for (const control of await settingsSection.getByRole("button", {name:/Open .* settings|Check access again/}).all()) {
+      const bounds = await control.boundingBox()
+      assert(bounds.x >= narrowCard.x && bounds.x + bounds.width <= narrowCard.x + narrowCard.width)
+    }
+    const beforeCheck = (await calls("jard.permission")).length
+    await settingsSection.getByRole("button", {name:"Check access again"}).click()
+    await settingsSection.getByRole("status").getByText("Access is ready.").waitFor()
+    assert.deepEqual((await calls("jard.permission")).slice(beforeCheck), [{source:"mic", prompt:false}, {source:"system", prompt:false}])
+    await page.setViewportSize({width:1050, height:760})
     await settingsSection.getByText("Jard isn’t listed in System Settings").click()
     await settingsSection.getByRole("button", {name:"Show this app in Finder"}).waitFor()
     assert.equal((await calls("jard.record")).length, 0)

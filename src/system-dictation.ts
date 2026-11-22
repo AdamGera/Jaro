@@ -47,7 +47,13 @@ export type DictationStatus = DictationPreferences & {
   rawLabel: string
   pasteLabel: string
   cancelLabel: string
-  shortcutTarget: "" | "shortcut" | "raw" | "paste" | "cancel"
+  annotateLabel?: string
+  annotationEnabled?: boolean
+  annotationShowOverlays?: boolean
+  annotationListener?: boolean
+  annotationRecorderAvailable?: boolean
+  annotationShortcutConflict?: boolean
+  shortcutTarget: "" | "shortcut" | "raw" | "paste" | "cancel" | "annotate"
   microphone: "granted" | "request" | "denied" | "restricted"
   accessibility: boolean
   accessibilityRequested: boolean
@@ -122,6 +128,9 @@ export type DictationScriptReview = {
 }
 export type DictationAction =
   | { action: "status" | "microphone" | "accessibility" | "repairAccessibility" | "inputMonitoring" | "reopen" | "cancelShortcut" | "clearRawShortcut" | "resetShortcut" | "resetCancelShortcut" | "resetPasteShortcut" | "copyLast" | "chooseOutputScript" | "clearOutputScript" | "requestMediaAccess" | "openMediaAutomationSettings" }
+  | { action: "cancelAnnotationShortcut" | "resetAnnotationShortcut" }
+  | { action: "setAnnotationEnabled"; enabled: boolean }
+  | { action: "setAnnotationOverlays"; show: boolean }
   | { action: "requestBrowserAccess" | "openBrowserAutomationSettings" }
   | { action: "previewSound"; cue: DictationSoundCue; style?: DictationPreferences["soundSet"] }
   | { action: "stopSoundPreview" }
@@ -130,7 +139,7 @@ export type DictationAction =
   | { action: "approveOutputScript"; token: string; grants?: DictationTransformGrants }
   | { action: "editVocabulary"; base: DictationVocabularyEntry[]; entries: DictationVocabularyEntry[] }
   | { [K in keyof DictationPreferences]: { action: "set"; key: K; value: DictationPreferences[K] } }[keyof DictationPreferences]
-  | { action: "chooseShortcut"; target?: "shortcut" | "raw" | "paste" | "cancel" }
+  | { action: "chooseShortcut"; target?: "shortcut" | "raw" | "paste" | "cancel" | "annotate" }
   | { action: "setShortcutSide"; value: DictationShortcutSide }
   | { action: "bulkHistory"; operation: "copy" | "delete"; ids: string[] }
   | { action: "clearHistory" }

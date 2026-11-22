@@ -1,7 +1,10 @@
 #import <AppKit/AppKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <Carbon/Carbon.h>
+#import <CoreAudio/CoreAudio.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <IOKit/IOKitLib.h>
+#import <IOKit/pwr_mgt/IOPM.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <signal.h>
 #import <errno.h>
@@ -11,17 +14,34 @@
 #import "jard_login_item.h"
 #import "jard_updater.h"
 #import "jard_annotation.h"
-#import "jard_annotation_route_panel.h"
+#import "jard_annotation_access.h"
+#import "jard_annotation_result_panel.h"
 #import "jard_meetings.h"
 #import "jard_meeting_audio_access.h"
 #import "jard_interface_language.h"
+#import "jard_permission_return.h"
 
 #define SDK_BYTES(text) (text).UTF8String, [(text) lengthOfBytesUsingEncoding:NSUTF8StringEncoding]
 
-static NSString *const showDockIconKey = @"JardShowDockIcon";
 static char statusItemVisibilityContext;
 static NSString *const updatesManagedMessage = @"Updates managed by your organization";
 static NSString *const annotationManagedMessage = @"Screen annotation is managed by your organization.";
+static const AudioObjectPropertyAddress inputDeviceProperties[] = {
+    {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+    {kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+    {kAudioHardwarePropertyServiceRestarted, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
+};
+
+typedef NS_ENUM(NSUInteger, JardCapturePermission) {
+    JardNoCapturePermission, JardScreenRecordingPermission, JardMacAudioPermission
+};
+
+@class JardHost;
+
+@interface JardTerminationDelegate : NSObject <NSApplicationDelegate>
+@property(nonatomic, weak) JardHost *host;
+@property(nonatomic, weak) id<NSApplicationDelegate> upstream;
+@end
 
 static BOOL JardForcedBoolean(CFStringRef key) {
     CFStringRef domain = CFSTR("local.jardaudio.desktop");
@@ -45,8 +65,10 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 @property(nonatomic, strong) JardLoginItem *loginItem;
 @property(nonatomic, strong) JardUpdater *updater;
 @property(nonatomic, strong) JardAnnotation *annotation;
+@property(nonatomic, strong) JardAnnotationAccess *annotationAccess;
 @property(nonatomic) BOOL annotationManaged;
-@property(nonatomic, strong) JardAnnotationRoutePanel *annotationRoutePanel;
+@property(nonatomic, strong) JardAnnotationResultPanel *annotationResultPanel;
+@property(nonatomic, strong) JardAnnotationResultPanel *annotationRoutePanel;
 @property(nonatomic, strong) JardMeetings *meetings;
 @property(nonatomic, strong) JardMeetingAudioAccess *meetingAudioAccess;
 @property(nonatomic, strong) NSMenuItem *updateMenu;
@@ -55,22 +77,60 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 @property(nonatomic, strong) NSDictionary<NSString *, NSMenuItem *> *meetingMenuItems;
 @property(nonatomic, copy) NSDictionary *meetingMenuStatus;
 @property(nonatomic, strong) NSTimer *updateTimer;
-@property(nonatomic, strong) id updateActivationObserver;
+@property(nonatomic, strong) NSTimer *capturePermissionTimer;
+@property(nonatomic, copy) AudioObjectPropertyListenerBlock inputDeviceListener;
+@property(nonatomic) NSUInteger inputDeviceNotifications;
+@property(nonatomic) IONotificationPortRef lidPort;
+@property(nonatomic) io_object_t lidNotification;
+@property(nonatomic) BOOL inputDeviceEventPending;
+@property(nonatomic) JardCapturePermission capturePermissionVisit;
+@property(nonatomic) NSTimeInterval capturePermissionOpenedAt, capturePermissionReturnDeadline;
 @property(nonatomic) BOOL updating, manualUpdateCheck, manualUpdateResult;
 @property(nonatomic) BOOL updatesDisabledAtLaunch, updateRestartBlocked;
+@property(nonatomic) BOOL updateRestartInProgress;
+@property(nonatomic, copy) NSString *updateRestartError;
 @property(nonatomic, copy) NSString *updateSettingsRequest;
 @property(nonatomic, copy) NSDictionary *windowNavigation;
 @property(nonatomic, copy) JardDictationReply pendingUpdateRestart;
 @property(nonatomic) BOOL showingApp, closing;
-@property(nonatomic) BOOL launchHandled, quietLoginStartup;
-@property(nonatomic) NSTimeInterval loginActivationDeadline;
+@property(nonatomic) BOOL menuQuitPending;
+@property(nonatomic) BOOL systemQuitPending, terminationApproved;
+@property(nonatomic, strong) JardTerminationDelegate *terminationDelegate;
+@property(nonatomic) BOOL launchHandled, quietStartupPending, hiddenLaunchRequested;
+@property(nonatomic) NSTimeInterval startupActivationDeadline;
 @property(nonatomic) BOOL otherRecording;
 @property(nonatomic, copy) NSString *sdkCaptureID;
 @property(nonatomic, copy) NSString *controlExitID;
 @property(nonatomic, weak) NSWindow *window;
 @property(nonatomic, strong) id dragMonitor;
 @property(nonatomic, strong) NSMapTable<NSMenuItem *, NSString *> *menuLabels;
-@property(nonatomic, copy) NSString *menuLanguage;
+@property(nonatomic, copy) NSString *menuLanguage, *selectedInterfaceLanguage;
+- (NSApplicationTerminateReply)requestSystemTermination;
+- (void)terminateAfterCleanup;
+- (void)queueInputDeviceEvent;
+- (void)registerInputDeviceProperties;
+- (void)removeInputDeviceProperties;
+@end
+
+static void lidStateChanged(void *context, io_service_t service, natural_t message, void *argument) {
+    if (message == kIOPMMessageClamshellStateChange) [(__bridge JardHost *)context queueInputDeviceEvent];
+}
+
+@implementation JardTerminationDelegate
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+    return self.host ? [self.host requestSystemTermination] : NSTerminateNow;
+}
+
+- (BOOL)respondsToSelector:(SEL)selector {
+    return [super respondsToSelector:selector] || [self.upstream respondsToSelector:selector];
+}
+
+- (id)forwardingTargetForSelector:(SEL)selector {
+    if ([self.upstream respondsToSelector:selector]) return self.upstream;
+    return [super forwardingTargetForSelector:selector];
+}
+
 @end
 
 @implementation JardHost
@@ -96,7 +156,7 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 - (void)received:(NSDictionary *)line {
     if (self.closing || ![line isKindOfClass:NSDictionary.class]) return;
     if ([self.controlExitID isEqual:line[@"desktopExitAccepted"]]) {
-        [NSApp terminate:nil];
+        [self terminateAfterCleanup];
         return;
     }
     if ([self.sdkCaptureID isEqual:line[@"sdkCaptureEnded"]]) {
@@ -143,7 +203,14 @@ static BOOL JardForcedBoolean(CFStringRef key) {
                     reply(failure ? nil : @{@"enabled": @([result[@"state"] isEqual:@"enabled"])}, failure);
                 }];
             } else {
-                [self.systemDictation controlSettings:request reply:reply];
+                if ([action isEqual:@"settings-apply"] && JardChangesAnnotationSettings(request[@"changes"])) {
+                    if (self.annotationManaged) { reply(nil, annotationManagedMessage); return; }
+                    if (self.closing || (JardChangesAnnotationInputSettings(request[@"changes"]) && [self hasActiveCapture])) {
+                        reply(nil, @"Finish the current recording before changing Annotate settings.");
+                        return;
+                    }
+                }
+                [self applyControlSettings:request reply:reply];
             }
             [self updateWindowClosePolicy];
         } else if ([action isEqual:@"check-for-updates"]) {
@@ -151,6 +218,13 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         } else if ([action isEqual:@"update-channel"]) {
             NSString *operation = request[@"channel"] ? @"channel" : request[@"offer"] ? @"confirmSwitch" : @"status";
             [self performUpdateAction:operation payload:request reply:reply];
+        } else if ([action isEqual:@"history-checkpoint"]) {
+            NSString *path = request[@"path"];
+            if (![path isKindOfClass:NSString.class] || !path.isAbsolutePath) {
+                reply(nil, @"The private dictation history file is unavailable.");
+                return;
+            }
+            [self.systemDictation writeHistorySnapshot:path reply:reply];
         } else if ([action isEqual:@"history-clear"]) {
             if (self.updating) { reply(nil, @"Jaro is preparing to restart."); return; }
             [self.systemDictation control:action reply:reply];
@@ -191,10 +265,11 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         // Build the destination locally. A helper message never supplies the navigation URL.
         self.showingApp = YES;
         [self.systemDictation workspaceReady];
-        if (self.quietLoginStartup && !self.systemDictation.quietAtLogin) [self showStartupWindowIfHidden];
-        self.quietLoginStartup = NO;
         [self.meetings workspaceReady];
         [self updateMeetingMenu:nil];
+        if (self.quietStartupPending && (!self.systemDictation.quietAtLogin || ![self canOpenFromMenuBar]))
+            [self showStartupWindowIfHidden];
+        self.quietStartupPending = NO;
         [self.pending removeAllObjects];
         // Use a fresh URL for the first request, even when WebKit still has
         // the previous bundle's workspace HTML cached under the loopback origin.
@@ -203,11 +278,15 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     } else if ([line[@"event"] isEqual:@"jard-microphone"]) {
         id detail = line[@"detail"];
         if ([detail isKindOfClass:NSDictionary.class]) [self.systemDictation updateWarmInputStatus:detail];
+    } else if ([line[@"event"] isEqual:@"jard-annotation-confirmation"]) {
+        [self confirmAnnotationDelivery:line[@"detail"]];
     } else if ([line[@"event"] isEqual:@"setup"] || [line[@"event"] isEqual:@"jard-capture"] ||
-               [line[@"event"] isEqual:@"jard-annotation-routing"]) {
+               [line[@"event"] isEqual:@"jard-annotation-routing"] || [line[@"event"] isEqual:@"jard-annotation-delivery-changed"]) {
         NSString *event = line[@"event"];
         NSDictionary *capture = [line[@"detail"] isKindOfClass:NSDictionary.class] ? line[@"detail"] : nil;
-        if ([event isEqual:@"jard-annotation-routing"] && capture) [self.annotationRoutePanel update:capture];
+        if ([event isEqual:@"jard-annotation-routing"] && capture &&
+            ![self.annotationResultPanel updateRouting:capture] && ![self.annotationRoutePanel updateRouting:capture])
+            [self.annotationRoutePanel showRoute:capture];
         if ([event isEqual:@"jard-capture"]) {
             [self.meetings handleCapture:capture];
             if (!capture[@"meeting"] && !capture[@"dictation"]) {
@@ -225,6 +304,18 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     }
 }
 
+- (void)applyControlSettings:(NSDictionary *)request reply:(JardDictationReply)reply {
+    [self.systemDictation controlSettings:request reply:^(id result, NSString *error) {
+        NSDictionary *changes = [request[@"action"] isEqual:@"settings-apply"] && !error ? request[@"changes"] : nil;
+        if (changes[JardShowDockIconSettingKey]) [self refreshDockIconPreference];
+        if (changes[JardInterfaceLanguageSettingKey]) {
+            [self refreshInterfaceLanguageWithCompletion:^{ reply(result, nil); }];
+        } else {
+            reply(result, error);
+        }
+    }];
+}
+
 - (BOOL)startBridge:(NSError **)error {
     if (self.bridge.running) return YES;
     NSTask *child = [[NSTask alloc] init];
@@ -232,6 +323,7 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     NSMutableDictionary *environment = [NSProcessInfo.processInfo.environment mutableCopy];
     environment[@"JARD_UI_EXECUTABLE"] = self.bridgeURL.path;
     environment[@"JARD_UI_INSTANCE"] = @(NSProcessInfo.processInfo.processIdentifier).stringValue;
+    environment[@"JARD_MEETING_CLOCK"] = [JardInterfaceLanguageStatus()[@"resolved"] isEqual:@"en"] ? @"12" : @"24";
     child.environment = environment;
     NSPipe *input = NSPipe.pipe;
     NSPipe *output = NSPipe.pipe;
@@ -274,11 +366,12 @@ static BOOL JardForcedBoolean(CFStringRef key) {
             NSArray *completions = self.nativePending.allValues;
             [self.nativePending removeAllObjects];
             for (JardDictationReply completion in completions) completion(nil, @"The local helper stopped. Try again.");
+            [self.annotationResultPanel dismiss];
             [self.annotationRoutePanel dismiss];
             [self.systemDictation helperDisconnected];
             [self.meetings bridgeDisconnected];
             self.otherRecording = NO;
-            if (self.controlExitID) { [NSApp terminate:nil]; return; }
+            if (self.controlExitID) { [self terminateAfterCleanup]; return; }
             [self setOwnedCapture:nil];
             [self refreshMeetingAvailability];
         });
@@ -300,16 +393,25 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 }
 
 - (void)completeWindowLaunch:(NSAppleEventDescriptor *)event {
+    if (!self.terminationDelegate && NSApp.delegate) {
+        self.terminationDelegate = JardTerminationDelegate.new;
+        self.terminationDelegate.host = self;
+        self.terminationDelegate.upstream = NSApp.delegate;
+        NSApp.delegate = self.terminationDelegate;
+    }
     if (self.launchHandled) return;
     self.launchHandled = YES;
     BOOL login = event.eventClass == kCoreEventClass && event.eventID == kAEOpenApplication &&
         [event paramDescriptorForKeyword:keyAEPropData].enumCodeValue == keyAELaunchedAsLogInItem;
-    if (login && self.systemDictation.quietAtLogin && !self.window.visible) {
-        self.quietLoginStartup = !self.showingApp;
+    BOOL menuOnly = self.hiddenLaunchRequested || ![self showDockIcon];
+    if (menuOnly) [self updateMeetingMenu:nil];
+    BOOL canStayQuiet = !menuOnly || [self canOpenFromMenuBar];
+    BOOL quiet = canStayQuiet && (self.hiddenLaunchRequested || ((login || menuOnly) && self.systemDictation.quietAtLogin));
+    if (quiet && !self.window.visible) {
+        self.quietStartupPending = !self.hiddenLaunchRequested && !self.showingApp;
         [self updateWindowClosePolicy];
-        // Ignore the activation AppKit can deliver with the login event. A background
-        // launch may deliver none, so leave later app-switcher activations eligible.
-        self.loginActivationDeadline = NSProcessInfo.processInfo.systemUptime + 1;
+        // AppKit can send an activation along with a background launch.
+        self.startupActivationDeadline = NSProcessInfo.processInfo.systemUptime + 1;
     } else if (!self.window.visible) {
         [self showWorkspace];
     }
@@ -330,9 +432,77 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         [self.systemDictation applicationActivationPolicyChanged];
 }
 
+- (void)finishBackgroundStartup {
+    self.quietStartupPending = NO;
+    if (self.hiddenLaunchRequested) {
+        self.hiddenLaunchRequested = NO;
+        self.meetingMenuItems[@"quit"].hidden = [self showDockIcon];
+        [self updateWindowClosePolicy];
+    }
+}
+
 - (void)showWorkspace {
+    [self finishBackgroundStartup];
     [self setDockIconVisible:YES];
     native_sdk_appkit_show_window(self.host, 1);
+}
+
+- (BOOL)canReturnFromPermissionSettings {
+    NSWindow *window = self.window;
+    return self.showingApp && window.visible && !window.miniaturized && !NSApp.hidden && !self.closing &&
+        !self.updating && !self.updateRestartInProgress && !self.systemDictation.sessionUnavailable && ![self hasActiveCapture];
+}
+
+- (void)returnFromPermissionSettings {
+    if (![self canReturnFromPermissionSettings] || NSApp.active) return;
+    NSString *foreground = NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier;
+    if (![foreground isEqual:JardSystemSettingsBundle]) return;
+    [NSApp activate];
+    [self.window makeKeyAndOrderFront:nil];
+}
+
+- (void)endCapturePermissionWatch {
+    [self.capturePermissionTimer invalidate];
+    self.capturePermissionTimer = nil;
+    self.capturePermissionVisit = JardNoCapturePermission;
+    self.capturePermissionReturnDeadline = 0;
+}
+
+- (void)pollCapturePermission {
+    if (![self canReturnFromPermissionSettings]) { [self endCapturePermissionWatch]; return; }
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    BOOL settingsOpen = [NSRunningApplication runningApplicationsWithBundleIdentifier:JardSystemSettingsBundle].count > 0;
+    if ((!settingsOpen || NSApp.active) && now - self.capturePermissionOpenedAt > JardPermissionReturnGrace) {
+        [self endCapturePermissionWatch];
+        return;
+    }
+    BOOL visiting = self.capturePermissionVisit == JardScreenRecordingPermission ?
+        [self.annotationAccess pollSettingsVisit] : [self.meetingAudioAccess pollSettingsVisit];
+    if (self.capturePermissionReturnDeadline) {
+        BOOL settingsFront = [NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier isEqual:JardSystemSettingsBundle];
+        if (JardTakePermissionReturn(&_capturePermissionReturnDeadline, now, settingsOpen, settingsFront, NSApp.active))
+            [self returnFromPermissionSettings];
+    }
+    if (!visiting && !self.capturePermissionReturnDeadline) [self endCapturePermissionWatch];
+}
+
+- (void)capturePermissionVisitChanged:(JardCapturePermission)permission granted:(BOOL)granted {
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    if (granted) {
+        if (self.capturePermissionVisit == permission) self.capturePermissionReturnDeadline = now + JardPermissionReturnGrace;
+        return;
+    }
+    if (![self canReturnFromPermissionSettings]) { [self endCapturePermissionWatch]; return; }
+    self.capturePermissionVisit = permission;
+    self.capturePermissionOpenedAt = now;
+    self.capturePermissionReturnDeadline = 0;
+    if (self.capturePermissionTimer) return;
+    __weak typeof(self) owner = self;
+    self.capturePermissionTimer = [NSTimer timerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
+        [owner pollCapturePermission];
+    }];
+    self.capturePermissionTimer.tolerance = 0.04;
+    [NSRunLoop.mainRunLoop addTimer:self.capturePermissionTimer forMode:NSRunLoopCommonModes];
 }
 
 - (void)controlWindowAction:(NSString *)action pane:(NSString *)pane reply:(JardDictationReply)reply {
@@ -349,7 +519,7 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         reply(nil, @"There is no live meeting transcript.");
         return;
     }
-    if (![@[@"settings", @"general", @"dictation", @"history", @"output", @"meetings", @"annotate", @"home", @"live-meeting"] containsObject:pane ?: NSNull.null]) {
+    if (![@[@"settings", @"general", @"dictation", @"history", @"output", @"meetings", @"annotate", @"home", @"live-meeting", @"meeting-library"] containsObject:pane ?: NSNull.null]) {
         reply(nil, @"Unknown Jaro workspace pane.");
         return;
     }
@@ -365,12 +535,11 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 
 - (void)applicationActivated {
     [self refreshInterfaceLanguage];
-    BOOL loginActivation = self.loginActivationDeadline > NSProcessInfo.processInfo.systemUptime;
-    self.loginActivationDeadline = 0;
-    if (!self.launchHandled || loginActivation || self.closing || self.updating || NSApp.hidden ||
+    BOOL startupActivation = self.startupActivationDeadline > NSProcessInfo.processInfo.systemUptime;
+    self.startupActivationDeadline = 0;
+    if (!self.launchHandled || startupActivation || self.closing || self.updating || NSApp.hidden ||
         NSApp.activationPolicy != NSApplicationActivationPolicyRegular || NSApp.keyWindow ||
         !self.window || self.window.visible || self.window.miniaturized) return;
-    self.quietLoginStartup = NO;
     [self showWorkspace];
 }
 
@@ -378,17 +547,106 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     [self.systemDictation stopSoundPreview];
 }
 
+- (void)checkForScheduledUpdate:(BOOL)workspaceFocused {
+    if (!self.closing && !self.updating && [NSUserDefaults.standardUserDefaults boolForKey:@"JardCheckForUpdatesOnLaunch"])
+        [self.updater checkAutomaticallyOnActivation:workspaceFocused];
+}
+
+- (void)workspaceFocused:(NSNotification *)notification {
+    [self checkForScheduledUpdate:YES];
+    [self queueInputDeviceEvent];
+}
+
+- (void)queueInputDeviceEvent {
+    if (self.closing || !self.showingApp || !self.window.visible || self.window.miniaturized || self.inputDeviceEventPending) return;
+    self.inputDeviceEventPending = YES;
+    __weak typeof(self) owner = self;
+    // A device arrival can change the list and the default input together.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        JardHost *app = owner;
+        app.inputDeviceEventPending = NO;
+        if (!app || app.closing || !app.showingApp || !app.window.visible || app.window.miniaturized) return;
+        native_sdk_appkit_emit_window_event(app.host, 1, SDK_BYTES(@"jard-input-devices"), "{}", 2);
+    });
+}
+
+- (void)registerInputDeviceProperties {
+    for (NSUInteger i = 0; i < sizeof(inputDeviceProperties) / sizeof(inputDeviceProperties[0]); i++) {
+        OSStatus result = AudioObjectAddPropertyListenerBlock(kAudioObjectSystemObject, &inputDeviceProperties[i],
+                                                              dispatch_get_main_queue(), self.inputDeviceListener);
+        if (result == noErr) self.inputDeviceNotifications |= 1UL << i;
+    }
+}
+
+- (void)observeInputDevices {
+    __weak typeof(self) owner = self;
+    self.inputDeviceListener = ^(UInt32 count, const AudioObjectPropertyAddress *addresses) {
+        JardHost *app = owner;
+        if (!app || app.closing) return;
+        for (UInt32 i = 0; i < count; i++) {
+            if (addresses[i].mSelector == kAudioHardwarePropertyServiceRestarted) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    JardHost *host = owner;
+                    if (!host || host.closing) return;
+                    [host removeInputDeviceProperties];
+                    [host registerInputDeviceProperties];
+                });
+                break;
+            }
+        }
+        [app queueInputDeviceEvent];
+    };
+    [self registerInputDeviceProperties];
+
+    // The lid can disable the built-in mic without changing either Core Audio property.
+    io_service_t root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"));
+    if (!root) return;
+    IONotificationPortRef port = IONotificationPortCreate(kIOMainPortDefault);
+    io_object_t notification = IO_OBJECT_NULL;
+    if (port && IOServiceAddInterestNotification(port, root, kIOGeneralInterest, lidStateChanged,
+                                                 (__bridge void *)self, &notification) == kIOReturnSuccess) {
+        self.lidPort = port;
+        self.lidNotification = notification;
+        IONotificationPortSetDispatchQueue(port, dispatch_get_main_queue());
+    } else if (port) {
+        IONotificationPortDestroy(port);
+    }
+    IOObjectRelease(root);
+}
+
+- (void)removeInputDeviceProperties {
+    for (NSUInteger i = 0; i < sizeof(inputDeviceProperties) / sizeof(inputDeviceProperties[0]); i++) {
+        if (self.inputDeviceNotifications & (1UL << i)) {
+            AudioObjectRemovePropertyListenerBlock(kAudioObjectSystemObject, &inputDeviceProperties[i],
+                                                   dispatch_get_main_queue(), self.inputDeviceListener);
+        }
+    }
+    self.inputDeviceNotifications = 0;
+}
+
+- (void)stopObservingInputDevices {
+    [self removeInputDeviceProperties];
+    self.inputDeviceListener = nil;
+    if (self.lidNotification) IOObjectRelease(self.lidNotification);
+    if (self.lidPort) IONotificationPortDestroy(self.lidPort);
+    self.lidNotification = IO_OBJECT_NULL;
+    self.lidPort = NULL;
+}
+
 - (void)installWindowChrome {
     self.window = NSApp.mainWindow ?: NSApp.windows.firstObject;
     self.window.titlebarSeparatorStyle = NSTitlebarSeparatorStyleNone;
     self.window.toolbarStyle = NSWindowToolbarStyleUnifiedCompact;
     self.window.collectionBehavior |= NSWindowCollectionBehaviorMoveToActiveSpace;
+    [self observeInputDevices];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(applicationStarted:)
         name:NSApplicationDidFinishLaunchingNotification object:NSApp];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(workspaceHidden:)
         name:NSApplicationDidHideNotification object:NSApp];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(workspaceHidden:)
         name:NSWindowDidMiniaturizeNotification object:self.window];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(workspaceFocused:)
+        name:NSWindowDidBecomeKeyNotification object:self.window];
     for (NSString *name in @[NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification]) {
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(chromeChanged:) name:name object:self.window];
     }
@@ -458,7 +716,7 @@ static BOOL JardForcedBoolean(CFStringRef key) {
                 reply(@{@"permission": @"system"}, @"Allow Mac audio access to record this meeting.");
                 return;
             }
-            if (self.closing || self.updating || self.annotation.busy || self.otherRecording || self.sdkCaptureID) {
+            if (self.closing || self.updating || [self annotationBlocksMeeting] || self.otherRecording || self.sdkCaptureID) {
                 reply(nil, @"Finish your current capture or update before starting a meeting.");
                 return;
             }
@@ -512,7 +770,10 @@ static BOOL JardForcedBoolean(CFStringRef key) {
                 [self reject:request reason:JardLocalized(@"Choose an available interface language.")];
                 return;
             }
-            [self refreshInterfaceLanguage];
+            [self refreshInterfaceLanguageWithCompletion:^{
+                [self respond:@{@"id": request, @"ok": @YES, @"result": JardInterfaceLanguageStatus()}];
+            }];
+            return;
         } else if (![payload[@"action"] isEqual:@"status"]) {
             [self reject:request reason:JardLocalized(@"The interface language cannot be changed right now.")];
             return;
@@ -535,6 +796,15 @@ static BOOL JardForcedBoolean(CFStringRef key) {
             return;
         }
         [self respond:@{@"id": request, @"ok": @YES, @"result": [self dockIconStatus]}];
+        return;
+    }
+    if (self.showingApp && [origin isEqual:self.origin] && [command isEqual:@"jard.agentSetup"]) {
+        NSString *cli = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"Contents/Helpers/jardctl"];
+        if (![NSFileManager.defaultManager isExecutableFileAtPath:cli]) {
+            [self reject:request reason:@"Jaro’s command line tool is unavailable."];
+            return;
+        }
+        [self respond:@{@"id": request, @"ok": @YES, @"result": @{@"cli": cli}}];
         return;
     }
     if (self.showingApp && [origin isEqual:self.origin] &&
@@ -579,6 +849,16 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         }];
         return;
     }
+    if (self.showingApp && [origin isEqual:self.origin] && [command isEqual:@"jard.copyMeetingTranscript"]) {
+        NSDictionary *payload = [message[@"payload"] isKindOfClass:NSDictionary.class] ? message[@"payload"] : @{};
+        NSString *key = [payload[@"id"] isKindOfClass:NSString.class] ? payload[@"id"] : @"";
+        if (![[NSUUID alloc] initWithUUIDString:key]) { [self reject:request reason:@"Invalid meeting ID."]; return; }
+        [self.meetings copySavedTranscript:key reply:^(id result, NSString *error) {
+            if (error) [self reject:request reason:error];
+            else [self respond:@{@"id": request, @"ok": @YES, @"result": result}];
+        }];
+        return;
+    }
     if (self.showingApp && [origin isEqual:self.origin] && [command isEqual:@"jard.meetings"]) {
         NSDictionary *payload = [message[@"payload"] isKindOfClass:NSDictionary.class] ? message[@"payload"] : @{};
         if ([payload[@"action"] isEqual:@"showLiveTranscript"]) {
@@ -607,57 +887,23 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         }];
         return;
     }
+    if (self.showingApp && [origin isEqual:self.origin] && [command isEqual:@"jard.annotationAccess"]) {
+        NSDictionary *payload = [message[@"payload"] isKindOfClass:NSDictionary.class] ? message[@"payload"] : @{};
+        NSString *action = [payload[@"action"] isKindOfClass:NSString.class] ? payload[@"action"] : @"";
+        JardDictationReply finish = ^(id result, NSString *error) {
+            if (error) [self reject:request reason:error];
+            else [self respond:@{@"id": request, @"ok": @YES, @"result": result}];
+        };
+        [self controlAnnotationAccess:action reply:finish];
+        return;
+    }
     BOOL pasteAnnotation = [command isEqual:@"jard.pasteAnnotation"];
     if (self.showingApp && [origin isEqual:self.origin] && (pasteAnnotation || [command isEqual:@"jard.copyAnnotation"])) {
         NSDictionary *payload = [message[@"payload"] isKindOfClass:NSDictionary.class] ? message[@"payload"] : @{};
         NSString *key = [payload[@"id"] isKindOfClass:NSString.class] ? payload[@"id"] : @"";
-        if (![[NSUUID alloc] initWithUUIDString:key]) { [self reject:request reason:@"Invalid annotation ID."]; return; }
-        if (self.updating || self.systemDictation.hasActivity || (pasteAnnotation && self.annotation.busy)) {
-            [self reject:request reason:@"Finish the current action before sharing this annotation."];
-            return;
-        }
-        NSRunningApplication *destination = pasteAnnotation ? [self.systemDictation annotationPasteDestination] : nil;
-        if (pasteAnnotation && !destination) {
-            [self reject:request reason:@"Focus a field in another app, then return to Jard to paste the annotation."];
-            return;
-        }
-        NSUInteger preparationRevision = [self.systemDictation annotationPreparationRevision];
-        NSPasteboard *board = NSPasteboard.generalPasteboard;
-        NSInteger clipboardRevision = board.changeCount;
-        [self sendToHelper:@"jard.annotationHandoff" payload:@{@"id": key} request:nil completion:^(id result, NSString *error) {
-            if (error) { [self reject:request reason:error]; return; }
-            if (self.updating || self.systemDictation.hasActivity || (pasteAnnotation && self.annotation.busy)) {
-                [self reject:request reason:@"Finish the current action before sharing this annotation."];
-                return;
-            }
-            NSString *markdown = [result[@"markdown"] isKindOfClass:NSString.class] ? result[@"markdown"] : nil;
-            NSString *path = [result[@"imagePath"] isKindOfClass:NSString.class] ? result[@"imagePath"] : nil;
-            NSData *image = nil;
-            if (path.isAbsolutePath && [path.lastPathComponent isEqual:@"contact-sheet.png"]) {
-                NSFileHandle *file = [NSFileHandle fileHandleForReadingFromURL:[NSURL fileURLWithPath:path] error:nil];
-                const NSUInteger limit = 12 * 1024 * 1024;
-                image = [file readDataUpToLength:limit + 1 error:nil];
-                [file closeFile];
-                if (image.length > limit) image = nil;
-            }
-            if (pasteAnnotation) {
-                [self.systemDictation pasteAnnotation:markdown image:image path:path destination:destination
-                    preparationRevision:preparationRevision clipboardRevision:clipboardRevision reply:^(id pasted, NSString *failure) {
-                    if (failure) [self reject:request reason:failure];
-                    else [self respond:@{@"id": request, @"ok": @YES, @"result": pasted}];
-                }];
-                return;
-            }
-            BOOL includedImage = NO;
-            if (board.changeCount != clipboardRevision) {
-                [self reject:request reason:@"The clipboard changed while Jard prepared the annotation. Copy it again to replace the current clipboard."];
-                return;
-            }
-            if (!JardCopyAnnotationHandoff(board, clipboardRevision, markdown, image, &includedImage)) {
-                [self reject:request reason:@"Could not copy the annotation."];
-                return;
-            }
-            [self respond:@{@"id": request, @"ok": @YES, @"result": @{@"includedImage": @(includedImage)}}];
+        [self shareAnnotation:key paste:pasteAnnotation fromPanel:NO reply:^(id result, NSString *error) {
+            if (error) [self reject:request reason:error];
+            else [self respond:@{@"id": request, @"ok": @YES, @"result": result}];
         }];
         return;
     }
@@ -684,6 +930,19 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         return;
     }
     if (self.showingApp && [origin isEqual:self.origin] && [command isEqual:@"jard.systemDictation"]) {
+        NSDictionary *payload = [message[@"payload"] isKindOfClass:NSDictionary.class] ? message[@"payload"] : @{};
+        if ([payload[@"action"] isEqual:@"setAnnotationOverlays"] && self.annotationManaged) {
+            [self reject:request reason:annotationManagedMessage];
+            return;
+        }
+        if (([payload[@"action"] isEqual:@"chooseShortcut"] && [payload[@"target"] isEqual:@"annotate"]) ||
+            [payload[@"action"] isEqual:@"resetAnnotationShortcut"] || [payload[@"action"] isEqual:@"setAnnotationEnabled"]) {
+            if (self.annotationManaged) { [self reject:request reason:annotationManagedMessage]; return; }
+            if (self.closing || self.updating || [self hasActiveCapture]) {
+                [self reject:request reason:@"Finish the current recording or update before changing the Annotate shortcut."];
+                return;
+            }
+        }
         if ([message[@"payload"] isKindOfClass:NSDictionary.class] && [message[@"payload"][@"action"] isEqual:@"reopen"]) {
             [self prepareControlExit:nil restart:YES force:NO reply:^(id result, NSString *error) {
                 if (error) [self reject:request reason:error];
@@ -701,10 +960,14 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         return;
     }
     NSArray *commands = self.showingApp
-        ? @[@"jard.devices", @"jard.record", @"jard.stop", @"jard.dictation", @"jard.live", @"jard.openAudio", @"jard.export", @"jard.meetingExports", @"jard.annotationRoutingPolicy", @"jard.annotationDestinations", @"jard.annotationRoute", @"jard.rememberAnnotationDestination", @"jard.forgetAnnotationDestination", @"jard.sendAnnotation", @"jard.annotationDeliveries", @"jard.undoAnnotationDelivery", @"jard.correctAnnotationDelivery", @"jard.recover", @"jard.discard", @"jard.open"]
+        ? @[@"jard.devices", @"jard.inputDevices", @"jard.microphoneLevel", @"jard.record", @"jard.stop", @"jard.dictation", @"jard.live", @"jard.openAudio", @"jard.export", @"jard.meetingExports", @"jard.annotationStorage", @"jard.annotationRoutingPolicy", @"jard.annotationDestinations", @"jard.annotationRoute", @"jard.rememberAnnotationDestination", @"jard.forgetAnnotationDestination", @"jard.sendAnnotation", @"jard.annotationAgentDestinations", @"jard.sendAnnotationToAgent", @"jard.sendSessionToAgent", @"jard.annotationDeliveries", @"jard.undoAnnotationDelivery", @"jard.correctAnnotationDelivery", @"jard.recover", @"jard.discard", @"jard.open"]
         : @[@"jard.prepare", @"jard.setup"];
     if (![origin isEqual:(self.showingApp ? self.origin : @"zero://inline")] || ![commands containsObject:command]) {
         [self reject:request reason:@"This command is unavailable in this view."];
+        return;
+    }
+    if ([command isEqual:@"jard.microphoneLevel"] && (!self.window.visible || self.window.miniaturized)) {
+        [self respond:@{@"id": request, @"ok": @YES, @"result": @{@"peak": NSNull.null}}];
         return;
     }
     if (self.updating) { [self reject:request reason:@"Jard is preparing to restart."]; return; }
@@ -713,8 +976,8 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         [self sendToHelper:command payload:payload request:nil completion:^(id result, NSString *error) {
             if (self.showingApp || self.closing) return;
             BOOL ready = [result isKindOfClass:NSDictionary.class] && [result[@"ready"] isEqual:@YES];
-            if ((!self.launchHandled || self.quietLoginStartup) && (error || !ready)) {
-                self.quietLoginStartup = NO;
+            if (!self.hiddenLaunchRequested && (!self.launchHandled || self.quietStartupPending) && (error || !ready)) {
+                self.quietStartupPending = NO;
                 [self showStartupWindowIfHidden];
             }
             if (error) [self reject:request reason:error];
@@ -773,13 +1036,12 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 
 - (void)updateWindowClosePolicy {
     native_sdk_appkit_set_window_close_policy(self.host, 1,
-        (self.updating || self.systemDictation.keepsRunning || self.annotation.busy || self.meetings.keepsRunning || self.sdkCaptureID ||
+        (self.updating || self.hiddenLaunchRequested || self.systemDictation.keepsRunning || self.annotation.busy || self.meetings.keepsRunning || self.sdkCaptureID ||
             (self.showingApp && ![self showDockIcon])) ? 1 : 0);
 }
 
 - (BOOL)showDockIcon {
-    id preference = [NSUserDefaults.standardUserDefaults objectForKey:showDockIconKey];
-    return ![preference isKindOfClass:NSNumber.class] || [preference boolValue];
+    return JardShowDockIconEnabled();
 }
 
 - (BOOL)canOpenFromMenuBar {
@@ -791,12 +1053,23 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 }
 
 - (void)setShowDockIcon:(BOOL)enabled {
-    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:showDockIconKey];
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:JardShowDockIconPreferenceKey];
+    [self refreshDockIconPreference];
+}
+
+- (void)refreshDockIconPreference {
     [self updateMeetingMenu:nil];
+    [self emitDockIconStatus];
 }
 
 - (void)updateDockPresentation {
     if (!self.launchHandled || self.closing || !self.window) return;
+    if (self.window.visible || self.window.miniaturized) [self finishBackgroundStartup];
+    if (self.hiddenLaunchRequested) {
+        if ([self canOpenFromMenuBar]) [self setDockIconVisible:NO];
+        else [self showStartupWindowIfHidden];
+        return;
+    }
     BOOL visible = !self.showingApp || self.window.visible || self.window.miniaturized || NSApp.hidden ||
         [self showDockIcon] || ![self canOpenFromMenuBar];
     [self setDockIconVisible:visible];
@@ -809,14 +1082,22 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     }
     [self updateWindowClosePolicy];
     [self updateDockPresentation];
+    [self emitDockIconStatus];
+}
+
+- (void)emitDockIconStatus {
     if (self.showingApp && !self.closing) {
         NSData *detail = [NSJSONSerialization dataWithJSONObject:[self dockIconStatus] options:0 error:nil];
         if (detail) native_sdk_appkit_emit_window_event(self.host, 1, SDK_BYTES(@"jard-dock-icon"), detail.bytes, detail.length);
     }
 }
 
+- (BOOL)annotationBlocksMeeting {
+    return self.annotation.busy && !self.annotation.sharesMicrophone;
+}
+
 - (void)refreshMeetingAvailability {
-    [self.meetings suspendOffers:self.annotation.busy || self.updating || self.otherRecording || self.sdkCaptureID != nil];
+    [self.meetings suspendOffers:[self annotationBlocksMeeting] || self.updating || self.otherRecording || self.sdkCaptureID != nil];
     if (self.showingApp) [self.meetings request:@{@"action": @"status"} reply:^(id result, NSString *error) {
         [self updateMeetingMenu:result];
     }];
@@ -843,6 +1124,7 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         @[@"keepRecording", @"Keep Recording"], @[@"copyNew", @"Copy New"], @[@"copyAll", @"Copy All"],
         @[@"indicator", @"Show Recording Indicator"], @[@"privacy", @"Open Recording Privacy Settings"],
         @[@"recoverMeeting", @"Recover Meeting"], @[@"pasteLast", @"Paste Last Dictation"],
+        @[@"copyLatest", @"Copy Last Meeting Transcript"],
         @[@"update", @"Check for Updates…"], @[@"quit", @"Quit Jaro"]
     ]) {
         NSMenuItem *item = [menu addItemWithTitle:entry[1] action:@selector(meetingMenuAction:) keyEquivalent:@""];
@@ -880,8 +1162,9 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     BOOL permission = [status[@"phase"] isEqual:@"permission"], recovery = [status[@"recoveryAvailable"] boolValue];
     BOOL meetingControls = busy || permission || recovery || [status[@"detection"] boolValue];
     BOOL dictationEnabled = self.showingApp && self.systemDictation.keepsRunning;
-    BOOL dockRequested = [self showDockIcon];
-    if (!meetingControls && !dictationEnabled && dockRequested) {
+    BOOL canCopyLatest = self.showingApp && [status[@"hasSavedMeeting"] boolValue];
+    BOOL dockRequested = [self showDockIcon] && !self.hiddenLaunchRequested;
+    if (!meetingControls && !dictationEnabled && !canCopyLatest && dockRequested) {
         [self setDockIconVisible:YES];
         [self removeMeetingMenu];
         [self updateWindowClosePolicy];
@@ -889,16 +1172,17 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     }
     if (!self.meetingStatusItem) [self createMeetingMenu];
     NSDictionary<NSString *, NSMenuItem *> *items = self.meetingMenuItems;
-    items[@"start"].hidden = !meetingControls || busy || permission || recovery;
+    items[@"start"].hidden = !self.showingApp || self.meetings.managed || busy || permission || recovery;
     items[@"pasteLast"].hidden = !dictationEnabled;
     [self.systemDictation configurePasteLastMenuItem:items[@"pasteLast"]];
     items[@"quit"].hidden = dockRequested;
-    items[@"start"].enabled = !self.annotation.busy && !self.otherRecording && !self.updating && !self.sdkCaptureID;
+    items[@"start"].enabled = ![self annotationBlocksMeeting] && !self.otherRecording && !self.updating && !self.sdkCaptureID;
     items[@"stop"].hidden = items[@"indicator"].hidden = !recording;
     items[@"keepRecording"].hidden = ![status[@"phase"] isEqual:@"callEnded"];
     items[@"copyNew"].hidden = items[@"copyAll"].hidden = !recording;
     items[@"copyNew"].enabled = ![status[@"copying"] boolValue];
     items[@"copyAll"].enabled = items[@"copyNew"].enabled && [status[@"hasText"] boolValue];
+    items[@"copyLatest"].hidden = !canCopyLatest || recording;
     items[@"indicator"].state = [status[@"showIndicator"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
     items[@"privacy"].hidden = !permission;
     items[@"recoverMeeting"].hidden = !recovery || busy;
@@ -908,12 +1192,19 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     NSStatusBarButton *button = self.meetingStatusItem.button;
     button.title = elapsed;
     BOOL silent = recording && [status[@"microphoneSilent"] boolValue];
-    BOOL reconnecting = recording && [status[@"systemAudioUnavailable"] boolValue];
-    NSString *symbol = reconnecting ? @"speaker.slash" : silent ? @"mic.slash" : recording ? @"record.circle" : @"waveform";
+    BOOL microphoneReconnecting = recording && [status[@"microphoneUnavailable"] boolValue];
+    BOOL systemReconnecting = recording && [status[@"systemAudioUnavailable"] boolValue];
+    NSString *symbol = microphoneReconnecting && systemReconnecting ? @"exclamationmark.circle" :
+        systemReconnecting ? @"speaker.slash" : microphoneReconnecting || silent ? @"mic.slash" :
+        recording ? @"record.circle" : @"waveform";
     button.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
     button.image.template = YES;
     NSString *title = [status[@"title"] isKindOfClass:NSString.class] ? status[@"title"] : nil;
-    NSString *warning = reconnecting ? @"Mac audio is reconnecting." : silent ? @"Microphone silent. Mac audio is still recording." : nil;
+    NSString *warning = microphoneReconnecting && systemReconnecting ? @"Microphone and Mac audio are reconnecting." :
+        microphoneReconnecting ? @"Microphone is reconnecting." :
+        systemReconnecting && silent ? @"Mac audio is reconnecting. The microphone is silent." :
+        systemReconnecting ? @"Mac audio is reconnecting." :
+        silent ? @"Microphone silent. Mac audio is still recording." : nil;
     button.toolTip = warning ?: (recording && title.length ? title : nil);
     [button setAccessibilityLabel:recording ? [NSString stringWithFormat:@"Jaro meeting recording, %@%@%@",
         title.length ? [title stringByAppendingString:@", "] : @"", elapsed,
@@ -949,14 +1240,19 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         [self.systemDictation pasteLastFromMenu];
         return;
     }
-    NSMutableDictionary *request = [@{@"action": [action isEqual:@"privacy"] ? @"recordingPrivacy" : action} mutableCopy];
-    if ([action isEqual:@"indicator"]) request[@"enabled"] = sender.state == NSControlStateValueOn ? @NO : @YES;
-    [self.meetings request:request reply:^(id result, NSString *error) {
+    JardDictationReply complete = ^(id result, NSString *error) {
         if (error && ![@[@"start", @"recoverMeeting"] containsObject:action]) [self showUpdateNotice:@"Meeting action unavailable" detail:error];
-        else if (!error && self.meetingStatusItem.button && [@[@"copyNew", @"copyAll"] containsObject:action])
+        else if (!error && self.meetingStatusItem.button && [@[@"copyNew", @"copyAll", @"copyLatest"] containsObject:action])
             NSAccessibilityPostNotificationWithUserInfo(self.meetingStatusItem.button, NSAccessibilityAnnouncementRequestedNotification,
                 @{NSAccessibilityAnnouncementKey: @"Meeting transcript copied.", NSAccessibilityPriorityKey: @(NSAccessibilityPriorityMedium)});
-    }];
+    };
+    if ([action isEqual:@"copyLatest"]) {
+        [self.meetings copyLatestTranscript:complete];
+        return;
+    }
+    NSMutableDictionary *request = [@{@"action": [action isEqual:@"privacy"] ? @"recordingPrivacy" : action} mutableCopy];
+    if ([action isEqual:@"indicator"]) request[@"enabled"] = sender.state == NSControlStateValueOn ? @NO : @YES;
+    [self.meetings request:request reply:complete];
 }
 
 - (void)openBrowser:(id)sender {
@@ -982,8 +1278,14 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     }
     NSString *error = nil;
     if ([action isEqual:@"check"]) [self checkForUpdatesOpeningSettings:NO];
-    else if ([action isEqual:@"channel"]) [self.updater selectChannel:payload[@"channel"] reason:&error];
-    else if ([action isEqual:@"confirmSwitch"]) [self.updater confirmChannelSwitch:payload[@"offer"] reason:&error];
+    else if ([action isEqual:@"channel"] || [action isEqual:@"confirmSwitch"]) {
+        BOOL accepted = [action isEqual:@"channel"] ? [self.updater selectChannel:payload[@"channel"] reason:&error] :
+            [self.updater confirmChannelSwitch:payload[@"offer"] reason:&error];
+        if (accepted && self.updateRestartError) {
+            self.updateRestartError = nil;
+            [self emitUpdateStatus:self.updater.status];
+        }
+    }
     else if ([action isEqual:@"download"] && [[self.updater status][@"phase"] isEqual:@"download"]) [self.updater openRelease];
     else if ([action isEqual:@"releaseNotes"]) [self.updater openStagedReleaseNotesForVersion:payload[@"version"] channel:payload[@"channel"] reason:&error];
     else error = @"Unknown update action.";
@@ -1003,17 +1305,34 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 }
 
 - (void)refreshInterfaceLanguage {
+    [self refreshInterfaceLanguageWithCompletion:nil];
+}
+
+- (void)refreshInterfaceLanguageWithCompletion:(dispatch_block_t)completion {
     NSDictionary *status = JardInterfaceLanguageStatus();
-    NSString *resolved = status[@"resolved"];
-    if ([resolved isEqual:self.menuLanguage]) return;
-    self.menuLanguage = resolved;
-    [self translateMenuLabels];
-    [self updateMenuTitle:[self.updater status]];
+    NSString *resolved = status[@"resolved"], *selected = status[@"selected"];
+    BOOL resolvedChanged = ![resolved isEqual:self.menuLanguage];
+    if (!resolvedChanged && [selected isEqual:self.selectedInterfaceLanguage]) {
+        if (completion) completion();
+        return;
+    }
+    self.selectedInterfaceLanguage = selected;
+    if (resolvedChanged) {
+        self.menuLanguage = resolved;
+        [self translateMenuLabels];
+        [self updateMenuTitle:[self.updater status]];
+    }
     if (self.showingApp && !self.closing) {
-        [self updateMeetingMenu:nil];
+        if (resolvedChanged) [self updateMeetingMenu:nil];
         NSData *detail = [NSJSONSerialization dataWithJSONObject:status options:0 error:nil];
         if (detail) native_sdk_appkit_emit_window_event(self.host, 1, SDK_BYTES(@"jard-interface-language"), detail.bytes, detail.length);
+        if (resolvedChanged && self.bridge.running && !self.updating) {
+            [self sendToHelper:@"jard.meetingClock" payload:@{@"hours": [resolved isEqual:@"en"] ? @"12" : @"24"}
+                       request:nil completion:^(id result, NSString *error) { if (completion) completion(); }];
+            return;
+        }
     }
+    if (completion) completion();
 }
 
 - (BOOL)updatesManaged {
@@ -1024,7 +1343,9 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     BOOL managed = [self updatesManaged];
     NSString *phase = status[@"phase"];
     NSString *title;
-    if ([phase isEqual:@"switch"]) {
+    if (self.updateRestartInProgress) {
+        title = JardLocalized(@"Restarting…");
+    } else if ([phase isEqual:@"switch"]) {
         NSString *name = JardLocalized([status[@"channel"] isEqual:@"dev"] ? @"Development" : @"Stable");
         title = [[JardLocalized(@"Switch to {channel} {version}") stringByReplacingOccurrencesOfString:@"{channel}" withString:name]
             stringByReplacingOccurrencesOfString:@"{version}" withString:status[@"version"] ?: @""];
@@ -1051,6 +1372,8 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     }
     NSMutableDictionary *result = [status mutableCopy] ?: [@{@"phase": @"unavailable"} mutableCopy];
     result[@"restartBlocked"] = @([status[@"staged"] boolValue] && [self hasActiveCapture]);
+    result[@"restartInProgress"] = @(self.updateRestartInProgress);
+    result[@"restartError"] = self.updateRestartError;
     result[@"manualCheck"] = @(self.manualUpdateCheck || self.manualUpdateResult);
     result[@"openUpdateSettings"] = self.updateSettingsRequest;
     return result;
@@ -1091,6 +1414,7 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     }
     self.manualUpdateCheck = YES;
     self.manualUpdateResult = NO;
+    self.updateRestartError = nil;
     [self.updater check];
     // A check that joins an existing transfer need not trigger a state change.
     [self emitUpdateStatus:self.updater.status];
@@ -1125,16 +1449,40 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 }
 
 - (BOOL)hasActiveCapture {
-    return self.systemDictation.hasActivity || self.annotation.busy || self.meetings.busy || self.otherRecording || self.sdkCaptureID;
+    return self.systemDictation.hasActivity || self.annotation.busy || self.annotationAccess.resetting ||
+        self.meetings.busy || self.otherRecording || self.sdkCaptureID;
 }
 
 - (BOOL)canStartAnnotation {
-    return !self.annotationManaged && self.showingApp && !self.closing && !self.updating && ![self hasActiveCapture];
+    return !self.annotationManaged && self.systemDictation.annotationEnabled && self.showingApp &&
+        !self.closing && !self.updating && !self.annotation.busy && !self.annotationAccess.resetting &&
+        !self.otherRecording && !self.sdkCaptureID &&
+        (!self.systemDictation.hasActivity || self.systemDictation.sharesMicrophone) &&
+        (!self.meetings.busy || self.meetings.sharesMicrophone);
+}
+
+- (void)controlAnnotationAccess:(NSString *)action reply:(JardDictationReply)reply {
+    if (self.annotationManaged) { reply(nil, annotationManagedMessage); return; }
+    if (!self.systemDictation.annotationEnabled) { reply(nil, @"Annotate is turned off in Settings."); return; }
+    BOOL blocked = self.closing || self.updating || [self hasActiveCapture];
+    if (![action isEqual:@"status"] && blocked) { reply(nil, @"Finish the current recording or update first."); return; }
+    if ([action isEqual:@"restart"]) {
+        if (![self.annotationAccess needsRestart]) { reply(nil, @"Screen Recording does not need a restart right now."); return; }
+        [self prepareControlExit:nil restart:YES force:NO reply:reply];
+        return;
+    }
+    [self.annotationAccess request:action refresh:!blocked reply:reply];
 }
 
 - (void)controlAnnotation:(NSString *)action parameters:(NSDictionary *)parameters reply:(JardDictationReply)reply {
+    [self controlAnnotation:action parameters:parameters quartzPointer:nil reply:reply];
+}
+
+- (void)controlAnnotation:(NSString *)action parameters:(NSDictionary *)parameters quartzPointer:(NSValue *)pointer
+    reply:(JardDictationReply)reply {
     if ([action isEqual:@"start"]) {
         if (self.annotationManaged) { reply(nil, annotationManagedMessage); return; }
+        if (!self.systemDictation.annotationEnabled) { reply(nil, @"Annotate is turned off in Settings."); return; }
         id source = parameters[@"source"] ?: @"display";
         if (![@[@"display", @"window", @"area", @"phone"] containsObject:source]) {
             reply(nil, @"Choose a display, window, area, or wired iPhone or iPad to annotate.");
@@ -1162,8 +1510,16 @@ static BOOL JardForcedBoolean(CFStringRef key) {
             reply(nil, @"Finish the current recording or update first.");
             return;
         }
-        [self.annotation start:languages source:source microphone:microphone[@"inputDevice"]
-            origin:[source isEqual:@"phone"] ? nil : [self.systemDictation annotationOriginSnapshotAllowingPrevious:[source isEqual:@"window"]] reply:^(id result, NSString *error) {
+        if (!pointer && !parameters[@"source"]) {
+            CGEventRef location = CGEventCreate(NULL);
+            if (location) {
+                pointer = [NSValue valueWithPoint:CGEventGetLocation(location)];
+                CFRelease(location);
+            }
+        }
+        [self.annotation start:languages source:source microphone:microphone
+            origin:[source isEqual:@"phone"] ? nil : [self.systemDictation annotationOriginSnapshotAllowingPrevious:[source isEqual:@"window"]]
+            quartzPointer:pointer reply:^(id result, NSString *error) {
             if (error) { reply(nil, error); return; }
             NSMutableDictionary *accepted = [result mutableCopy];
             accepted[@"changed"] = @YES;
@@ -1179,6 +1535,7 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     NSMutableDictionary *result = [[self.annotation status] mutableCopy];
     result[@"changed"] = @(changed);
     result[@"managed"] = @(self.annotationManaged);
+    result[@"enabled"] = @((BOOL)(!self.annotationManaged && self.systemDictation.annotationEnabled));
     if (self.annotationManaged) result[@"message"] = annotationManagedMessage;
     reply(result, nil);
 }
@@ -1250,17 +1607,18 @@ static BOOL JardForcedBoolean(CFStringRef key) {
             status[@"updateApplied"] = @(applied);
             reply(status, nil);
             // The workspace has no private CLI connection to acknowledge this reply.
-            if (!identifier) [NSApp terminate:nil];
+            if (!identifier) [self terminateAfterCleanup];
         };
         if (![self.updater prepareToInstallOnQuit]) {
             ready(NO);
             return;
         }
         [self sendToHelper:@"jard.updateQuiesce" payload:@{} request:nil completion:^(id drain, NSString *drainError) {
-            NSString *failure = nil;
-            BOOL applied = !drainError && [drain[@"ready"] boolValue] && [self.updater installOnQuit:&failure];
-            if (failure) NSLog(@"Jard deferred the staged update: %@", failure);
-            ready(applied);
+            if (drainError || ![drain[@"ready"] boolValue]) { ready(NO); return; }
+            [self.updater installOnQuitWithCompletion:^(BOOL applied, NSString *failure) {
+                if (failure) NSLog(@"Jard deferred the staged update: %@", failure);
+                ready(applied);
+            }];
         }];
     }];
 }
@@ -1275,93 +1633,280 @@ static BOOL JardForcedBoolean(CFStringRef key) {
         return;
     }
     self.updating = YES;
+    self.updateRestartInProgress = YES;
+    self.updateRestartError = nil;
     self.pendingUpdateRestart = reply;
     [self refreshMeetingAvailability];
+    [self updateMenuTitle:self.updater.status];
+    [self emitUpdateStatus:self.updater.status];
     [self.updater checkBeforeRestart:^{
         JardDictationReply reply = self.pendingUpdateRestart;
         self.pendingUpdateRestart = nil;
         if (!reply || self.closing) return;
         NSDictionary *status = [self.updater status];
         if ([self hasActiveCapture] || ![status[@"phase"] isEqual:@"ready"] || ![status[@"staged"] boolValue]) {
-            self.updating = NO;
-            [self refreshMeetingAvailability];
-            reply(nil, [self hasActiveCapture] ? @"Finish your recording or dictation before restarting Jard." :
+            NSString *failure = [self hasActiveCapture] ? @"Finish your recording or dictation before restarting Jard." :
                 ([status[@"phase"] isEqual:@"switch"] ? @"The channel release changed. Confirm the new release before restarting." :
-                @"There is no verified update ready to restart."));
+                @"There is no verified update ready to restart.");
+            [self finishFailedUpdateRestart:failure reply:reply];
             return;
         }
         [self quiesceAndRestart:reply];
     }];
 }
 
+- (void)finishFailedUpdateRestart:(NSString *)failure reply:(JardDictationReply)reply {
+    self.updateRestartInProgress = NO;
+    self.updateRestartError = failure;
+    [self resumeAfterControlExitFailure];
+    [self updateMenuTitle:self.updater.status];
+    [self emitUpdateStatus:self.updater.status];
+    reply(nil, failure);
+}
+
 - (void)quiesceAndRestart:(JardDictationReply)reply {
     [self.systemDictation pauseForUpdate:YES];
     [self sendToHelper:@"jard.updateQuiesce" payload:@{} request:nil completion:^(id result, NSString *error) {
         if (error || ![result[@"ready"] boolValue]) {
-            self.updating = NO;
-            [self refreshMeetingAvailability];
-            [self.systemDictation pauseForUpdate:NO];
-            reply(nil, error ?: @"The local engine is busy. Try again.");
+            [self finishFailedUpdateRestart:error ?: @"The local engine is busy. Try again." reply:reply];
             return;
         }
-        NSString *failure = nil;
-        if (![self.updater restart:&failure]) {
-            self.updating = NO;
-            [self refreshMeetingAvailability];
+        [self.updater restartWithCompletion:^(BOOL applied, NSString *failure) {
+            if (applied) {
+                reply([self.updater status], nil);
+                [self terminateAfterCleanup];
+                return;
+            }
             [self sendToHelper:@"jard.updateAbort" payload:@{} request:nil completion:^(id reopened, NSString *abortError) {
-                [self.systemDictation pauseForUpdate:NO];
+                NSString *message = failure ?: @"The application could not be replaced.";
+                if (abortError || ![reopened[@"ready"] boolValue])
+                    message = [message stringByAppendingString:@" The local engine could not reopen."];
+                [self finishFailedUpdateRestart:message reply:reply];
             }];
-            reply(nil, failure ?: @"The application could not be replaced.");
+        }];
+    }];
+}
+
+- (BOOL)annotationResultAvailable {
+    return self.showingApp && self.bridge.running && !self.closing && !self.updating &&
+        !self.annotationManaged && !self.annotation.busy && [self.systemDictation annotationRoutingDisplayAvailable];
+}
+
+- (void)confirmAnnotationDelivery:(id)detail {
+    if (![detail isKindOfClass:NSDictionary.class]) return;
+    NSString *capture = detail[@"capture"], *nonce = detail[@"nonce"];
+    if (![capture isKindOfClass:NSString.class] || ![[NSUUID alloc] initWithUUIDString:capture] ||
+        ![nonce isKindOfClass:NSString.class] || ![[NSUUID alloc] initWithUUIDString:nonce]) return;
+    NSDictionary *session = CFBridgingRelease(CGSessionCopyCurrentDictionary());
+    BOOL unlocked = [session[(__bridge NSString *)kCGSessionOnConsoleKey] boolValue] && ![session[@"CGSSessionScreenIsLocked"] boolValue];
+    NSString *state = unlocked ? ([self.annotationResultPanel confirmationStateForCapture:capture] ?:
+        [self.annotationRoutePanel confirmationStateForCapture:capture]) : nil;
+    [self sendToHelper:@"jard.annotationRouteConfirm" payload:@{@"capture": capture, @"nonce": nonce, @"state": state ?: @"unavailable"}
+                 request:nil completion:nil];
+}
+
+- (NSURL *)annotationContactSheet:(id)result {
+    if (![result isKindOfClass:NSDictionary.class]) return nil;
+    NSString *path = [result[@"imagePath"] isKindOfClass:NSString.class] ? result[@"imagePath"] : nil;
+    return path.isAbsolutePath && [path.lastPathComponent isEqual:@"contact-sheet.png"] ? [NSURL fileURLWithPath:path] : nil;
+}
+
+- (void)inspectAnnotation:(NSString *)key reply:(JardDictationReply)reply {
+    [self sendToHelper:@"jard.annotationReview" payload:@{@"id": key} request:nil completion:^(id result, NSString *error) {
+        if (![self annotationResultAvailable]) { reply(nil, @"The annotation panel is unavailable."); return; }
+        NSURL *sheet = [self annotationContactSheet:result];
+        if (error || !sheet || ![NSWorkspace.sharedWorkspace openURL:sheet]) {
+            reply(nil, error ?: @"The contact sheet is unavailable. Open the annotation in Sessions.");
             return;
         }
-        reply([self.updater status], nil);
-        [NSApp terminate:nil];
+        reply(@YES, nil);
+    }];
+}
+
+- (void)shareAnnotation:(NSString *)key paste:(BOOL)paste fromPanel:(BOOL)fromPanel reply:(JardDictationReply)reply {
+    if (![[NSUUID alloc] initWithUUIDString:key]) { reply(nil, @"Invalid annotation ID."); return; }
+    if (self.updating || self.systemDictation.hasActivity || (paste && self.annotation.busy)) {
+        reply(nil, @"Finish the current action before sharing this annotation.");
+        return;
+    }
+    NSRunningApplication *destination = paste ? [self.systemDictation annotationPasteDestinationFromPanel:fromPanel] : nil;
+    if (paste && !destination) {
+        reply(nil, fromPanel ? @"Focus a field in another app, then click Paste." :
+            @"Focus a field in another app, then return to Jaro to paste the annotation.");
+        return;
+    }
+    NSUInteger preparationRevision = [self.systemDictation annotationPreparationRevision];
+    NSPasteboard *board = NSPasteboard.generalPasteboard;
+    NSInteger clipboardRevision = board.changeCount;
+    [self sendToHelper:@"jard.annotationHandoff" payload:@{@"id": key, @"waitForNarration": @(fromPanel)}
+                 request:nil completion:^(id result, NSString *error) {
+        if (error) { reply(nil, error); return; }
+        if (self.updating || self.systemDictation.hasActivity || (paste && self.annotation.busy) ||
+            (fromPanel && ![self annotationResultAvailable])) {
+            reply(nil, @"Finish the current action before sharing this annotation.");
+            return;
+        }
+        NSString *markdown = [result[@"markdown"] isKindOfClass:NSString.class] ? result[@"markdown"] : nil;
+        NSURL *sheet = [self annotationContactSheet:result];
+        NSData *image = nil;
+        if (sheet) {
+            NSFileHandle *file = [NSFileHandle fileHandleForReadingFromURL:sheet error:nil];
+            const NSUInteger limit = 12 * 1024 * 1024;
+            image = [file readDataUpToLength:limit + 1 error:nil];
+            [file closeFile];
+            if (image.length > limit) image = nil;
+        }
+        if (paste) {
+            [self.systemDictation pasteAnnotation:markdown image:image path:sheet.path destination:destination fromPanel:fromPanel
+                preparationRevision:preparationRevision clipboardRevision:clipboardRevision reply:reply];
+            return;
+        }
+        BOOL includedImage = NO;
+        if (board.changeCount != clipboardRevision) {
+            reply(nil, @"The clipboard changed while Jaro prepared the annotation. Copy it again to replace the current clipboard.");
+            return;
+        }
+        if (!JardCopyAnnotationHandoff(board, clipboardRevision, markdown, image, &includedImage)) {
+            reply(nil, @"Could not copy the annotation.");
+            return;
+        }
+        reply(@{@"includedImage": @(includedImage)}, nil);
     }];
 }
 
 - (void)annotationChanged:(NSDictionary *)status {
     if (self.closing) return;
+    if ([status[@"busy"] boolValue]) [self.annotationResultPanel endForNextCapture];
+    [self.systemDictation setAnnotationPhase:status[@"phase"]];
+    [self.systemDictation setAnnotationActive:[status[@"busy"] boolValue] microphoneShared:[status[@"sharedMicrophone"] boolValue]];
     [self refreshMeetingAvailability];
-    [self.systemDictation setAnnotationActive:[status[@"busy"] boolValue]];
     [self updateWindowClosePolicy];
     NSData *detail = [NSJSONSerialization dataWithJSONObject:status options:0 error:nil];
     if (detail) native_sdk_appkit_emit_window_event(self.host, 1, SDK_BYTES(@"jard-annotation"), detail.bytes, detail.length);
 }
 
-- (void)quitApp:(id)sender {
-    if (self.sdkCaptureID) {
-        [self showUpdateNotice:@"Jard is handling an SDK recording." detail:@"Finish or cancel the recording in the connected app before quitting Jard."];
-        return;
+- (NSApplicationTerminateReply)requestSystemTermination {
+    if (self.terminationApproved || self.closing) return NSTerminateNow;
+    if (self.systemQuitPending) return NSTerminateLater;
+    if (self.sdkCaptureID || (self.updating && !self.pendingUpdateRestart && !self.menuQuitPending))
+        return NSTerminateCancel;
+    if (!self.menuQuitPending && !self.meetings.busy && !self.annotation.busy && ![self.updater canInstallStagedUpdate])
+        return NSTerminateNow;
+
+    self.systemQuitPending = YES;
+    if (!self.menuQuitPending) {
+        __weak typeof(self) owner = self;
+        // AppKit pumps a modal run loop while it waits for the reply to Quit.
+        [NSRunLoop.mainRunLoop performInModes:@[NSRunLoopCommonModes, NSModalPanelRunLoopMode] block:^{
+            if (owner.systemQuitPending) [owner quitApp:nil];
+        }];
     }
-    if (self.annotation.busy) {
-        [self.annotation stop];
-        [self showUpdateNotice:@"Jard is saving the annotation." detail:@"Quit after the screen recording finishes saving."];
-        return;
-    }
-    if (self.meetings.busy) {
-        if (self.meetings.recording) [self.meetings request:@{@"action": @"stop"} reply:^(id result, NSString *error) {}];
-        [self showUpdateNotice:@"Jard is finishing your meeting." detail:@"Quit after the meeting finishes saving."];
-        return;
-    }
-    if (self.updating && !self.pendingUpdateRestart) return;
-    JardDictationReply superseded = self.pendingUpdateRestart;
-    self.pendingUpdateRestart = nil;
-    BOOL installable = [self.updater prepareToInstallOnQuit];
-    if (superseded) superseded([self.updater status], nil);
-    if (self.showingApp && !self.systemDictation.hasActivity && installable) {
+    return NSTerminateLater;
+}
+
+- (void)replyToSystemQuit:(BOOL)allow {
+    self.systemQuitPending = NO;
+    [NSApp replyToApplicationShouldTerminate:allow];
+}
+
+- (void)terminateAfterCleanup {
+    self.terminationApproved = YES;
+    self.menuQuitPending = NO;
+    if (self.systemQuitPending) [self replyToSystemQuit:YES];
+    else [NSApp terminate:nil];
+}
+
+- (void)finishMenuQuitWithStagedUpdate:(BOOL)installable {
+    if (self.showingApp && ![self hasActiveCapture] && installable) {
         self.updating = YES;
         [self refreshMeetingAvailability];
         [self.systemDictation pauseForUpdate:YES];
         [self sendToHelper:@"jard.updateQuiesce" payload:@{} request:nil completion:^(id result, NSString *error) {
-            if (!error && [result[@"ready"] boolValue]) {
-                NSString *failure = nil;
-                if (![self.updater installOnQuit:&failure]) NSLog(@"Jard deferred the staged update: %@", failure);
-            }
-            [NSApp terminate:nil];
+            if (error || ![result[@"ready"] boolValue]) { [self terminateAfterCleanup]; return; }
+            [self.updater installOnQuitWithCompletion:^(BOOL applied, NSString *failure) {
+                if (!applied) NSLog(@"Jard deferred the staged update: %@", failure);
+                [self terminateAfterCleanup];
+            }];
         }];
         return;
     }
-    [NSApp terminate:nil];
+    [self terminateAfterCleanup];
+}
+
+- (void)cancelMenuQuitWhileSaving:(NSString *)message {
+    self.menuQuitPending = NO;
+    [self.updater resumeAfterCancelledQuit];
+    [self resumeAfterControlExitFailure];
+    [self updateMenuTitle:self.updater.status];
+    [self emitUpdateStatus:self.updater.status];
+    if (self.systemQuitPending) [self replyToSystemQuit:NO];
+    [self showUpdateNotice:@"Jaro is still open." detail:message];
+}
+
+- (void)waitForMenuQuitUntil:(NSTimeInterval)deadline meeting:(BOOL)meeting annotation:(BOOL)annotation
+               stagedUpdate:(BOOL)installable {
+    if (self.closing || !self.menuQuitPending) return;
+    if (meeting && !self.meetings.busy) {
+        NSDictionary *status = self.meetings.status;
+        if (![status[@"phase"] isEqual:@"finished"] || ![status[@"session"] length]) {
+            [self cancelMenuQuitWhileSaving:status[@"message"] ?: @"The meeting could not be saved before quitting."];
+            return;
+        }
+    }
+    if (annotation && !self.annotation.busy) {
+        NSDictionary *status = self.annotation.status;
+        if (![@[@"finished", @"cancelled"] containsObject:status[@"phase"] ?: @""]) {
+            [self cancelMenuQuitWhileSaving:status[@"message"] ?: @"The annotation could not be saved before quitting."];
+            return;
+        }
+    }
+    if (![self hasActiveCapture]) {
+        [self finishMenuQuitWithStagedUpdate:installable];
+        return;
+    }
+    if (NSProcessInfo.processInfo.systemUptime >= deadline) {
+        [self cancelMenuQuitWhileSaving:@"Wait for the recording to finish saving before quitting."];
+        return;
+    }
+    if (meeting && self.meetings.recording)
+        [self.meetings request:@{@"action": @"stop"} reply:^(id result, NSString *error) {}];
+    __weak typeof(self) owner = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        [owner waitForMenuQuitUntil:deadline meeting:meeting annotation:annotation stagedUpdate:installable];
+    });
+}
+
+- (void)quitApp:(id)sender {
+    if (self.closing || self.terminationApproved || self.menuQuitPending) return;
+    if (self.updating && !self.pendingUpdateRestart) {
+        if (self.systemQuitPending) [self replyToSystemQuit:NO];
+        return;
+    }
+    if (self.sdkCaptureID) {
+        if (self.systemQuitPending) { [self replyToSystemQuit:NO]; return; }
+        [self showUpdateNotice:@"Jard is handling an SDK recording." detail:@"Finish or cancel the recording in the connected app before quitting Jard."];
+        return;
+    }
+    JardDictationReply superseded = self.pendingUpdateRestart;
+    self.pendingUpdateRestart = nil;
+    self.updateRestartInProgress = NO;
+    self.menuQuitPending = YES;
+    BOOL installable = [self.updater prepareToInstallOnQuit];
+    if (superseded) superseded([self.updater status], nil);
+    BOOL meeting = self.meetings.busy, annotation = self.annotation.busy;
+    if (!meeting && !annotation) {
+        [self finishMenuQuitWithStagedUpdate:installable];
+        return;
+    }
+    self.updating = YES;
+    [self refreshMeetingAvailability];
+    [self updateWindowClosePolicy];
+    [self updateMenuTitle:self.updater.status];
+    [self emitUpdateStatus:self.updater.status];
+    if (!self.systemDictation.hasActivity) [self.systemDictation pauseForUpdate:YES];
+    if (annotation) [self.annotation stop];
+    NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + (annotation ? 40 : 30);
+    [self waitForMenuQuitUntil:deadline meeting:meeting annotation:annotation stagedUpdate:installable];
 }
 
 - (void)toggleAutomaticUpdates:(NSMenuItem *)item {
@@ -1380,6 +1925,8 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 
 - (void)shutdown {
     if (self.closing) return;
+    [self endCapturePermissionWatch];
+    [self.annotationResultPanel dismiss];
     [self.annotationRoutePanel dismiss];
     [self.annotation shutdown];
     [self.meetings shutdown];
@@ -1389,13 +1936,13 @@ static BOOL JardForcedBoolean(CFStringRef key) {
     self.pendingUpdateRestart = nil;
     [self.updateTimer invalidate];
     self.updateTimer = nil;
-    if (self.updateActivationObserver)
-        [NSNotificationCenter.defaultCenter removeObserver:self.updateActivationObserver];
-    self.updateActivationObserver = nil;
     self.closing = YES;
+    [self stopObservingInputDevices];
     [self.nativePending removeAllObjects];
     if (self.dragMonitor) { [NSEvent removeMonitor:self.dragMonitor]; self.dragMonitor = nil; }
     [NSNotificationCenter.defaultCenter removeObserver:self];
+    if (NSApp.delegate == self.terminationDelegate) NSApp.delegate = self.terminationDelegate.upstream;
+    self.terminationDelegate = nil;
     [self.input closeAndReturnError:nil];
     self.input = nil;
     // EOF lets the helper finalize any accepted audio and release its client lease.
@@ -1415,7 +1962,7 @@ static void hostEvent(void *context, const native_sdk_appkit_event_t *event) {
     JardHost *app = (__bridge JardHost *)context;
     if (event->kind == NATIVE_SDK_APPKIT_EVENT_SHUTDOWN) [app shutdown];
     else if (event->kind == NATIVE_SDK_APPKIT_EVENT_APP_ACTIVATED) [app applicationActivated];
-    else if (event->kind == NATIVE_SDK_APPKIT_EVENT_APP_DEACTIVATED) app.loginActivationDeadline = 0;
+    else if (event->kind == NATIVE_SDK_APPKIT_EVENT_APP_DEACTIVATED) app.startupActivationDeadline = 0;
     else if (event->kind == NATIVE_SDK_APPKIT_EVENT_WINDOW_FRAME && event->window_id == 1) {
         if (!event->open || event->hidden) [app.systemDictation stopSoundPreview];
         if (event->open) [app updateDockPresentation];
@@ -1425,7 +1972,8 @@ static void hostEvent(void *context, const native_sdk_appkit_event_t *event) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         signal(SIGPIPE, SIG_IGN);
-        if (argc == 2 && !strcmp(argv[1], "--settings-apply-offline")) return JardApplyOfflineDictationSettings();
+        if (argc == 2 && !strcmp(argv[1], "--settings-apply-offline"))
+            return JardApplyOfflineDictationSettings(JardForcedBoolean(CFSTR("DisableAnnotate")));
         int preferencesLease = JardLockDictationPreferences(NO);
         if (preferencesLease < 0) {
             NSLog(@"Jard could not lock its settings for startup.");
@@ -1436,6 +1984,7 @@ int main(int argc, const char *argv[]) {
         NSString *title = [bundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: @"Jaro";
         NSString *identifier = bundle.bundleIdentifier ?: @"local.jardaudio.desktop";
         JardHost *app = [[JardHost alloc] init];
+        app.hiddenLaunchRequested = [NSProcessInfo.processInfo.arguments containsObject:@"--hidden"];
         app.pending = NSMutableDictionary.dictionary;
         app.nativePending = NSMutableDictionary.dictionary;
         app.loginItem = JardLoginItem.new;
@@ -1445,7 +1994,13 @@ int main(int argc, const char *argv[]) {
             [weakApp sendToHelper:command payload:payload request:nil completion:completion];
         }];
         app.systemDictation.activityChanged = ^{
-            [weakApp refreshUpdateRestartAvailability];
+            JardHost *owner = weakApp;
+            if (owner.menuQuitPending && !owner.systemDictation.hasActivity)
+                [owner.systemDictation pauseForUpdate:YES];
+            [owner refreshUpdateRestartAvailability];
+        };
+        app.systemDictation.accessibilityGrantedInSettings = ^{
+            [weakApp returnFromPermissionSettings];
         };
         app.systemDictation.phaseChanged = ^(NSString *phase) {
             JardHost *owner = weakApp;
@@ -1454,7 +2009,12 @@ int main(int argc, const char *argv[]) {
         };
         app.systemDictation.preferencesChanged = ^(NSDictionary *status) {
             JardHost *owner = weakApp;
-            if (!owner.showingApp || owner.closing) return;
+            if (owner.closing) return;
+            BOOL show = [status[@"annotationShowOverlays"] boolValue];
+            owner.annotation.showOverlaysInRecordings = show;
+            owner.annotationResultPanel.showOverlaysInRecordings = show;
+            owner.annotationRoutePanel.showOverlaysInRecordings = show;
+            if (!owner.showingApp) return;
             [owner updateMeetingMenu:nil];
             NSData *detail = [NSJSONSerialization dataWithJSONObject:status options:0 error:nil];
             if (detail) native_sdk_appkit_emit_window_event(owner.host, 1, SDK_BYTES(@"jard-dictation-preferences"), detail.bytes, detail.length);
@@ -1466,29 +2026,75 @@ int main(int argc, const char *argv[]) {
         };
         app.bridgeURL = [[bundle.bundleURL URLByAppendingPathComponent:@"Contents/Helpers"] URLByAppendingPathComponent:@"jard-ui"];
         app.annotationManaged = JardForcedBoolean(CFSTR("DisableAnnotate"));
+        app.annotationAccess = JardAnnotationAccess.new;
+        app.annotationAccess.settingsVisitChanged = ^(BOOL granted) {
+            [weakApp capturePermissionVisitChanged:JardScreenRecordingPermission granted:granted];
+        };
+        app.annotationAccess.mayProbe = ^BOOL{
+            JardHost *owner = weakApp;
+            return owner.systemDictation.annotationEnabled && owner.window.visible && !owner.closing && !owner.updating && ![owner hasActiveCapture];
+        };
         app.annotation = [[JardAnnotation alloc] initWithSend:^(NSString *command, NSDictionary *payload, JardDictationReply completion) {
             [weakApp sendToHelper:command payload:payload request:nil completion:completion];
         } stateChanged:^(NSDictionary *status) {
             [weakApp annotationChanged:status];
         }];
-        app.annotationRoutePanel = [[JardAnnotationRoutePanel alloc] initWithAvailability:^BOOL{
+        void (^annotationAction)(NSString *, BOOL, JardDictationReply) = ^(NSString *session, BOOL paste, JardDictationReply reply) {
             JardHost *owner = weakApp;
-            return owner.showingApp && !owner.closing && !owner.updating && [owner.systemDictation annotationRoutingDisplayAvailable];
-        } action:^(NSString *capture, NSString *action, BOOL held) {
-            [weakApp sendToHelper:@"jard.annotationRoutePanel" payload:@{@"capture": capture, @"action": action, @"held": @(held)}
-                         request:nil completion:nil];
-        }];
+            if (paste) [owner shareAnnotation:session paste:YES fromPanel:YES reply:reply];
+            else [owner inspectAnnotation:session reply:reply];
+        };
+        void (^routeAction)(NSString *, NSString *, BOOL, JardDictationReply) = ^(NSString *capture, NSString *action,
+                                                                                  BOOL held, JardDictationReply reply) {
+            if ([action isEqual:@"cancel"] && reply) {
+                [weakApp sendToHelper:@"jard.annotationRoute" payload:@{@"id": capture, @"action": @"cancel"} request:nil completion:reply];
+            } else if ([action isEqual:@"undo"] && reply) {
+                [weakApp sendToHelper:@"jard.annotationRouteUndo" payload:@{@"id": capture} request:nil completion:reply];
+            } else {
+                [weakApp sendToHelper:@"jard.annotationRoutePanel" payload:@{@"capture": capture, @"action": action, @"held": @(held)}
+                             request:nil completion:nil];
+            }
+        };
+        app.annotationResultPanel = [[JardAnnotationResultPanel alloc] initWithAvailability:^BOOL{
+            return [weakApp annotationResultAvailable];
+        } action:annotationAction routeAction:routeAction];
+        app.annotation.saved = ^(NSString *session, NSImage *preview, NSDictionary *routing) {
+            [weakApp.annotationResultPanel showSession:session preview:preview routing:routing];
+        };
+        app.annotationRoutePanel = [[JardAnnotationResultPanel alloc] initWithAvailability:^BOOL{
+            JardHost *owner = weakApp;
+            return owner.showingApp && owner.bridge.running && !owner.closing && !owner.updating &&
+                !owner.annotationManaged && [owner.systemDictation annotationRoutingDisplayAvailable];
+        } action:annotationAction routeAction:routeAction];
+        void (^annotationCue)(NSString *) = ^(NSString *name) { [weakApp.systemDictation playAnnotationCue:name]; };
+        app.annotationResultPanel.playCue = annotationCue;
+        app.annotationRoutePanel.playCue = annotationCue;
+        BOOL showAnnotationOverlays = [app.systemDictation.status[@"annotationShowOverlays"] boolValue];
+        app.annotation.showOverlaysInRecordings = showAnnotationOverlays;
+        app.annotationResultPanel.showOverlaysInRecordings = showAnnotationOverlays;
+        app.annotationRoutePanel.showOverlaysInRecordings = showAnnotationOverlays;
+        if (!JardForcedBoolean(CFSTR("DisableOpenCodeProcessing"))) {
+            JardDictationSend destinationRequest = ^(NSString *command, NSDictionary *payload, JardDictationReply reply) {
+                [weakApp sendToHelper:command payload:payload request:nil completion:reply];
+            };
+            app.annotationResultPanel.destinationRequest = destinationRequest;
+            app.annotationRoutePanel.destinationRequest = destinationRequest;
+        }
         if (!app.annotationManaged) {
-            [app.systemDictation setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, CGKeyCode shortcutCode, BOOL chordFree) {
+            [app.systemDictation setAnnotationInput:^BOOL(CGEventType type, CGEventRef event, JardAnnotationShortcut shortcut, BOOL chordFree) {
                 JardHost *owner = weakApp;
                 BOOL allowStart = chordFree && [owner canStartAnnotation];
-                return [owner.annotation handleEvent:type event:event shortcutCode:shortcutCode allowStart:allowStart start:^{
+                return [owner.annotation handleEvent:type event:event shortcut:shortcut allowStart:allowStart start:^(CGPoint pointer) {
                     JardHost *target = weakApp;
-                    [target controlAnnotation:@"start" parameters:@{} reply:^(id result, NSString *error) {}];
+                    [target controlAnnotation:@"start" parameters:@{} quartzPointer:[NSValue valueWithPoint:pointer]
+                        reply:^(id result, NSString *error) {}];
                 }];
             }];
         }
         app.meetingAudioAccess = JardMeetingAudioAccess.new;
+        app.meetingAudioAccess.settingsVisitChanged = ^(BOOL granted) {
+            [weakApp capturePermissionVisitChanged:JardMacAudioPermission granted:granted];
+        };
         app.meetings = [[JardMeetings alloc] initWithManaged:JardForcedBoolean(CFSTR("DisableMeetings"))
                 start:^(NSDictionary *options, BOOL prompt, JardDictationReply completion) {
             [weakApp startMeeting:options prompt:prompt reply:completion];
@@ -1540,22 +2146,13 @@ int main(int argc, const char *argv[]) {
             app.automaticUpdatesMenu = toggle;
             toggle.target = app;
             toggle.state = automatic ? NSControlStateValueOn : NSControlStateValueOff;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [app.updater restoreStagedUpdate];
-                if (automatic) [app.updater check];
+            [app.updater restoreStagedUpdateWithCompletion:nil];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                [weakApp checkForScheduledUpdate:NO];
             });
             app.updateTimer = [NSTimer scheduledTimerWithTimeInterval:60 repeats:YES block:^(NSTimer *timer) {
-                JardHost *owner = weakApp;
-                if (!owner.updating && [NSUserDefaults.standardUserDefaults boolForKey:@"JardCheckForUpdatesOnLaunch"]) {
-                    [owner.updater checkAutomaticallyOnActivation:NO];
-                }
+                [weakApp checkForScheduledUpdate:NO];
             }];
-            app.updateActivationObserver = [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidBecomeActiveNotification
-                object:NSApp queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
-                    JardHost *owner = weakApp;
-                    if (!owner.updating && [NSUserDefaults.standardUserDefaults boolForKey:@"JardCheckForUpdatesOnLaunch"])
-                        [owner.updater checkAutomaticallyOnActivation:YES];
-                }];
         }
         NSMenu *applicationMenu = NSApp.mainMenu.itemArray.firstObject.submenu;
         for (NSMenuItem *item in applicationMenu.itemArray) {

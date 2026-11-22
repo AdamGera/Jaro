@@ -10,6 +10,8 @@ import unittest
 from unittest.mock import patch
 
 from engine_paths import ENGINE_ROOT
+from meeting_brief import editorial_context
+from meeting_search import meeting_passages
 from saved_dictations import DEFAULT_BUNDLE_ID, history_page, render_history
 
 
@@ -70,6 +72,87 @@ class SavedDictationTests(unittest.TestCase):
         self.assertEqual(len(self.history(search='"paperback arrived"')["entries"]), 2)
         with self.assertRaisesRegex(ValueError, "oldest-first"):
             self.history(search="paperbacks", oldest_first=True)
+
+    def test_large_history_retains_the_newest_entries_before_filtering(self):
+        rows = [self.entry("expired", 25, "Expired")] + [
+            self.entry(str(i), i / 1000, f"Saved take {i}") for i in range(10_001)
+        ]
+        self.store(rows, {"retention": 1})
+        page = self.history(oldest_first=True, limit=2)
+        self.assertEqual([entry["id"] for entry in page["entries"]], ["9999", "9998"])
+        self.assertTrue(page["truncated"])
+        self.assertEqual(self.history(grep="take 10000")["entries"], [])
+        self.assertEqual(self.history(offset=9_999, legacy=True)["total"], 10_000)
+
+    def test_large_history_counts_utf8_raw_and_final_text_together(self):
+        text = "語" * 5_461 + "!"
+        raw = "😀" * 4_096
+        self.assertEqual(len(text.encode()) + len(raw.encode()), 32 * 1024)
+        rows = [self.entry(str(i), i / 100, text, raw=raw) for i in range(513)]
+        rows.append(self.entry("older-short-take", 6, "Short"))
+        self.store(rows, {"retention": 0, "previousRetention": 7})
+        page = self.history(oldest_first=True, limit=2, raw=True)
+        self.assertEqual([entry["id"] for entry in page["entries"]], ["511", "510"])
+        self.assertEqual(page["entries"][0]["raw_text"], raw)
+        self.assertEqual(self.history(grep="Short")["entries"], [])
+
+    def test_live_history_can_be_newer_than_the_saved_preferences(self):
+        self.store([self.entry("previous", 1, "Delete me")])
+        self.assertEqual(self.history(snapshot={"JardSystemDictationHistory": []})["entries"], [])
+        self.assertEqual(self.history()["entries"][0]["id"], "previous")
+
+    def test_meeting_brief_uses_shared_vocabulary_from_private_preferences(self):
+        self.store([], {"vocabulary": "Jaro\n\n Rumble2 Flash "})
+        with patch("saved_dictations.preferences_path", return_value=self.path):
+            self.assertEqual(editorial_context(None), {"vocabulary": ["Jaro", "Rumble2 Flash"]})
+
+    def test_ranked_history_uses_original_spellings_and_the_current_snapshot(self):
+        rows = [
+            self.entry("alias", 1, "Proposal sent.", raw="Zin Ash, Zin Ash."),
+            self.entry("exact", 3, "Zinnesh approved the proposal."),
+            self.entry("separate", 2, "Ask Zin about Ash."),
+            self.entry("updated", 4, "Spoke with Chinn."),
+        ]
+        saved = {"vocabulary": "Zinnesh", "vocabularySoundsLike": {"ZINNESH": ["Zin Ash"]}}
+        self.store(rows, saved)
+        entries = self.history(search="Zinnesh")["entries"]
+        self.assertEqual([entry["id"] for entry in entries], ["exact", "alias"])
+        self.assertEqual(entries[1]["snippet"], "**Zin** **Ash**, **Zin** **Ash**.")
+        self.assertEqual([entry["id"] for entry in self.history(search='"Zinnesh"')["entries"]], ["exact"])
+        self.assertEqual([entry["id"] for entry in self.history(grep="zinnesh")["entries"]], ["exact"])
+
+        live = {"JardSystemDictationHistory": rows, "JardSystemDictation": {
+            "vocabulary": "Zinnesh", "vocabularySoundsLike": {"zinnesh": ["Chinn"]}}}
+        self.assertEqual([entry["id"] for entry in self.history(search="Zinnesh", snapshot=live)["entries"]],
+                         ["exact", "updated"])
+        live["JardSystemDictation"].clear()
+        self.assertEqual([entry["id"] for entry in self.history(search="Zinnesh", snapshot=live)["entries"]],
+                         ["exact", "alias"])
+
+    def test_fuzzy_vocabulary_splits_words_and_limits_phonetic_matches(self):
+        lines = [
+            "Opencode is shipping.",
+            "We should open code review.",
+            "We should open their code.",
+            "The open coat release went out.",
+            "Cappuccino arrived.",
+            "Capuchin arrived.",
+            "Rain tomorrow.",
+            *["Scroll down."] * 6,
+        ]
+        passages = [{"id": index, "text": text} for index, text in enumerate(lines)]
+        vocab = (("OpenCode", ["open coat"]), ("Cappuccino", []), ("Rune", []), ("Scrawl", []))
+
+        def hits(query, fuzzy=True):
+            return [entry["id"] for entry in meeting_passages(passages, query, 20, fuzzy, vocabulary=vocab)]
+
+        results = hits("opencode")
+        self.assertEqual(results[0], 0)
+        self.assertCountEqual(results[1:], [1, 3])
+        self.assertEqual(hits("opencode", fuzzy=False), [0])
+        self.assertEqual(hits("cappuccino"), [4, 5])
+        self.assertEqual(hits("rune"), [entry["id"] for entry in meeting_passages(passages, "rune", 20, True)])
+        self.assertFalse(hits("scrawl"))
 
     def test_retention_and_entries_are_read_from_one_open_snapshot(self):
         old = self.entry("old", 3, "Readable before exchange.")

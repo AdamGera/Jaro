@@ -16,7 +16,7 @@ export function useDesktopUpdate(native: DesktopBridge | undefined) {
     const initial = revision.current
     const receive = (event: WindowEventMap["native-sdk:jard-update"]) => {
       const request = event.detail.openUpdateSettings
-      if (request && request !== latestMenuRequest.current) setError("")
+      if (event.detail.restartInProgress || (request && request !== latestMenuRequest.current)) setError("")
       latestMenuRequest.current = request
       revision.current++
       setUpdate(event.detail)

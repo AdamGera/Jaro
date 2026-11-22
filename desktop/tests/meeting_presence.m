@@ -6,6 +6,7 @@
 @interface JardMeetings (Test)
 @property(nonatomic) NSTimeInterval lastPresent;
 @property(nonatomic, strong) JardMeetingPresence *presence;
+@property(nonatomic, readonly) JardCall *offered;
 @property(nonatomic, strong) JardCalendar *calendar;
 @property(nonatomic, strong) NSMutableDictionary *policies;
 @property(nonatomic) BOOL autoStop;
@@ -13,6 +14,7 @@
 - (void)observed:(NSArray<JardCall *> *)calls;
 - (void)observeCalls:(NSArray<JardCall *> *)calls now:(NSTimeInterval)now date:(NSDate *)date;
 - (void)pollCalendarAt:(NSDate *)date;
+- (void)dismissOffer;
 - (NSString *)policyForCall:(JardCall *)call;
 - (NSString *)policyForCalendar:(JardCalendarMeeting *)event;
 - (void)renderPanel;
@@ -94,16 +96,23 @@ static void exerciseCalendar(void) {
     [meeting shutdown];
 }
 
-static void exerciseAutoStop(void) {
+static void exerciseAutoStop(BOOL manualStop) {
     NSString *chrome = @"com.google.chrome";
     JardCall *original = JardMeetingBrowserCall([NSURL URLWithString:@"https://meet.google.com/abc-defg-hij"], chrome);
-    JardCall *changed = JardMeetingBrowserCall([NSURL URLWithString:@"https://meet.google.com/abc-defg-xyz"], chrome);
+    JardCall *named = JardMeetingBrowserTitleCall(@"Meet – Design sync", chrome);
+    JardCall *changed = JardMeetingBrowserTitleCall(@"Meet - abc-defg-xyz - Google Chrome", chrome);
     JardCall *third = JardMeetingBrowserCall([NSURL URLWithString:@"https://meet.google.com/xyz-wxyz-xyz"], chrome);
     __block NSString *identifier;
-    __block NSUInteger stops = 0;
+    __block NSUInteger starts = 0, stops = 0;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSString *previous = [defaults stringForKey:@"JardLastMeetingSession"];
     TestMeetings *meeting = [[TestMeetings alloc] initWithManaged:NO start:^(NSDictionary *options, BOOL prompt, JardDictationReply reply) {
-        assert(!prompt); identifier = options[@"meeting"]; reply(@{}, nil);
+        assert(!prompt && [options[@"meetingApplication"] isEqual:chrome]);
+        starts++;
+        identifier = options[@"meeting"];
+        reply(@{}, nil);
     } send:^(NSString *command, NSDictionary *options, JardDictationReply reply) {
+        if ([command isEqual:@"jard.meetingCompletion"]) { reply(@{@"status": @"processing"}, nil); return; }
         assert([command isEqual:@"jard.stopMeeting"] && [options[@"meeting"] isEqual:identifier]);
         stops++; reply(nil, nil);
     } changed:nil];
@@ -112,10 +121,13 @@ static void exerciseAutoStop(void) {
     meeting.autoStop = YES;
     NSDate *date = NSDate.date;
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    [meeting observeCalls:@[original] now:now date:date];
-    [meeting observeCalls:@[original] now:now + 2 date:date];
-    assert(identifier);
+    [meeting observeCalls:@[named] now:now date:date];
+    [meeting observeCalls:@[named] now:now + 2 date:date];
+    assert(identifier && starts == 1);
     [meeting handleCapture:@{@"meeting": identifier, @"event": @"started"}];
+    [meeting observeCalls:@[original] now:now + 3 date:date];
+    [meeting observeCalls:@[named] now:now + 4 date:date];
+    assert([[meeting status][@"phase"] isEqual:@"recording"]);
     original.inputActive = NO;
     [meeting observeCalls:@[original] now:now + 6 date:date];
     assert([[meeting status][@"phase"] isEqual:@"recording"]);
@@ -129,16 +141,155 @@ static void exerciseAutoStop(void) {
     [meeting observeCalls:@[changed] now:now + 15 date:date];
     assert([[meeting status][@"phase"] isEqual:@"callEnded"]);
     [meeting request:@{@"action": @"keepRecording"} reply:^(id result, NSString *error) { assert(!error); }];
+    [meeting observeCalls:@[original] now:now + 16 date:date];
+    [meeting observeCalls:@[named] now:now + 17 date:date];
+    [meeting observeCalls:@[changed] now:now + 18 date:date];
     [meeting observeCalls:@[changed] now:now + 48 date:date];
     assert(stops == 0 && [[meeting status][@"phase"] isEqual:@"recording"]);
     [meeting observeCalls:@[third] now:now + 49 date:date];
     [meeting observeCalls:@[third] now:now + 53 date:date];
     assert([[meeting status][@"phase"] isEqual:@"callEnded"]);
-    [meeting observeCalls:@[third] now:now + 82 date:date];
-    assert(stops == 0);
-    [meeting observeCalls:@[third] now:now + 83 date:date];
+    [meeting observeCalls:@[named] now:now + 54 date:date];
+    assert([[meeting status][@"phase"] isEqual:@"callEnded"]);
+    [meeting observeCalls:@[original] now:now + 55 date:date];
+    assert([[meeting status][@"phase"] isEqual:@"recording"]);
+    [meeting observeCalls:@[third] now:now + 56 date:date];
+    [meeting observeCalls:@[third] now:now + 60 date:date];
+    assert([[meeting status][@"phase"] isEqual:@"callEnded"]);
+    [meeting observeCalls:@[named] now:now + 89 date:date];
+    assert(stops == 0 && [[meeting status][@"phase"] isEqual:@"callEnded"]);
+    if (manualStop) [meeting request:@{@"action": @"stop"} reply:^(id result, NSString *error) { assert(!error); }];
+    else [meeting observeCalls:@[named] now:now + 90 date:date];
     assert(stops == 1 && [[meeting status][@"phase"] isEqual:@"saving"]);
+    NSString *prior = identifier;
+    original.inputActive = YES;
+    for (NSUInteger second = 91; second < 100; ++second)
+        [meeting observeCalls:@[original] now:now + second date:date];
+    assert(starts == 1 && meeting.lastPresent == now + 99);
+    [meeting handleCapture:@{@"meeting": identifier, @"event": @"accepted", @"id": NSUUID.UUID.UUIDString.lowercaseString}];
+    [meeting observeCalls:@[named] now:now + 100 date:date];
+    assert(starts == 2 && ![identifier isEqual:prior]);
+    [meeting handleCapture:@{@"meeting": identifier, @"event": @"started"}];
+    [meeting observeCalls:@[original] now:now + 101 date:date];
+    [meeting observeCalls:@[original] now:now + 106 date:date];
+    assert(stops == 1 && [[meeting status][@"phase"] isEqual:@"recording"]);
+    [meeting observeCalls:@[changed] now:now + 107 date:date];
+    [meeting observeCalls:@[changed] now:now + 111 date:date];
+    assert(stops == 1 && [[meeting status][@"phase"] isEqual:@"callEnded"]);
     [meeting shutdown];
+    [defaults setObject:previous forKey:@"JardLastMeetingSession"];
+}
+
+static void exerciseBrowserTitles(void) {
+    NSString *arc = @"company.thebrowser.browser";
+    JardCall *address = JardMeetingBrowserCall([NSURL URLWithString:@"https://meet.google.com/meet/abc-defg-hij?authuser=1"], arc);
+    JardCall *codeTitle = JardMeetingBrowserTitleCall(@"Meet – ABC-DEFG-HIJ - Arc", arc);
+    JardCall *namedTitle = JardMeetingBrowserTitleCall(@"Meet — Design sync - Arc", arc);
+    JardCall *different = JardMeetingBrowserTitleCall(@"Meet - xyz-wxyz-xyz", arc);
+    assert([codeTitle.identity isEqual:address.identity] && [codeTitle.googleMeetCode isEqual:@"abc-defg-hij"]);
+    assert([namedTitle.label isEqual:@"Google Meet"] && !namedTitle.googleMeetCode && !namedTitle.slow);
+    assert(![namedTitle.identity containsString:@"Design sync"] && [address matchesObservation:namedTitle]);
+    assert(![address matchesObservation:different]);
+    assert(!JardMeetingBrowserTitleCall(@"Google Meet - Arc", arc));
+    assert(!JardMeetingBrowserTitleCall(@"Meet -  - Arc", arc));
+    assert(!JardMeetingBrowserTitleCall(@"Meet - abc-defg-hij", @"com.example.editor"));
+
+    JardMeetingPresence *watch = JardMeetingPresence.new;
+    assert(![watch offerFromCalls:@[address] now:10]);
+    assert([watch offerFromCalls:@[codeTitle] now:12] == codeTitle);
+    [watch snooze:codeTitle absence:3 now:12];
+    assert(![watch offerFromCalls:@[namedTitle] now:14]);
+    assert(![watch offerFromCalls:@[namedTitle] now:16]);
+    assert(![watch offerFromCalls:@[address] now:18]);
+    assert(![watch offerFromCalls:@[different] now:20]);
+    assert([watch offerFromCalls:@[different] now:22] == different);
+    puts("Google Meet title and URL evidence shared call identity and snooze, with unresolved titles preserving an active call.");
+}
+
+static void exerciseSwitchMemory(void) {
+    NSString *arc = @"company.thebrowser.browser";
+    JardCall *first = JardMeetingBrowserTitleCall(@"Meet - abc-defg-hij", arc);
+    JardCall *next = JardMeetingBrowserTitleCall(@"Meet - xyz-wxyz-xyz", arc);
+    JardCall *third = JardMeetingBrowserTitleCall(@"Meet - qqq-qqqq-qqq", arc);
+    JardCall *unresolved = JardMeetingUnnamedBrowser(arc, @"Arc");
+    JardMeetingPresence *watch = JardMeetingPresence.new;
+    [watch rememberSwitchFrom:first to:next confirmedAt:10 lastSeen:12];
+    assert([[[watch callsResolvingSwitch:@[first] now:13] firstObject].identity isEqual:next.identity]);
+    assert([[[watch callsResolvingSwitch:@[unresolved] now:14] firstObject].identity isEqual:next.identity]);
+    assert([[watch callsResolvingSwitch:@[third] now:15] firstObject] == third);
+    assert([[watch callsResolvingSwitch:@[first] now:16] firstObject] == first);
+    assert(![watch takePreviousIdentityForCall:next]);
+
+    [watch rememberSwitchFrom:first to:next confirmedAt:20 lastSeen:20];
+    first.inputActive = NO;
+    assert([[watch callsResolvingSwitch:@[first] now:21] firstObject] == first);
+    assert(![watch callsResolvingSwitch:@[] now:23].count);
+    first.inputActive = YES;
+    assert([[watch callsResolvingSwitch:@[first] now:24] firstObject] == first);
+
+    [watch rememberSwitchFrom:first to:next confirmedAt:30 lastSeen:30];
+    for (NSUInteger second = 31; second < 150; ++second)
+        assert([[[watch callsResolvingSwitch:@[first] now:second] firstObject].identity isEqual:next.identity]);
+    assert([[watch callsResolvingSwitch:@[first] now:150] firstObject] == first);
+    puts("Confirmed call-switch context expired after microphone loss, a different code, or two minutes.");
+}
+
+static void exerciseOfferLifecycle(void) {
+    NSString *chrome = @"com.google.chrome";
+    JardCall *first = JardMeetingBrowserTitleCall(@"Meet - abc-defg-hij", chrome);
+    JardCall *next = JardMeetingBrowserTitleCall(@"Meet - xyz-wxyz-xyz", chrome);
+    JardCall *unnamed = JardMeetingUnnamedBrowser(chrome, @"Chrome");
+    TestMeetings *meeting = [[TestMeetings alloc] initWithManaged:NO start:^(NSDictionary *options, BOOL prompt, JardDictationReply reply) {
+        assert(NO);
+    } send:nil changed:nil];
+    [meeting.policies removeAllObjects];
+    NSDate *date = NSDate.date;
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    [meeting observeCalls:@[unnamed] now:now date:date];
+    [meeting observeCalls:@[unnamed] now:now + 1 date:date];
+    assert(!meeting.offered);
+    [meeting observeCalls:@[first] now:now + 2 date:date];
+    assert(meeting.offered == first); // The first two seconds are from the same browser input.
+    for (NSUInteger second = 3; second < 22; ++second) {
+        [meeting observeCalls:@[unnamed] now:now + second date:date];
+        assert(meeting.offered == first);
+    }
+    [meeting observeCalls:@[unnamed] now:now + 22 date:date];
+    assert(!meeting.offered);
+    [meeting observeCalls:@[first] now:now + 23 date:date];
+    assert(!meeting.offered);
+    [meeting observeCalls:@[] now:now + 24 date:date];
+    [meeting observeCalls:@[first] now:now + 25 date:date];
+    assert(!meeting.offered);
+    [meeting observeCalls:@[first] now:now + 27 date:date];
+    assert(meeting.offered == first);
+    [meeting observeCalls:@[next] now:now + 28 date:date];
+    assert(meeting.offered == first);
+    [meeting observeCalls:@[next] now:now + 30 date:date];
+    assert(meeting.offered == next);
+    [meeting dismissOffer];
+    for (NSUInteger second = 31; second < 65; ++second) {
+        [meeting observeCalls:@[second % 2 ? unnamed : next] now:now + second date:date];
+        assert(!meeting.offered);
+    }
+    [meeting shutdown];
+
+    JardMeetingPresence *watch = JardMeetingPresence.new;
+    [watch deferOfferForCall:first now:10.5];
+    assert(![watch offerFromCalls:@[unnamed] now:11]);
+    assert(![watch offerFromCalls:@[next] now:12]);
+    assert([watch offerFromCalls:@[next] now:13] == next);
+    watch = JardMeetingPresence.new;
+    [watch snooze:unnamed absence:60 now:20];
+    assert(![watch offerFromCalls:@[first] now:21]);
+    assert(![watch offerFromCalls:@[first] now:23]);
+
+    watch = JardMeetingPresence.new;
+    assert(![watch offerFromCalls:@[unnamed] now:30]);
+    assert(![watch offerFromCalls:@[unnamed] now:31]);
+    assert(![watch offerFromCalls:@[first] now:34]);
+    assert([watch offerFromCalls:@[first] now:36] == first);
+    puts("Meeting offers kept microphone continuity across tabs and rearmed after unanswered pre-join released the mic.");
 }
 
 static void exerciseProviderSettings(void) {
@@ -214,7 +365,11 @@ static void exerciseProviderSettings(void) {
 int main(void) {
     @autoreleasepool {
         exerciseCalendar();
-        exerciseAutoStop();
+        exerciseBrowserTitles();
+        exerciseSwitchMemory();
+        exerciseOfferLifecycle();
+        exerciseAutoStop(NO);
+        exerciseAutoStop(YES);
         exerciseProviderSettings();
         JardCall *zoom = JardMeetingDirectCall(@"us.zoom.CptHost");
         assert([zoom.identity isEqual:JardMeetingDirectCall(@"us.zoom.xos.helper").identity]);
@@ -298,6 +453,7 @@ int main(void) {
         [meeting observed:@[zoom]];
         assert([[meeting status][@"phase"] isEqual:@"offered"]);
         [meeting request:start reply:^(id result, NSString *error) { assert(!error && [result[@"busy"] boolValue]); }];
+        assert([take[@"meetingApplication"] isEqual:@"us.zoom.cpthost"]);
         NSString *identifier = take[@"meeting"];
         assert([identifier isEqual:identifier.lowercaseString]);
         [meeting handleCapture:@{@"meeting": @"stale", @"event": @"started"}];
@@ -312,22 +468,22 @@ int main(void) {
             @"deltaSegments": @[@{@"speaker": @2, @"start": @4.1, @"end": @4.8, @"text": @"Second phrase."}]}];
         NSPasteboard *pasteboard = NSPasteboard.pasteboardWithUniqueName;
         [meeting copyNew:YES to:pasteboard reply:^(id result, NSString *error) { assert(result && !error); }];
-        assert([[pasteboard stringForType:NSPasteboardTypeString] isEqual:@"Them: First phrase."]);
+        assert([[pasteboard stringForType:NSPasteboardTypeString] isEqual:@"Speaker 2: First phrase."]);
         [meeting copyNew:YES to:pasteboard reply:^(id result, NSString *error) { assert(!result && error); }];
         cutoff = 240000;
         [meeting preparePaste:^(NSString *text, void (^didPaste)(BOOL)) {
-            assert([text isEqual:@"Them: Second phrase."]);
+            assert([text isEqual:@"Speaker 2: Second phrase."]);
             assert([[meeting status][@"copying"] boolValue]);
             didPaste(NO);
         }];
         [meeting preparePaste:^(NSString *text, void (^didPaste)(BOOL)) {
-            assert([text isEqual:@"Them: Second phrase."]);
+            assert([text isEqual:@"Speaker 2: Second phrase."]);
             didPaste(YES);
         }];
         [meeting copyNew:YES to:pasteboard reply:^(id result, NSString *error) { assert(!result && error); }];
         complete = NO;
         [meeting copyNew:NO to:pasteboard reply:^(id result, NSString *error) { assert([result[@"copyPartial"] boolValue] && !error); }];
-        assert([[pasteboard stringForType:NSPasteboardTypeString] isEqual:@"Them: First phrase. Second phrase."]);
+        assert([[pasteboard stringForType:NSPasteboardTypeString] isEqual:@"Speaker 2: First phrase. Second phrase."]);
         meeting.lastPresent = now - 4;
         [meeting observed:@[]];
         assert([[meeting status][@"phase"] isEqual:@"callEnded"]);
@@ -341,7 +497,7 @@ int main(void) {
         // A draft with nothing new must leave the shortcut ready for final publication.
         assert(meeting.canPaste);
         settled = YES;
-        NSString *expected = @"You: Overlapping local note.\n\nThem: A recovered gap. Tail.";
+        NSString *expected = @"Speaker 1: Overlapping local note.\n\nSpeaker 2: A recovered gap. Tail.";
         [meeting preparePaste:^(NSString *text, void (^didPaste)(BOOL)) {
             assert([text isEqual:expected]);
             didPaste(NO);
@@ -362,7 +518,7 @@ int main(void) {
                 else if ([command isEqual:@"jard.latestMeeting"]) reply(@{@"session": recovered, @"recovering": @NO}, nil);
                 else {
                     assert([command isEqual:@"jard.meetingExcerpt"] && [options[@"session"] isEqual:recovered]);
-                    reply(@{@"turns": @[finalTurns[0]], @"settled": @YES}, nil);
+                    reply(@{@"turns": @[finalTurns[0]], @"labels": @{@"2": @"Them"}, @"settled": @YES}, nil);
                 }
             } changed:nil];
         [reopened workspaceReady];

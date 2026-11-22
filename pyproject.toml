@@ -1,14 +1,16 @@
 [project]
 name = "jaro"
-version = "0.0.7"
+version = "0.0.8"
 description = "Your recordings, transcripts, and notes stay on your Mac."
 license = "Apache-2.0"
 authors = [{ name = "Jard" }]
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    "dbus-fast==5.2.0 ; sys_platform == 'linux'",
     "fastapi==0.165.0",
     "httpcore>=1,<2",
     "httpx>=0.28,<0.29",
+    "python-xlib==0.33 ; sys_platform == 'linux'",
     "regex==2026.11.19",
     "torch==2.15.0",
     "transformers==5.23.0",

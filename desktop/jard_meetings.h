@@ -12,10 +12,13 @@ typedef void (^JardMeetingStart)(NSDictionary *options, BOOL requestPermissions,
 - (BOOL)busy;
 - (BOOL)keepsRunning;
 - (BOOL)recording;
+- (BOOL)sharesMicrophone;
 - (BOOL)canPaste;
+- (NSDictionary *)status;
 - (void)preparePaste:(JardPasteExcerpt)ready;
 - (void)startWithEstablishedPermissionsTitle:(NSString *)title reply:(JardDictationReply)reply;
 - (void)copyLatestTranscript:(JardDictationReply)reply;
+- (void)copySavedTranscript:(NSString *)identifier reply:(JardDictationReply)reply;
 - (void)request:(NSDictionary *)request reply:(JardDictationReply)reply;
 - (void)handleCapture:(NSDictionary *)capture;
 - (void)bridgeDisconnected;

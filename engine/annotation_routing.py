@@ -458,7 +458,27 @@ def prompt(root, identifier):
     return {"text": markdown, "files": files, "delivery": "queue"}, detail["id"]
 
 
-async def send_annotation(root, identifier, target, service=None, *, directory=None, authorize=None):
+async def send_session_prompt(body, target, service):
+    require_opencode()
+    if not isinstance(target, str) or not SESSION_ID.fullmatch(target) or not isinstance(service, str) or not SERVICE_ID.fullmatch(service):
+        raise RoutingError("Refresh the OpenCode destinations and choose a session.")
+    async with make_client() as client:
+        record = await discover(client, service, state_directory())
+        path = f"/api/session/{target}"
+        await current_session(client, record, path, target)
+        if not await asyncio.to_thread(owns_listener, record):
+            raise RouteUnavailable("OpenCode closed before Jaro sent the session.")
+        try:
+            status, _ = await request(client, record, "POST", path + "/prompt", seconds=5, json=body)
+        except (TimeoutError, httpx.HTTPError) as error:
+            raise RoutingError("OpenCode did not confirm delivery. Check the session before trying again.") from error
+        if status >= 500:
+            raise RoutingError("OpenCode did not confirm delivery. Check the session before trying again.")
+        if not 200 <= status < 300:
+            raise RoutingError("OpenCode declined the session context.")
+
+
+async def send_annotation(root, identifier, target, service=None, *, directory=None, authorize=None, remember_scope=None, body=None):
     require_opencode()
     if not isinstance(identifier, str) or len(identifier) > 36:
         raise RoutingError("Enter a saved annotation ID or latest.")
@@ -466,7 +486,10 @@ async def send_annotation(root, identifier, target, service=None, *, directory=N
         raise RoutingError("Choose a valid OpenCode session ID.")
     if service is not None and (not isinstance(service, str) or not SERVICE_ID.fullmatch(service)):
         raise RoutingError("Refresh the OpenCode destinations and choose again.")
-    body, capture = await asyncio.to_thread(prompt, root, identifier)
+    if body is None:
+        body, capture = await asyncio.to_thread(prompt, root, identifier)
+    else:
+        capture = str(UUID(identifier))
     async with make_client() as client:
         record = await discover(client, service, directory or state_directory())
         path = f"/api/session/{target}"
@@ -477,7 +500,8 @@ async def send_annotation(root, identifier, target, service=None, *, directory=N
         if authorize:
             delivery = await authorize(record.key, destination, bool(body["files"]))
         else:
-            delivery = await asyncio.to_thread(receipts.begin, capture, record.key, destination, bool(body["files"]))
+            delivery = await asyncio.to_thread(receipts.begin, capture, record.key, destination, bool(body["files"]),
+                                               remember_scope=remember_scope)
         try:
             status, response = await request(client, record, "POST", path + "/prompt", seconds=5, json=body)
         except httpx.ConnectError as error:
@@ -491,7 +515,11 @@ async def send_annotation(root, identifier, target, service=None, *, directory=N
             await asyncio.to_thread(receipts.change, delivery, "refused")
             raise RoutingError("OpenCode refused the annotation. The saved capture is still available in Jard.")
         try:
-            receipt = await asyncio.to_thread(receipts.change, delivery, "queued", accepted_message(response))
+            message = accepted_message(response)
+            if remember_scope:
+                receipt = await asyncio.to_thread(receipts.confirm_remembered_delivery, delivery, message, record.channel)
+            else:
+                receipt = await asyncio.to_thread(receipts.change, delivery, "queued", message)
         except ReceiptError as error:
             raise RoutingError("OpenCode accepted the annotation. Jard could not save the receipt.") from error
         return {**receipt, "delivery": "queued"}
@@ -571,7 +599,7 @@ async def withdraw_annotation(root, delivery, *, directory=None):
     identifier = saved["deliveryId"]
     if saved["status"] in ("withdrawn", "received", "missing", "corrected", "correction-unconfirmed"):
         return saved
-    if not saved["canUndo"]:
+    if not saved["canUndo"] or not saved["message"]:
         raise RoutingError("This annotation can no longer be withdrawn from the OpenCode inbox.")
     target, message = receipt_target(saved)
 

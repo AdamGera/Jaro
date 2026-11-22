@@ -1,18 +1,124 @@
 import { useEffect, useId, useRef, useState } from "react"
-import { Search, Send } from "lucide-react"
-import { AlertDialog, Dialog } from "radix-ui"
-import type { AnnotationDelivery, AnnotationDestinations, AnnotationRouteScope, AnnotationRouteStatus, DesktopBridge } from "@/desktop"
+import { Search } from "lucide-react"
+import { AlertDialog, Dialog, Popover, Tooltip } from "radix-ui"
+import { useInterfaceLanguage } from "@/interface-language"
+import type { AnnotationAgent, AnnotationDelivery, AnnotationDestinations, AnnotationRouteScope, AnnotationRouteStatus, DesktopBridge } from "@/desktop"
+import claudeLogo from "@/assets/agent-logos/claude-code.png"
+import codexDarkLogo from "@/assets/agent-logos/codex-dark.png"
+import codexLightLogo from "@/assets/agent-logos/codex-light.png"
+import openCodeDarkLogo from "@/assets/agent-logos/opencode-dark.svg"
+import openCodeLightLogo from "@/assets/agent-logos/opencode-light.svg"
+import t3Logo from "@/assets/agent-logos/t3-code.svg"
 import { Button } from "./ui/button"
 
-export function AnnotationDestinationPicker({ native, id, disabled, onChanged }: {
+const annotationAgents: Record<AnnotationAgent, { name: string; logo: string; darkLogo?: string }> = {
+  claude: { name: "Claude Code", logo: claudeLogo },
+  codex: { name: "Codex", logo: codexLightLogo, darkLogo: codexDarkLogo },
+  opencode: { name: "OpenCode", logo: openCodeLightLogo, darkLogo: openCodeDarkLogo },
+  t3: { name: "T3 Code", logo: t3Logo },
+}
+const agentOrder: AnnotationAgent[] = ["claude", "codex", "opencode", "t3"]
+
+function AgentLogo({ agent }: { agent: AnnotationAgent }) {
+  const { logo, darkLogo } = annotationAgents[agent]
+  return <picture aria-hidden="true">
+    {darkLogo && <source media="(prefers-color-scheme: dark)" srcSet={darkLogo} />}
+    <img src={logo} alt="" width={20} height={20} draggable={false} className="annotation-agent-logo" />
+  </picture>
+}
+
+type AgentPickerProps = {
   native: DesktopBridge
   id: string
+  annotation: boolean
   disabled: boolean
-  onChanged: () => void
+  allowOpenCode: boolean
+  onChanged: (agent: AnnotationAgent, status?: string) => void
+}
+
+export function AnnotationAgentPicker({ native, id, annotation, disabled, allowOpenCode, onChanged }: AgentPickerProps) {
+  const { t } = useInterfaceLanguage()
+  const stack = useRef<HTMLButtonElement>(null)
+  const handingOff = useRef(false)
+  const [expanded, setExpanded] = useState(false)
+  const [agent, setAgent] = useState<AnnotationAgent>()
+  const label = t("Send to your agent")
+
+  return <>
+    <Tooltip.Provider delayDuration={300}>
+      <Popover.Root open={expanded} onOpenChange={next => {
+        if (next) handingOff.current = false
+        setExpanded(next)
+      }}>
+        <Tooltip.Root>
+          <Tooltip.Trigger asChild>
+            <Popover.Trigger asChild>
+              <Button ref={stack} variant="outline" size="icon-sm" aria-label={label} disabled={disabled}
+                className="annotation-agent-stack">
+                <span aria-hidden="true" className="annotation-agent-stack-fan">
+                  {agentOrder.map(provider => <span key={provider} className="annotation-agent-stack-card">
+                    <AgentLogo agent={provider} />
+                  </span>)}
+                </span>
+              </Button>
+            </Popover.Trigger>
+          </Tooltip.Trigger>
+          <Tooltip.Portal>
+            <Tooltip.Content sideOffset={6} className="annotation-agent-tooltip">{label}</Tooltip.Content>
+          </Tooltip.Portal>
+        </Tooltip.Root>
+        <Popover.Portal>
+          <Popover.Content align="end" side="top" sideOffset={7} collisionPadding={12} aria-label={label}
+            className="annotation-agent-popover"
+            onKeyDown={event => {
+              // A focused logo's tooltip can receive Escape before the popover does.
+              if (event.key === "Escape") setExpanded(false)
+            }}
+            onCloseAutoFocus={event => {
+              if (handingOff.current) event.preventDefault()
+            }}>
+            {agentOrder.map(provider => {
+              const name = annotationAgents[provider].name
+              return <Tooltip.Root key={provider}>
+                <Tooltip.Trigger asChild>
+                  <Button variant="ghost" size="icon-sm" aria-label={`Send to ${name}…`}
+                    disabled={disabled || (provider === "opencode" && !allowOpenCode)}
+                    onClick={() => {
+                      handingOff.current = true
+                      setExpanded(false)
+                      setAgent(provider)
+                    }}>
+                    <AgentLogo agent={provider} />
+                  </Button>
+                </Tooltip.Trigger>
+                <Tooltip.Portal>
+                  <Tooltip.Content sideOffset={6} className="annotation-agent-tooltip">Send to {name}</Tooltip.Content>
+                </Tooltip.Portal>
+              </Tooltip.Root>
+            })}
+          </Popover.Content>
+        </Popover.Portal>
+      </Popover.Root>
+    </Tooltip.Provider>
+    {agent && <AnnotationDestinationPicker key={agent} native={native} id={id} agent={agent} annotation={annotation}
+      disabled={disabled || (agent === "opencode" && !allowOpenCode)} onChanged={status => onChanged(agent, status)}
+      onClose={() => setAgent(undefined)} onRestoreFocus={() => stack.current?.focus({ preventScroll: true })} />}
+  </>
+}
+
+function AnnotationDestinationPicker({ native, id, agent, annotation, disabled, onChanged, onClose, onRestoreFocus }: {
+  native: DesktopBridge
+  id: string
+  agent: AnnotationAgent
+  annotation: boolean
+  disabled: boolean
+  onChanged: (status?: string) => void
+  onClose: () => void
+  onRestoreFocus: () => void
 }) {
+  const { name } = annotationAgents[agent]
   const search = useRef<HTMLInputElement>(null)
   const group = useId()
-  const [open, setOpen] = useState(false)
   const [query, setQuery] = useState("")
   const [results, setResults] = useState<AnnotationDestinations>()
   const [target, setTarget] = useState("")
@@ -25,17 +131,19 @@ export function AnnotationDestinationPicker({ native, id, disabled, onChanged }:
   const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
-    if (!open) return
     let current = true
     const wait = window.setTimeout(() => {
-      void native.request("annotationDestinations", { query, id }).then(list => {
+      const request = agent === "opencode"
+        ? native.request("annotationDestinations", { query, ...(annotation && { id }) })
+        : native.request("annotationAgentDestinations", { agent, query }).then(list => ({ ...list, service: null }))
+      void request.then(list => {
         if (current) setResults(list)
       }).catch(error => {
-        if (current) setFailure(error instanceof Error ? error.message : "Could not list OpenCode sessions.")
+        if (current) setFailure(error instanceof Error ? error.message : `Could not list ${name} sessions.`)
       })
     }, query ? 250 : 0)
     return () => { current = false; window.clearTimeout(wait) }
-  }, [native, open, query, attempt, id])
+  }, [native, query, attempt, id, agent, name, annotation])
 
   function reset() {
     setTarget("")
@@ -44,16 +152,22 @@ export function AnnotationDestinationPicker({ native, id, disabled, onChanged }:
   }
 
   async function deliver() {
-    if (!results?.service || !target || sending) return
+    const selected = results?.sessions.find(item => item.id === target)
+    if (!selected || sending || disabled) return
     setWorking("send")
     setFailure("")
     try {
-      await native.request("sendAnnotation", { id, target, service: results.service })
-      setOpen(false)
+      const delivery = await native.request("sendSessionToAgent", {
+        agent, id, target, service: results?.service ?? undefined, open: true,
+      })
+      const shared = delivery.images === "attached" ? "Session context and images sent"
+        : delivery.images === "references" ? "Session context and image links sent" : "Session context sent"
+      onChanged(`${shared} to ${selected.title} in ${name}.`)
+      onClose()
     } catch (error) {
-      setFailure(error instanceof Error ? error.message : "Could not send the annotation.")
+      if (agent === "opencode") onChanged()
+      setFailure(error instanceof Error ? error.message : "Could not send the session context.")
     } finally {
-      onChanged()
       setWorking(undefined)
     }
   }
@@ -77,30 +191,26 @@ export function AnnotationDestinationPicker({ native, id, disabled, onChanged }:
     }
   }
 
-  return <Dialog.Root open={open} onOpenChange={next => {
-    if (sending) return
-    if (next) { setQuery(""); setRuleScope(undefined); setAutomatic(false); reset() }
-    setOpen(next)
-  }}>
-    <Dialog.Trigger asChild>
-      <Button variant="outline" size="sm" disabled={disabled}><Send />Send to OpenCode…</Button>
-    </Dialog.Trigger>
+  return <Dialog.Root open onOpenChange={next => { if (!next && !sending) onClose() }}>
     <Dialog.Portal>
       <Dialog.Overlay className="note-language-scrim" />
       <Dialog.Content className="note-language-confirm annotation-destinations"
-        onOpenAutoFocus={event => { event.preventDefault(); search.current?.focus() }}>
-        <Dialog.Title>Send to OpenCode</Dialog.Title>
-        <Dialog.Description>Queue the narration and any available contact sheet in an open session.</Dialog.Description>
+        onOpenAutoFocus={event => { event.preventDefault(); search.current?.focus() }}
+        onCloseAutoFocus={event => { event.preventDefault(); onRestoreFocus() }}>
+        <Dialog.Title>Send to {name}</Dialog.Title>
+        <Dialog.Description>{agent === "t3"
+          ? "Send the overview, transcript, My Notes, and local image links to an existing chat."
+          : "Send the overview, transcript, My Notes, and available images to an existing chat."}</Dialog.Description>
         <label className="annotation-destination-search">
           <Search aria-hidden="true" />
-          <input ref={search} aria-label="Search OpenCode sessions" placeholder="Search title, project, or session ID"
+          <input ref={search} aria-label={`Search ${name} sessions`} placeholder="Search title, project, or session ID"
             maxLength={300} value={query} disabled={sending} onChange={event => { reset(); setQuery(event.target.value) }} />
         </label>
         {failure && <p role="alert">{failure}</p>}
-        {!results && !failure && <p role="status">Looking for OpenCode sessions…</p>}
+        {!results && !failure && <p role="status">Looking for {name} sessions…</p>}
         {results?.warning && <p role="status">{results.warning}</p>}
         {results && !results.warning && !results.sessions.length && <p role="status">{query ? "No matching sessions." : "No open sessions."}</p>}
-        {!!results?.sessions.length && <div role="radiogroup" aria-label="OpenCode sessions" className="annotation-destination-list">
+        {!!results?.sessions.length && <div role="radiogroup" aria-label={`${name} sessions`} className="annotation-destination-list">
           {results.sessions.map(session => <label key={session.id} className="annotation-destination-row">
             <input type="radio" name={group} checked={target === session.id} disabled={sending}
               onChange={() => { setFailure(""); setTarget(session.id) }} />
@@ -134,7 +244,7 @@ export function AnnotationDestinationPicker({ native, id, disabled, onChanged }:
         <div className="note-language-actions">
           <Button variant="ghost" size="sm" disabled={sending} onClick={() => { reset(); setAttempt(value => value + 1) }}>Refresh</Button>
           <Dialog.Close asChild><Button variant="outline" size="sm" disabled={sending}>Cancel</Button></Dialog.Close>
-          <Button size="sm" disabled={!target || sending} onClick={() => void deliver()}>{working === "send" ? "Sending…" : "Send annotation"}</Button>
+          <Button size="sm" disabled={!target || sending || disabled || (agent === "opencode" && !results?.service)} onClick={() => void deliver()}>{working === "send" ? "Sending…" : "Send context"}</Button>
         </div>
       </Dialog.Content>
     </Dialog.Portal>
@@ -160,6 +270,14 @@ const outcome: Record<AnnotationDelivery["status"], string> = {
 
 const deliveryTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
 
+const rememberedOutcome = {
+  pending: "",
+  saved: "Automatic destination saved",
+  changed: "Destination changed separately",
+  restored: "Previous destination restored",
+  removed: "Automatic destination removed",
+}
+
 export function AnnotationDeliveryLog({ native, id, revision, remoteEnabled }: {
   native: DesktopBridge; id: string; revision: number; remoteEnabled: boolean
 }) {
@@ -180,11 +298,19 @@ export function AnnotationDeliveryLog({ native, id, revision, remoteEnabled }: {
       setRoute(event.detail)
       if (event.detail.phase === "sent") setRouteRevision(value => value + 1)
     }
+    const changed = (event: WindowEventMap["native-sdk:jard-annotation-delivery-changed"]) => {
+      if (event.detail.capture === id) setRouteRevision(value => value + 1)
+    }
     window.addEventListener("native-sdk:jard-annotation-routing", received)
+    window.addEventListener("native-sdk:jard-annotation-delivery-changed", changed)
     void native.request("annotationRoute", { id, action: "status" }).then(result => {
       if (valid && !latest) setRoute(result)
     }).catch(() => {})
-    return () => { valid = false; window.removeEventListener("native-sdk:jard-annotation-routing", received) }
+    return () => {
+      valid = false
+      window.removeEventListener("native-sdk:jard-annotation-routing", received)
+      window.removeEventListener("native-sdk:jard-annotation-delivery-changed", changed)
+    }
   }, [native, id])
 
   useEffect(() => {
@@ -247,6 +373,9 @@ export function AnnotationDeliveryLog({ native, id, revision, remoteEnabled }: {
             <p role="status">{outcome[item.status]} · <time dateTime={new Date(item.createdAt).toISOString()}>
               {deliveryTime.format(item.createdAt)}
             </time></p>
+            {item.rememberedRule && rememberedOutcome[item.rememberedRule.status] && <p>
+              {rememberedOutcome[item.rememberedRule.status]} · {item.rememberedRule.label}
+            </p>}
             {needsReview && <p>Review any staged revert in OpenCode before sending another prompt.</p>}
           </div>
           <div className="annotation-delivery-actions">

@@ -5,8 +5,8 @@ import json
 import os
 import re
 import signal
-import fcntl
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -18,16 +18,23 @@ import httpx
 from pydantic_core import from_json
 
 import writing_cache
-from engine_paths import WORKSPACE_ROOT
+from rumble_model import MODEL_DIR
 
-ROOT = Path(os.environ.get("JARD_MODEL_DIR", WORKSPACE_ROOT / "model")) / "qwen"
+ROOT = MODEL_DIR.expanduser() / "qwen"
 BUILD = "b12521"
-SERVER = Path(os.environ.get("JARD_LLAMA_SERVER", ROOT / f"llama-{BUILD}/llama-server"))
+SERVER_OVERRIDE = os.environ.get("JARD_LLAMA_SERVER")
+WINDOWS = sys.platform == "win32"
+RUNTIME_DIRECTORY = f"llama-{BUILD}-win-x64" if WINDOWS else f"llama-{BUILD}"
+SERVER = Path(SERVER_OVERRIDE or ROOT / RUNTIME_DIRECTORY / ("llama-server.exe" if WINDOWS else "llama-server"))
 MODEL_NAME = "Qwen3.5-2B"
 WEIGHTS = ROOT / f"{MODEL_NAME}-Q8_0.gguf"
 MODEL_URL = "https://huggingface.co/axteam/Qwen3.5-2B-GGUF/resolve/271502ee0817e5f4ac3242ae5b1d334f74939871/" + WEIGHTS.name
 MODEL_SHA = "be5b6f17394f71bb15629a7e115f3a62d8b3c1de90387770b0d3012bed0c01a5"
 BIN_SHA = "6ebeeea8575081ff968eb1c26f6fffcafe8e3ff2a0fb5d548c0aea7f5575e038"
+LINUX_BIN_SHA = "ab8343cb39e17a18f183ce0a35543a6c3dcc15fb287f55909dd182cb975e345e"
+WINDOWS_BIN_SHA = "bd4e093bce292452248c318d4b176fbfebe1ca43a7f3779ebb3846fe7753653e"
+PORTABLE_BIN_SHA = {"linux": LINUX_BIN_SHA, "win32": WINDOWS_BIN_SHA}
+RUNTIME_REVISION = PORTABLE_BIN_SHA.get(sys.platform, BIN_SHA)
 
 
 # Keep these options in both the request and the durable cache identity.
@@ -92,6 +99,8 @@ def download(url, path, digest):
 
 
 def setup():
+    import fcntl
+
     ROOT.mkdir(parents=True, exist_ok=True)
     archive = ROOT / f"llama-{BUILD}.tar.gz"
     with (ROOT / ".setup-lock").open("a") as lock:
@@ -104,12 +113,27 @@ def setup():
         download(MODEL_URL, WEIGHTS, MODEL_SHA)
 
 
+def runtime_installed():
+    if not SERVER.is_file():
+        return False
+    if SERVER_OVERRIDE or sys.platform not in PORTABLE_BIN_SHA:
+        return True
+    try:
+        return (SERVER.parent / ".verified").read_text().strip() == PORTABLE_BIN_SHA[sys.platform]
+    except (OSError, UnicodeError):
+        return False
+
+
 class LocalQwen:
     def __init__(self):
-        self.socket_dir = tempfile.TemporaryDirectory(prefix="jard-", dir="/tmp")
-        self.socket = str(Path(self.socket_dir.name) / "model.sock")
-        self.http = httpx.AsyncClient(base_url="http://localhost", timeout=None,
-                                      transport=httpx.AsyncHTTPTransport(uds=self.socket))
+        self.socket_dir = None
+        self.http = None
+        self.worker_output = None
+        if not WINDOWS:
+            self.socket_dir = tempfile.TemporaryDirectory(prefix="jard-", dir="/tmp")
+            self.socket = str(Path(self.socket_dir.name) / "model.sock")
+            self.http = httpx.AsyncClient(base_url="http://localhost", timeout=None,
+                                          transport=httpx.AsyncHTTPTransport(uds=self.socket))
         self.lock = asyncio.Lock()
         self.process = None
         self.context_size = BASE_CONTEXT
@@ -128,13 +152,13 @@ class LocalQwen:
             if release_idle and self.process and not self.lock.locked():
                 # Long ASR jobs benefit from reclaiming unified memory; a running chat keeps its slot.
                 await self.stop_process()
-            elif self.process and self.process.returncode is None:
+            elif not WINDOWS and self.process and self.process.returncode is None:
                 self.process.send_signal(signal.SIGSTOP)
             yield
         finally:
             self.audio_users -= 1
             if not self.audio_users:
-                if self.process and self.process.returncode is None:
+                if not WINDOWS and self.process and self.process.returncode is None:
                     self.process.send_signal(signal.SIGCONT)
                 self.available.set()
 
@@ -142,23 +166,33 @@ class LocalQwen:
         await self.available.wait()
         if self.process and self.process.returncode is None and self.healthy:
             return
-        if not SERVER.is_file() or not WEIGHTS.is_file():
+        if not runtime_installed() or not WEIGHTS.is_file():
+            if sys.platform in PORTABLE_BIN_SHA:
+                raise RuntimeError("Run `jardctl model install --all` to install the local writing model.")
             raise RuntimeError("Run Setup Jaro to install the local writing model.")
         if self.process is None or self.process.returncode is not None:
             self.healthy = False
-            Path(self.socket).unlink(missing_ok=True)
-            self.process = await asyncio.create_subprocess_exec(
-                str(SERVER), "-m", str(WEIGHTS), "--host", self.socket, "-c", str(self.context_size), *RUNTIME, "--sleep-idle-seconds", "120",
-                "--offline", "--no-webui", "--no-slots",
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if self.audio_users:
-                self.process.send_signal(signal.SIGSTOP)
+            command = (str(SERVER), "-m", str(WEIGHTS), "-c", str(self.context_size), *RUNTIME,
+                       "--sleep-idle-seconds", "120", "--offline", "--no-webui", "--no-slots")
+            if WINDOWS:
+                from llama_loopback import start_worker
+
+                await self.close_worker_connection()
+                self.process, self.http, self.worker_output = await start_worker(command)
+            else:
+                Path(self.socket).unlink(missing_ok=True)
+                self.process = await asyncio.create_subprocess_exec(
+                    *command, "--host", self.socket, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if self.audio_users:
+                    self.process.send_signal(signal.SIGSTOP)
+        # /props requires the worker's key. /health is public in llama.cpp.
+        endpoint = "/props" if WINDOWS else "/health"
         for _ in range(500):
             await self.available.wait()
             if self.process.returncode is not None:
                 raise RuntimeError("Local writing model could not start.")
             try:
-                if (await self.http.get("/health", timeout=2)).is_success:
+                if (await self.http.get(endpoint, timeout=2)).is_success:
                     self.healthy = True
                     return
             except httpx.TransportError:
@@ -236,7 +270,7 @@ class LocalQwen:
         messages = [*source_messages(data, policy, plain_transcript=full_context), {"role": "user", "content": task}]
         budgets = (limit, limit + min(limit, 1024))
         # Each stage has its own identity: a downstream writing-prompt change leaves upstream calls reusable.
-        key = writing_cache.memo_key("structured-v2", [MODEL_SHA, BIN_SHA, RUNTIME, REQUEST, sampling, messages, schema, budgets])
+        key = writing_cache.memo_key("structured-v2", [MODEL_SHA, RUNTIME_REVISION, RUNTIME, REQUEST, sampling, messages, schema, budgets])
         def check(value):
             check_structure(value, schema)
             if validate:
@@ -293,15 +327,27 @@ class LocalQwen:
         proc, self.process = self.process, None
         self.healthy = False
         if proc and proc.returncode is None:
-            proc.send_signal(signal.SIGCONT)
+            if not WINDOWS:
+                proc.send_signal(signal.SIGCONT)
             proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), 4)
             except TimeoutError:
                 proc.kill()
                 await proc.wait()
+        if WINDOWS:
+            await self.close_worker_connection()
+
+    async def close_worker_connection(self):
+        if self.http is not None:
+            client, self.http = self.http, None
+            await client.aclose()
+        if self.worker_output is not None:
+            output, self.worker_output = self.worker_output, None
+            await output
 
     async def close(self):
         await self.stop_process()
-        await self.http.aclose()
-        self.socket_dir.cleanup()
+        if self.socket_dir is not None:
+            await self.http.aclose()
+            self.socket_dir.cleanup()

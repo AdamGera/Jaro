@@ -1,4 +1,5 @@
 #import "jard_meeting_audio_access.h"
+#import "jard_permission_return.h"
 #import <dlfcn.h>
 
 typedef int32_t (*JardAudioPreflight)(CFStringRef, CFDictionaryRef);
@@ -99,12 +100,12 @@ typedef void (^AudioConsentReply)(BOOL);
 - (void)observeSettings {
     if (!self.visitingSettings) return;
     NSString *front = NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier;
-    [self observeSettingsFront:[front isEqual:@"com.apple.systempreferences"] active:NSApp.active];
+    [self observeSettingsFront:[front isEqual:JardSystemSettingsBundle] active:NSApp.active];
 }
 
 - (void)applicationActivated:(NSNotification *)note {
     NSRunningApplication *application = note.userInfo[NSWorkspaceApplicationKey];
-    BOOL settingsFront = [application.bundleIdentifier isEqual:@"com.apple.systempreferences"];
+    BOOL settingsFront = [application.bundleIdentifier isEqual:JardSystemSettingsBundle];
     BOOL active = application.processIdentifier == NSProcessInfo.processInfo.processIdentifier;
     [self observeSettingsFront:settingsFront active:active];
 }
@@ -114,10 +115,23 @@ typedef void (^AudioConsentReply)(BOOL);
     self.returnedAt = 0;
 }
 
-- (NSDictionary *)status {
+- (int32_t)observeTapPermission {
     int32_t tap = [self tapStatus];
-    if (tap == 0) [self endSettingsVisit];
-    else [self observeSettings];
+    if (tap == 0) {
+        BOOL requested = self.visitingSettings;
+        [self endSettingsVisit];
+        if (requested && self.settingsVisitChanged) self.settingsVisitChanged(YES);
+    } else [self observeSettings];
+    return tap;
+}
+
+- (BOOL)pollSettingsVisit {
+    if (self.visitingSettings && !self.resetting) [self observeTapPermission];
+    return self.visitingSettings;
+}
+
+- (NSDictionary *)status {
+    int32_t tap = [self observeTapPermission];
     NSString *authorization = tap == 0 ? @"granted" : tap == 1 ? @"denied" : tap > 1 ? @"request" : @"unknown";
     BOOL canRepair = tap > 0 && self.returnedAt && [self now] - self.returnedAt >= 2;
     return @{@"authorization": authorization, @"screen": @([self screenAllowed]),
@@ -131,10 +145,11 @@ typedef void (^AudioConsentReply)(BOOL);
 
 - (BOOL)showSettings {
     [self endSettingsVisit];
-    self.visitingSettings = YES;
-    if ([self openSettings]) return YES;
-    [self endSettingsVisit];
-    return NO;
+    BOOL missing = [self tapStatus] != 0;
+    if (![self openSettings]) return NO;
+    self.visitingSettings = missing;
+    if (missing && self.settingsVisitChanged) self.settingsVisitChanged(NO);
+    return YES;
 }
 
 - (void)allow:(JardDictationReply)reply {

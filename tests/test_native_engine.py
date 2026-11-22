@@ -3,6 +3,7 @@ import asyncio
 from contextlib import aclosing
 import json
 import os
+import struct
 import tempfile
 import unittest
 import wave
@@ -19,9 +20,11 @@ from annotation_assets import staged_annotation_paths
 from engine_lifecycle import ClientLeases, engine_proof, library_id
 from managed_preferences import ANNOTATION_MANAGED, MEETINGS_MANAGED, annotate_managed, meetings_managed
 import meeting_brief
-from native_recordings import recording_marker
+from meeting_rolling import append_rolling, read_rolling
+from native_recordings import recording_marker, source_tracks
+from personal_notes import NoteEdit, save
 from server import URL, app, connect_browser, quiesce_update, renew_client
-from session_store import SHUTDOWN_INTERRUPTION, SessionStore
+from session_store import RECOVERY_LIMIT, SHUTDOWN_INTERRUPTION, SessionStore
 
 
 class NativeEngineTests(unittest.TestCase):
@@ -57,6 +60,40 @@ class NativeEngineTests(unittest.TestCase):
             dest.writeframes(bytes(2 * 48_000))
         return f"/api/native/staging/{value['id']}", value["id"]
 
+    def test_annotation_retention_requires_local_changes_and_keeps_a_valid_policy(self):
+        endpoint = "/api/annotations/retention"
+        default = {"mediaDays": 7, "recordDays": 30, "includeExisting": False}
+        custom = {"mediaDays": 30, "recordDays": 90, "includeExisting": True}
+        self.assertEqual(self.client.get(endpoint).json(), default)
+        self.assertEqual(self.client.put(endpoint, headers={"Origin": "https://another.example"}, json=custom).status_code, 403)
+        self.assertEqual(self.client.put(endpoint, json={**custom, "mediaDays": True}).status_code, 422)
+        self.assertEqual(self.client.put(endpoint, json={**custom, "recordDays": 6}).status_code, 400)
+        self.assertEqual(self.client.get(endpoint).json(), default)
+        with patch("managed_preferences.annotate_managed", return_value=True):
+            self.assertEqual(self.client.put(endpoint, json=custom).json()["code"], "managed")
+        self.assertEqual(self.client.put(endpoint, json=custom).json(), custom)
+        self.assertEqual(self.client.get(endpoint).json(), custom)
+
+    def test_annotation_folder_requires_native_auth_and_tracks_a_disconnected_folder(self):
+        endpoint = "/api/native/annotation-storage"
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "Captures"
+            folder.mkdir()
+            value = {"folder": str(folder)}
+            self.assertEqual(self.client.get(endpoint).status_code, 403)
+            self.assertEqual(self.client.put(endpoint, json=value).status_code, 403)
+            self.assertEqual(self.client.put(endpoint, json={"folder": str(self.root)}, headers=self.header).status_code, 400)
+            with patch("managed_preferences.annotate_managed", return_value=True):
+                self.assertEqual(self.client.put(endpoint, json=value, headers=self.header).json()["code"], "managed")
+            saved = self.client.put(endpoint, json=value, headers=self.header).raise_for_status().json()
+            self.assertEqual(saved["folder"], str(folder.resolve()))
+            self.assertTrue(saved["custom"] and saved["available"])
+            folder.rename(folder.with_name("Detached"))
+            self.assertEqual(self.client.get(endpoint, headers=self.header).json(), {**saved, "available": False})
+            reset = self.client.put(endpoint, json={"folder": None}, headers=self.header).raise_for_status().json()
+            self.assertEqual(reset["folder"], str(self.root / "audio"))
+            self.assertTrue(reset["available"] and not reset["custom"])
+
     def test_engine_proves_library_and_native_operations_require_local_token(self):
         info = self.client.get("/api/status?challenge=012345").json()
         self.assertEqual(info["proof"], engine_proof(self.secret, "012345"))
@@ -67,6 +104,22 @@ class NativeEngineTests(unittest.TestCase):
         ep, _ = self.new_stage()
         self.assertEqual(self.client.delete(ep, headers=self.header).status_code, 204)
         self.assertEqual(self.client.post(ep + "/submit", headers=self.header).status_code, 404)
+
+    def test_workspace_reports_unavailable_after_its_bundle_moves(self):
+        dist = self.root / "dist"
+        dist.mkdir()
+        (dist / "index.html").write_text("<html>Jaro fixture</html>")
+        with patch("server.DIST", dist):
+            response = self.client.get("/")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("Jaro fixture", response.text)
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            dist.rename(self.root / "Former dist")
+            for path in ("/", "/index.html"):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, 503)
+                self.assertIn("workspace is unavailable", response.text)
+            self.assertEqual(self.client.get("/api/status").json()["status"], "ready")
 
     def test_live_preview_uses_written_range_and_submit_is_idempotent(self):
         ep, key = self.new_stage()
@@ -91,6 +144,89 @@ class NativeEngineTests(unittest.TestCase):
     async def wait_for_jobs():
         await asyncio.wait_for(asyncio.gather(*app.state.jobs), timeout=10)
 
+    def test_meeting_diarizes_the_mix_and_keeps_the_internal_mic_track(self):
+        stage = self.client.post("/api/native/staging?recording=true&meeting=true", headers=self.header).raise_for_status().json()
+        path = Path(stage["path"])
+        tracks = source_tracks(path)
+        for destination in (path, *tracks.values()):
+            with wave.open(str(destination), "wb") as wav:
+                wav.setparams((1, 2, 48_000, 0, "NONE", ""))
+                wav.writeframes(struct.pack("<h", 8192 if destination != tracks["system"] else 0) * 48_000)
+        original = {name: track.read_bytes() for name, track in tracks.items()}
+        turns = [{"speaker": 1, "start": 0, "end": .4, "text": "Hello"},
+                 {"speaker": 3, "start": .5, "end": .9, "text": "Jard"}]
+        speaker_session = Mock()
+        speaker_session.label.return_value = (turns, [])
+        speaker_session.intervals.return_value = [{key: value for key, value in turn.items() if key != "text"} for turn in turns]
+        diarizer = Mock()
+        diarizer.session.return_value = speaker_session
+        endpoint = f"/api/native/staging/{stage['id']}"
+        preview = f"{endpoint}/preview?meeting=true&start=0&frames=48000"
+        unlabeled = self.client.post(preview, headers=self.header).raise_for_status().json()
+        self.assertIsNone(unlabeled["segments"][0]["speaker"])
+        append_rolling(path, 0, 48_000, unlabeled)
+        self.assertEqual(list(read_rolling(path, 48_000))[0][2], unlabeled)
+        app.state.model.transcribe.reset_mock()
+        with patch.object(app.state, "diarizer", diarizer):
+            live = self.client.post(preview, headers=self.header).raise_for_status().json()
+            self.assertEqual(live["segments"], turns)
+            self.client.post(f"{endpoint}/submit?recording=true&recover=true", headers=self.header).raise_for_status()
+            self.client.portal.call(self.wait_for_jobs)
+        self.assertEqual([call.kwargs for call in diarizer.session.call_args_list], [{"live": True}, {}])
+        self.assertEqual(app.state.model.transcribe.call_count, 2)
+        for call in app.state.model.transcribe.call_args_list:
+            self.assertAlmostEqual(struct.unpack_from("<f", call.args[0], 8000 * 4)[0], .25, places=3)
+        session = self.client.get(f"/api/sessions/{stage['id']}").raise_for_status().json()
+        self.assertEqual(session["status"], "complete")
+        self.assertTrue(session["diarization"])
+        self.assertEqual(session["transcript"]["segments"], turns)
+        self.assertNotIn("speakerNames", session["transcript"])
+        self.assertEqual({row["speaker"] for row in session["transcript"]["speakerActivity"]}, {1, 3})
+        for name, url in session["recordingTracks"].items():
+            self.assertEqual(self.client.get(url).raise_for_status().content, original[name])
+
+    def test_workspace_reads_original_meeting_turns_behind_cached_segments(self):
+        source = self.root / "meeting-turns.wav"
+        source.write_bytes(b"audio fixture")
+        library = app.state.library
+        options = {"meeting": True, "sourceSpeakerTurns": True, "recording": True, "diarization": False}
+        key, _ = library.create(source, "Meeting fixture", "audio/wav", options, 40)
+        turns = [{"speaker": 1, "start": 0, "end": 2, "text": "Before the pause."},
+                 {"speaker": 1, "start": 4, "end": 5, "text": "Same turn."},
+                 {"speaker": 1, "start": 37, "end": 39, "text": "After the pause."}]
+        for turn in turns:
+            library.append(key, {"text": turn["text"], "words": [], "segments": [turn]}, turn["end"])
+        url = f"/api/sessions/{key}/transcript-clipboard"
+        waiting = self.client.get(url)
+        self.assertEqual(waiting.status_code, 409)
+        self.assertIn("finish transcribing", waiting.json()["detail"])
+        library.finish(key)
+        cached = library.get(key)["transcript"]
+        self.assertEqual(len(cached["segments"]), 1)
+        saved = self.client.get(f"/api/sessions/{key}").raise_for_status().json()
+        self.assertEqual(saved["meetingTurns"], turns)
+        self.assertEqual(saved["transcript"], cached)
+        self.assertEqual(library.get(key)["transcript"], cached)
+        with library.connection() as db:
+            db.execute("DELETE FROM overviews WHERE id=?", (key,))
+            db.execute("DELETE FROM notes WHERE id=?", (key,))
+        markdown = "**00:00 · You**  \nBefore the pause. Same turn.\n\n**00:37 · You**  \nAfter the pause."
+        copied = self.client.get(url).raise_for_status()
+        self.assertEqual(copied.text, markdown)
+        self.assertEqual(copied.headers["cache-control"], "no-store")
+        with library.connection() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM notes WHERE id=?", (key,)).fetchone())
+        library.remove_meeting_audio(key, trash=lambda path: path.rename(self.root / "audio-trash"))
+        self.assertEqual(self.client.get(url).raise_for_status().text, markdown)
+        self.assertEqual(self.client.get(f"/api/sessions/{uuid4()}/transcript-clipboard").status_code, 404)
+
+        source.write_bytes(b"silent audio fixture")
+        silent, _ = library.create(source, "Silent", "audio/wav", options, 1)
+        library.finish(silent)
+        error = self.client.get(f"/api/sessions/{silent}/transcript-clipboard")
+        self.assertEqual(error.status_code, 409)
+        self.assertEqual(error.json()["detail"], "This meeting has no transcript to copy.")
+
     def test_meeting_delete_reports_and_retries_a_committed_trash_archive(self):
         source = self.root / "trash-fixture.wav"
         source.write_bytes(b"audio fixture")
@@ -111,6 +247,86 @@ class NativeEngineTests(unittest.TestCase):
             self.assertEqual(self.client.delete(url).status_code, 204)
         self.assertEqual(self.client.delete(url).status_code, 404)
         self.assertTrue((self.root / "Fixture Trash" / "Meeting.json").is_file())
+
+    def test_settled_meeting_draft_can_be_copied_revealed_and_archived(self):
+        library = app.state.library
+        source, mic, system = (self.root / name for name in ("draft.wav", "draft-mic.wav", "draft-system.wav"))
+        source.write_bytes(b"draft mix")
+        mic.write_bytes(b"draft microphone")
+        system.write_bytes(b"draft system audio")
+        options = {"meeting": True, "sourceSpeakerTurns": True, "recording": True, "diarization": False,
+                   "meetingEndedAt": "2000-01-01T00:00:00Z", "retentionApplies": 1}
+        key, audio = library.create(source, "Draft meeting", "audio/wav", options, 12,
+                                    tracks={"mic": mic, "system": system})
+        text = "Keep the saved part."
+        library.append(key, {"text": text, "words": [], "segments": [{"speaker": 1, "start": 4, "end": 8, "text": text}]}, 8)
+        library.finish(key, SHUTDOWN_INTERRUPTION, closing=True)
+        url = f"/api/sessions/{key}"
+        copy = f"{url}/transcript-clipboard"
+        reveal = f"/api/native/meetings/{key}/recording-files"
+        self.assertEqual(self.client.get(copy).status_code, 409)
+        self.assertEqual(self.client.get(reveal, headers=self.header).status_code, 404)
+        self.assertEqual(self.client.delete(url).status_code, 409)
+
+        with library.connection() as db:
+            db.execute("UPDATE meeting_finalization SET attempts=? WHERE session_id=?", (RECOVERY_LIMIT, key))
+            save(db, key, NoteEdit(revision=0, document={"type": "doc", "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Draft notes to keep."}]}]}))
+        self.assertIsNone(library.claim_meeting_finalization())
+        self.assertEqual(library.expire_meetings(), [])
+        self.assertEqual([row["id"] for row in library.list("", meetings_only=True)], [key])
+        self.assertEqual(self.client.get(copy).raise_for_status().text, f"**00:04 · You**  \n{text}")
+        self.assertEqual(self.client.get(reveal, headers=self.header).raise_for_status().json(), {"folder": str(audio.parent)})
+
+        archive = self.root / "Recovered meeting in Trash"
+        deliver = library._deliver_meeting_archive
+        with patch.object(library, "_deliver_meeting_archive", side_effect=lambda key, _: deliver(key, lambda path: path.rename(archive))):
+            self.assertEqual(self.client.delete(url).status_code, 204)
+        self.assertEqual(self.client.get(copy).status_code, 404)
+        self.assertEqual(self.client.get(reveal, headers=self.header).status_code, 404)
+        self.assertEqual(library.list("", meetings_only=True), [])
+        self.assertEqual({path.name: path.read_bytes() for path in (archive / "Audio").iterdir()},
+                         {"source.wav": b"draft mix", "mic.wav": b"draft microphone", "system.wav": b"draft system audio"})
+        self.assertIn(f"**00:04 · You**  \n{text}", (archive / "Transcript.md").read_text())
+        self.assertIn("Draft notes to keep.", (archive / "Notes.md").read_text())
+        self.assertEqual(json.loads((archive / "Meeting.json").read_text())["tables"]["sessions"][0]["status"], "interrupted")
+
+    def test_reveal_meeting_files_requires_a_finished_readable_meeting_and_native_authentication(self):
+        library = app.state.library
+        source = self.root / "recording-fixture.wav"
+        source.write_bytes(b"audio fixture")
+        options = {"recording": True, "diarization": False}
+        key, _ = library.create(source, "Meeting fixture", "audio/wav", {**options, "meeting": True}, 1)
+        url = f"/api/native/meetings/{key}/recording-files"
+        self.assertEqual(self.client.get(url).status_code, 403)
+        self.assertEqual(self.client.get(url, headers={**self.header, "Origin": "https://example.net"}).status_code, 403)
+        self.assertEqual(self.client.get(url, headers=self.header).status_code, 404)
+
+        library.finish(key)
+        path, _ = library.media(key)
+        response = self.client.get(url, headers=self.header).raise_for_status()
+        self.assertEqual(response.json(), {"folder": str(path.parent)})
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+        elsewhere = self.root / "other-folder"
+        path.parent.rename(elsewhere)
+        path.parent.symlink_to(elsewhere, target_is_directory=True)
+        self.assertEqual(self.client.get(url, headers=self.header).status_code, 404)
+        path.parent.unlink()
+        elsewhere.rename(path.parent)
+
+        with library.connection() as db:
+            db.execute("UPDATE sessions SET options=json_set(options,'$.audioRemovedAt', 'now') WHERE id=?", (key,))
+        self.assertEqual(self.client.get(url, headers=self.header).status_code, 404)
+        with library.connection() as db:
+            db.execute("UPDATE sessions SET options=json_remove(options,'$.audioRemovedAt') WHERE id=?", (key,))
+            db.execute("UPDATE sessions SET options=json_set(options,'$.retentionApplies',1,'$.meetingEndedAt','2020-01-01') WHERE id=?", (key,))
+        self.assertEqual(self.client.get(url, headers=self.header).status_code, 404)
+
+        source.write_bytes(b"ordinary recording fixture")
+        ordinary, _ = library.create(source, "Ordinary recording", "audio/wav", options, 1)
+        library.finish(ordinary)
+        self.assertEqual(self.client.get(f"/api/native/meetings/{ordinary}/recording-files", headers=self.header).status_code, 404)
 
     def test_clients_can_detach_independently(self):
         a,b = (str(uuid4()) for _ in range(2))

@@ -1,0 +1,199 @@
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react"
+import { ChevronDown, ImagePlus, Images, X } from "lucide-react"
+import { Dialog } from "radix-ui"
+import { desktopBridge } from "@/desktop"
+import { useInterfaceLanguage } from "@/interface-language"
+import { clock } from "@/speaker-activity"
+import type { SavedSession } from "@/audio"
+import { AnnotationAgentPicker, AnnotationDeliveryLog } from "./annotation-destinations"
+import { Button } from "./ui/button"
+
+type ImageAsset = { id: string; url: string }
+type Tile = ImageAsset & { label: string; crop?: CSSProperties; removable?: boolean }
+
+async function jpeg(file: File) {
+  if (file.size > 30 * 1024 * 1024) throw new Error("Choose an image smaller than 30 MB.")
+  const image = await createImageBitmap(file)
+  try {
+    const scale = Math.min(1, 1600 / Math.max(image.width, image.height))
+    const canvas = document.createElement("canvas")
+    canvas.width = Math.max(1, Math.round(image.width * scale))
+    canvas.height = Math.max(1, Math.round(image.height * scale))
+    const context = canvas.getContext("2d", { alpha: false })
+    if (!context) throw new Error("Could not prepare the image.")
+    context.fillStyle = "#fff"
+    context.fillRect(0, 0, canvas.width, canvas.height)
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    for (const quality of [.9, .68, .46, .28]) {
+      const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, "image/jpeg", quality))
+      if (blob && blob.size <= 512 * 1024) return blob
+    }
+    throw new Error("This image is too large after compression.")
+  } finally {
+    image.close()
+  }
+}
+
+function TileImage({ tile }: { tile: Tile }) {
+  return tile.crop
+    ? <span aria-hidden="true" className="session-image-crop" style={tile.crop} />
+    : <img src={tile.url} alt={tile.label} draggable={false} loading="lazy" decoding="async" />
+}
+
+export function SessionImages({ session, children }: { session: SavedSession; children?: ReactNode }) {
+  const { t } = useInterfaceLanguage()
+  const native = desktopBridge()
+  const endpoint = `/api/sessions/${session.id}/images`
+  const input = useRef<HTMLInputElement>(null)
+  const previousTile = useRef<HTMLElement | null>(null)
+  const [assets, setAssets] = useState<ImageAsset[]>([])
+  const [loading, setLoading] = useState(true)
+  const [expanded, setExpanded] = useState(false)
+  const [viewer, setViewer] = useState<Tile>()
+  const [error, setError] = useState("")
+  const [status, setStatus] = useState("")
+  const [mutating, setMutating] = useState(false)
+  const [revision, setRevision] = useState(0)
+  const [managed, setManaged] = useState<boolean>()
+  const complete = session.status !== "processing" && !session.finalizationPending
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void fetch(endpoint, { cache: "no-store", signal: controller.signal }).then(async response => {
+      if (!response.ok) throw new Error()
+      setAssets(await response.json())
+    }).catch(() => { if (!controller.signal.aborted) setError("Could not load the saved images.") })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false) })
+    return () => controller.abort()
+  }, [endpoint])
+
+  useEffect(() => {
+    if (!native) return
+    let active = true
+    void native.request("annotationRoutingPolicy").then(result => { if (active) setManaged(result.managed) })
+      .catch(() => { if (active) setError("Could not check whether OpenCode is available.") })
+    return () => { active = false }
+  }, [native])
+
+  const sheet = session.annotation?.contactSheetUrl
+  const frames = session.annotation?.frames ?? []
+  const columns = Math.min(2, frames.length)
+  const rows = columns ? Math.ceil(frames.length / columns) : 0
+  const tiles: Tile[] = [
+    ...(sheet ? frames.map((seconds, index) => {
+      const column = index % columns
+      const row = Math.floor(index / columns)
+      return {
+        id: `frame-${index}`, url: sheet, label: `Screen capture at ${clock(seconds)}`,
+        crop: {
+          backgroundImage: `url("${sheet}")`, backgroundSize: `${100 * columns}% ${100 * rows}%`,
+          backgroundPosition: `${columns === 1 ? 0 : column * 100 / (columns - 1)}% ${rows === 1 ? 0 : row * 100 / (rows - 1)}%`,
+        },
+      }
+    }) : []),
+    ...assets.map((asset, index) => ({ ...asset, label: `Image ${index + 1}`, removable: true })),
+  ]
+
+  async function add(files: File[]) {
+    if (!files.length || mutating) return
+    setMutating(true)
+    setError("")
+    setExpanded(true)
+    try {
+      for (const file of files) {
+        const blob = await jpeg(file)
+        const response = await fetch(endpoint, {
+          method: "POST", headers: { "Content-Type": "image/jpeg" }, body: await blob.arrayBuffer(),
+        })
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}))
+          throw new Error(body.detail || "Could not save the image.")
+        }
+        const image: ImageAsset = await response.json()
+        setAssets(current => current.some(item => item.id === image.id) ? current : [...current, image])
+      }
+    } catch (failure) {
+      setError(failure instanceof Error && failure.message ? failure.message : "Could not add the images.")
+    } finally {
+      setMutating(false)
+    }
+  }
+
+  async function remove(tile: Tile) {
+    setMutating(true)
+    setError("")
+    try {
+      const response = await fetch(tile.url, { method: "DELETE" })
+      if (!response.ok) throw new Error("Could not remove the image.")
+      setAssets(current => current.filter(asset => asset.id !== tile.id))
+      setViewer(undefined)
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "Could not remove the image.")
+    } finally {
+      setMutating(false)
+    }
+  }
+
+  return <section className="session-images" aria-label={t("Session images")}>
+    <div className="session-images-bar">
+      <Button variant="ghost" size="sm" aria-controls={`images-${session.id}`} aria-expanded={expanded}
+        onClick={() => setExpanded(value => !value)}>
+        <Images aria-hidden="true" />{t("Images")} <span className="session-images-count">{tiles.length}</span>
+        <ChevronDown aria-hidden="true" className="session-images-chevron" />
+      </Button>
+      <div className="session-images-actions">
+        {complete && <>
+          <input ref={input} type="file" accept="image/*" multiple hidden onChange={event => {
+            const files = Array.from(event.target.files ?? [])
+            event.target.value = ""
+            void add(files)
+          }} />
+          <Button variant="outline" size="icon-sm" aria-label={t("Add images")} title={t("Add images")}
+            disabled={loading || mutating} onClick={() => input.current?.click()}><ImagePlus aria-hidden="true" /></Button>
+        </>}
+        {native && complete && <AnnotationAgentPicker native={native} id={session.id}
+          annotation={!!session.annotation} disabled={mutating} allowOpenCode={managed === false}
+          onChanged={(agent, message) => {
+            setStatus(message ?? "")
+            if (agent === "opencode") setRevision(value => value + 1)
+          }} />}
+      </div>
+    </div>
+    {!expanded && tiles[0] && <button className="session-images-preview" type="button"
+      aria-label={t("Expand images")} onClick={() => setExpanded(true)}><TileImage tile={tiles[0]} /></button>}
+    <div id={`images-${session.id}`} hidden={!expanded}>
+      {!!tiles.length && expanded && <div className="session-images-grid">
+        {tiles.map(tile => <button key={tile.id} className="session-image-tile" type="button"
+          aria-label={tile.label} onClick={event => { previousTile.current = event.currentTarget; setViewer(tile) }}>
+          <TileImage tile={tile} />
+        </button>)}
+      </div>}
+      {expanded && !tiles.length && <p className="session-image-message">{t("No images attached.")}</p>}
+    </div>
+    {status && <p className="session-image-message" role="status">{status}</p>}
+    {managed && <p className="session-image-message" role="status">{t("OpenCode processing is managed by your organization.")}</p>}
+    {error && <p className="session-image-message" role="alert">{error}</p>}
+    {children}
+    {native && session.annotation && <AnnotationDeliveryLog native={native} id={session.id} revision={revision} remoteEnabled={managed === false} />}
+    <Dialog.Root open={!!viewer} onOpenChange={open => { if (!open) setViewer(undefined) }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="note-language-scrim" />
+        <Dialog.Content className="note-language-confirm session-image-viewer" onCloseAutoFocus={event => {
+          event.preventDefault()
+          if (previousTile.current?.isConnected) previousTile.current.focus()
+        }}>
+          <div className="session-image-viewer-header">
+            <Dialog.Title>{viewer?.label}</Dialog.Title>
+            <Dialog.Close asChild>
+              <Button variant="ghost" size="icon-sm" aria-label={t("Close image")}><X aria-hidden="true" /></Button>
+            </Dialog.Close>
+          </div>
+          <Dialog.Description className="sr-only">{t("Image from this session")}</Dialog.Description>
+          {viewer && <TileImage tile={viewer} />}
+          {viewer?.removable && <Button size="sm" variant="outline" disabled={mutating}
+            onClick={() => void remove(viewer)}>{t("Remove image")}</Button>}
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  </section>
+}

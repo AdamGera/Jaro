@@ -261,20 +261,27 @@ def verify_retention(library, helper, api, base, managed_meeting):
                 os.rename(entry, library / ("Restored disposable " + entry.name))
 
 
-def verify_manual_meeting_trash(library, helper, api, base):
+def verify_manual_meeting_trash(library, helper, api, base, status):
     trash = disposable_trash_location(library, helper)
     identifier = str(uuid4())
     source = library / "audio" / identifier / "source.wav"
     source.parent.mkdir()
     source.write_bytes(b"Disposable meeting audio.")
     archive = trash / f"Jard Meeting {identifier}"
-    transcript = {"text": "Disposable meeting transcript.", "durationSeconds": 1, "segments": [], "words": []}
+    text = "Disposable meeting transcript."
+    transcript = {"text": text, "durationSeconds": 1, "words": [],
+                  "segments": [{"speaker": 1, "start": 0.1, "end": 0.8, "text": text}], "speakerNames": {"1": "You"}}
     with closing(sqlite3.connect(library / "sessions.sqlite3", timeout=10)) as db, db:
         db.execute("""INSERT INTO sessions(id,name,created,filename,mime,options,duration,processed,status,transcript,search_text)
                    VALUES(?, 'Disposable manual Trash meeting',strftime('%Y-%m-%dT%H:%M:%SZ','now'),'source.wav','audio/wav',
-                          '{"meeting":true,"recording":true,"diarization":false}',1,1,'complete',?,?)""",
-                   (identifier, json.dumps(transcript), transcript["text"]))
+                          '{"meeting":true,"recording":true,"diarization":false}',1,1,?,?,?)""",
+                   (identifier, status, json.dumps(transcript), text))
     try:
+        with api(f"/api/native/meetings/{identifier}/recording-files",
+                 headers={"X-Jard-Token": (library / ".native-token").read_text().strip()}) as response:
+            assert Path(json.load(response)["folder"]) == source.parent.resolve()
+        with api(f"/api/sessions/{identifier}/transcript-clipboard") as response:
+            assert response.read().decode() == f"**00:00 · You**  \n{text}"
         with api(f"/api/sessions/{identifier}", headers={"Origin": base}, method="DELETE") as response:
             assert response.status == 204
         assert (archive / "Audio" / source.name).read_bytes() == b"Disposable meeting audio."
@@ -282,7 +289,7 @@ def verify_manual_meeting_trash(library, helper, api, base):
         assert (archive / "Meeting.json").is_file() and (archive / "Notes.md").is_file()
         assert not source.exists()
         assert all(row["id"] != identifier for row in json.loads(helper("jardctl", "meetings", "list", "--json")))
-        print("Packaged manual deletion moved the disposable meeting's audio, transcript and notes to macOS Trash.", flush=True)
+        print(f"Packaged {status} meeting passed reveal, copy, and manual removal to macOS Trash.", flush=True)
     finally:
         if archive.exists():
             os.rename(archive, library / ("Restored disposable " + archive.name))
@@ -327,6 +334,82 @@ def verify_audio_retention(library, helper, api, base):
             os.rename(moved, library / ("Restored disposable audio " + identifier))
 
 
+def verify_annotation_retention(library, helper, api, base):
+    mounted = os.environ.get("JARD_TEST_ANNOTATION_STORAGE")
+    destination = Path(mounted).resolve() / ("Disposable retention " + str(uuid4())) if mounted else None
+    storage_id = None
+    if destination is not None:
+        destination.mkdir(mode=0o700)
+        storage_endpoint = "/api/native/annotation-storage"
+        headers = {"X-Jard-Token": (library / ".native-token").read_text().strip(), "Content-Type": "application/json"}
+        body = json.dumps({"folder": str(destination)}).encode()
+        with api(storage_endpoint, headers=headers, data=body, method="PUT") as response:
+            configured = json.load(response)
+        assert configured["custom"] and configured["available"] and Path(configured["folder"]) == destination
+        storage_id = configured["storageId"]
+    trash = disposable_trash_location(destination or library, helper)
+    expired_video, expired_record, older = (str(uuid4()) for _ in range(3))
+    video = trash / f"Jaro Annotation Video {expired_video}.mp4"
+    archive = trash / f"Jaro Annotation {expired_record}"
+    endpoint = "/api/annotations/retention"
+    with api(endpoint) as response:
+        setting = json.load(response)
+    assert setting == {"mediaDays": 7, "recordDays": 30, "includeExisting": False}
+    with closing(sqlite3.connect(library / "sessions.sqlite3", timeout=10)) as db, db:
+        for key, age, eligible in ((expired_video, 9, 1), (expired_record, 35, 1), (older, 100, 0)):
+            folder = destination / f"Jaro Annotation {key}" if destination and eligible else library / "audio" / key
+            folder.mkdir(mode=0o700)
+            if destination and eligible:
+                marker = folder / ".jaro-annotation-id"
+                marker.write_text(key)
+                marker.chmod(0o600)
+            (folder / "source.mp4").write_bytes(b"Disposable video.")
+            (folder / "annotation.json").write_text("{}")
+            (folder / "contact-sheet.png").write_bytes(b"Disposable contact sheet.")
+            options = {"recording": False, "diarization": False, "annotation": {"version": 1, "strokeCount": 1,
+                       "source": "display", "frames": [0.5], "manifestUrl": f"/api/sessions/{key}/annotation/manifest",
+                       "contactSheetUrl": f"/api/sessions/{key}/annotation/contact-sheet"}}
+            if eligible:
+                options["annotationRetentionEligible"] = 1
+                if storage_id:
+                    options["annotationLocation"] = storage_id
+            transcript = {"text": "Disposable narration.", "segments": [], "words": []}
+            db.execute("""INSERT INTO sessions(id,name,created,filename,mime,options,duration,processed,status,transcript,search_text)
+                VALUES(?, 'Disposable annotation',strftime('%Y-%m-%dT%H:%M:%SZ','now',?),'source.mp4','video/mp4',?,
+                       1,1,'complete',?,?)""", (key, f"-{age} days", json.dumps(options), json.dumps(transcript), transcript["text"]))
+            notes = {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Disposable note."}]}]}
+            db.execute("INSERT INTO personal_notes(id,document,revision) VALUES(?,?,1)", (key, json.dumps(notes)))
+    try:
+        headers = {"Origin": base, "Content-Type": "application/json"}
+        with api(endpoint, headers=headers, data=json.dumps(setting).encode(), method="PUT") as response:
+            assert json.load(response) == setting
+        expired_folder = destination / f"Jaro Annotation {expired_record}" if destination else library / "audio" / expired_record
+        for _ in range(80):
+            if video.is_file() and archive.is_dir() and not expired_folder.exists():
+                break
+            time.sleep(.2)
+        assert video.read_bytes() == b"Disposable video."
+        assert (archive / "Capture" / "source.mp4").read_bytes() == b"Disposable video."
+        assert "Disposable narration." in (archive / "Narration.md").read_text()
+        assert "Disposable note." in (archive / "Notes.md").read_text()
+        assert (library / "audio" / older / "source.mp4").is_file()
+        with api(f"/api/sessions/{expired_video}") as response:
+            saved = json.load(response)
+        assert saved["audioUrl"] is None and saved["transcript"]["text"] == "Disposable narration."
+        with api(f"/api/sessions/{expired_video}/annotation/contact-sheet") as response:
+            assert response.read() == b"Disposable contact sheet."
+        paths = json.loads(helper("jardctl", "annotate", "show", expired_video))
+        assert paths["videoPath"] is None and Path(paths["manifestPath"]).is_file()
+        remaining = {row["id"] for row in json.loads(helper("jardctl", "annotate", "list"))["annotations"]}
+        assert {expired_video, older} <= remaining and expired_record not in remaining
+        volume = " from a separate APFS volume" if destination else ""
+        print(f"Packaged annotation expiry moved video and full records{volume} to macOS Trash and kept legacy captures.", flush=True)
+    finally:
+        for entry in (video, archive):
+            if entry.exists():
+                os.rename(entry, (destination or library) / ("Restored disposable " + entry.name))
+
+
 def run(app, model_source):
     app = app.resolve()
     helpers = app / "Contents/Helpers"
@@ -355,6 +438,8 @@ def run(app, model_source):
                 {"id": "stored", "time": time.time() - 60, "app": "Notes", "text": "Ready.",
                  "raw": "The paperback shipment is ready.", "kind": "dictation", "mode": "app:Notes"},
                 {"id": "expired", "time": time.time() - 8 * 86_400, "text": "Paperback archive."},
+                *[{"id": f"retained-{index}", "time": time.time() - 100 - index, "text": "Retained entry."}
+                  for index in range(280)],
             ],
         }, fmt=plistlib.FMT_BINARY))
         preferences.chmod(0o600)
@@ -363,6 +448,9 @@ def run(app, model_source):
         history = json.loads(helper("jardctl", "history", "--search", "paperbak", "--json", "--raw"))
         assert history["version"] == 1 and [entry["id"] for entry in history["entries"]] == ["stored"], history
         assert history["entries"][0]["mode"] == "app:Notes" and "shipment" in history["entries"][0]["raw_text"]
+        deep_page = json.loads(helper("jardctl", "history", "--grep", "Retained entry", "--offset", "270", "--limit", "5", "--json"))
+        assert [entry["id"] for entry in deep_page["entries"]] == [f"retained-{i}" for i in range(270, 275)]
+        assert deep_page["truncated"]
         assert json.loads(helper("jardctl", "annotate", "list")) == {"version": 1, "annotations": []}
         assert not (library / ".native-token").exists() and not (library / ".native-control").exists()
         assert before == (preferences.read_bytes(), preferences.stat().st_mtime_ns)
@@ -413,6 +501,16 @@ def run(app, model_source):
         if model_source is None:
             return
         assert json.loads(helper("jard-engine", "models", "--from", str(model_source.resolve())).splitlines()[-1])["ready"]
+        previous_logs = []
+        for name, filler, recent in (
+            ("live.ndjson", b'{"kind":"fixture","phase":"old"}\n', b'{"phase":"saved"}\n'),
+            ("server.log", b"Expired engine message.\n", b"Kept recent engine message.\n"),
+        ):
+            destination = log_dir / name
+            with destination.open("wb") as log:
+                log.write(filler * (10 * 1024 * 1024 // len(filler) + 1))
+                log.write(recent)
+            previous_logs.append((destination, destination.stat().st_ino, recent))
         helper("jard-engine", "start")
         def api(path, data=None, headers=None, *, method=None):
             req = Request(base + path, data=data, headers=headers or {}, method=method)
@@ -424,10 +522,24 @@ def run(app, model_source):
         try:
             status = wait_ready(api)
             assert status["status"] == "ready" and status["diarization"], status["status"]
+            for log, inode, recent in previous_logs:
+                for _ in range(30):
+                    if log.stat().st_size <= 6 * 1024 * 1024:
+                        break
+                    time.sleep(.1)
+                assert log.stat().st_ino == inode and log.stat().st_size <= 6 * 1024 * 1024
+                with log.open("rb") as stream:
+                    stream.seek(-min(65_536, log.stat().st_size), os.SEEK_END)
+                    tail = stream.read()
+                assert recent in tail
+                if log.name == "server.log":
+                    assert b"Started server process" in tail
+            print("Packaged engine startup compacted both diagnostic logs in place and continued writing.", flush=True)
             with api("/") as r:
                 assert b"<html" in r.read()
             audio = work / "sample.aiff"
-            subprocess.run(["/usr/bin/say", "-o", audio, "The books for the library arrive on Monday."], check=True, timeout=20)
+            subprocess.run(["/usr/bin/say", "-v", "Samantha", "-o", audio,
+                            "The books for the library arrive on Monday."], check=True, timeout=20)
             sdk_file = app / "Contents/Resources/sdk/typescript/index.mjs"
             sdk_record = library / ".jard-sdk.json"
             assert sdk_file.is_file() and sdk_record.stat().st_mode & 0o777 == 0o600
@@ -491,21 +603,42 @@ console.log("Packaged Node SDK verified endpoint ownership and transcribed real 
                    "-fflags", "+bitexact", "-f", "wav", str(mixed))
             with wave.open(str(mixed)) as wav:
                 samples = array("h", wav.readframes(wav.getnframes()))
-            samples.extend(array("h", [0]) * 48000)
-            delay = 3840
-            echo = array("h", [0]) * delay + array("h", (sample // 3 for sample in samples[:-delay]))
-            for path, track in ((mixed, samples), (mixed.with_suffix(".system.wav"), samples), (mixed.with_suffix(".mic.wav"), echo)):
+            second_voice = work / "Second voice.aiff"
+            subprocess.run(["/usr/bin/say", "-v", "Daniel", "-o", second_voice,
+                            "Rachel will bring the presentation after lunch. I will reserve the room before everyone arrives."],
+                           check=True, timeout=20)
+            second_wav = second_voice.with_suffix(".wav")
+            helper("ffmpeg", "-v", "error", "-i", str(second_voice), "-ar", "48000", "-ac", "1", str(second_wav))
+            samples.extend(array("h", [0]) * 24_000)
+            with wave.open(str(second_wav)) as wav:
+                samples.extend(array("h", wav.readframes(wav.getnframes())))
+            samples.extend(array("h", [0]) * 24_000)
+            silence = array("h", [0]) * len(samples)
+            mix = array("h", (round(sample / 2) for sample in samples))
+            for path, track in ((mixed, mix), (mixed.with_suffix(".system.wav"), silence), (mixed.with_suffix(".mic.wav"), samples)):
                 with wave.open(str(path), "wb") as wav:
                     wav.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
                     wav.writeframes(track.tobytes())
-            echo_wav = mixed.with_suffix(".mic.wav").read_bytes()
+            microphone_wav = mixed.with_suffix(".mic.wav").read_bytes()
             system_wav = mixed.with_suffix(".system.wav").read_bytes()
             stage = f"/api/native/staging/{draft['id']}"
+            journal = mixed.with_suffix(".rolling.ndjson")
+            title_text = "ועדת השיווק החליטה להשיק את המוצר ביום שלישי."
+            title_chunk = {"text": title_text, "language": "English", "meetingSpeakerMode": "mixed",
+                           "segments": [{"start": 0, "end": 3, "text": title_text, "speaker": 1}],
+                           "words": [], "activity": []}
+            journal.write_text(json.dumps([0, 144_000, title_chunk], ensure_ascii=False) + "\n", encoding="utf-8")
+            with mixed.with_suffix(".recording").open("rb") as marker:
+                fcntl.flock(marker, fcntl.LOCK_EX)
+                with api(f"{stage}/meeting-title?through=144000", b"", token) as r:
+                    title = json.load(r)["title"]
+                assert any("א" <= char <= "ת" for char in title), title
+            print("Packaged local Qwen titled a live Hebrew meeting in Hebrew despite an English ASR tag.", flush=True)
             with api(f"{stage}/preview?meeting=true&start=0&frames={len(samples)}&language=en", b"", token) as r:
                 live = json.load(r)
-            assert {turn["speaker"] for turn in live["segments"]} == {2} and live["echoSuppressedUtterances"] > 0, live
+            assert live["meetingSpeakerMode"] == "mixed" and "library" in live["text"].lower(), live
+            assert "rachel" in live["text"].lower() and len({turn["speaker"] for turn in live["segments"]}) >= 2, live
             rolling = (json.dumps([0, len(samples), live]) + "\n").encode()
-            journal = mixed.with_suffix(".rolling.ndjson")
             journal.write_bytes(rolling)
             with api("/api/meetings/events", headers={"Authorization": "Bearer " + token["X-Jard-Token"]}) as event_stream:
                 assert event_stream.headers.get_content_type() == "text/event-stream"
@@ -548,7 +681,9 @@ console.log("Packaged Node SDK verified endpoint ownership and transcribed real 
             finally:
                 with api(lease, headers={"Origin": base}, method="DELETE") as r:
                     assert r.status == 204
-            assert brief and brief["status"] == "ready", brief
+            if not brief or brief["status"] != "ready":
+                log = (log_dir / "server.log").read_text()
+                raise AssertionError((brief, [line for line in log.splitlines() if "Meeting summary failed" in line]))
             assert export["notesFilename"] == managed.name.replace(".transcript.md", ".notes.md"), export
             notes = (export_folder / export["notesFilename"]).read_text()
             assert brief["summary"] in notes and brief["summary"] in managed.read_text()
@@ -574,20 +709,22 @@ console.log("Packaged Node SDK verified endpoint ownership and transcribed real 
             print("Packaged title editing renamed the linked pair and Reveal resolved its new location.", flush=True)
             assert not journal.exists()
             transcript = meeting["transcript"]
-            assert transcript["text"].lower().count("library") == 1 and transcript["echoSuppressedUtterances"] > 0
-            assert transcript["speakerNames"] == {"1": "You", "2": "Them"}
+            assert transcript["text"].lower().count("library") == 1 and "rachel" in transcript["text"].lower(), transcript
+            assert meeting["diarization"] and "speakerNames" not in transcript, meeting
+            assert len({turn["speaker"] for turn in transcript["segments"] if turn["speaker"]}) >= 2, transcript
+            assert len(transcript["speakerActivity"]) >= 2 and transcript["words"], transcript
             assert meeting["meeting"] and meeting["meetingProvider"] == "Meeting"
             with api(f"/api/native/meetings/{meeting_key}/excerpt", headers=token) as r:
                 excerpt = json.load(r)
-            assert excerpt["settled"] and excerpt["available"] and excerpt["labels"] == transcript["speakerNames"]
-            assert {turn["speaker"] for turn in excerpt["turns"]} == {2}
+            assert excerpt["settled"] and excerpt["available"] and excerpt["labels"] == {}
+            assert {turn["speaker"] for turn in excerpt["turns"]} == {turn["speaker"] for turn in transcript["segments"]}
             with api(f"/api/sessions/{meeting_key}/export?kind=srt") as r:
-                assert b"Them:" in r.read()
+                assert b"Speaker " in r.read()
             removed_audio = disposable_trash_location(library, helper) / f"Jard Meeting Audio {meeting_key}"
             try:
                 with api(f"/api/sessions/{meeting_key}/audio", headers={"Origin": base}, method="DELETE") as r:
                     assert json.load(r)["audioRemovedAt"]
-                assert (removed_audio / "mic.wav").read_bytes() == echo_wav
+                assert (removed_audio / "mic.wav").read_bytes() == microphone_wav
                 assert (removed_audio / "system.wav").read_bytes() == system_wav
             finally:
                 if removed_audio.is_dir():
@@ -595,7 +732,19 @@ console.log("Packaged Node SDK verified endpoint ownership and transcribed real 
             listed = json.loads(helper("jardctl", "meetings", "list", "--since", "1h", "--json"))
             assert [(row["id"], bool(row["audioRemovedAt"])) for row in listed] == [(meeting_key, True)], listed
             shown = json.loads(helper("jardctl", "meetings", "show", "latest", "--json"))
-            assert shown["transcriptSource"] == "final" and shown["turns"][0]["speaker"] == "Them", shown
+            assert shown["transcriptSource"] == "final" and shown["turns"][0]["speaker"].startswith("Speaker "), shown
+            excerpt = json.loads(helper("jardctl", "meetings", "show", "latest", "--to", "1.5s", "--json"))
+            assert excerpt["range"] == {"from_ms": 0, "to_ms": 1500}
+            assert excerpt["turns"] == [turn for turn in shown["turns"] if round(turn["start"] * 1000) < 1500]
+            companion = helper("jardctl", "meetings", "show", "latest", "--from", "0.5s", "--md")
+            assert "- **Range:** 00:00.500–end" in companion and companion.count("## Summary") == 1
+            request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "get_transcript",
+                                             "arguments": {"meeting_id": meeting_key, "to": 1.5}}}) + "\n"
+            answer = json.loads(subprocess.check_output([helpers / "jardctl", "mcp"], input=request,
+                                                        cwd=work, env=env, text=True, timeout=10))
+            transcript_view = json.loads(answer["result"]["content"][0]["text"])
+            assert transcript_view["range"] == excerpt["range"] and transcript_view["turns"] == excerpt["turns"]
             hits = json.loads(helper("jardctl", "meetings", "search", '"the library"', "--json"))
             assert hits[0]["id"] == meeting_key and "**the** **library**" in hits[0]["snippet"].lower(), hits
             calendar = {"title": "Architecture / review", "attendees": ["Riley"]}
@@ -608,7 +757,7 @@ console.log("Packaged Node SDK verified endpoint ownership and transcribed real 
                 wav.writeframes(samples.tobytes())
             Path(damaged["path"]).with_suffix(".rolling.ndjson").write_bytes(rolling + b'[broken')
             draft = json.loads(helper("jardctl", "meetings", "show", damaged["id"], "--json"))
-            assert draft["staged"] and draft["transcriptSource"] == "rolling" and draft["turns"][0]["speaker"] == "Them", draft
+            assert draft["staged"] and draft["transcriptSource"] == "rolling" and draft["turns"][0]["speaker"].startswith("Speaker "), draft
             with api(f"/api/native/staging/{damaged['id']}/submit?recording=true&recover=true&name=Recovered&language=en", b"", token) as r:
                 recovered_id = json.load(r)["id"]
             for _ in range(120):
@@ -620,17 +769,44 @@ console.log("Packaged Node SDK verified endpoint ownership and transcribed real 
             assert recovered["status"] == "complete" and recovered["meeting"] and recovered["meetingProvider"] == "Teams", recovered
             assert recovered["meetingCalendar"] == calendar and recovered["name"] == calendar["title"]
             assert "recordingTracks" not in recovered and recovered["audioUrl"]
-            assert recovered["transcript"]["speakerNames"] == {"1": "You", "2": "Them"}
-            print("Packaged Rumble2 Flash meetings, completion events, offline search, subtitles, audio removal, and recovery passed.", flush=True)
-            pending, exhausted, stranded = seed_pending_meetings(library, samples, echo, token, api)
+            assert recovered["diarization"] and "speakerNames" not in recovered["transcript"]
+            print("Packaged Rumble2 Flash and Nemotron distinguished two speakers on the mic with silent Mac audio. Meetings also passed completion events, search, subtitles, audio removal, and recovery.", flush=True)
+
+            with api("/api/native/staging?recording=true", b"", token) as r:
+                mic_stage = json.load(r)
+            mic_path = Path(mic_stage["path"])
+            for source in ("mic", "system"):
+                assert not mic_path.with_suffix(f".{source}.wav").exists()
+            mic_path.write_bytes(microphone_wav)
+            with api(f"/api/native/staging/{mic_stage['id']}/submit?recording=true&diarization=true&language=en",
+                     b"", token) as r:
+                mic_id = json.load(r)["id"]
+            for _ in range(120):
+                with api(f"/api/sessions/{mic_id}") as r:
+                    mic_session = json.load(r)
+                if mic_session["status"] != "processing":
+                    break
+                time.sleep(0.5)
+            assert mic_session["status"] == "complete" and mic_session["recording"], mic_session
+            assert not mic_session.get("meeting") and "recordingTracks" not in mic_session, mic_session
+            mic_transcript = mic_session["transcript"]
+            assert all(word in mic_transcript["text"].lower() for word in ("library", "rachel")), mic_transcript
+            assert mic_session["diarization"] and len(mic_transcript["speakerActivity"]) >= 2, mic_transcript
+            with api(mic_session["audioUrl"]) as r:
+                assert r.read() == microphone_wav
+            print("A regular mic-only recording saved its original WAV and identified two speakers after meeting finalization.", flush=True)
+
+            pending, exhausted, stranded = seed_pending_meetings(library, samples, silence, token, api)
         finally:
             stop_engine(api, base, library)
 
         try:
             verify_restart_recovery(library, helper, api, pending, exhausted, stranded)
             verify_retention(library, helper, api, base, (meeting_key, renamed_transcript, renamed_notes))
+            verify_annotation_retention(library, helper, api, base)
             verify_audio_retention(library, helper, api, base)
-            verify_manual_meeting_trash(library, helper, api, base)
+            for status in ("complete", "interrupted"):
+                verify_manual_meeting_trash(library, helper, api, base, status)
         finally:
             stop_engine(api, base, library)
 

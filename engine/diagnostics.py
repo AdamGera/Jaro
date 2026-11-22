@@ -1,7 +1,6 @@
 """Local diagnostic files and an offline tail reader."""
 from contextlib import suppress
 from datetime import datetime, timezone
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -11,30 +10,37 @@ import time
 EVENT_LOG = "live.ndjson"
 PROCESS_LOG = "server.log"
 TAIL_BYTES = 4 * 1024 * 1024
-EVENT_LIMIT = 10 * 1024 * 1024
-EVENT_KEEP = EVENT_LIMIT // 2
+LOG_LIMIT = 10 * 1024 * 1024
+LOG_KEEP = LOG_LIMIT // 2
+LOG_TRIM_INTERVAL = 3600
 
 
 def log_directory():
     return Path(os.environ.get("RUMBLE_LOG_DIR") or Path.home() / "Library/Logs/Jaro")
 
 
-def open_log(name, *, append=False):
+def open_log(name, *, mode="rb", create=False):
     path = log_directory() / name
-    if append:
+    if create:
         path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if mode != "rb":
         directory = path.parent.lstat()
         if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid():
             raise OSError("Jaro needs a log directory owned by the current user.")
-    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT if append else os.O_RDONLY
+    flags = {"rb": os.O_RDONLY, "r+b": os.O_RDWR, "a+b": os.O_RDWR | os.O_APPEND}[mode]
+    if create:
+        flags |= os.O_CREAT
     descriptor = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         details = os.fstat(descriptor)
         if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() or details.st_mode & 0o022:
             raise OSError("Jaro logs must be regular files owned by the current user.")
-        if append and details.st_mode & 0o077:
-            os.fchmod(descriptor, 0o600)
-        return os.fdopen(descriptor, "a+b" if append else "rb")
+        if mode != "rb":
+            if details.st_nlink != 1:
+                raise OSError("Jaro logs must not be hard-linked.")
+            if details.st_mode & 0o077:
+                os.fchmod(descriptor, 0o600)
+        return os.fdopen(descriptor, mode)
     except BaseException:
         os.close(descriptor)
         raise
@@ -50,18 +56,41 @@ def write_transform_event(phase, **fields):
 
 
 def _append_event(kind, phase, fields):
+    import fcntl
+
     event = {"time": datetime.now(timezone.utc).isoformat(timespec="milliseconds"), "kind": kind, "phase": phase, **fields}
     line = json.dumps(event, separators=(",", ":")).encode() + b"\n"
-    with suppress(OSError), open_log(EVENT_LOG, append=True) as log:
+    with suppress(OSError), open_log(EVENT_LOG, mode="r+b", create=True) as log:
         fcntl.flock(log, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        size = os.fstat(log.fileno()).st_size
-        if size >= EVENT_LIMIT:
-            log.seek(size - EVENT_KEEP)
-            log.readline()
-            recent = log.read(EVENT_KEEP)
-            log.truncate(0)
-            log.write(recent)
+        compact_log(log)
+        log.seek(0, os.SEEK_END)
         log.write(line)
+
+
+def compact_log(log):
+    """Keep recent whole lines without replacing the engine's open log file."""
+    size = os.fstat(log.fileno()).st_size
+    if size < LOG_LIMIT:
+        return
+    log.seek(size - LOG_KEEP - 1)
+    tail = log.read(LOG_KEEP + 1)
+    boundary = tail.find(b"\n")
+    recent = tail[boundary + 1:] if boundary >= 0 else b""
+    log.seek(0)
+    log.write(recent)
+    log.flush()
+    log.truncate(len(recent))
+
+
+def maintain_logs():
+    import fcntl
+
+    while True:
+        for name in (EVENT_LOG, PROCESS_LOG):
+            with suppress(OSError), open_log(name, mode="r+b") as log:
+                fcntl.flock(log, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                compact_log(log)
+        time.sleep(LOG_TRIM_INTERVAL)
 
 
 def initial_tail(log, lines, follow):

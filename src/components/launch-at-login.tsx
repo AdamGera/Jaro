@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react"
 import { Power } from "lucide-react"
 import type { DesktopBridge, DesktopLoginAction, DesktopLoginItem } from "@/desktop"
 import { useInterfaceLanguage } from "@/interface-language"
-import { SettingRow } from "./settings-rows"
+import { SettingRow, type SettingControlLabels } from "./settings-rows"
 import { Button } from "./ui/button"
 
 export function LaunchAtLogin({ native, onboarding = false }: { native: DesktopBridge; onboarding?: boolean }) {
@@ -68,11 +68,11 @@ export function LaunchAtLogin({ native, onboarding = false }: { native: DesktopB
   const title = t(onboarding ? "Launch Jard at login" : "Launch at login")
   const error = actionError || (status?.state === "unknown" ? status.message : undefined)
   if (status?.state === "enabled" || status?.state === "disabled") {
-    const input = <input type="checkbox" role={onboarding ? undefined : "switch"} aria-label={title}
+    const input = (labels?: SettingControlLabels) => <input {...labels} type="checkbox" role={onboarding ? undefined : "switch"}
       checked={requested ?? (status.state === "enabled")}
       onChange={event => void change({ action: "set", enabled: event.target.checked })} />
     if (onboarding) return <>
-      <label className="dictation-login">{input}{title}</label>
+      <label className="dictation-login">{input()}{title}</label>
       {error && <p className="dictation-error" role="alert">{t(error)}</p>}
     </>
     return <SettingRow icon={Power} title={title} detail={error && <span className="dictation-error" role="alert">{t(error)}</span>}>

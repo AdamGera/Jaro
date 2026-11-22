@@ -6,12 +6,17 @@ import type { DesktopBridge, DictationDestination, WindowNavigation } from "@/de
 import { readSession, type SavedSession } from "@/audio"
 import { useSessionList, type SessionSummary } from "@/session-list"
 import { SessionSearch } from "./session-search"
-import { SettingsSearch } from "./settings-search"
+import { MeetingsWorkspace, type MeetingWorkspaceOptions } from "./meetings-workspace"
+import { revealSetting, SettingsSearch } from "./settings-search"
+import { WhatsNewSettings, type HighlightDestination } from "./whats-new-settings"
 import { Button } from "./ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs"
 import "@/sidebar.css"
 
 const compactWindow = "(max-width: 800px)"
+const scrollKeys = new Set(["PageUp", "PageDown", "Home", "End"])
+const editingControl = "input, select, textarea, [contenteditable]:not([contenteditable=false]), [role=combobox], [role=listbox], [role=menu], [role=slider]"
+const modalOverlay = '[role="dialog"][data-state="open"], [aria-modal="true"], [role="alertdialog"]'
 const date = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" })
 const settingsPages = [
   { id: "general", label: "General" },
@@ -19,6 +24,36 @@ const settingsPages = [
   { id: "meetings", label: "Meetings" },
   { id: "annotate", label: "Annotate" },
 ] as const
+const highlightSettings = {
+  sounds: { page: "dictation", anchor: "#dictation-sound-styles" },
+  microphone: { page: "dictation", anchor: "#dictation-microphone" },
+  updates: { page: "general", anchor: "#desktop-app-updates" },
+} as const
+type SettingsPage = (typeof settingsPages)[number]["id"]
+type Pane = "settings" | "dictation" | "meetings"
+
+function scrollablePane(target: Element | null, frame: HTMLElement) {
+  for (let element = target; element && element !== frame; element = element.parentElement) {
+    if (element instanceof HTMLElement && element.clientHeight > 0 && element.scrollHeight > element.clientHeight + 1
+      && /^(auto|scroll)$/.test(getComputedStyle(element).overflowY)) return element
+  }
+}
+
+function scrollWorkspace(event: KeyboardEvent, frame: HTMLElement, pointer: [number, number] | null) {
+  if (event.defaultPrevented || event.isComposing || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return
+  const target = event.target
+  if (!(target instanceof Element) || (target !== document.body && !frame.contains(target))
+    || target.closest(editingControl) || document.querySelector(modalOverlay)) return
+
+  const focusedPane = frame.contains(target) ? scrollablePane(target, frame) : undefined
+  const hovered = !focusedPane && pointer ? document.elementFromPoint(...pointer) : null
+  const pane = focusedPane ?? (hovered && frame.contains(hovered) ? scrollablePane(hovered, frame) : undefined)
+  if (!pane) return
+  event.preventDefault()
+  if (event.key === "Home") pane.scrollTop = 0
+  else if (event.key === "End") pane.scrollTop = pane.scrollHeight
+  else pane.scrollTop += (event.key === "PageDown" ? 1 : -1) * Math.round(pane.clientHeight * 0.9)
+}
 
 type Props = {
   busy: boolean
@@ -26,15 +61,17 @@ type Props = {
   onHome: () => void
   onSelect: (session: SavedSession) => void
   onDelete: (id: string) => void
-  settings?: Record<(typeof settingsPages)[number]["id"], ReactNode>
+  settings?: Record<Exclude<SettingsPage, "dictation">, ReactNode> & { dictation: (visible: boolean) => ReactNode }
   native?: DesktopBridge
+  meetingOptions?: MeetingWorkspaceOptions
   dictation?: (destination: DictationDestination, navigationId?: string) => ReactNode
   update?: ReactNode
   openUpdateSettings?: string
+  installedVersion?: string
   children: ReactNode
 }
 
-export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, settings, native, dictation, update, openUpdateSettings, children }: Props) {
+export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, settings, native, meetingOptions, dictation, update, openUpdateSettings, installedVersion, children }: Props) {
   const { t } = useInterfaceLanguage()
   const [compact, setCompact] = useState(() => matchMedia(compactWindow).matches)
   const [pinned, setPinned] = useState(() => {
@@ -44,7 +81,8 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
   const expanded = compact ? overlay : pinned
   const [showSessions, setShowSessions] = useState(true)
   const [searchOpen, setSearchOpen] = useState(false)
-  const [pane, setPane] = useState<"settings" | "dictation">()
+  const [pane, setPane] = useState<Pane>()
+  const [meetingQuery, setMeetingQuery] = useState("")
   const [settingsPage, setSettingsPage] = useState("general")
   const [windowNavigation, setWindowNavigation] = useState<WindowNavigation>()
   const [dictationRoute, setDictationRoute] = useState<{ pane: DictationDestination; id: string }>()
@@ -52,6 +90,7 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
   const settingsScope = useRef<HTMLDivElement>(null)
   const settingsButton = useRef<HTMLButtonElement>(null)
   const dictationButton = useRef<HTMLButtonElement>(null)
+  const meetingsButton = useRef<HTMLButtonElement>(null)
   const [selectionError, setSelectionError] = useState("")
   const [deletionNotice, setDeletionNotice] = useState("")
   const [deleting, setDeleting] = useState<SessionSummary | null>(null)
@@ -63,6 +102,8 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
   const toggleButton = useRef<HTMLButtonElement>(null)
   const overlayToggleButton = useRef<HTMLButtonElement>(null)
   const deleteButton = useRef<HTMLButtonElement>(null)
+  const workspaceFrame = useRef<HTMLDivElement>(null)
+  const scrollPointer = useRef<[number, number] | null>(null)
   const handledUpdateSettings = useRef<string>(undefined)
   const handledNavigation = useRef<string>(undefined)
 
@@ -90,6 +131,10 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
   }
   useEffect(() => {
     function keydown(event: KeyboardEvent) {
+      if (scrollKeys.has(event.key)) {
+        if (workspaceFrame.current) scrollWorkspace(event, workspaceFrame.current, scrollPointer.current)
+        return
+      }
       if (pane || event.defaultPrevented || !(event.metaKey || event.ctrlKey) || event.altKey || event.repeat || event.isComposing) return
       if (event.key.toLowerCase() === "k" && !event.shiftKey) {
         if (busy || deleting || document.querySelector('[role="alertdialog"]')) return
@@ -103,12 +148,32 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
     return () => window.removeEventListener("keydown", keydown)
   }, [busy, deleting, pane])
 
-  const openPane = useCallback((next?: "settings" | "dictation") => {
+  const openPane = useCallback((next?: Pane) => {
     request.current?.abort()
     setSelectionError("")
     setOverlay(false)
     setPane(next)
   }, [])
+  function openHighlight(destination: HighlightDestination) {
+    if (destination === "meetings") {
+      openPane("meetings")
+      return
+    }
+    const { page, anchor } = highlightSettings[destination]
+    setSettingsPage(page)
+    requestAnimationFrame(() => {
+      const scope = settingsScope.current
+      const row = scope?.querySelector<HTMLElement>(anchor)
+      if (!scope) return
+      if (!row) {
+        paneTitle.current?.focus({ preventScroll: true })
+        return
+      }
+      if (row.closest("[hidden]")) return
+      const control = revealSetting(row, scope)
+      if (destination === "sounds" && control.getAttribute("aria-haspopup") === "dialog") control.click()
+    })
+  }
   useEffect(() => {
     if (!openUpdateSettings || busy || deleting || handledUpdateSettings.current === openUpdateSettings) return
     const frame = requestAnimationFrame(() => {
@@ -141,7 +206,7 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
     }
   }, [native])
   useEffect(() => {
-    if (!windowNavigation || (busy && windowNavigation.pane !== "live-meeting") || deleting ||
+    if (!windowNavigation || (busy && windowNavigation.pane !== "live-meeting" && windowNavigation.pane !== "meeting-library") || deleting ||
         handledNavigation.current === windowNavigation.id) return
     const frame = requestAnimationFrame(() => {
       handledNavigation.current = windowNavigation.id
@@ -159,6 +224,8 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
       } else if (destination === "dictation" || destination === "history" || destination === "output") {
         setDictationRoute({ pane: destination, id })
         openPane("dictation")
+      } else if (destination === "meeting-library") {
+        openPane("meetings")
       } else {
         setSettingsPage(destination === "settings" ? "general" : destination)
         openPane("settings")
@@ -199,6 +266,11 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
       if (!abort.signal.aborted) setSelectionError(error instanceof Error ? error.message : "Could not open session.")
     }
   }
+  function confirmTrash(row: SessionSummary, trigger: HTMLButtonElement) {
+    deleteButton.current = trigger
+    setDeleteError("")
+    setDeleting(row)
+  }
   async function remove() {
     if (!deleting || deletePending) return
     setDeletePending(true)
@@ -210,7 +282,8 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
       onDelete(deleting.id)
       deleteButton.current = null
       setDeleting(null)
-      list.refresh()
+      if (deleting.meeting) window.dispatchEvent(new Event("jard-meeting-retention"))
+      else list.refresh()
     } catch (error) {
       setDeleteError(error instanceof Error ? error.message : "Could not delete session.")
     } finally { setDeletePending(false) }
@@ -254,6 +327,10 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
       }}>
       <Mic aria-hidden="true" />{t("Dictation")}
     </button>}
+    {native && meetingOptions && <button type="button" ref={meetingsButton} className="sidebar-home"
+      aria-current={pane === "meetings" ? "page" : undefined} onClick={() => openPane("meetings")}>
+      <UsersRound aria-hidden="true" />{t("Meetings")}
+    </button>}
     <button className="sidebar-section" aria-expanded={showSessions} aria-controls="sidebar-sessions"
       onClick={() => setShowSessions(!showSessions)}>
       {t("Sessions")}<ChevronDown aria-hidden="true" />
@@ -269,11 +346,8 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
           {row.status !== "complete" && <small>{row.status === "processing" ? t("Processing") : t("Interrupted")}</small>}
         </button>
         <button className="sidebar-delete" aria-label={"Delete " + row.name} title="Delete session"
-          disabled={busy || row.status === "processing" || (!!row.meeting && (row.status !== "complete" || row.finalizationPending))} onClick={event => {
-            deleteButton.current = event.currentTarget
-            setDeleteError("")
-            setDeleting(row)
-          }}>
+          disabled={busy || row.status === "processing" || row.finalizationPending}
+          onClick={event => confirmTrash(row, event.currentTarget)}>
           <Trash2 aria-hidden="true" />
         </button>
       </div>)}
@@ -287,7 +361,10 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
     </div>}
   </nav>
 
-  return <Tooltip.Provider delayDuration={360} skipDelayDuration={100}><div className="workspace-frame" data-sidebar={expanded && !compact}>
+  return <Tooltip.Provider delayDuration={360} skipDelayDuration={100}><div ref={workspaceFrame} className="workspace-frame"
+    data-sidebar={expanded && !compact} onPointerMove={event => {
+      if (event.pointerType !== "touch") scrollPointer.current = [event.clientX, event.clientY]
+    }} onPointerLeave={() => { scrollPointer.current = null }}>
     {!compact && <aside className="desktop-sidebar" inert={!expanded} aria-hidden={!expanded}>{navigation}</aside>}
     <div className="main-navigation-tools">{tools()}</div>
     <Dialog.Root open={compact && overlay} onOpenChange={setOverlay}>
@@ -310,26 +387,34 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
     {pane && <main className="workspace-settings" data-pane={pane}>
       <button type="button" className="settings-back" onClick={() => {
         setPane(undefined)
-        const button = pane === "dictation" ? dictationButton : settingsButton
+        const button = pane === "dictation" ? dictationButton : pane === "meetings" ? meetingsButton : settingsButton
         const target = expanded && !compact ? button.current : toggleButton.current
         target?.focus()
       }}><ArrowLeft aria-hidden="true" />{t("Back")}</button>
       <div className="settings-pane-title">
-        <h1 tabIndex={-1} ref={paneTitle}>{pane === "dictation" ? t("Dictation") : t("Settings")}</h1>
+        <h1 tabIndex={-1} ref={paneTitle}>{pane === "dictation" ? t("Dictation") : pane === "meetings" ? t("Meetings") : t("Settings")}</h1>
         {pane === "settings" && <SettingsSearch scope={settingsScope} onReveal={row => {
           const page = row.closest<HTMLElement>("[data-settings-page]")?.dataset.settingsPage
           if (page) setSettingsPage(page)
         }} />}
       </div>
-      {pane === "dictation" ? dictation?.(dictationRoute?.pane ?? "dictation", dictationRoute?.id) : settings && <Tabs value={settingsPage} onValueChange={setSettingsPage} className="workspace-settings-tabs">
+      {pane === "dictation" && dictation?.(dictationRoute?.pane ?? "dictation", dictationRoute?.id)}
+      {pane === "meetings" && native && meetingOptions && <MeetingsWorkspace native={native} options={meetingOptions}
+        busy={busy} currentId={currentId} query={meetingQuery} onQuery={setMeetingQuery} onOpen={id => void select(id)}
+        onTrash={confirmTrash} onSettings={() => { setSettingsPage("meetings"); openPane("settings") }} />}
+      {pane === "settings" && settings && <Tabs value={settingsPage} onValueChange={setSettingsPage} className="workspace-settings-tabs">
         <TabsList variant="line" aria-label={t("Settings")}>
           {settingsPages.map(({ id, label }) => <TabsTrigger key={id} value={id}>{t(label)}</TabsTrigger>)}
+          <TabsTrigger value="whats-new">{t("What's new")}</TabsTrigger>
         </TabsList>
         <div ref={settingsScope}>
           {settingsPages.map(({ id, label }) => <TabsContent key={id} value={id} forceMount hidden={settingsPage !== id}
             data-settings-page={id} data-setting-group={id === "general" ? t(label) : undefined}>
-            {settings[id]}
+            {id === "dictation" ? settings.dictation(settingsPage === id) : settings[id]}
           </TabsContent>)}
+          <TabsContent value="whats-new">
+            <WhatsNewSettings version={installedVersion} onOpen={openHighlight} />
+          </TabsContent>
         </div>
       </Tabs>}
     </main>}

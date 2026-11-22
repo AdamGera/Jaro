@@ -1,5 +1,6 @@
 #import "jard_updater.h"
 #import "appkit_host.h"
+#import <CommonCrypto/CommonDigest.h>
 #import <Security/Security.h>
 #import <errno.h>
 #import <fcntl.h>
@@ -10,15 +11,24 @@
 
 #define UTF8_BYTES(text) (text).UTF8String, [(text) lengthOfBytesUsingEncoding:NSUTF8StringEncoding]
 
+extern NSInteger JardVerifyRolloutFeed(const void *bytes, NSInteger length, const char *publicKey,
+    const char *channel, uint8_t *legacy, NSInteger capacity, uint8_t *percentage, uint8_t *required);
+
 static NSString *const pendingKey = @"JardPendingUpdate";
 static NSString *const cleanupKey = @"JardInstalledUpdateBackup";
 static NSString *const channelKey = @"JardUpdateChannel";
+static NSString *const rolloutBucketKey = @"JardUpdateRolloutBucket";
 static NSString *const stagePrefix = @".jard-update-";
 static const int64_t feedLimit = 64 * 1024;
+static const int64_t rolloutFeedLimit = 128 * 1024;
 static const uint64_t archiveLimit = 4ULL * 1024 * 1024 * 1024;
 static const NSTimeInterval restartFeedTimeout = 15;
 static const NSTimeInterval feedTimeout = 60;
+static const NSTimeInterval developmentCheckInterval = 600;
+static const NSTimeInterval stableCheckInterval = 3600;
+static const NSTimeInterval focusCheckInterval = 60;
 static const NSTimeInterval archiveTimeout = 1200;
+static const NSTimeInterval abandonedStageGrace = 300;
 static const uint64_t archivePiece = 8ULL * 1024 * 1024;
 static const NSUInteger archiveAttempts = 3;
 
@@ -28,16 +38,61 @@ static NSString *configuredChannel(NSDictionary *settings) {
     return [channel isEqual:@"dev"] ? @"dev" : nil;
 }
 
-static NSString *bundleChannel(NSURL *app) {
-    NSDictionary *info = [NSDictionary dictionaryWithContentsOfURL:[app URLByAppendingPathComponent:@"Contents/Info.plist"]];
+static NSDictionary *updateBundleInfo(NSURL *app) {
+    return [NSDictionary dictionaryWithContentsOfURL:[app URLByAppendingPathComponent:@"Contents/Info.plist"]];
+}
+
+static NSString *updateBundleChannel(NSDictionary *info) {
     id settings = info[@"JardUpdates"];
     return configuredChannel([settings isKindOfClass:NSDictionary.class] ? settings : nil);
 }
+
+static NSString *bundleChannel(NSURL *app) { return updateBundleChannel(updateBundleInfo(app)); }
 
 static NSURL *httpsURL(id address) {
     if (![address isKindOfClass:NSString.class]) return nil;
     NSURLComponents *parts = [NSURLComponents componentsWithString:address];
     return [parts.scheme.lowercaseString isEqual:@"https"] && parts.host.length && !parts.user && !parts.password ? parts.URL : nil;
+}
+
+static BOOL developmentVersion(id version) {
+    if (![version isKindOfClass:NSString.class] || [version length] > 29) return NO;
+    return [version rangeOfString:@"\\A(?:0|[1-9][0-9]{0,8})(?:\\.(?:0|[1-9][0-9]{0,8})){2}\\z"
+        options:NSRegularExpressionSearch].location != NSNotFound;
+}
+
+// Read this resource only after verifying the candidate's signature and channel.
+static NSString *developmentReleaseNotes(NSURL *candidate, NSString *offered, NSString *running) {
+    if (!developmentVersion(offered) || (running && !developmentVersion(running))) return nil;
+    NSURL *file = [candidate URLByAppendingPathComponent:@"Contents/Resources/Jaro-development-notes.json"];
+    struct stat info;
+    if (lstat(file.fileSystemRepresentation, &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_size <= 0 || info.st_size > 128 * 1024) return nil;
+    NSData *data = [NSData dataWithContentsOfURL:file];
+    if (!data.length || data.length > 128 * 1024) return nil;
+    id root = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![root isKindOfClass:NSDictionary.class] || ![root[@"schema"] isEqual:@1]) return nil;
+    id builds = root[@"builds"];
+    if (![builds isKindOfClass:NSArray.class] || ![builds count] || [builds count] > 40) return nil;
+
+    NSMutableOrderedSet<NSString *> *changes = NSMutableOrderedSet.orderedSet;
+    NSString *last = nil;
+    for (id build in builds) {
+        if (![build isKindOfClass:NSDictionary.class]) return nil;
+        NSString *version = build[@"version"];
+        if (!developmentVersion(version) ||
+            (last ? [version compare:last options:NSNumericSearch] != NSOrderedAscending : ![version isEqual:offered])) return nil;
+        last = version;
+        id items = build[@"changes"];
+        if (![items isKindOfClass:NSArray.class] || [items count] > 40) return nil;
+        BOOL include = !running || [version compare:running options:NSNumericSearch] == NSOrderedDescending;
+        for (id item in items) {
+            if (![item isKindOfClass:NSString.class] || ![item length] || [item length] > 320 ||
+                [item rangeOfCharacterFromSet:NSCharacterSet.newlineCharacterSet].location != NSNotFound) return nil;
+            if (include && changes.count < 40) [changes addObject:item];
+        }
+    }
+    return changes.count ? [changes.array componentsJoinedByString:@"\n"] : nil;
 }
 
 static NSString *feedETag(NSHTTPURLResponse *response) {
@@ -331,7 +386,56 @@ static BOOL isSiblingStage(NSURL *current, NSURL *stage) {
 
 static BOOL matchesInstalledPath(id path, NSURL *installed) {
     if (![path isKindOfClass:NSString.class] || ![path hasPrefix:@"/"]) return NO;
-    return [[NSURL fileURLWithPath:path].URLByStandardizingPath.path isEqual:installed.path];
+    return [[NSURL fileURLWithPath:path].URLByStandardizingPath.path isEqual:installed.URLByStandardizingPath.path];
+}
+
+static BOOL receiptMatchesStage(NSDictionary *receipt, NSURL *installed, NSURL *stage) {
+    return matchesInstalledPath(receipt[@"installed"], installed) && matchesInstalledPath(receipt[@"stage"], stage);
+}
+
+static NSURL *receiptCandidate(NSDictionary *receipt, NSURL *stage) {
+    id name = receipt[@"candidate"];
+    if (![name isKindOfClass:NSString.class] || ![[name lastPathComponent] isEqual:name] ||
+        ![[[name pathExtension] lowercaseString] isEqual:@"app"]) return nil;
+    return [stage URLByAppendingPathComponent:name isDirectory:YES];
+}
+
+static NSString *installationStagePrefix(NSURL *installed, NSString *identifier) {
+    NSString *identity = [NSString stringWithFormat:@"%@\n%@", identifier, installed.URLByResolvingSymlinksInPath.path];
+    NSData *bytes = [identity dataUsingEncoding:NSUTF8StringEncoding];
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(bytes.bytes, (CC_LONG)bytes.length, digest);
+    NSMutableString *prefix = [stagePrefix mutableCopy];
+    for (NSUInteger i = 0; i < 16; i++) [prefix appendFormat:@"%02x", digest[i]];
+    [prefix appendString:@"-"];
+    return prefix;
+}
+
+static int lockStage(NSURL *stage) {
+    int descriptor = open(stage.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (descriptor < 0) return -1;
+    struct stat opened, current;
+    if (fstat(descriptor, &opened) == 0 && opened.st_uid == getuid() && (opened.st_mode & 077) == 0 &&
+        flock(descriptor, LOCK_EX | LOCK_NB) == 0 && lstat(stage.fileSystemRepresentation, &current) == 0 &&
+        opened.st_dev == current.st_dev && opened.st_ino == current.st_ino) return descriptor;
+    close(descriptor);
+    return -1;
+}
+
+static BOOL directoryMatchesIdentity(NSURL *url, const struct stat *identity) {
+    struct stat current;
+    return lstat(url.fileSystemRepresentation, &current) == 0 && S_ISDIR(current.st_mode) &&
+        current.st_dev == identity->st_dev && current.st_ino == identity->st_ino;
+}
+
+static dispatch_queue_t stageMaintenanceQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("local.jardaudio.update-maintenance",
+            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    });
+    return queue;
 }
 
 BOOL JardVerifyUpdateBundle(NSURL *current, NSURL *candidate, NSString *version, NSString **reason) {
@@ -393,6 +497,8 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 @property(nonatomic, strong) NSURL *installed, *stage, *candidate, *releaseDownload;
 @property(nonatomic, copy) NSDictionary<NSString *, NSDictionary *> *channels;
 @property(nonatomic, copy) NSString *identifier, *version, *phase, *message, *availableVersion, *notes;
+@property(nonatomic, copy) NSString *stageVersion, *stageNotes;
+@property(nonatomic, copy) NSString *installationStagePrefix;
 @property(nonatomic, copy) NSString *buildChannel, *selectedChannel, *stageChannel, *stageDigest, *offerDigest, *confirmedDigest;
 @property(nonatomic, copy) NSString *sha256, *transferVersion, *transferNotes, *transferChannel;
 @property(nonatomic, strong) NSURLSession *session;
@@ -403,10 +509,11 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 @property(nonatomic, copy) NSData *feedCacheData;
 @property(nonatomic, copy) void (^changed)(NSDictionary *);
 @property(nonatomic, copy) void (^restartCheck)(void);
-@property(nonatomic) NSTimeInterval lastAttempt;
-@property(nonatomic) NSUInteger generation;
+@property(nonatomic) NSTimeInterval lastAttempt, nextScheduledCheck, feedDeadline;
+@property(nonatomic) NSUInteger generation, checkFailures;
+@property(nonatomic) int stageLease;
 @property(nonatomic) uint64_t archiveBytes;
-@property(nonatomic) BOOL closed, quitting;
+@property(nonatomic) BOOL closed, quitting, restoringStage, checkAfterRestore, verifyingInstall;
 @end
 
 @implementation JardUpdater
@@ -424,7 +531,9 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
         stableKey.length == 32 && devKey.length == 32 && ![devKey isEqual:stableKey] &&
         ![httpsURL(dev[@"feed_url"]) isEqual:httpsURL(configuration[@"feed_url"])];
     if (!(self = [super init])) return nil;
+    _stageLease = -1;
     _installed = [bundle.bundleURL URLByStandardizingPath];
+    _installationStagePrefix = installationStagePrefix(_installed, bundle.bundleIdentifier);
     _buildChannel = configuredChannel(configuration);
     if (!_buildChannel || ([_buildChannel isEqual:@"dev"] && !development)) return nil;
     _channels = development ? @{@"stable": configuration, @"dev": dev} : @{@"stable": configuration};
@@ -434,8 +543,15 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     _phase = @"idle";
     _message = @"";
     _changed = [changed copy];
-    [self cleanPreviousUpdate];
+    dispatch_async(stageMaintenanceQueue(), ^{
+        [self cleanPreviousUpdate];
+        [self pruneAbandonedStages];
+    });
     return self;
+}
+
+- (void)dealloc {
+    if (_stageLease >= 0) close(_stageLease);
 }
 
 - (NSURL *)stagedReleaseNotesURL {
@@ -445,7 +561,8 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 - (NSDictionary *)status {
     BOOL staged = [self canInstallStagedUpdate];
     NSMutableDictionary *status = [@{@"phase": self.phase, @"message": self.message ?: @"",
-        @"currentVersion": self.version ?: @"", @"version": self.availableVersion ?: @"", @"notes": self.notes ?: @"",
+        @"currentVersion": self.version ?: @"", @"version": (staged ? self.stageVersion : self.availableVersion) ?: @"",
+        @"notes": (staged ? self.stageNotes : self.notes) ?: @"",
         @"installedChannel": self.buildChannel, @"channel": self.selectedChannel,
         @"channels": self.channels[@"dev"] ? @[@"stable", @"dev"] : @[@"stable"],
         @"updatesDisabled": @([self updatesDisabled]),
@@ -455,7 +572,10 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
         status[@"stageChannel"] = self.stageChannel;
         status[@"releaseNotesAvailable"] = @([self stagedReleaseNotesURL] != nil);
     }
-    if (self.offerDigest && [self.phase isEqual:@"switch"]) status[@"offer"] = self.offerDigest;
+    if (self.offerDigest && (staged || [self.phase isEqual:@"switch"])) {
+        status[@"offer"] = self.offerDigest;
+        status[@"offerVersion"] = self.availableVersion;
+    }
     return status;
 }
 
@@ -466,6 +586,18 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 
 - (BOOL)switching {
     return ![self.selectedChannel isEqual:self.buildChannel];
+}
+
+- (NSUInteger)rolloutBucket {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    id saved = [defaults objectForKey:rolloutBucketKey];
+    if ([saved isKindOfClass:NSNumber.class]) {
+        NSInteger bucket = [saved integerValue];
+        if (bucket >= 0 && bucket < 100 && [saved isEqualToNumber:@(bucket)]) return (NSUInteger)bucket;
+    }
+    NSUInteger bucket = arc4random_uniform(100);
+    [defaults setInteger:bucket forKey:rolloutBucketKey];
+    return bucket;
 }
 
 - (BOOL)updatesDisabled {
@@ -484,29 +616,53 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 }
 
 - (BOOL)canInstallStagedUpdate {
+    NSString *preferred = [self preferredChannel];
+    // A feed selection alone does not revoke a verified update to this installation's channel.
+    BOOL homeStage = [self.stageChannel isEqual:self.buildChannel];
+    BOOL channelManaged = [NSUserDefaults.standardUserDefaults objectIsForcedForKey:channelKey];
     return !self.closed && ![self.phase isEqual:@"applying"] && ![self.phase isEqual:@"download"] && ![self updatesDisabled] &&
-        self.stage && self.candidate && [self.stageChannel isEqual:self.selectedChannel] &&
-        [self.stageChannel isEqual:[self preferredChannel]] &&
-        (![self switching] || [self.confirmedDigest isEqual:self.stageDigest]) && [self replaceable];
+        self.stage && self.candidate && [self.selectedChannel isEqual:preferred] &&
+        (!channelManaged || [self.stageChannel isEqual:preferred]) &&
+        (homeStage || ([self.stageChannel isEqual:preferred] && [self.confirmedDigest isEqual:self.stageDigest])) &&
+        [self replaceable];
+}
+
+- (NSTimeInterval)updateUptime {
+    return NSProcessInfo.processInfo.systemUptime;
+}
+
+- (void)completeCheck:(NSString *)phase message:(NSString *)message failed:(BOOL)failed {
+    self.checkFailures = failed ? MIN(self.checkFailures + 1, 3) : 0;
+    NSTimeInterval interval = [self.selectedChannel isEqual:@"dev"] ? developmentCheckInterval : stableCheckInterval;
+    self.nextScheduledCheck = [self updateUptime] + MIN(interval * (1u << self.checkFailures), stableCheckInterval);
+    [self setState:phase message:message];
 }
 
 - (void)error:(NSString *)message {
-    [self setState:[self canInstallStagedUpdate] ? @"ready" : @"error" message:message];
+    [self completeCheck:[self canInstallStagedUpdate] ? @"ready" : @"error" message:message failed:YES];
 }
 
 - (void)discardStage {
     if (self.stage && isSiblingStage(self.installed, self.stage)) [NSFileManager.defaultManager removeItemAtURL:self.stage error:nil];
+    [self releaseStageLease];
     self.stage = nil;
     self.candidate = nil;
     self.stageChannel = nil;
     self.stageDigest = nil;
+    self.stageVersion = self.stageNotes = nil;
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     if (matchesInstalledPath([defaults dictionaryForKey:pendingKey][@"installed"], self.installed))
         [defaults removeObjectForKey:pendingKey];
 }
 
+- (void)releaseStageLease {
+    if (self.stageLease >= 0) close(self.stageLease);
+    self.stageLease = -1;
+}
+
 - (void)stopTransfer {
     self.generation++;
+    self.restoringStage = self.checkAfterRestore = NO;
     [self.archive cancel];
     self.archive = nil;
     [self.session invalidateAndCancel];
@@ -516,10 +672,12 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 
 - (void)resetForChannel:(NSString *)channel {
     [self stopTransfer];
-    [self discardStage];
+    if (self.stage && ![self.stageChannel isEqual:self.buildChannel]) [self discardStage];
     [self clearFeedCache];
     self.selectedChannel = channel;
     self.lastAttempt = 0;
+    self.nextScheduledCheck = 0;
+    self.checkFailures = 0;
     self.offerDigest = self.confirmedDigest = nil;
     self.availableVersion = self.notes = nil;
     self.releaseDownload = nil;
@@ -528,7 +686,7 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 
 - (BOOL)selectChannel:(NSString *)channel reason:(NSString **)reason {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    if (self.closed || self.quitting || [self updatesDisabled] || self.restartCheck || [self.phase isEqual:@"applying"] ||
+    if (self.closed || self.quitting || [self updatesDisabled] || self.restartCheck || self.verifyingInstall || [self.phase isEqual:@"applying"] ||
         [defaults objectIsForcedForKey:channelKey] || ![channel isKindOfClass:NSString.class] || !self.channels[channel]) {
         if (reason) *reason = @"This update channel is unavailable.";
         return NO;
@@ -539,8 +697,9 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 }
 
 - (BOOL)confirmChannelSwitch:(NSString *)digest reason:(NSString **)reason {
-    if (self.closed || self.quitting || [self updatesDisabled] || ![self switching] || ![self.selectedChannel isEqual:[self preferredChannel]] ||
-        ![self.phase isEqual:@"switch"] || !self.offerDigest || ![self.offerDigest isEqual:digest]) {
+    if (self.closed || self.quitting || self.restartCheck || self.verifyingInstall || [self updatesDisabled] ||
+        ![self switching] || ![self.selectedChannel isEqual:[self preferredChannel]] ||
+        ![@[@"switch", @"ready"] containsObject:self.phase] || !self.offerDigest || ![self.offerDigest isEqual:digest]) {
         if (reason) *reason = @"The release offer changed. Check for updates and confirm the current release.";
         return NO;
     }
@@ -563,48 +722,146 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     NSString *path = receipt[@"stage"];
     if (!matchesInstalledPath(receipt[@"installed"], self.installed) ||
         ![receipt[@"version"] isEqual:self.version] ||
-        ![(receipt[@"channel"] ?: @"stable") isEqual:self.buildChannel] || !path.length) return;
+        ![(receipt[@"channel"] ?: @"stable") isEqual:self.buildChannel] ||
+        ![path isKindOfClass:NSString.class] || ![path hasPrefix:@"/"]) return;
     NSURL *stage = [NSURL fileURLWithPath:path isDirectory:YES];
-    if (isSiblingStage(self.installed, stage)) [NSFileManager.defaultManager removeItemAtURL:stage error:nil];
-    [defaults removeObjectForKey:cleanupKey];
-    [defaults removeObjectForKey:pendingKey];
+    if (isSiblingStage(self.installed, stage)) {
+        int lease = lockStage(stage);
+        if (lease < 0) return;
+        BOOL removed = [NSFileManager.defaultManager removeItemAtURL:stage error:nil];
+        close(lease);
+        if (!removed) return;
+    }
+    if ([[defaults dictionaryForKey:cleanupKey] isEqual:receipt]) [defaults removeObjectForKey:cleanupKey];
+    if (receiptMatchesStage([defaults dictionaryForKey:pendingKey], self.installed, stage))
+        [defaults removeObjectForKey:pendingKey];
 }
 
-- (BOOL)restoreStagedUpdate {
-    if ([self updatesDisabled]) return NO;
-    NSDictionary *saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:pendingKey];
-    if (!matchesInstalledPath(saved[@"installed"], self.installed) ||
-        ![saved[@"runningVersion"] isEqual:self.version] || ![saved[@"stage"] length] ||
-        ![saved[@"version"] length] || ![saved[@"candidate"] length]) return NO;
-    NSURL *stage = [NSURL fileURLWithPath:saved[@"stage"] isDirectory:YES];
-    NSString *candidateName = saved[@"candidate"];
-    if (![candidateName.lastPathComponent isEqual:candidateName] || ![candidateName.pathExtension.lowercaseString isEqual:@"app"] ||
-        !isSiblingStage(self.installed, stage)) return NO;
-    NSURL *candidate = [stage URLByAppendingPathComponent:candidateName isDirectory:YES];
-    NSString *channel = saved[@"channel"] ?: @"stable";
-    if (![channel isEqual:self.buildChannel] || ![channel isEqual:self.selectedChannel] ||
-        [saved[@"version"] compare:self.version options:NSNumericSearch] != NSOrderedDescending ||
-        !JardVerifyUpdateBundle(self.installed, candidate, saved[@"version"], nil) ||
-        ![bundleChannel(candidate) isEqual:channel]) {
-        [NSFileManager.defaultManager removeItemAtURL:stage error:nil];
-        [NSUserDefaults.standardUserDefaults removeObjectForKey:pendingKey];
-        return NO;
+- (BOOL)hasLiveReceiptForStage:(NSURL *)stage {
+    NSDictionary *installed = updateBundleInfo(self.installed);
+    id installedVersion = installed[@"CFBundleVersion"];
+    NSString *installedChannel = updateBundleChannel(installed);
+    if (![installed[@"CFBundleIdentifier"] isEqual:self.identifier] ||
+        ![installedVersion isKindOfClass:NSString.class] || ![installedVersion length] || !installedChannel) return YES;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSDictionary *cleanup = [defaults dictionaryForKey:cleanupKey];
+    if (receiptMatchesStage(cleanup, self.installed, stage) && [cleanup[@"version"] isEqual:installedVersion] &&
+        [(cleanup[@"channel"] ?: @"stable") isEqual:installedChannel]) return YES;
+    NSDictionary *pending = [defaults dictionaryForKey:pendingKey];
+    if (!receiptMatchesStage(pending, self.installed, stage) || ![pending[@"runningVersion"] isEqual:installedVersion]) return NO;
+    // After an interrupted swap the receipt can name this directory,
+    // but the candidate path now holds the old bundle.
+    NSURL *candidate = receiptCandidate(pending, stage);
+    if (!candidate || !realDirectory(candidate)) return NO;
+    NSDictionary *staged = updateBundleInfo(candidate);
+    return [staged[@"CFBundleIdentifier"] isEqual:self.identifier] &&
+        [staged[@"CFBundleVersion"] isEqual:pending[@"version"]] &&
+        [updateBundleChannel(staged) isEqual:(pending[@"channel"] ?: @"stable")];
+}
+
+- (void)pruneAbandonedStages {
+    NSFileManager *manager = NSFileManager.defaultManager;
+    NSURL *parent = self.installed.URLByDeletingLastPathComponent;
+    NSArray<NSURL *> *siblings = [manager contentsOfDirectoryAtURL:parent includingPropertiesForKeys:nil options:0 error:nil];
+    NSString *prefix = self.installationStagePrefix;
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    for (NSURL *stage in siblings) {
+        NSString *name = stage.lastPathComponent;
+        if (![name hasPrefix:prefix] || ![[NSUUID alloc] initWithUUIDString:[name substringFromIndex:prefix.length]] ||
+            !isSiblingStage(self.installed, stage)) continue;
+        int lease = lockStage(stage);
+        if (lease < 0) continue;
+        struct stat info;
+        if (fstat(lease, &info) == 0 && now - info.st_mtimespec.tv_sec >= abandonedStageGrace &&
+            ![self hasLiveReceiptForStage:stage]) {
+            NSError *error = nil;
+            if (![manager removeItemAtURL:stage error:&error])
+                NSLog(@"Jaro could not remove an abandoned update folder: %@", error.localizedDescription);
+        }
+        close(lease);
     }
-    self.stage = stage;
-    self.candidate = candidate;
-    self.stageChannel = channel;
-    self.stageDigest = saved[@"sha256"];
-    self.availableVersion = saved[@"version"];
-    id notes = saved[@"notes"];
-    self.notes = [notes isKindOfClass:NSString.class] && [notes length] <= 16384 ? notes : @"";
-    [self setState:@"ready" message:@""];
-    return YES;
+}
+
+- (void)scheduleStageCleanup {
+    dispatch_async(stageMaintenanceQueue(), ^{ [self pruneAbandonedStages]; });
+}
+
+- (BOOL)verifyCandidate:(NSURL *)candidate version:(NSString *)version channel:(NSString *)channel reason:(NSString **)reason {
+    if (!JardVerifyUpdateBundle(self.installed, candidate, version, reason)) return NO;
+    if ([bundleChannel(candidate) isEqual:channel]) return YES;
+    if (reason) *reason = @"The staged application belongs to a different update channel.";
+    return NO;
+}
+
+- (void)restoreStagedUpdateWithCompletion:(void (^)(BOOL restored))completion {
+    if (self.closed || self.quitting || self.stage || self.restoringStage || self.task || self.archive ||
+        [self.phase isEqual:@"staging"] || [self updatesDisabled]) {
+        if (completion) completion(NO);
+        return;
+    }
+    NSDictionary *saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:pendingKey];
+    id stagePath = saved[@"stage"], version = saved[@"version"];
+    if (!matchesInstalledPath(saved[@"installed"], self.installed) ||
+        ![saved[@"runningVersion"] isEqual:self.version] || ![stagePath isKindOfClass:NSString.class] ||
+        ![stagePath hasPrefix:@"/"] || ![version isKindOfClass:NSString.class] || ![version length]) {
+        if (completion) completion(NO);
+        return;
+    }
+    NSURL *stage = [NSURL fileURLWithPath:stagePath isDirectory:YES];
+    NSURL *candidate = receiptCandidate(saved, stage);
+    if (!candidate) { if (completion) completion(NO); return; }
+    NSString *channel = saved[@"channel"] ?: @"stable";
+    NSString *selected = self.selectedChannel;
+    BOOL eligible = [channel isEqual:self.buildChannel] &&
+        [version compare:self.version options:NSNumericSearch] == NSOrderedDescending;
+    self.restoringStage = YES;
+    NSUInteger generation = self.generation;
+    dispatch_async(stageMaintenanceQueue(), ^{
+        int lease = isSiblingStage(self.installed, stage) ? lockStage(stage) : -1;
+        BOOL verified = lease >= 0 && eligible && [self verifyCandidate:candidate version:version channel:channel reason:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (generation != self.generation) {
+                if (lease >= 0) close(lease);
+                if (completion) completion(NO);
+                return;
+            }
+            self.restoringStage = NO;
+            BOOL queuedCheck = self.checkAfterRestore;
+            self.checkAfterRestore = NO;
+            NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+            BOOL current = !self.closed && !self.quitting && !self.stage && ![self updatesDisabled] &&
+                [selected isEqual:self.selectedChannel] && [selected isEqual:[self preferredChannel]] &&
+                [[defaults dictionaryForKey:pendingKey] isEqual:saved];
+            BOOL restored = current && verified;
+            if (restored) {
+                self.stage = stage;
+                self.stageLease = lease;
+                self.candidate = candidate;
+                self.stageChannel = channel;
+                self.stageDigest = saved[@"sha256"];
+                self.stageVersion = version;
+                id notes = saved[@"notes"];
+                self.stageNotes = [notes isKindOfClass:NSString.class] && [notes length] <= 16384 ? notes : @"";
+                if (!queuedCheck && [self canInstallStagedUpdate]) [self setState:@"ready" message:@""];
+            } else if (lease >= 0 && current) {
+                [defaults removeObjectForKey:pendingKey];
+                dispatch_async(stageMaintenanceQueue(), ^{
+                    [NSFileManager.defaultManager removeItemAtURL:stage error:nil];
+                    close(lease);
+                });
+            } else if (lease >= 0) {
+                close(lease);
+            }
+            if (queuedCheck) [self check];
+            if (completion) completion(restored);
+        });
+    });
 }
 
 - (void)persistStage {
     [NSUserDefaults.standardUserDefaults setObject:@{@"installed": self.installed.path, @"runningVersion": self.version,
-        @"stage": self.stage.path, @"candidate": self.candidate.lastPathComponent, @"version": self.availableVersion,
-        @"notes": self.notes ?: @"", @"channel": self.stageChannel, @"sha256": self.stageDigest} forKey:pendingKey];
+        @"stage": self.stage.path, @"candidate": self.candidate.lastPathComponent, @"version": self.stageVersion,
+        @"notes": self.stageNotes ?: @"", @"channel": self.stageChannel, @"sha256": self.stageDigest} forKey:pendingKey];
 }
 
 - (void)clearFeedCache {
@@ -638,6 +895,7 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     configuration.URLCache = nil;
     self.session = [NSURLSession sessionWithConfiguration:configuration delegate:self delegateQueue:NSOperationQueue.mainQueue];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    [request setValue:[self feedUserAgent] forHTTPHeaderField:@"User-Agent"];
     [request setValue:[self conditionalFeedTagForURL:url resource:url] forHTTPHeaderField:@"If-None-Match"];
     if (self.restartCheck) [request setValue:@"no-cache" forHTTPHeaderField:@"Cache-Control"];
     self.task = [self.session downloadTaskWithRequest:request];
@@ -645,37 +903,60 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     [self.task resume];
 }
 
+- (NSString *)feedUserAgent {
+    return [NSString stringWithFormat:@"jaro/%@/%@", self.buildChannel, self.version ?: @"0.0.0"];
+}
+
+- (NSURL *)rolloutFeedURL {
+    return httpsURL(self.channels[self.selectedChannel][@"rollout_url"]);
+}
+
+- (int64_t)feedLimitForURL:(NSURL *)url {
+    return [url isEqual:[self rolloutFeedURL]] ? rolloutFeedLimit : feedLimit;
+}
+
 - (void)check {
-    if (self.closed || self.quitting || [self.phase isEqual:@"applying"]) return;
+    if (self.closed || self.quitting || self.verifyingInstall || [self.phase isEqual:@"applying"]) return;
     if ([self updatesDisabled]) {
         [self stopTransfer];
         [self clearFeedCache];
         self.offerDigest = self.confirmedDigest = nil;
-        if ([self switching]) [self discardStage];
+        if (self.stage && ![self.stageChannel isEqual:self.buildChannel]) [self discardStage];
         [self setState:@"unavailable" message:@""];
         return;
     }
     NSString *preferred = [self preferredChannel];
     if (![preferred isEqual:self.selectedChannel]) [self resetForChannel:preferred];
+    if (self.restoringStage) {
+        self.checkAfterRestore = YES;
+        [self setState:@"checking" message:@""];
+        return;
+    }
     if (self.task || self.archive || [self.phase isEqual:@"staging"]) return;
-    NSURL *feed = httpsURL(self.channels[self.selectedChannel][@"feed_url"]);
+    NSURL *feed = [self rolloutFeedURL] ?: httpsURL(self.channels[self.selectedChannel][@"feed_url"]);
     if (!feed) { [self error:@"The update feed URL is invalid."]; return; }
-    self.lastAttempt = NSProcessInfo.processInfo.systemUptime;
-    NSTimeInterval deadline = self.restartCheck ? restartFeedTimeout : feedTimeout;
-    [self downloadFeed:feed timeout:deadline];
+    self.offerDigest = nil;
+    [self scheduleStageCleanup];
+    self.lastAttempt = [self updateUptime];
+    NSTimeInterval timeout = self.restartCheck ? restartFeedTimeout : feedTimeout;
+    self.feedDeadline = self.lastAttempt + timeout;
+    [self downloadFeed:feed timeout:timeout];
 }
 
 - (void)checkAutomaticallyOnActivation:(BOOL)activation {
-    BOOL development = [[self preferredChannel] isEqual:@"dev"];
-    if (activation && !development) return;
-    NSTimeInterval interval = development ? (activation ? 60 : 600) : 3600;
-    if (!self.lastAttempt || NSProcessInfo.processInfo.systemUptime - self.lastAttempt >= interval) [self check];
+    NSString *channel = [self preferredChannel];
+    if (activation && ![channel isEqual:@"dev"]) return;
+    NSTimeInterval now = [self updateUptime];
+    BOOL due = activation ? !self.lastAttempt || now - self.lastAttempt >= focusCheckInterval
+                          : now >= self.nextScheduledCheck;
+    if (due || ![channel isEqual:self.selectedChannel]) [self check];
 }
 
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task willPerformHTTPRedirection:(NSHTTPURLResponse *)response
     newRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURLRequest *))completion {
     if (task != self.task || !httpsURL(request.URL.absoluteString)) { completion(nil); return; }
     NSMutableURLRequest *redirect = [request mutableCopy];
+    [redirect setValue:[self feedUserAgent] forHTTPHeaderField:@"User-Agent"];
     [redirect setValue:[self conditionalFeedTagForURL:task.originalRequest.URL resource:request.URL]
         forHTTPHeaderField:@"If-None-Match"];
     if (self.restartCheck) [redirect setValue:@"no-cache" forHTTPHeaderField:@"Cache-Control"];
@@ -685,7 +966,8 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)task
       didWriteData:(int64_t)bytes totalBytesWritten:(int64_t)written totalBytesExpectedToWrite:(int64_t)expected {
     if (task != self.task) return;
-    if (written > feedLimit || expected > feedLimit) {
+    int64_t limit = [self feedLimitForURL:task.originalRequest.URL];
+    if (written > limit || expected > limit) {
         [task cancel];
     }
 }
@@ -714,6 +996,14 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     }
     NSHTTPURLResponse *response = (NSHTTPURLResponse *)task.response;
     NSURL *url = task.originalRequest.URL;
+    if (response.statusCode == 404 && [url isEqual:[self rolloutFeedURL]]) {
+        NSTimeInterval remaining = self.feedDeadline - [self updateUptime];
+        NSURL *legacy = httpsURL(self.channels[self.selectedChannel][@"feed_url"]);
+        if (remaining > 0 && legacy && ![legacy isEqual:url]) {
+            [self downloadFeed:legacy timeout:remaining];
+            return;
+        }
+    }
     if (response.statusCode == 304) {
         NSString *sent = [task.currentRequest valueForHTTPHeaderField:@"If-None-Match"];
         NSString *expected = [self conditionalFeedTagForURL:url resource:response.URL];
@@ -733,7 +1023,8 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     [self clearFeedCache];
     NSNumber *size = nil;
     [location getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
-    NSData *data = size.longLongValue > 0 && size.longLongValue <= feedLimit ? [NSData dataWithContentsOfURL:location] : nil;
+    NSData *data = size.longLongValue > 0 && size.longLongValue <= [self feedLimitForURL:url]
+        ? [NSData dataWithContentsOfURL:location] : nil;
     if (!data.length) {
         [self error:@"The update feed was empty or too large."];
         return;
@@ -745,14 +1036,28 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     char version[64], address[4096], notes[16384];
     BOOL switching = [self switching];
     NSString *key = self.channels[self.selectedChannel][@"public_key"];
+    NSData *release = data;
+    uint8_t percentage = 100, required = 0;
+    if ([feedURL isEqual:[self rolloutFeedURL]]) {
+        NSMutableData *legacy = [NSMutableData dataWithLength:feedLimit];
+        NSInteger length = JardVerifyRolloutFeed(data.bytes, data.length, key.UTF8String, self.selectedChannel.UTF8String,
+            legacy.mutableBytes, legacy.length, &percentage, &required);
+        if (!length) {
+            [self clearFeedCache];
+            [self error:@"The signed update feed could not be verified."];
+            return;
+        }
+        legacy.length = length;
+        release = legacy;
+    }
     NSString *baseline = switching ? @"0.0.0" : self.version;
-    native_sdk_update_verify_result_t result = native_sdk_update_verify_feed(data.bytes, data.length, UTF8_BYTES(key),
+    native_sdk_update_verify_result_t result = native_sdk_update_verify_feed(release.bytes, release.length, UTF8_BYTES(key),
         UTF8_BYTES(self.identifier), UTF8_BYTES(baseline), UTF8_BYTES(@"macos-aarch64"),
         version, sizeof version, address, sizeof address, notes, sizeof notes);
     if (result.ok != 1) {
         if (result.ok == 2 && !switching) {
             [self rememberFeed:data response:response url:feedURL];
-            [self setState:self.stage ? @"ready" : @"current" message:@""];
+            [self completeCheck:[self canInstallStagedUpdate] ? @"ready" : @"current" message:@"" failed:NO];
         } else {
             [self clearFeedCache];
             [self error:@"The signed update feed could not be verified."];
@@ -768,6 +1073,10 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
         return;
     }
     [self rememberFeed:data response:response url:feedURL];
+    if (!switching && !required && percentage < 100 && [self rolloutBucket] >= percentage) {
+        [self completeCheck:[self canInstallStagedUpdate] ? @"ready" : @"current" message:@"" failed:NO];
+        return;
+    }
     self.transferVersion = next;
     self.transferNotes = [[NSString alloc] initWithBytes:notes length:result.release_notes_len encoding:NSUTF8StringEncoding] ?: @"";
     self.transferChannel = self.selectedChannel;
@@ -775,21 +1084,21 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
         self.availableVersion = next;
         self.notes = self.transferNotes;
         self.releaseDownload = httpsURL(self.channels[self.selectedChannel][@"release_url"]) ?: (switching || [self.selectedChannel isEqual:@"dev"] ? url : nil);
-        [self setState:@"download" message:@"Install the new version from a writable Applications folder."];
+        [self completeCheck:@"download" message:@"Install the new version from a writable Applications folder." failed:NO];
         return;
     }
     if (switching && ![digest isEqual:self.confirmedDigest]) {
-        [self discardStage];
+        if (self.stage && ![self.stageChannel isEqual:self.buildChannel]) [self discardStage];
         self.availableVersion = next;
         self.notes = self.transferNotes;
         self.offerDigest = digest;
         self.confirmedDigest = nil;
-        [self setState:@"switch" message:@""];
+        [self completeCheck:[self canInstallStagedUpdate] ? @"ready" : @"switch" message:@"" failed:NO];
         return;
     }
-    if (self.stage && [next isEqual:self.availableVersion] &&
+    if (self.stage && [next isEqual:self.stageVersion] &&
         [self.stageChannel isEqual:self.selectedChannel] && [self.stageDigest isEqual:digest]) {
-        [self setState:@"ready" message:@""];
+        [self completeCheck:@"ready" message:@"" failed:NO];
         return;
     }
     self.archiveBytes = result.archive_bytes;
@@ -828,18 +1137,23 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 - (void)stageArchive:(NSURL *)location {
     NSFileManager *manager = NSFileManager.defaultManager;
     NSURL *stage = [self.installed.URLByDeletingLastPathComponent URLByAppendingPathComponent:
-        [stagePrefix stringByAppendingString:NSUUID.UUID.UUIDString] isDirectory:YES];
+        [self.installationStagePrefix stringByAppendingString:NSUUID.UUID.UUIDString] isDirectory:YES];
     NSURL *archive = [stage URLByAppendingPathComponent:@"update.zip"];
     NSError *error = nil;
-    if (![manager createDirectoryAtURL:stage withIntermediateDirectories:NO attributes:@{NSFilePosixPermissions: @0700} error:&error] ||
-        ![manager moveItemAtURL:location toURL:archive error:&error]) {
-        if (isSiblingStage(self.installed, stage)) [manager removeItemAtURL:stage error:nil];
+    BOOL created = [manager createDirectoryAtURL:stage withIntermediateDirectories:NO attributes:@{NSFilePosixPermissions: @0700} error:&error];
+    int lease = created ? lockStage(stage) : -1;
+    if (lease < 0 || ![manager moveItemAtURL:location toURL:archive error:&error]) {
+        if (lease >= 0) {
+            [manager removeItemAtURL:stage error:nil];
+            close(lease);
+        }
         [manager removeItemAtURL:location error:nil];
         [self error:error.localizedDescription ?: @"Could not stage the update."];
         return;
     }
     NSURL *installed = self.installed;
     NSString *version = self.transferVersion, *notes = self.transferNotes, *digest = self.sha256, *channel = self.transferChannel;
+    NSString *runningDevelopment = [self.buildChannel isEqual:@"dev"] ? self.version : nil;
     NSUInteger generation = self.generation;
     uint64_t size = self.archiveBytes;
     [self setState:@"staging" message:@""];
@@ -870,31 +1184,42 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
                 failure = @"The signed application belongs to a different update channel.";
             }
         }
+        NSString *displayNotes = candidate && [channel isEqual:@"dev"]
+            ? (developmentReleaseNotes(candidate, version, runningDevelopment) ?: notes) : notes;
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (self.closed || self.quitting || generation != self.generation || !candidate || [self updatesDisabled]) {
+            BOOL policyChanged = [self updatesDisabled] || ![self.selectedChannel isEqual:[self preferredChannel]];
+            if (self.closed || self.quitting || generation != self.generation || !candidate || policyChanged) {
                 [manager removeItemAtURL:stage error:nil];
+                close(lease);
                 if (!self.closed && !self.quitting && generation == self.generation) {
-                    if ([self updatesDisabled]) [self check];
+                    if (policyChanged) {
+                        self.phase = @"idle";
+                        [self check];
+                    }
                     else [self error:failure ?: @"The update could not be staged."];
                 }
                 return;
             }
             NSURL *previous = self.stage;
+            int previousLease = self.stageLease;
             self.stage = stage;
+            self.stageLease = lease;
             self.candidate = candidate;
             self.stageChannel = channel;
             self.stageDigest = digest;
-            self.availableVersion = version;
-            self.notes = notes;
+            self.stageVersion = version;
+            self.stageNotes = displayNotes;
+            self.availableVersion = self.notes = nil;
             [self persistStage];
             if (previous && isSiblingStage(installed, previous)) [manager removeItemAtURL:previous error:nil];
-            [self setState:@"ready" message:@""];
+            if (previousLease >= 0) close(previousLease);
+            [self completeCheck:@"ready" message:@"" failed:NO];
         });
     });
 }
 
 - (void)checkBeforeRestart:(void (^)(void))completion {
-    if (self.quitting || self.restartCheck || ![self canInstallStagedUpdate]) {
+    if (self.quitting || self.restartCheck || self.verifyingInstall || ![self canInstallStagedUpdate]) {
         completion();
         return;
     }
@@ -905,10 +1230,19 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 }
 
 - (BOOL)prepareToInstallOnQuit {
+    if (self.verifyingInstall) return NO;
     self.quitting = YES;
     self.restartCheck = nil;
     [self stopTransfer];
     return [self canInstallStagedUpdate];
+}
+
+- (void)resumeAfterCancelledQuit {
+    if (!self.quitting || self.closed || self.verifyingInstall) return;
+    self.quitting = NO;
+    BOOL staged = [self canInstallStagedUpdate];
+    [self setState:staged ? @"ready" : @"idle" message:@""];
+    if (!staged) [self restoreStagedUpdateWithCompletion:nil];
 }
 
 - (void)openRelease {
@@ -918,7 +1252,7 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 
 - (BOOL)openStagedReleaseNotesForVersion:(NSString *)version channel:(NSString *)channel reason:(NSString **)reason {
     NSURL *url = [self stagedReleaseNotesURL];
-    if (![self canInstallStagedUpdate] || ![self.availableVersion isEqual:version] || ![self.stageChannel isEqual:channel] || !url) {
+    if (![self canInstallStagedUpdate] || ![self.stageVersion isEqual:version] || ![self.stageChannel isEqual:channel] || !url) {
         if (reason) *reason = @"Release notes are unavailable for this update.";
         return NO;
     }
@@ -927,22 +1261,56 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     return opened;
 }
 
-- (BOOL)restart:(NSString **)reason { return [self applyUpdateAndRelaunch:YES reason:reason]; }
+- (void)restartWithCompletion:(JardUpdateInstallReply)completion {
+    [self verifyInstallAndRelaunch:YES completion:completion];
+}
 
-- (BOOL)installOnQuit:(NSString **)reason { return [self applyUpdateAndRelaunch:NO reason:reason]; }
+- (void)installOnQuitWithCompletion:(JardUpdateInstallReply)completion {
+    [self verifyInstallAndRelaunch:NO completion:completion];
+}
 
-- (BOOL)applyUpdateAndRelaunch:(BOOL)relaunch reason:(NSString **)reason {
-    if (![self canInstallStagedUpdate] || (relaunch && (self.quitting || ![self.phase isEqual:@"ready"])) ||
+- (void)verifyInstallAndRelaunch:(BOOL)relaunch completion:(JardUpdateInstallReply)completion {
+    if (self.verifyingInstall || ![self canInstallStagedUpdate] ||
+        (relaunch && (self.quitting || self.restartCheck || ![self.phase isEqual:@"ready"])) ||
         !isSiblingStage(self.installed, self.stage)) {
-        if (reason) *reason = @"There is no verified update ready to restart.";
-        return NO;
+        completion(NO, @"There is no verified update ready to restart.");
+        return;
     }
-    if (!JardVerifyUpdateBundle(self.installed, self.candidate, self.availableVersion, reason)) return NO;
-    if (![bundleChannel(self.candidate) isEqual:self.stageChannel]) {
-        if (reason) *reason = @"The staged application belongs to a different update channel.";
-        return NO;
+    int lease = fcntl(self.stageLease, F_DUPFD_CLOEXEC, 0);
+    if (lease < 0) {
+        completion(NO, @"The staged update is no longer available.");
+        return;
     }
     if (!relaunch && !self.quitting) [self prepareToInstallOnQuit];
+    NSUInteger generation = self.generation;
+    NSURL *installed = self.installed, *stage = self.stage, *candidate = self.candidate;
+    NSString *version = self.stageVersion, *channel = self.stageChannel, *selection = self.selectedChannel;
+    self.verifyingInstall = YES;
+    dispatch_async(stageMaintenanceQueue(), ^{
+        struct stat installedIdentity = {0}, stageIdentity = {0}, candidateIdentity = {0};
+        BOOL identified = lstat(installed.fileSystemRepresentation, &installedIdentity) == 0 &&
+            fstat(lease, &stageIdentity) == 0 && directoryMatchesIdentity(stage, &stageIdentity) &&
+            lstat(candidate.fileSystemRepresentation, &candidateIdentity) == 0;
+        NSString *failure = nil;
+        BOOL verified = identified && [self verifyCandidate:candidate version:version channel:channel reason:&failure];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.verifyingInstall = NO;
+            BOOL authorized = generation == self.generation && [self canInstallStagedUpdate] &&
+                [self.stage isEqual:stage] && [self.candidate isEqual:candidate] &&
+                [self.stageChannel isEqual:channel] && [self.stageVersion isEqual:version] &&
+                [selection isEqual:self.selectedChannel] && [selection isEqual:[self preferredChannel]] &&
+                (!relaunch || (!self.quitting && [self.phase isEqual:@"ready"]));
+            BOOL sameDirectories = verified && directoryMatchesIdentity(installed, &installedIdentity) &&
+                directoryMatchesIdentity(stage, &stageIdentity) && directoryMatchesIdentity(candidate, &candidateIdentity);
+            NSString *installFailure = failure ?: @"The staged update changed during verification.";
+            BOOL applied = authorized && sameDirectories && [self swapVerifiedUpdateAndRelaunch:relaunch reason:&installFailure];
+            close(lease);
+            completion(applied, applied ? nil : installFailure);
+        });
+    });
+}
+
+- (BOOL)swapVerifiedUpdateAndRelaunch:(BOOL)relaunch reason:(NSString **)reason {
     NSTask *reopen = nil;
     if (relaunch) {
         reopen = JardScheduleRelaunch(self.installed, reason);
@@ -953,7 +1321,7 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
         return NO;
     }
     [NSUserDefaults.standardUserDefaults setObject:@{@"installed": self.installed.path, @"stage": self.stage.path,
-        @"version": self.availableVersion, @"channel": self.stageChannel} forKey:cleanupKey];
+        @"version": self.stageVersion, @"channel": self.stageChannel} forKey:cleanupKey];
     [NSUserDefaults.standardUserDefaults removeObjectForKey:pendingKey];
     [self setState:@"applying" message:@""];
     return YES;
@@ -963,6 +1331,7 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     self.closed = YES;
     self.restartCheck = nil;
     [self stopTransfer];
+    [self releaseStageLease];
 }
 
 @end

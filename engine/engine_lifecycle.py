@@ -1,5 +1,4 @@
 """Coordination shared by the browser launcher and the packaged app."""
-import fcntl
 import hashlib
 import hmac
 import json
@@ -13,16 +12,14 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from engine_paths import library_path
+
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("RUMBLE_PORT", 8765))
 URL = f"http://{HOST}:{PORT}"
 API_VERSION = 5
 LEASE_SECONDS = 90
-
-
-def library_path():
-    return Path(os.environ.get("RUMBLE_DATA_DIR") or "~/Library/Application Support/Rumble").expanduser().resolve()
 
 
 def desktop_control_path(root):
@@ -48,6 +45,8 @@ def library_id(root):
 
 @contextmanager
 def startup_lock():
+    import fcntl
+
     root = library_path()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (root / ".launch.lock").open("a") as lock:

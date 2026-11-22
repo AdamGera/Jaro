@@ -1,3 +1,5 @@
+import type { Transcript } from "./audio"
+
 export type Interval = { start: number; end: number }
 export type SpeakerActivity = {
   speaker: number
@@ -7,8 +9,6 @@ export type SpeakerActivity = {
 }
 
 const colors = ["#8977cb", "#449587", "#cd8558", "#5b95c3", "#c47092", "#809447", "#ac8065", "#837eac"]
-export const meetingSpeakerNames = { 1: "You", 2: "Them" }
-
 export function speakerColor(speaker: number) {
   return colors[(speaker - 1) % colors.length]
 }
@@ -16,6 +16,11 @@ export function speakerColor(speaker: number) {
 // Nemotron channels are numbered in order of first appearance.
 export function speakerLabel(speaker: number, names?: Record<number, string>) {
   return names?.[speaker] ?? `Speaker ${String.fromCharCode(64 + speaker)}`
+}
+
+export function transcriptForClipboard({ text, segments, speakerNames }: Transcript) {
+  return segments.length ? segments.map(segment => segment.speaker === null ? segment.text :
+    `${speakerLabel(segment.speaker, speakerNames)}\n${segment.text}`).join("\n\n") : text
 }
 
 export function clock(seconds: number) {

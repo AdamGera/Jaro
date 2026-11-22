@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import fcntl
 import json
 import hmac
 import socket
@@ -24,23 +23,27 @@ from urllib.parse import quote
 from uuid import UUID, uuid4
 
 import meeting_brief
+import session_images
+import annotation_retention
+import annotation_storage
 import meeting_exports
-from session_store import SHUTDOWN_INTERRUPTION, MissingSession, open_library
+from session_store import SHUTDOWN_INTERRUPTION, MissingSession, SessionStore, open_library
 from annotation_assets import read_staged_annotation, staged_annotation_paths
-from diagnostics import PROCESS_LOG, log_directory, open_log
+from diagnostics import PROCESS_LOG, log_directory, maintain_logs, open_log
 from native_recordings import capture_active, is_meeting_stage, list_drafts, meeting_title_path, read_meeting_title, read_wav_header, recording_marker, recording_metadata, recover_wav, recover_tracks, source_tracks
-from managed_preferences import ManagedFeatureError, meetings_managed, require_annotation, require_meetings
+from managed_preferences import ManagedFeatureError, annotate_managed, meetings_managed, require_annotation, require_meetings
 from dictation_output import MAX_REWRITE_DEADLINE, keeps_rewrite_numbers, rewrite_deadline, rewrite_messages, vocabulary_terms
-from meeting_rolling import read_rolling, rolling_path
+from meeting_rolling import MIXED_SPEAKERS, SOURCE_LABELS, read_rolling, rolling_path
 from meeting_retention import readable_source
 from meeting_transcript import FRAME as MEETING_FRAME, RATE as MEETING_RATE, read_window, merge_sources
-from saved_meetings import export_name, get_meeting, meeting_detail, render_export
+from saved_dictations import shared_vocabulary
+from saved_meetings import export_name, get_meeting, meeting_detail, render_export, saved_meeting_clipboard
 from sdk_discovery import SDK_MAX_REQUESTS, SDK_MAX_UPLOAD, SDK_VERSION, publish_sdk, remove_sdk, sdk_proof
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -108,7 +111,7 @@ async def load_model(app: FastAPI):
         try:
             from diarization import Diarizer
 
-            app.state.diarizer = await run_in_threadpool(Diarizer)
+            app.state.diarizer = await run_in_threadpool(Diarizer, app.state.model.device)
         except Exception:
             logger.exception("Speaker labeling could not start. Run Setup Jaro to install its models.")
         try:
@@ -116,6 +119,27 @@ async def load_model(app: FastAPI):
         except Exception:
             logger.exception("Word timing could not start. Run Setup Jaro to install alignment weights.")
         app.state.status = "ready"
+
+
+async def open_linux_dictation(state, root):
+    try:
+        if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+            from wayland_dictation import WaylandDictation as Dictation, supported
+        else:
+            from x11_dictation import X11Dictation as Dictation, supported
+    except ImportError:
+        logger.info("The Linux dictation desktop adapter is unavailable.", exc_info=True)
+        return None
+    if not supported():
+        return None
+    from portable_dictation_history import PortableDictationHistory
+
+    history = PortableDictationHistory(root)
+    try:
+        await run_in_threadpool(history.initialize)
+    except (OSError, ValueError, sqlite3.Error):
+        logger.exception("Linux dictation history could not open.")
+    return Dictation(state, transcribe_linux_dictation, history)
 
 
 @asynccontextmanager
@@ -127,41 +151,89 @@ async def lifespan(app: FastAPI):
     app.state.meeting_subscriber = None
     root = library_path()
     app.state.jobs = set()
+    portable = getattr(app.state, "portable_workspace", False)
+    linux_audio = portable and sys.platform == "linux"
+    recorder = None
+    if linux_audio:
+        from linux_capture import LinuxRecording
+
+        recorder = LinuxRecording
+    elif portable and sys.platform == "win32":
+        from windows_capture import WindowsRecording, helper_path
+
+        if helper_path() is not None:
+            recorder = WindowsRecording
     with open_library(root) as library:
         app.state.library = library
-        app.state.native_token = install_token(root)
+        app.state.portable_recorder = recorder
+        app.state.portable_recording = None
+        app.state.linux_dictation = None
+        if recorder is not None:
+            app.state.portable_recording_lock = asyncio.Lock()
+            app.state.portable_recording_dir = root / "microphone-drafts"
+            app.state.portable_recording_dir.mkdir(mode=0o700, exist_ok=True)
+        if linux_audio:
+            app.state.linux_dictation = await open_linux_dictation(app.state, root)
+        app.state.native_token = os.urandom(32).hex() if portable else install_token(root)
         app.state.staging = root / "staging"
         app.state.staging.mkdir(mode=0o700, exist_ok=True)
         app.state.submitting = set()
+        app.state.annotation_expiry_due = time.monotonic() + 90
+        app.state.annotation_expiry = None
         app.state.sdk_pending = 0
-        app.state.sdk = None
+        if not portable:
+            app.state.sdk = None
         app.state.draining = False
         app.state.leases = ClientLeases()
         managed_meetings = meetings_managed()
         app.state.insights = Insights(library, meetings_managed=managed_meetings)
-        start_job(app.state, publish_meeting_exports(app.state))
+        if not portable:
+            start_job(app.state, publish_meeting_exports(app.state))
         async def load_speech():
             async with app.state.insights.model.audio_priority():
                 await load_model(app)
 
         loading = asyncio.create_task(load_speech())
-        monitor = asyncio.create_task(watch_idle(app))
-        # Recover drafts from this startup only. New drafts stay under the current recorder's control.
         state = app.state
-        state.startup_stranded = {marker.stem for marker in state.staging.glob("*.recording")}
-        state.startup_recovery = not managed_meetings and bool(state.startup_stranded or library.has_pending_meetings())
-        recovery = asyncio.create_task(resume_meetings(state))
+        state.startup_recovery = False
+        background = []
+        if not portable:
+            background.append(asyncio.create_task(watch_idle(app)))
+        if state.linux_dictation is not None:
+            background.append(asyncio.create_task(expire_portable_dictations(state.linux_dictation.history)))
+        if not portable or recorder is not None:
+            # Recover drafts from this startup only, while the native recorder owns new drafts.
+            state.startup_stranded = set() if portable else {marker.stem for marker in state.staging.glob("*.recording")}
+            state.startup_recovery = not managed_meetings and bool(state.startup_stranded or library.has_pending_meetings())
+            background.append(asyncio.create_task(resume_meetings(state)))
+        command_listener = None
         try:
             if getattr(state, "sdk_port", None):
                 state.sdk = publish_sdk(root, state.sdk_port)
+            if state.linux_dictation is not None and state.linux_dictation.platform == "wayland":
+                from wayland_dictation_commands import command_prefix, listen
+
+                try:
+                    command_listener = await listen(root, state.linux_dictation.run_command)
+                    await state.linux_dictation.restore_command_preference(command_prefix(root))
+                except OSError:
+                    logger.warning("Could not start the Wayland dictation command listener.", exc_info=True)
             yield
         finally:
-            if state.sdk is not None:
+            if command_listener is not None:
+                command_listener.close()
+                await command_listener.wait_closed()
+            if app.state.linux_dictation is not None:
+                await app.state.linux_dictation.close()
+            if app.state.portable_recording:
+                with suppress(OSError):
+                    await app.state.portable_recording.stop()
+            if not portable and state.sdk is not None:
                 remove_sdk(root, state.sdk)
                 state.sdk = None
-            monitor.cancel()
-            recovery.cancel()
-            await asyncio.gather(monitor, recovery, return_exceptions=True)
+            for task in background:
+                task.cancel()
+            await asyncio.gather(*background, return_exceptions=True)
             jobs = list(app.state.jobs)
             for job in jobs:
                 job.cancel()
@@ -175,9 +247,14 @@ async def watch_idle(app):
     while True:
         await asyncio.sleep(5)
         state = app.state
-        if time.monotonic() >= next_expiry and not state.draining:
-            next_expiry = time.monotonic() + 3600
+        now = time.monotonic()
+        if now >= next_expiry and not state.draining:
+            next_expiry = now + 3600
             start_job(state, sweep_meeting_retention(state))
+        if (now >= state.annotation_expiry_due and not state.draining and not annotate_managed()
+                and (state.annotation_expiry is None or state.annotation_expiry.done())):
+            state.annotation_expiry_due = now + 3600
+            state.annotation_expiry = start_job(state, sweep_annotation_retention(state))
         busy = (state.jobs or state.submitting or state.sdk_pending or state.insights.active_job or state.insights.chat_count
                 or state.insights.model.audio_users or state.insights.wake.is_set())
         if state.leases.idle(busy) and getattr(state, "request_shutdown", None):
@@ -198,6 +275,15 @@ async def sweep_meeting_retention(state):
         logger.exception("Could not apply meeting retention.")
 
 
+async def sweep_annotation_retention(state):
+    try:
+        _, failures = await run_in_threadpool(annotation_retention.sweep, state.library)
+        if failures:
+            logger.warning("%d annotations are still waiting for the Trash.", len(failures))
+    except (OSError, sqlite3.Error):
+        logger.exception("Could not apply annotation retention.")
+
+
 async def publish_meeting_exports(state, *, key=None):
     try:
         await meeting_exports.flush_async(state.library, key=key)
@@ -207,7 +293,9 @@ async def publish_meeting_exports(state, *, key=None):
 
 async def resume_meetings(state):
     def available():
+        capture_lock = getattr(state, "portable_recording_lock", None)
         return (state.status == "ready" and not state.draining and not state.jobs and not state.submitting
+                and not getattr(state, "portable_recording", None) and not (capture_lock and capture_lock.locked())
                 and not state.insights.model.audio_users and not state.inference.waiting_dictation
                 and not getattr(state, "is_shutting_down", lambda: False)())
 
@@ -219,7 +307,8 @@ async def resume_meetings(state):
             if not available():
                 continue
             try:
-                if await run_in_threadpool(capture_active, state.staging) or not available():
+                if ((not getattr(state, "portable_workspace", False) and await run_in_threadpool(capture_active, state.staging))
+                        or not available()):
                     continue
                 if not await asyncio.shield(start_job(state, recover_pending_meeting(state, state.startup_stranded))):
                     return
@@ -247,6 +336,8 @@ async def recover_pending_meeting(state, stranded):
 async def recover_stranded_meeting(state, stranded):
     if not stranded:
         return False
+    import fcntl
+
     drafts = await run_in_threadpool(list_drafts, state.staging)
     candidates = [draft for draft in reversed(drafts) if draft["meeting"] and draft["id"] in stranded]
     if not candidates:
@@ -363,6 +454,9 @@ async def meeting_events(request: Request):
 async def quit_app(request: Request):
     if request.headers.get("origin") != URL or request.headers.get("x-jard-action") != "quit":
         raise HTTPException(403, "Quit from the local Jaro app.")
+    state = request.app.state
+    if getattr(state, "portable_workspace", False):
+        return Response(status_code=202, background=BackgroundTask(state.request_shutdown))
     return Response(status_code=202, background=BackgroundTask(os.kill, os.getpid(), signal.SIGTERM))
 
 
@@ -374,6 +468,11 @@ async def managed_feature(request: Request, error: ManagedFeatureError):
 @app.exception_handler(MissingSession)
 async def missing_session(request: Request, error: MissingSession):
     return JSONResponse({"detail": "Session no longer exists."}, status_code=404)
+
+
+@app.exception_handler(annotation_storage.Unavailable)
+async def unavailable_annotation_storage(request: Request, error: annotation_storage.Unavailable):
+    return JSONResponse({"detail": str(error), "code": "annotation-storage-unavailable"}, status_code=503)
 
 
 @app.get("/api/sessions")
@@ -392,10 +491,64 @@ def list_sessions(request: Request, q: str = "", meetings: bool = False):
 
 @app.get("/api/sessions/{key}")
 async def get_session(request: Request, key: UUID):
-    session = await run_in_threadpool(request.app.state.library.get, str(key))
+    session = await run_in_threadpool(request.app.state.library.get, str(key), include_turns=True)
     if not session.get("meetingsManaged") and session["overview"] and session["overview"]["status"] == "queued":
         request.app.state.insights.wake.set()
     return JSONResponse(session, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/sessions/{key}/images")
+def list_session_images(request: Request, key: UUID):
+    library = request.app.state.library
+    with library.connection() as db:
+        return JSONResponse(session_images.list_images(db, str(key)), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/sessions/{key}/images", status_code=201)
+async def attach_session_image(request: Request, key: UUID):
+    if request.headers.get("origin") != URL or request.headers.get("content-type") != "image/jpeg":
+        raise HTTPException(403, "Add images from the Jaro workspace.")
+    state = request.app.state
+    if state.draining:
+        raise HTTPException(409, "Jaro is preparing to restart.")
+    image = bytearray()
+    async for chunk in request.stream():
+        if len(image) + len(chunk) > session_images.MAX_BYTES:
+            raise HTTPException(413, "This image exceeds the 512 KB size limit.")
+        image.extend(chunk)
+
+    def attach():
+        with state.library.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return session_images.add(db, str(key), image)
+
+    try:
+        result = await run_in_threadpool(attach)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    if result is None:
+        raise MissingSession(str(key))
+    return result
+
+
+@app.get("/api/sessions/{key}/images/{image_id}")
+def session_image(request: Request, key: UUID, image_id: UUID):
+    with request.app.state.library.connection() as db:
+        image = session_images.get(db, str(key), str(image_id))
+    if image is None:
+        raise MissingSession(str(key))
+    return Response(image, media_type="image/jpeg", headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@app.delete("/api/sessions/{key}/images/{image_id}", status_code=204)
+def remove_session_image(request: Request, key: UUID, image_id: UUID):
+    if request.headers.get("origin") != URL:
+        raise HTTPException(403, "Remove images from the Jaro workspace.")
+    if request.app.state.draining:
+        raise HTTPException(409, "Jaro is preparing to restart.")
+    with request.app.state.library.connection() as db:
+        db.execute("DELETE FROM session_images WHERE session_id=? AND id=?", (str(key), str(image_id)))
+    return Response(status_code=204)
 
 
 @app.get("/api/sessions/{key}/audio")
@@ -412,12 +565,33 @@ def session_annotation_asset(request: Request, key: UUID, kind: Literal["manifes
 
 @app.get("/api/sessions/{key}/export")
 def export_meeting(request: Request, key: UUID, kind: Literal["md", "srt", "vtt", "notes"]):
-    session = get_meeting(request.app.state.library, str(key), turns=kind != "notes", staged=False)
+    library = request.app.state.library
+    session = get_meeting(library, str(key), turns=kind != "notes", staged=False)
     name = export_name(session, kind)
-    body = render_export(meeting_detail(session), kind)
+    with library.connection() as db:
+        use_24_hour = kind in ("md", "notes") and meeting_exports.clock_24(db)
+    body = render_export(meeting_detail(session), kind, use_24_hour=use_24_hour)
     media = {"md": "text/markdown", "notes": "text/markdown", "vtt": "text/vtt", "srt": "application/x-subrip"}
     return Response(body, media_type=media[kind], headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
                     "Content-Disposition": "attachment; filename*=UTF-8''" + quote(name, safe="")})
+
+
+@app.get("/api/sessions/{key}/transcript-clipboard")
+def meeting_clipboard(request: Request, key: UUID):
+    library = SessionStore(request.app.state.library.root, read_only=True)
+    try:
+        text = saved_meeting_clipboard(library, str(key))
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    return PlainTextResponse(text, headers={"Cache-Control": "no-store"})
+
+
+@app.put("/api/native/meeting-clock/{hours}", status_code=204)
+def set_meeting_clock(request: Request, hours: Literal["12", "24"]):
+    check_native(request)
+    with request.app.state.library.connection() as db:
+        meeting_exports.set_clock_24(db, hours == "24")
+    return Response(status_code=204)
 
 
 @app.get("/api/sessions/{key}/managed-export")
@@ -501,6 +675,16 @@ def locate_meeting_export(request: Request, key: UUID):
     raise HTTPException(404, "The exported transcript is no longer at its saved location.")
 
 
+@app.get("/api/native/meetings/{key}/recording-files")
+def native_meeting_recording_folder(request: Request, key: UUID):
+    check_native(request)
+    try:
+        folder = request.app.state.library.meeting_recording_folder(str(key))
+    except MissingSession as error:
+        raise HTTPException(404, "This meeting's recording files are no longer available.") from error
+    return JSONResponse({"folder": str(folder)}, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/native/meetings/{key}/excerpt")
 def native_meeting_excerpt(request: Request, key: UUID):
     check_native(request)
@@ -563,6 +747,74 @@ def get_audio_retention(request: Request):
 @app.get("/api/meetings/retention")
 def get_meeting_retention(request: Request):
     return {"days": request.app.state.library.meeting_retention_days()}
+
+
+class AnnotationRetentionPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    mediaDays: int | None
+    recordDays: int | None
+    includeExisting: bool
+
+
+class AnnotationFolder(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    folder: str | None
+
+
+@app.get("/api/native/annotation-storage")
+def get_annotation_storage(request: Request):
+    check_native(request)
+    library = request.app.state.library
+    with library.connection() as db:
+        return annotation_storage.status(db, library.audio)
+
+
+@app.put("/api/native/annotation-storage")
+async def put_annotation_storage(request: Request, setting: AnnotationFolder):
+    check_native(request)
+    require_annotation()
+    state = request.app.state
+    if state.draining:
+        raise HTTPException(409, "Jaro is preparing to restart.")
+
+    def save():
+        with state.library.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            annotation_storage.select(db, setting.folder, state.library.root)
+            return annotation_storage.status(db, state.library.audio)
+
+    try:
+        return await asyncio.shield(start_job(state, run_in_threadpool(save)))
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    except OSError as error:
+        raise HTTPException(409, "Jaro could not use that folder. Choose a writable location.") from error
+
+
+@app.get("/api/annotations/retention")
+def get_annotation_retention(request: Request):
+    with request.app.state.library.connection() as db:
+        return annotation_retention.policy(db)
+
+
+@app.put("/api/annotations/retention")
+async def put_annotation_retention(request: Request, setting: AnnotationRetentionPolicy):
+    check_client(request)
+    require_annotation()
+    state = request.app.state
+    if state.draining:
+        raise HTTPException(409, "Jaro is preparing to restart.")
+
+    def save():
+        with state.library.retention_lock, state.library.connection() as db:
+            return annotation_retention.set_policy(db, setting.mediaDays, setting.recordDays, setting.includeExisting)
+
+    try:
+        result = await asyncio.shield(start_job(state, run_in_threadpool(save)))
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    state.annotation_expiry_due = 0
+    return result
 
 
 @app.get("/api/meetings/automatic-notes")
@@ -633,6 +885,8 @@ async def delete_session(request: Request, key: UUID):
         raise HTTPException(409, "Jaro is preparing to restart.")
     try:
         waiting = await asyncio.shield(start_job(state, run_in_threadpool(state.library.delete, str(key))))
+    except annotation_storage.Unavailable:
+        raise
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
     except (OSError, sqlite3.Error) as error:
@@ -665,6 +919,12 @@ async def run_inference(state, function, *args, dictation=False, **kwargs):
         return await run_in_threadpool(function, *args, **kwargs)
 
 
+async def speech_vocabulary(state):
+    if getattr(state, "sdk_embedded", False):
+        return state.embedded_vocabulary
+    return await run_in_threadpool(shared_vocabulary)
+
+
 async def decode_pcm(state, pcm: bytes, languages, speakers=None, offset=0, live=False, vocabulary=(), *,
                      timed_output=False, dictation=False, measure_inference=False, screen_nonspeech=False,
                      speech_prefix_samples=None):
@@ -693,7 +953,7 @@ async def decode_pcm(state, pcm: bytes, languages, speakers=None, offset=0, live
 
         started = time.monotonic_ns() if measure_inference else None
         try:
-            # Fixed-size decoder storage avoids growing Metal tensors on every final-pass token.
+            # Fixed-size decoder storage avoids growing tensors on every final-pass token.
             recognized = recognize(None if live else "static")
         except RuntimeError as error:
             if live or "out of memory" not in str(error).lower():
@@ -701,7 +961,7 @@ async def decode_pcm(state, pcm: bytes, languages, speakers=None, offset=0, live
             recognized = None
         if recognized is None:
             # Retry outside the exception handler so its traceback can release tensors.
-            model.torch.mps.empty_cache()
+            model.release_device_cache()
             logger.warning("Retrying ASR with a dynamic cache after a memory error at %.2f seconds.", offset / SAMPLE_RATE)
             recognized = recognize()
         elapsed = time.monotonic_ns() - started if started is not None else None
@@ -742,7 +1002,7 @@ async def resample_capture(data):
     return pcm
 
 
-async def decode_meeting(state, tracks, start, frames, languages, *, live=False):
+async def decode_meeting(state, tracks, start, frames, languages, *, vocabulary, live=False):
     window = await run_in_threadpool(read_window, tracks, start, frames)
     if window is None:
         raise HTTPException(409, "The requested audio has not been written yet.")
@@ -756,10 +1016,15 @@ async def decode_meeting(state, tracks, start, frames, languages, *, live=False)
         for name, data in clips.items():
             pcm = await resample_capture(data)
             recognized[name] = await decode_pcm(state, pcm, languages, offset=start * SAMPLE_RATE // MEETING_RATE,
-                                                live=live, timed_output=True)
+                                                live=live, timed_output=True, vocabulary=vocabulary)
         result = await run_in_threadpool(merge_sources, recognized, echo, start_time, end_time)
     result["meetingCoverage"] = {str(speaker): [[start_time, end_time]] for speaker in (1, 2)}
     return result
+
+
+def ensure_meeting_turn(result, start, end):
+    if result["text"] and not result["segments"]:
+        result["segments"] = [{"speaker": None, "start": start, "end": end, "text": result["text"]}]
 
 
 def live_speakers(request, session_id):
@@ -791,8 +1056,11 @@ async def transcribe(request: Request, session: UUID | None = None, offset: int 
         raise HTTPException(400, "The live audio offset could not be read.")
 
     try:
-        async with request.app.state.insights.model.audio_priority():
-            return await decode_pcm(request.app.state, bytes(pcm), languages, live_speakers(request, session), offset, live=True)
+        state = request.app.state
+        vocabulary = await speech_vocabulary(state)
+        async with state.insights.model.audio_priority():
+            return await decode_pcm(state, bytes(pcm), languages, live_speakers(request, session), offset,
+                                    live=True, vocabulary=vocabulary)
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
     except Exception as error:
@@ -850,7 +1118,8 @@ async def transcribe_file(
 
 async def accept_audio(state, source, name, mime, languages, recording, diarization, live, progress_only, stage_id=None, *,
                        notes_draft=None, tracks=None, meeting_provider=None, meeting_calendar=None, meeting_started=None,
-                       rolling=(), applies_retention=True, annotation=None, provisional_title=None, meeting_title=None,
+                       rolling=(), applies_retention=True, annotation=None, annotation_location=None,
+                       provisional_title=None, meeting_title=None,
                        meeting_microphone_warning=None):
     library = state.library
     if state.draining:
@@ -860,17 +1129,15 @@ async def accept_audio(state, source, name, mime, languages, recording, diarizat
         limit = MAX_AUDIO_SECONDS + int(recording)
         if duration is not None and duration > limit:
             raise ValueError(DURATION_ERROR)
-        identify_speakers = diarization and state.diarizer is not None and not tracks
-        options = dict(recording=recording, live=live, diarization=bool(tracks) or identify_speakers,
+        meeting = bool(meeting_provider or tracks)
+        identify_speakers = (diarization or meeting) and state.diarizer is not None
+        options = dict(recording=recording, live=live, diarization=identify_speakers,
                        languageHints=list(languages), model=MODEL_ID, modelRevision=REVISION,
                        speakerModel=DIARIZATION_ID if identify_speakers else None,
                        speakerModelRevision=DIARIZATION_REVISION if identify_speakers else None)
-        if tracks:
-            options["sourceSpeakerTurns"] = True
-        if meeting_provider or tracks:
-            options.update(meeting=True, meetingProvider=meeting_provider or "Meeting", retentionApplies=int(applies_retention))
-            if not tracks:
-                options["audioChunking"] = PAUSE_AWARE_CHUNKING
+        if meeting:
+            options.update(meeting=True, meetingProvider=meeting_provider or "Meeting", retentionApplies=int(applies_retention),
+                           audioChunking=PAUSE_AWARE_CHUNKING, meetingSpeakerMode=MIXED_SPEAKERS)
             if provisional_title:
                 options["provisionalTitle"] = provisional_title
             if meeting_title:
@@ -885,10 +1152,12 @@ async def accept_audio(state, source, name, mime, languages, recording, diarizat
             options["meetingCalendar"] = meeting_calendar
             name = meeting_calendar["title"].translate(str.maketrans({"/": "／", "\\": "＼", ":": "꞉"}))
         key, source = await run_in_threadpool(library.create, source, name, mime, options, duration,
-                                              key=stage_id, notes_draft=notes_draft, tracks=tracks, rolling=rolling, annotation=annotation)
-        stored_tracks = {track: source.parent / f"{track}.wav" for track in tracks} if tracks else None
+                                              key=stage_id, notes_draft=notes_draft, tracks=tracks, rolling=rolling,
+                                              annotation=annotation, annotation_location=annotation_location)
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
+    except annotation_storage.Unavailable:
+        raise
     except FileNotFoundError as error:
         raise HTTPException(503, "Could not open the audio or find FFmpeg.") from error
     except OSError as error:
@@ -903,7 +1172,7 @@ async def accept_audio(state, source, name, mime, languages, recording, diarizat
             queue.put_nowait(json.dumps(payload, ensure_ascii=False) + "\n")
 
     job = start_job(state, process_saved_audio(
-        state, key, source, options, duration, tracks=stored_tracks,
+        state, key, source, options, duration,
         progress_only=progress_only, emit=emit,
     ))
     job.add_done_callback(lambda _: queue.put_nowait(None))
@@ -929,6 +1198,240 @@ def start_job(state, work):
     return job
 
 
+def portable_capture_state(request):
+    state = request.app.state
+    if not getattr(state, "portable_recording_dir", None):
+        raise HTTPException(404, "The desktop audio recorder is unavailable.")
+    if request.method != "GET" and request.headers.get("origin") != URL:
+        raise HTTPException(403, "Open Jaro’s desktop workspace to record audio.")
+    return state
+
+
+@app.post("/api/portable/recording", status_code=201)
+async def start_portable_recording(request: Request, mode: Literal["mic", "system", "both"] = "mic"):
+    from portable_capture import CaptureError
+
+    state = portable_capture_state(request)
+    transcription_languages(request)
+    async with state.portable_recording_lock:
+        if state.draining or state.portable_recording or (state.linux_dictation and state.linux_dictation.busy):
+            raise HTTPException(409, "Finish or recover the current recording first.")
+        key = uuid4()
+        capture = state.portable_recorder(key, state.portable_recording_dir / f"{key}.wav", mode)
+        try:
+            await capture.start()
+        except CaptureError as error:
+            raise HTTPException(503, str(error)) from error
+        state.portable_recording = capture
+    return {"id": key, "sampleRate": SAMPLE_RATE}
+
+
+@app.get("/api/portable/dictation")
+def linux_dictation_status(request: Request):
+    return JSONResponse(linux_dictation(request).snapshot(), headers={"Cache-Control": "no-store"})
+
+
+def linux_dictation(request):
+    dictation = portable_capture_state(request).linux_dictation
+    if dictation is None:
+        raise HTTPException(404, "System dictation is unavailable on this desktop.")
+    return dictation
+
+
+async def expire_portable_dictations(history):
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await run_in_threadpool(history.expire)
+        except (OSError, ValueError, sqlite3.Error):
+            logger.warning("Could not expire Linux dictation history.", exc_info=True)
+
+
+class PortableHistoryChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["retention", "delete", "clear"]
+    retention: Literal[0, 1, 7, 30] | None = None
+    ids: list[UUID] = Field(default_factory=list, max_length=15)
+
+
+@app.get("/api/portable/dictation/history")
+def portable_history(request: Request, query: str = Query("", max_length=512),
+                     offset: int = Query(0, ge=0, le=10_000)):
+    history = linux_dictation(request).history
+    try:
+        result = history.page(query=query.strip() or None, offset=offset, limit=15, legacy=True, include_timing=True)
+    except (OSError, ValueError, sqlite3.Error) as failure:
+        raise HTTPException(503, "Could not read dictation history.") from failure
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/portable/dictation/history")
+def change_portable_history(request: Request, change: PortableHistoryChange):
+    dictation = linux_dictation(request)
+    if (change.action == "retention" and change.retention is None) or (change.action == "delete" and not change.ids):
+        raise HTTPException(400, "Choose a retention period or select which dictations to delete.")
+    try:
+        if change.action == "retention":
+            dictation.history.configure(retention=change.retention)
+        else:
+            dictation.history.remove([str(key) for key in change.ids] if change.action == "delete" else None)
+    except (OSError, ValueError, sqlite3.Error) as failure:
+        raise HTTPException(503, "Could not change dictation history.") from failure
+    return dictation.snapshot()
+
+
+@app.post("/api/portable/dictation/{action}")
+async def change_linux_dictation(request: Request, action: Literal[
+                                   "enable", "disable", "paste-shortcut", "configure", "toggle", "allow-paste",
+                                   "disable-paste", "enable-commands"],
+                               terminal: bool = False):
+    from linux_capture import CaptureError
+
+    state = portable_capture_state(request)
+    dictation = linux_dictation(request)
+    async with dictation.control:
+        if action == "disable":
+            if dictation.platform == "wayland" and dictation.command_mode:
+                try:
+                    await dictation.save_command_preference(False)
+                except CaptureError as failure:
+                    raise HTTPException(503, str(failure)) from failure
+            await dictation.disable()
+        elif state.draining:
+            raise HTTPException(409, "Jaro is preparing to restart.")
+        elif action == "paste-shortcut":
+            if dictation.platform == "wayland" and not dictation.keyboard_allowed:
+                raise HTTPException(404, "Automatic paste is unavailable on this desktop.")
+            try:
+                await run_in_threadpool(dictation.history.configure, terminal=terminal)
+            except (OSError, ValueError, sqlite3.Error) as failure:
+                raise HTTPException(503, "Could not save the paste shortcut.") from failure
+            dictation.terminal = terminal
+        elif action in ("configure", "toggle", "allow-paste", "disable-paste", "enable-commands"):
+            if dictation.platform != "wayland":
+                raise HTTPException(404, "This action uses the Wayland desktop.")
+            if action == "disable-paste":
+                await dictation.disable_paste()
+                dictation.feedback = ""
+            elif action == "allow-paste":
+                try:
+                    dictation.allow_paste()
+                except CaptureError as failure:
+                    raise HTTPException(409, str(failure)) from failure
+            elif action == "configure":
+                try:
+                    await dictation.configure_shortcut()
+                except CaptureError as failure:
+                    raise HTTPException(409, str(failure)) from failure
+            elif action == "enable-commands":
+                try:
+                    await dictation.enable_commands()
+                except CaptureError as failure:
+                    raise HTTPException(409, str(failure)) from failure
+            elif dictation.authorizing or dictation.paste_authorizing or dictation.phase not in ("idle", "recording"):
+                raise HTTPException(409, "Finish the current dictation action first.")
+            else:
+                dictation.schedule()
+        else:
+            try:
+                dictation.enable()
+            except CaptureError as failure:
+                raise HTTPException(409, str(failure)) from failure
+    return await run_in_threadpool(dictation.snapshot)
+
+
+@app.get("/api/portable/recording/drafts")
+def portable_recording_drafts(request: Request):
+    from portable_capture import draft_frames
+
+    state = portable_capture_state(request)
+    capture = state.portable_recording
+    with state.library.connection() as db:
+        saved = {row[0] for row in db.execute("SELECT id FROM sessions")}
+    recordings = []
+    for path in state.portable_recording_dir.glob("*.wav"):
+        try:
+            key = str(UUID(path.stem))
+        except ValueError:
+            continue
+        if path.stem != key or key in saved or (capture and str(capture.key) == key):
+            continue
+        if frames := draft_frames(path):
+            meeting = any(track.is_file() for track in source_tracks(path).values())
+            recordings.append({"id": key, "seconds": frames / SAMPLE_RATE, "meeting": meeting})
+    return recordings
+
+
+@app.get("/api/portable/recording/{key}/frames")
+async def portable_recording_frames(request: Request, key: UUID, offset: int = Query(0, ge=0)):
+    state = portable_capture_state(request)
+    capture = state.portable_recording
+    if capture is None or capture.key != key:
+        raise HTTPException(404, "This recording has ended.")
+    start, data = capture.recent(offset)
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Audio-Offset": str(start),
+        "X-Audio-Finished": str(int(capture.worker.done())),
+    }
+    if capture.levels is not None:
+        microphone, computer_audio = capture.levels
+        headers.update({"X-Microphone-Level": f"{microphone:.4f}", "X-Computer-Audio-Level": f"{computer_audio:.4f}"})
+    return Response(data, media_type="application/octet-stream", headers=headers)
+
+
+async def stop_portable_recording(state, key):
+    if state.portable_recording and state.portable_recording.key == key:
+        try:
+            with suppress(OSError):
+                await state.portable_recording.stop()
+        finally:
+            state.portable_recording = None
+
+
+@app.post("/api/portable/recording/{key}/finish")
+async def save_portable_recording(request: Request, key: UUID, name: str = "", diarization: bool = False,
+                                live: bool = False, session: UUID | None = None):
+    from portable_capture import clear_draft, draft_frames, draft_tracks
+
+    state = portable_capture_state(request)
+    languages = transcription_languages(request)
+    async with state.portable_recording_lock:
+        await stop_portable_recording(state, key)
+        if session:
+            state.live_speakers.pop(session, None)
+        with state.library.connection() as db:
+            saved = db.execute("SELECT 1 FROM sessions WHERE id=?", (str(key),)).fetchone()
+        path = state.portable_recording_dir / f"{key}.wav"
+        if saved:
+            with suppress(OSError):
+                clear_draft(path)
+            return JSONResponse({"id": str(key)}, status_code=202)
+        frames = draft_frames(path)
+        if not frames:
+            raise HTTPException(404, "No captured audio is available to save.")
+        tracks = await run_in_threadpool(draft_tracks, path, frames)
+        meeting = any(track.is_file() for track in source_tracks(path).values())
+        accepted = await accept_audio(state, path, name, "audio/wav", languages, True, diarization, live, True,
+                                      stage_id=str(key), tracks=tracks, meeting_provider="Meeting" if meeting else None,
+                                      applies_retention=False)
+        with suppress(OSError):
+            clear_draft(path)
+        return accepted
+
+
+@app.delete("/api/portable/recording/{key}", status_code=204)
+async def discard_portable_recording(request: Request, key: UUID):
+    from portable_capture import clear_draft
+
+    state = portable_capture_state(request)
+    async with state.portable_recording_lock:
+        await stop_portable_recording(state, key)
+        clear_draft(state.portable_recording_dir / f"{key}.wav")
+    return Response(status_code=204)
+
+
 def publish_finished_meeting(state, key):
     events = state.meeting_subscriber
     if events is None:
@@ -949,6 +1452,7 @@ async def process_saved_audio(state, key, source, options, duration, *, tracks=N
     meeting = options.get("meeting", options.get("sourceSpeakerTurns", False))
     languages = options["languageHints"]
     try:
+        vocabulary = await speech_vocabulary(state)
         async with state.insights.model.audio_priority(release_idle=duration is not None and duration >= 15 * 60):
             if tracks:
                 frames = (source.stat().st_size - 44) // 2
@@ -957,13 +1461,14 @@ async def process_saved_audio(state, key, source, options, duration, *, tracks=N
                 block = MAX_SAMPLES * MEETING_RATE // SAMPLE_RATE
                 for start in range(checkpoint, frames, block):
                     length = min(block, frames - start)
-                    result = await decode_meeting(state, tracks, start, length, languages)
+                    result = await decode_meeting(state, tracks, start, length, languages, vocabulary=vocabulary)
                     end = start + length
                     await run_in_threadpool(library.append, key, result, end / MEETING_RATE, next_frame=end)
                 samples = frames * SAMPLE_RATE // MEETING_RATE
             else:
                 samples = await process_mixed_audio(state, key, source, options, duration,
-                                                    checkpoint=checkpoint, progress_only=progress_only, emit=emit)
+                                                    checkpoint=checkpoint, progress_only=progress_only,
+                                                    emit=emit, vocabulary=vocabulary)
         await run_in_threadpool(library.finish, key)
         if meeting:
             await publish_meeting_exports(state, key=key)
@@ -983,7 +1488,7 @@ async def process_saved_audio(state, key, source, options, duration, *, tracks=N
             emit(error=message)
 
 
-async def process_mixed_audio(state, key, source, options, duration, *, checkpoint, progress_only, emit):
+async def process_mixed_audio(state, key, source, options, duration, *, checkpoint, progress_only, emit, vocabulary):
     languages = options["languageHints"]
     meeting = options.get("meeting", options.get("sourceSpeakerTurns", False))
     diarizer = state.diarizer
@@ -994,11 +1499,11 @@ async def process_mixed_audio(state, key, source, options, duration, *, checkpoi
     resume_at = checkpoint // conversion
 
     async def transcript(pcm, offset):
-        result = await decode_pcm(state, pcm, languages, speakers, offset)
+        result = await decode_pcm(state, pcm, languages, speakers, offset, vocabulary=vocabulary)
         end = offset + len(pcm) // 4
         seconds = end / SAMPLE_RATE
-        if meeting and result["text"] and not result["segments"]:
-            result["segments"] = [{"speaker": None, "start": offset / SAMPLE_RATE, "end": seconds, "text": result["text"]}]
+        if meeting:
+            ensure_meeting_turn(result, offset / SAMPLE_RATE, seconds)
         await run_in_threadpool(state.library.append, key, result, seconds, next_frame=end * conversion if meeting else None)
         emit(**({} if progress_only else result), seconds=seconds, duration=duration)
 
@@ -1208,16 +1713,20 @@ async def abandon_stage(request: Request, key: UUID, dictation: bool = False):
 @app.post("/api/native/staging/{key}/submit")
 async def submit_stage(request: Request, key: UUID, recording: bool = False, diarization: bool = False,
                        name: str = "", mime: str = "audio/wav", live: bool = False, recover: bool = False,
-                       notes_draft: UUID | None = None, annotation: bool = False):
+                       notes_draft: UUID | None = None, annotation: bool = False, annotation_location: UUID | None = None):
     check_native(request)
     return await submit_staged_audio(request.app.state, key, transcription_languages(request, require_ready=False), recording=recording,
                                     diarization=diarization, name=name, mime=mime, live=live, recover=recover,
-                                    notes_draft=notes_draft, annotation=annotation)
+                                    notes_draft=notes_draft, annotation=annotation,
+                                    annotation_location=str(annotation_location) if annotation_location else None)
 
 
-async def submit_staged_audio(state, key, languages, *, recording, diarization, name, mime, live, recover, notes_draft=None, annotation=False):
+async def submit_staged_audio(state, key, languages, *, recording, diarization, name, mime, live, recover,
+                              notes_draft=None, annotation=False, annotation_location=None):
     if annotation:
         require_annotation()
+    if annotation_location is not None and not annotation:
+        raise HTTPException(400, "An annotation folder requires a staged annotation.")
     if meetings_managed() and await run_in_threadpool(is_meeting_stage, state.staging / str(key)):
         require_meetings()
     if state.draining:
@@ -1236,12 +1745,14 @@ async def submit_staged_audio(state, key, languages, *, recording, diarization, 
             raise HTTPException(409, "Dictation belongs in My notes.")
         annotation_info = None
         if annotation:
-            if recording or recover or mime != "video/mp4" or notes_draft is not None:
-                raise HTTPException(400, "An annotation requires a staged MP4 movie.")
+            if recording or recover or mime not in ("video/mp4", "audio/wav") or notes_draft is not None:
+                raise HTTPException(400, "An annotation requires a staged MP4 or narration WAV.")
             try:
                 annotation_info = await run_in_threadpool(read_staged_annotation, source)
             except (OSError, ValueError) as error:
                 raise HTTPException(400, str(error)) from error
+            if (mime == "audio/wav") != bool(annotation_info.get("missingVideo")):
+                raise HTTPException(400, "The annotation manifest does not match its media.")
         meeting_provider = meeting_calendar = meeting_started = meeting_title = meeting_microphone_warning = None
         applies_retention = False
         if recover and recording_marker(source).is_file():
@@ -1287,7 +1798,7 @@ async def submit_staged_audio(state, key, languages, *, recording, diarization, 
                                     notes_draft=str(notes_draft) if notes_draft else None, tracks=tracks,
                                     meeting_provider=meeting_provider, meeting_calendar=meeting_calendar,
                                     meeting_started=meeting_started, rolling=rolling, applies_retention=applies_retention,
-                                    annotation=annotation_info, meeting_title=meeting_title,
+                                    annotation=annotation_info, annotation_location=annotation_location, meeting_title=meeting_title,
                                     meeting_microphone_warning=meeting_microphone_warning,
                                     provisional_title=read_meeting_title(source) if meeting_provider else None)
         clear_recording_stage(source)
@@ -1305,15 +1816,29 @@ def clear_recording_stage(path):
             logger.warning("Could not remove completed staging files for %s", path.name)
 
 
-async def dictate_audio(request, source, languages, vocabulary=(), *, sdk=False, measure_inference=False,
+async def dictate_audio(request, source, languages, vocabulary=None, *, sdk=False, measure_inference=False,
                         screen_recording=False, release_frame=None):
+    return await transcribe_dictation(request.app.state, source, languages, vocabulary, sdk=sdk,
+                                     disconnected=request.is_disconnected if sdk else None,
+                                     measure_inference=measure_inference, screen_recording=screen_recording,
+                                     release_frame=release_frame)
+
+
+async def transcribe_linux_dictation(state, source):
+    return await transcribe_dictation(state, source, (), screen_nonspeech=True, measure_inference=True)
+
+
+async def transcribe_dictation(state, source, languages, vocabulary=None, *, sdk=False, disconnected=None,
+                               measure_inference=False, screen_recording=False, screen_nonspeech=False,
+                               release_frame=None):
     parts = []
     samples = 0
     inference_ns = 0
     before_release = None if release_frame is None else release_frame * SAMPLE_RATE // 48_000
-    state = request.app.state
     audio_priority = nullcontext() if getattr(state, "sdk_embedded", False) else state.insights.model.audio_priority()
     try:
+        if vocabulary is None:
+            vocabulary = await speech_vocabulary(state)
         async with audio_priority:
             if screen_recording and not await run_in_threadpool(dictation_has_signal, source, release_frame):
                 return {"text": "", "inferenceMs": 0}
@@ -1321,7 +1846,7 @@ async def dictate_audio(request, source, languages, vocabulary=(), *, sdk=False,
                 async for pcm in blocks:
                     count = len(pcm) // 4
                     if sdk:
-                        if await request.is_disconnected():
+                        if await disconnected():
                             raise ClientDisconnect()
                         samples += count
                         if samples > MAX_AUDIO_SECONDS * SAMPLE_RATE:
@@ -1334,7 +1859,8 @@ async def dictate_audio(request, source, languages, vocabulary=(), *, sdk=False,
                             options["speech_prefix_samples"] = before_release
                         before_release = max(0, before_release - count)
                     result = await decode_pcm(state, pcm, languages, live=True, vocabulary=vocabulary, dictation=not sdk,
-                                              measure_inference=measure_inference, screen_nonspeech=screen_recording, **options)
+                                              measure_inference=measure_inference,
+                                              screen_nonspeech=screen_recording or screen_nonspeech, **options)
                     if measure_inference:
                         inference_ns += result["inferenceNs"]
                     if result["text"].strip():
@@ -1506,6 +2032,8 @@ async def native_dictation(request: Request, key: UUID,
 
 
 def staged_meeting_title_rows(path, through):
+    import fcntl
+
     try:
         with recording_marker(path).open("rb") as marker:
             # A live recorder owns the marker exclusively. Recovery uses its stored title.
@@ -1515,8 +2043,19 @@ def staged_meeting_title_rows(path, through):
             except BlockingIOError:
                 if not recording_metadata(marker).get("meetingProvider"):
                     return []
-        return [{"start": turn["start"] or 0, "text": f"{'You' if turn['speaker'] == 1 else 'Them'}: {turn['text']}"}
-                for _, _, result in read_rolling(path, through) for turn in result["segments"] if turn["text"].strip()]
+        rows = []
+        for _, _, result in read_rolling(path, through):
+            labels = {} if result.get("meetingSpeakerMode") == MIXED_SPEAKERS else SOURCE_LABELS
+            language = result.get("language")
+            if language not in LANGUAGES.values():
+                language = None
+            for turn in result["segments"]:
+                if turn["text"].strip():
+                    speaker = turn["speaker"]
+                    label = labels.get(str(speaker), f"Speaker {speaker}") if speaker else None
+                    rows.append({"start": turn["start"] or 0, "text": f"{label}: {turn['text']}" if label else turn["text"],
+                                 "language": language})
+        return rows
     except OSError:
         return []
 
@@ -1578,13 +2117,8 @@ async def preview_stage(request: Request, key: UUID, start: int = Query(ge=0, le
     if meetings_managed() and (meeting or await run_in_threadpool(is_meeting_stage, request.app.state.staging / str(key))):
         require_meetings()
     languages = transcription_languages(request)
-    path = stage_path(request.app.state, key)
-    if meeting:
-        async with request.app.state.insights.model.audio_priority():
-            try:
-                return await decode_meeting(request.app.state, source_tracks(path), start, frames, languages, live=True)
-            except (OSError, ValueError) as error:
-                raise HTTPException(400, "Could not decode meeting preview audio.") from error
+    state = request.app.state
+    path = stage_path(state, key)
     # Our recorder writes PCM16 mono under a fixed 44-byte WAV header. Only use
     # committed samples; the RIFF length gets its final value after Stop.
     def read_pcm():
@@ -1599,20 +2133,30 @@ async def preview_stage(request: Request, key: UUID, start: int = Query(ge=0, le
     data = await run_in_threadpool(read_pcm)
     if len(data) != frames * 2:
         raise HTTPException(409, "The requested audio has not been written yet.")
+    if meeting and frames < MEETING_FRAME:
+        return {"text": "", "language": None, "segments": [], "words": [], "activity": [], "meetingSpeakerMode": MIXED_SPEAKERS}
     try:
         pcm = await resample_capture(data)
     except ValueError as error:
         raise HTTPException(400, "Could not decode live audio.") from error
-    async with request.app.state.insights.model.audio_priority():
-        return await decode_pcm(request.app.state, pcm, languages, live_speakers(request, key) if diarization else None,
-                                start * SAMPLE_RATE // 48000, live=True, dictation=path.with_suffix(".dictation").is_file())
+    dictation = path.with_suffix(".dictation").is_file()
+    vocabulary = () if dictation else await speech_vocabulary(state)
+    async with state.insights.model.audio_priority():
+        speakers = live_speakers(request, key) if diarization or meeting else None
+        result = await decode_pcm(state, pcm, languages, speakers, start * SAMPLE_RATE // MEETING_RATE,
+                                  live=True, timed_output=meeting, dictation=dictation, vocabulary=vocabulary)
+    if meeting:
+        ensure_meeting_turn(result, start / MEETING_RATE, (start + frames) / MEETING_RATE)
+        result["words"] = [{"speaker": None, **word} for word in result["words"]]
+        result.update(activity=[], meetingSpeakerMode=MIXED_SPEAKERS)
+    return result
 
 
 def start_in_background(*, open_page: bool):
     log = log_directory() / PROCESS_LOG
     with startup_lock():
         if not running_engine():
-            with open_log(PROCESS_LOG, append=True) as output:
+            with open_log(PROCESS_LOG, mode="a+b", create=True) as output:
                 process = subprocess.Popen(
                     [sys.executable, str(Path(__file__).resolve()), "--serve"], cwd=WORKSPACE_ROOT,
                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
@@ -1635,8 +2179,24 @@ def start_in_background(*, open_page: bool):
 
 @app.get("/", include_in_schema=False)
 @app.get("/index.html", include_in_schema=False)
-def workspace_page():
-    return FileResponse(DIST / "index.html", headers={"Cache-Control": "no-store"})
+def workspace_page(request: Request):
+    headers = {"Cache-Control": "no-store"}
+    try:
+        html = (DIST / "index.html").read_bytes()
+    except OSError:
+        return Response("Jaro’s workspace is unavailable. Quit Jaro and reopen the installed app.",
+                        status_code=503, media_type="text/plain", headers=headers)
+    if getattr(request.app.state, "portable_workspace", False):
+        html = html.replace(b"<html", b"<html data-jaro-portable-workspace", 1)
+        if request.app.state.portable_recorder is not None:
+            html = html.replace(b"<html ", b"<html data-jaro-portable-audio ", 1)
+        if sys.platform == "linux":
+            html = html.replace(b"<html ", b'<html data-jaro-linux-audio ', 1)
+            if request.app.state.linux_dictation is not None:
+                html = html.replace(b"<html ", b'<html data-jaro-linux-dictation ', 1)
+                if request.app.state.linux_dictation.platform == "x11":
+                    html = html.replace(b"<html ", b'<html data-jaro-x11-dictation ', 1)
+    return Response(html, media_type="text/html", headers=headers)
 
 
 def main():
@@ -1647,6 +2207,7 @@ def main():
     parser.add_argument("--background", action="store_true", help="Start a detached server and open the browser.")
     parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--embedded", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--portable-workspace", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.setup_model:
         os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -1663,6 +2224,26 @@ def main():
             raise SystemExit(run_embedded(sdk_router, SpeechInference, RumbleModel))
         except (OSError, RuntimeError) as error:
             parser.exit(1, str(error) + "\n")
+    if args.portable_workspace:
+        from portable_workspace import configure_workspace
+        from sdk_embedded import run_owned_service
+
+        if not (DIST / "index.html").is_file():
+            parser.error("Build Jaro’s workspace before launching the desktop host.")
+
+        def build_app(_scratch, record):
+            global URL
+            URL = f"http://{HOST}:{record['port']}"
+            configure_workspace(app, record, URL)
+            app.mount("/", StaticFiles(directory=DIST, html=True), name="ui")
+            return app
+
+        try:
+            raise SystemExit(run_owned_service(build_app))
+        except (OSError, RuntimeError) as error:
+            parser.exit(1, str(error) + "\n")
+    if os.name == "nt":
+        parser.error("Run jardctl transcribe or start the embedded speech service on Windows.")
     if not (DIST / "index.html").is_file():
         parser.error("Run Setup Jaro to build the browser interface.")
     try:
@@ -1690,6 +2271,7 @@ def main():
         except OSError as error:
             parser.exit(1, f"Cannot start Jaro at {URL}: {error}\n")
         app.state.sdk_port = listener.getsockname()[1]
+        Thread(target=maintain_logs, name="jaro-log-retention", daemon=True).start()
         if not args.no_open and not args.serve:
             def open_when_ready():
                 while not server.started and not server.should_exit:

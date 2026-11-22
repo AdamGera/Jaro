@@ -6,16 +6,15 @@ from http.client import HTTPConnection, HTTPException as HTTPProtocolError
 import json
 import os
 from pathlib import Path
+from queue import Empty, Queue
 import re
 import secrets
-from selectors import DefaultSelector, EVENT_READ
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
-import time
 from threading import Event, Thread
 from urllib.parse import urlencode
 
@@ -28,11 +27,40 @@ SDK_PATH = "/api/sdk/v1"
 
 
 def run_embedded(router, inference_factory, model_factory):
+    from saved_dictations import shared_vocabulary
+
+    def build_app(root, record):
+        @asynccontextmanager
+        async def lifespan(app):
+            app.state.embedded_vocabulary = await asyncio.to_thread(shared_vocabulary)
+            app.state.model = await asyncio.to_thread(model_factory)
+            app.state.status = "ready"
+            yield
+
+        app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+        app.include_router(router)
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1"])
+        app.state.sdk = record
+        app.state.sdk_embedded = True
+        app.state.sdk_upload_root = root
+        app.state.inference = inference_factory()
+        app.state.sdk_pending = 0
+        app.state.draining = False
+        return app
+
+    return run_owned_service(build_app)
+
+
+def run_owned_service(build_app):
     import uvicorn
 
     if os.isatty(0) or os.isatty(1):
         raise RuntimeError("Start the embedded Jard helper with piped stdin and stdout.")
-    if os.getpgrp() != os.getpid():
+    if os.name == "nt":
+        from windows_job import own_process_tree
+
+        own_process_tree()
+    elif os.getpgrp() != os.getpid():
         os.setsid()
     finished = Event()
     try:
@@ -48,22 +76,10 @@ def run_embedded(router, inference_factory, model_factory):
             os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(root / "torch")
             record = sdk_identity(root, port)
 
-            @asynccontextmanager
-            async def lifespan(app):
-                app.state.model = await asyncio.to_thread(model_factory)
-                app.state.status = "ready"
-                yield
-
-            app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
-            app.include_router(router)
-            app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1"])
-            app.state.sdk = record
-            app.state.sdk_embedded = True
-            app.state.sdk_upload_root = root
-            app.state.inference = inference_factory()
-            app.state.sdk_pending = 0
-            app.state.draining = False
+            app = build_app(root, record)
             server = uvicorn.Server(uvicorn.Config(app, access_log=False, ws="none", timeout_graceful_shutdown=3))
+            app.state.request_shutdown = lambda: setattr(server, "should_exit", True)
+            app.state.is_shutting_down = lambda: server.should_exit
 
             def watch_parent():
                 try:
@@ -74,6 +90,8 @@ def run_embedded(router, inference_factory, model_factory):
                 server.should_exit = True
                 if not finished.wait(5):
                     shutil.rmtree(root, ignore_errors=True)
+                    if os.name == "nt":
+                        os._exit(1)  # Windows closes the job handle and ends the decoder processes.
                     os.killpg(os.getpgrp(), signal.SIGKILL)
 
             def report_ready():
@@ -97,20 +115,32 @@ def run_embedded(router, inference_factory, model_factory):
 
 
 def read_ready(process, timeout):
-    data = bytearray()
-    deadline = time.monotonic() + timeout
-    with DefaultSelector() as selector:
-        selector.register(process.stdout, EVENT_READ)
-        while b"\n" not in data:
-            if not selector.select(max(0, deadline - time.monotonic())):
-                raise RuntimeError("The embedded Jard helper did not become ready.")
-            block = os.read(process.stdout.fileno(), 4097 - len(data))
-            if not block:
-                raise RuntimeError("The embedded Jard helper stopped before it was ready. Check that Jard’s model is installed.")
-            data.extend(block)
-            if len(data) > 4096:
-                raise RuntimeError("Jard returned an invalid embedded startup record.")
+    output = Queue(maxsize=1)
+
+    def read():
+        try:
+            data = bytearray()
+            while b"\n" not in data and len(data) < 4097:
+                block = process.stdout.read1(4097 - len(data))
+                if not block:
+                    break
+                data.extend(block)
+            output.put(data)
+        except OSError as error:
+            output.put(error)
+
+    # Windows selectors can only wait on sockets. The owner closes or kills
+    # the child on timeout, which also ends this pipe read.
+    Thread(target=read, daemon=True).start()
     try:
+        data = output.get(timeout=timeout)
+    except Empty:
+        raise RuntimeError("The embedded Jard helper did not become ready.") from None
+    if isinstance(data, OSError) or (len(data) <= 4096 and b"\n" not in data):
+        raise RuntimeError("The embedded Jard helper stopped before it was ready. Check that Jard’s model is installed.")
+    try:
+        if len(data) > 4096:
+            raise ValueError("oversized handshake")
         line, _, rest = data.partition(b"\n")
         record = json.loads(line)
         port = record["port"]
@@ -129,17 +159,27 @@ def owned_transcriber():
     helper = os.environ.get("JARD_EMBEDDED_HELPER")
     command = ([helper, "service", "--embedded"] if helper else
                [sys.executable, str(Path(__file__).with_name("server.py")), "--embedded"])
-    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                          start_new_session=True) as process:
+    with owned_service(command) as (record, _):
+        yield record
+
+
+@contextmanager
+def owned_service(command, *, stderr=subprocess.DEVNULL, env=None):
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+                          start_new_session=os.name != "nt", env=env,
+                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0) as process:
         try:
-            yield read_ready(process, 60)
+            yield read_ready(process, 60), process
         finally:
             process.stdin.close()
             try:
                 process.wait(timeout=5.5)
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    if os.name == "nt":
+                        process.kill()
+                    else:
+                        os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 try:
@@ -148,18 +188,22 @@ def owned_transcriber():
                     raise RuntimeError("The owned Jard helper did not exit.") from error
 
 
+def verify_service(connection, record):
+    challenge = secrets.token_hex(16)
+    connection.request("GET", SDK_PATH + "/identify?" + urlencode({"challenge": challenge}))
+    identity = connection.getresponse()
+    received = json.loads(identity.read(4096)).get("proof")
+    if (identity.status != 200 or not isinstance(received, str)
+            or not hmac.compare_digest(received, sdk_proof(record, challenge)) or connection.sock is None):
+        raise RuntimeError("Could not verify the local Jaro transcription service.")
+    # Send credentials and audio on the socket that proved its identity.
+    connection.auto_open = False
+
+
 def sdk_transcription(record, audio, languages):
     connection = HTTPConnection("127.0.0.1", record["port"], timeout=3)
     try:
-        challenge = secrets.token_hex(16)
-        connection.request("GET", SDK_PATH + "/identify?" + urlencode({"challenge": challenge}))
-        identity = connection.getresponse()
-        received = json.loads(identity.read(4096)).get("proof")
-        if (identity.status != 200 or not isinstance(received, str)
-                or not hmac.compare_digest(received, sdk_proof(record, challenge)) or connection.sock is None):
-            raise RuntimeError("Could not verify the local Jaro transcription service.")
-        # HTTPConnection must use the proven socket or fail before sending audio.
-        connection.auto_open = False
+        verify_service(connection, record)
         connection.sock.settimeout(180)
         query = urlencode({"language": languages, "speech_screen": "true"}, doseq=True)
         route = SDK_PATH + "/transcriptions?" + query
