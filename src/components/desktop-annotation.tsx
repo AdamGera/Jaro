@@ -1,8 +1,8 @@
 import { useInterfaceLanguage } from "@/interface-language"
 import { useEffect, useRef, useState } from "react"
-import { AppWindow, Crop, FolderOpen, HardDrive, History, Keyboard, ScreenShare, Smartphone, Square, X, type LucideIcon } from "lucide-react"
+import { AppWindow, AudioLines, Crop, FolderOpen, HardDrive, History, Keyboard, Mic, ScreenShare, Smartphone, Square, X, type LucideIcon } from "lucide-react"
 import { AlertDialog } from "radix-ui"
-import type { DesktopAnnotation, DesktopAnnotationSource, DesktopBridge } from "@/desktop"
+import type { DesktopAnnotation, DesktopAnnotationAction, DesktopAnnotationSource, DesktopBridge } from "@/desktop"
 import type { SystemDictationControls } from "@/system-dictation"
 import { AnnotationAccess } from "./annotation-access"
 import { SettingGroup, SettingRow } from "./settings-rows"
@@ -39,13 +39,13 @@ export function DesktopAnnotationControls({ native, busy, languages, controls, a
     return () => { active = false; window.removeEventListener("native-sdk:jard-annotation", receive) }
   }, [native])
 
-  async function act(action: "start" | "stop" | "cancel" | "reveal", source?: DesktopAnnotationSource) {
-    if (action === "start" && annotation?.managed) return
+  async function act(command: DesktopAnnotationAction) {
+    if (command.action === "start" && annotation?.managed) return
     setError("")
     setPending(true)
     const observed = revision.current
     try {
-      const result = await native.request("annotation", { action, languages, source })
+      const result = await native.request("annotation", command)
       if (observed === revision.current) setAnnotation(result)
     } catch (failure) { setError(failure instanceof Error ? failure.message : "Could not open screen annotation.") }
     finally { setPending(false) }
@@ -56,6 +56,7 @@ export function DesktopAnnotationControls({ native, busy, languages, controls, a
   const finalizing = annotation.phase === "saving" || annotation.phase === "cancelling"
   const notice = error || (!annotation.busy && annotation.message)
   const enabled = controls.status?.annotationEnabled === undefined || !!controls.status.annotationEnabled
+  const audio = annotation.audio
   return <div className="dictation-settings dictation-preferences annotation-settings">
     <SettingGroup id="annotation-title" title={t("Screen Annotation")}>
       {!annotation.managed && <SettingRow icon={ScreenShare} title={t("Enable Annotate")}
@@ -78,7 +79,7 @@ export function DesktopAnnotationControls({ native, busy, languages, controls, a
       {annotation.busy ? <SettingRow icon={ScreenShare} label={false} title={t("Current capture")}
         detail={annotation.message && <span role="status">{t(annotation.message)}</span>}>
         <div className="dictation-row-actions">
-          <Button size="sm" variant="outline" disabled={pending || finalizing} onClick={() => void act(choosing ? "cancel" : "stop")}>
+          <Button size="sm" variant="outline" disabled={pending || finalizing} onClick={() => void act({ action: choosing ? "cancel" : "stop" })}>
             {choosing ? <X aria-hidden="true" /> : <Square aria-hidden="true" />}
             {t(choosing ? "Cancel" : annotation.phase === "saving" ? "Saving…" : finalizing ? "Discarding…" : "Stop & Save")}
           </Button>
@@ -88,12 +89,24 @@ export function DesktopAnnotationControls({ native, busy, languages, controls, a
       </SettingRow> : (enabled || !!annotation.managed) && sources.map(({ source, icon, title, detail, action }) =>
         <SettingRow key={source} icon={icon} title={t(title)} detail={t(detail)} find={`${t(action)} ${t(detail)}`} label={false}>
           <Button size="sm" variant="outline" disabled={pending || (busy && !allowConcurrentCapture) || !!annotation.managed || controls.status?.shortcutTarget === "annotate"}
-            onClick={() => void act("start", source)}>{t(action)}</Button>
+            onClick={() => void act({ action: "start", source, languages })}>{t(action)}</Button>
         </SettingRow>)}
       {!!annotation.recoverable && <SettingRow icon={FolderOpen} title={t("Recovered recording")} label={false}>
-        <Button size="sm" variant="outline" disabled={pending} onClick={() => void act("reveal")}>{t("Show Recording in Finder")}</Button>
+        <Button size="sm" variant="outline" disabled={pending} onClick={() => void act({ action: "reveal" })}>{t("Show Recording in Finder")}</Button>
       </SettingRow>}
     </SettingGroup>
+    {!annotation.managed && enabled && audio && <SettingGroup id="annotation-audio" title={t("Recording audio")}>
+      <SettingRow icon={Mic} title={t("Microphone narration")} detail={t("Include your voice from the selected microphone.")}>
+        {labels => <input {...labels} type="checkbox" role="switch" checked={audio.microphone}
+          disabled={pending || busy || !!annotation.busy}
+          onChange={event => void act({ ...audio, action: "setAudio", microphone: event.currentTarget.checked })} />}
+      </SettingRow>
+      <SettingRow icon={AudioLines} title={t("Mac audio")} detail={t("Include computer sound in display, window, and area recordings.")}>
+        {labels => <input {...labels} type="checkbox" role="switch" checked={audio.computerAudio}
+          disabled={pending || busy || !!annotation.busy}
+          onChange={event => void act({ ...audio, action: "setAudio", computerAudio: event.currentTarget.checked })} />}
+      </SettingRow>
+    </SettingGroup>}
     {!annotation.managed && enabled && <AnnotationAccess native={native} busy={busy || pending || !!annotation.busy} />}
     {!annotation.managed && <AnnotationShortcut native={native} controls={controls} busy={busy || pending || !!annotation.busy} />}
     {!annotation.managed && <AnnotationStorage native={native} busy={busy || pending || !!annotation.busy} />}
@@ -105,7 +118,7 @@ export function DesktopAnnotationControls({ native, busy, languages, controls, a
           <AlertDialog.Description>{t("The current recording and drawings will be deleted.")}</AlertDialog.Description>
           <div className="note-language-actions">
             <AlertDialog.Cancel asChild><Button variant="ghost" size="sm">{t("Keep recording")}</Button></AlertDialog.Cancel>
-            <AlertDialog.Action asChild><Button variant="destructive" size="sm" onClick={() => void act("cancel")}>{t("Discard")}</Button></AlertDialog.Action>
+            <AlertDialog.Action asChild><Button variant="destructive" size="sm" onClick={() => void act({ action: "cancel" })}>{t("Discard")}</Button></AlertDialog.Action>
           </div>
         </AlertDialog.Content>
       </AlertDialog.Portal>

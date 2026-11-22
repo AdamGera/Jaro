@@ -1,4 +1,6 @@
 """Bounded native annotation artifacts published with their recorded Session."""
+import asyncio
+from contextlib import suppress
 import json
 import math
 from pathlib import Path, PurePosixPath
@@ -19,6 +21,36 @@ MISSING_VIDEO_REASONS = {
 
 def staged_annotation_paths(source):
     return {kind: source.with_suffix(extension) for kind, (_, extension, _, _) in ASSETS.items()}
+
+
+async def annotation_movie_info(path, probe="ffprobe"):
+    process = await asyncio.create_subprocess_exec(
+        probe, "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov",
+        "-show_entries", "stream=codec_type,duration:format=duration", "-of", "json", path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        output, _ = await process.communicate()
+    finally:
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+    if process.returncode:
+        raise ValueError("The annotation video could not be opened.")
+    try:
+        metadata = json.loads(output)
+        streams = metadata["streams"]
+        video = next(stream for stream in streams if stream["codec_type"] == "video")
+        duration = video.get("duration")
+        if not duration or duration == "N/A":
+            duration = metadata.get("format", {}).get("duration")
+        duration = float(duration)
+    except (ValueError, TypeError, KeyError, StopIteration) as error:
+        raise ValueError("The annotation video could not be opened.") from error
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("The annotation video has no valid duration.")
+    return duration, any(stream["codec_type"] == "audio" for stream in streams)
 
 
 def annotation_input(path, kind):

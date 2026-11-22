@@ -28,7 +28,7 @@ import annotation_retention
 import annotation_storage
 import meeting_exports
 from session_store import SHUTDOWN_INTERRUPTION, MissingSession, SessionStore, open_library
-from annotation_assets import read_staged_annotation, staged_annotation_paths
+from annotation_assets import annotation_movie_info, read_staged_annotation, staged_annotation_paths
 from diagnostics import PROCESS_LOG, log_directory, maintain_logs, open_log
 from native_recordings import capture_active, is_meeting_stage, list_drafts, meeting_title_path, read_meeting_title, read_wav_header, recording_marker, recording_metadata, recover_wav, recover_tracks, source_tracks
 from managed_preferences import ManagedFeatureError, annotate_managed, meetings_managed, require_annotation, require_meetings
@@ -121,14 +121,16 @@ async def load_model(app: FastAPI):
         app.state.status = "ready"
 
 
-async def open_linux_dictation(state, root):
+async def open_portable_dictation(state, root):
     try:
-        if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+        if sys.platform == "win32":
+            from windows_dictation import WindowsDictation as Dictation, helper_path as supported
+        elif os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
             from wayland_dictation import WaylandDictation as Dictation, supported
         else:
             from x11_dictation import X11Dictation as Dictation, supported
     except ImportError:
-        logger.info("The Linux dictation desktop adapter is unavailable.", exc_info=True)
+        logger.info("The system dictation adapter is unavailable.", exc_info=True)
         return None
     if not supported():
         return None
@@ -138,8 +140,8 @@ async def open_linux_dictation(state, root):
     try:
         await run_in_threadpool(history.initialize)
     except (OSError, ValueError, sqlite3.Error):
-        logger.exception("Linux dictation history could not open.")
-    return Dictation(state, transcribe_linux_dictation, history)
+        logger.exception("Portable dictation history could not open.")
+    return Dictation(state, transcribe_portable_dictation, history)
 
 
 @asynccontextmanager
@@ -167,13 +169,12 @@ async def lifespan(app: FastAPI):
         app.state.library = library
         app.state.portable_recorder = recorder
         app.state.portable_recording = None
-        app.state.linux_dictation = None
+        app.state.portable_dictation = None
         if recorder is not None:
             app.state.portable_recording_lock = asyncio.Lock()
             app.state.portable_recording_dir = root / "microphone-drafts"
             app.state.portable_recording_dir.mkdir(mode=0o700, exist_ok=True)
-        if linux_audio:
-            app.state.linux_dictation = await open_linux_dictation(app.state, root)
+            app.state.portable_dictation = await open_portable_dictation(app.state, root)
         app.state.native_token = os.urandom(32).hex() if portable else install_token(root)
         app.state.staging = root / "staging"
         app.state.staging.mkdir(mode=0o700, exist_ok=True)
@@ -199,8 +200,8 @@ async def lifespan(app: FastAPI):
         background = []
         if not portable:
             background.append(asyncio.create_task(watch_idle(app)))
-        if state.linux_dictation is not None:
-            background.append(asyncio.create_task(expire_portable_dictations(state.linux_dictation.history)))
+        if state.portable_dictation is not None:
+            background.append(asyncio.create_task(expire_portable_dictations(state.portable_dictation.history)))
         if not portable or recorder is not None:
             # Recover drafts from this startup only, while the native recorder owns new drafts.
             state.startup_stranded = set() if portable else {marker.stem for marker in state.staging.glob("*.recording")}
@@ -210,12 +211,12 @@ async def lifespan(app: FastAPI):
         try:
             if getattr(state, "sdk_port", None):
                 state.sdk = publish_sdk(root, state.sdk_port)
-            if state.linux_dictation is not None and state.linux_dictation.platform == "wayland":
+            if state.portable_dictation is not None and state.portable_dictation.platform == "wayland":
                 from wayland_dictation_commands import command_prefix, listen
 
                 try:
-                    command_listener = await listen(root, state.linux_dictation.run_command)
-                    await state.linux_dictation.restore_command_preference(command_prefix(root))
+                    command_listener = await listen(root, state.portable_dictation.run_command)
+                    await state.portable_dictation.restore_command_preference(command_prefix(root))
                 except OSError:
                     logger.warning("Could not start the Wayland dictation command listener.", exc_info=True)
             yield
@@ -223,8 +224,8 @@ async def lifespan(app: FastAPI):
             if command_listener is not None:
                 command_listener.close()
                 await command_listener.wait_closed()
-            if app.state.linux_dictation is not None:
-                await app.state.linux_dictation.close()
+            if app.state.portable_dictation is not None:
+                await app.state.portable_dictation.close()
             if app.state.portable_recording:
                 with suppress(OSError):
                     await app.state.portable_recording.stop()
@@ -1125,7 +1126,11 @@ async def accept_audio(state, source, name, mime, languages, recording, diarizat
     if state.draining:
         raise HTTPException(409, "Jard is preparing to restart.")
     try:
-        duration = await audio_duration(source)
+        video_only = False
+        if annotation and mime == "video/mp4":
+            video_duration, has_audio = await annotation_movie_info(source)
+            video_only = not has_audio
+        duration = video_duration if video_only else await audio_duration(source)
         limit = MAX_AUDIO_SECONDS + int(recording)
         if duration is not None and duration > limit:
             raise ValueError(DURATION_ERROR)
@@ -1153,7 +1158,8 @@ async def accept_audio(state, source, name, mime, languages, recording, diarizat
             name = meeting_calendar["title"].translate(str.maketrans({"/": "／", "\\": "＼", ":": "꞉"}))
         key, source = await run_in_threadpool(library.create, source, name, mime, options, duration,
                                               key=stage_id, notes_draft=notes_draft, tracks=tracks, rolling=rolling,
-                                              annotation=annotation, annotation_location=annotation_location)
+                                              annotation=annotation, annotation_location=annotation_location,
+                                              video_only=video_only)
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
     except annotation_storage.Unavailable:
@@ -1163,6 +1169,9 @@ async def accept_audio(state, source, name, mime, languages, recording, diarizat
     except OSError as error:
         logger.exception("Could not prepare audio.")
         raise HTTPException(500, "Could not prepare audio. Check available disk space.") from error
+
+    if video_only:
+        return JSONResponse({"id": key}, status_code=202)
 
     queue = asyncio.Queue()
     connected = stage_id is None
@@ -1214,7 +1223,7 @@ async def start_portable_recording(request: Request, mode: Literal["mic", "syste
     state = portable_capture_state(request)
     transcription_languages(request)
     async with state.portable_recording_lock:
-        if state.draining or state.portable_recording or (state.linux_dictation and state.linux_dictation.busy):
+        if state.draining or state.portable_recording or (state.portable_dictation and state.portable_dictation.busy):
             raise HTTPException(409, "Finish or recover the current recording first.")
         key = uuid4()
         capture = state.portable_recorder(key, state.portable_recording_dir / f"{key}.wav", mode)
@@ -1227,12 +1236,12 @@ async def start_portable_recording(request: Request, mode: Literal["mic", "syste
 
 
 @app.get("/api/portable/dictation")
-def linux_dictation_status(request: Request):
-    return JSONResponse(linux_dictation(request).snapshot(), headers={"Cache-Control": "no-store"})
+def portable_dictation_status(request: Request):
+    return JSONResponse(portable_dictation(request).snapshot(), headers={"Cache-Control": "no-store"})
 
 
-def linux_dictation(request):
-    dictation = portable_capture_state(request).linux_dictation
+def portable_dictation(request):
+    dictation = portable_capture_state(request).portable_dictation
     if dictation is None:
         raise HTTPException(404, "System dictation is unavailable on this desktop.")
     return dictation
@@ -1244,7 +1253,7 @@ async def expire_portable_dictations(history):
         try:
             await run_in_threadpool(history.expire)
         except (OSError, ValueError, sqlite3.Error):
-            logger.warning("Could not expire Linux dictation history.", exc_info=True)
+            logger.warning("Could not expire Portable dictation history.", exc_info=True)
 
 
 class PortableHistoryChange(BaseModel):
@@ -1258,7 +1267,7 @@ class PortableHistoryChange(BaseModel):
 @app.get("/api/portable/dictation/history")
 def portable_history(request: Request, query: str = Query("", max_length=512),
                      offset: int = Query(0, ge=0, le=10_000)):
-    history = linux_dictation(request).history
+    history = portable_dictation(request).history
     try:
         result = history.page(query=query.strip() or None, offset=offset, limit=15, legacy=True, include_timing=True)
     except (OSError, ValueError, sqlite3.Error) as failure:
@@ -1268,7 +1277,7 @@ def portable_history(request: Request, query: str = Query("", max_length=512),
 
 @app.post("/api/portable/dictation/history")
 def change_portable_history(request: Request, change: PortableHistoryChange):
-    dictation = linux_dictation(request)
+    dictation = portable_dictation(request)
     if (change.action == "retention" and change.retention is None) or (change.action == "delete" and not change.ids):
         raise HTTPException(400, "Choose a retention period or select which dictations to delete.")
     try:
@@ -1282,14 +1291,14 @@ def change_portable_history(request: Request, change: PortableHistoryChange):
 
 
 @app.post("/api/portable/dictation/{action}")
-async def change_linux_dictation(request: Request, action: Literal[
+async def change_portable_dictation(request: Request, action: Literal[
                                    "enable", "disable", "paste-shortcut", "configure", "toggle", "allow-paste",
                                    "disable-paste", "enable-commands"],
                                terminal: bool = False):
-    from linux_capture import CaptureError
+    from portable_capture import CaptureError
 
     state = portable_capture_state(request)
-    dictation = linux_dictation(request)
+    dictation = portable_dictation(request)
     async with dictation.control:
         if action == "disable":
             if dictation.platform == "wayland" and dictation.command_mode:
@@ -1335,7 +1344,10 @@ async def change_linux_dictation(request: Request, action: Literal[
                 dictation.schedule()
         else:
             try:
-                dictation.enable()
+                if dictation.platform == "windows":
+                    await dictation.enable()
+                else:
+                    dictation.enable()
             except CaptureError as failure:
                 raise HTTPException(409, str(failure)) from failure
     return await run_in_threadpool(dictation.snapshot)
@@ -1824,7 +1836,7 @@ async def dictate_audio(request, source, languages, vocabulary=None, *, sdk=Fals
                                      release_frame=release_frame)
 
 
-async def transcribe_linux_dictation(state, source):
+async def transcribe_portable_dictation(state, source):
     return await transcribe_dictation(state, source, (), screen_nonspeech=True, measure_inference=True)
 
 
@@ -2190,11 +2202,13 @@ def workspace_page(request: Request):
         html = html.replace(b"<html", b"<html data-jaro-portable-workspace", 1)
         if request.app.state.portable_recorder is not None:
             html = html.replace(b"<html ", b"<html data-jaro-portable-audio ", 1)
+        if request.app.state.portable_dictation is not None:
+            html = html.replace(b"<html ", b'<html data-jaro-portable-dictation ', 1)
         if sys.platform == "linux":
             html = html.replace(b"<html ", b'<html data-jaro-linux-audio ', 1)
-            if request.app.state.linux_dictation is not None:
+            if request.app.state.portable_dictation is not None:
                 html = html.replace(b"<html ", b'<html data-jaro-linux-dictation ', 1)
-                if request.app.state.linux_dictation.platform == "x11":
+                if request.app.state.portable_dictation.platform == "x11":
                     html = html.replace(b"<html ", b'<html data-jaro-x11-dictation ', 1)
     return Response(html, media_type="text/html", headers=headers)
 

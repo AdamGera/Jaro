@@ -17,6 +17,12 @@ export const RECORDING_MODES: Record<RecordingMode, string> = {
 }
 
 export type DesktopAnnotationSource = "display" | "window" | "area" | "phone"
+export type DesktopScreenshotSource = Exclude<DesktopAnnotationSource, "phone">
+export type DesktopAnnotationAudio = { microphone: boolean; computerAudio: boolean }
+export type DesktopAnnotationAction =
+  | { action: "status" | "stop" | "cancel" | "reveal" }
+  | { action: "start"; languages?: string[]; source?: DesktopAnnotationSource }
+  | ({ action: "setAudio" } & DesktopAnnotationAudio)
 
 export type DesktopAnnotation = {
   phase: "idle" | "starting" | "picking" | "selecting" | "recording" | "saving" | "cancelling" | "finished" | "cancelled" | "error"
@@ -25,6 +31,8 @@ export type DesktopAnnotation = {
   recoverable: boolean
   busy: boolean
   managed?: boolean
+  enabled?: boolean
+  audio?: DesktopAnnotationAudio
 }
 
 export type DesktopAnnotationAccess = {
@@ -185,7 +193,8 @@ export type WindowNavigation = {
 type Requests = {
   microphoneLevel: undefined
   windowNavigation: undefined
-  annotation: { action: "status" | "start" | "stop" | "cancel" | "reveal"; languages?: string[]; source?: DesktopAnnotationSource }
+  annotation: DesktopAnnotationAction
+  sessionScreenshot: { source: DesktopScreenshotSource }
   annotationAccess: { action: "status" | "allow" | "repair" | "restart" }
   annotationStorage: { action: "status" | "choose" | "reveal" | "reset" }
   copyAnnotation: { id: string }
@@ -232,6 +241,7 @@ type Responses = {
   microphoneLevel: { peak: number | null }
   windowNavigation: { navigation?: WindowNavigation }
   annotation: DesktopAnnotation
+  sessionScreenshot: { jpeg?: string }
   annotationAccess: DesktopAnnotationAccess
   annotationStorage: { folder: string; custom: boolean; available: boolean }
   copyAnnotation: { includedImage: boolean }

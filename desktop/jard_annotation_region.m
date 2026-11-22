@@ -43,7 +43,7 @@ NSRect JardAnnotationControlsRect(NSRect available, NSRect area) {
 @property(nonatomic, copy) void (^complete)(JardRegionChoice, NSRect);
 @property(nonatomic) NSPoint anchor;
 @property(nonatomic) NSRect selection;
-@property(nonatomic) BOOL moved, dragging;
+@property(nonatomic) BOOL moved, dragging, screenshot;
 @property(nonatomic, strong) NSTextField *instruction;
 - (void)confirmSelection;
 - (NSString *)selectionTitle;
@@ -87,7 +87,8 @@ NSRect JardAnnotationControlsRect(NSRect available, NSRect area) {
     self.dragging = YES;
     self.moved = NO;
     self.selection = NSZeroRect;
-    self.instruction.stringValue = JardLocalized(@"Drag an area or click to record the display");
+    self.instruction.stringValue = JardLocalized(self.screenshot ? @"Drag an area or click to capture the display"
+        : @"Drag an area or click to record the display");
     self.needsDisplay = YES;
 }
 
@@ -198,10 +199,12 @@ static JardSelectionPanel *selectionPanel(NSScreen *screen, JardRegionView *view
     return panel;
 }
 
-JardSelectionPanel *JardAnnotationRegionPanel(NSScreen *screen, void (^complete)(JardRegionChoice, NSRect)) {
+JardSelectionPanel *JardAnnotationRegionPanel(NSScreen *screen, BOOL screenshot, void (^complete)(JardRegionChoice, NSRect)) {
     JardRegionView *view = [[JardRegionView alloc] initWithFrame:NSZeroRect];
     view.complete = complete;
-    return selectionPanel(screen, view, @"Select an area to annotate", @"Drag an area or click to record the display");
+    view.screenshot = screenshot;
+    return selectionPanel(screen, view, screenshot ? @"Select an area to capture" : @"Select an area to annotate",
+        screenshot ? @"Drag an area or click to capture the display" : @"Drag an area or click to record the display");
 }
 
 static CGRect windowBounds(NSDictionary *window) {
@@ -248,7 +251,9 @@ static NSScreen *screenAtPointer(NSPoint point) {
     NSDictionary *hovered = JardAnnotationWindowAtPoint(quartz, stack, self.owners);
     if (hovered != self.hovered && ![hovered isEqual:self.hovered]) {
         self.hovered = hovered;
-        self.instruction.stringValue = JardLocalized(hovered ? @"Click to record the highlighted window" : @"Click to record this display");
+        NSString *hint = self.screenshot ? (hovered ? @"Click to capture the highlighted window" : @"Point to a window to capture")
+            : (hovered ? @"Click to record the highlighted window" : @"Click to record this display");
+        self.instruction.stringValue = JardLocalized(hint);
         self.needsDisplay = YES;
     }
     NSRect bounds = JardAnnotationAppKitRect(windowBounds(hovered), height);
@@ -270,6 +275,7 @@ static NSScreen *screenAtPointer(NSPoint point) {
     NSPoint location = NSEvent.mouseLocation;
     if (!screenAtPointer(location)) return;
     CGPoint pointer = [self refreshAtPointer:location];
+    if (self.screenshot && !self.hovered) return;
     NSNumber *window = self.hovered[(__bridge NSString *)kCGWindowNumber];
     NSNumber *owner = self.hovered[(__bridge NSString *)kCGWindowOwnerPID];
     void (^choose)(BOOL, CGWindowID, pid_t, CGPoint) = self.choose;
@@ -287,7 +293,7 @@ static NSScreen *screenAtPointer(NSPoint point) {
 }
 @end
 
-JardSelectionPanel *JardAnnotationWindowPanel(NSDictionary<NSNumber *, NSNumber *> *owners,
+JardSelectionPanel *JardAnnotationWindowPanel(NSDictionary<NSNumber *, NSNumber *> *owners, BOOL screenshot,
     void (^complete)(BOOL, CGWindowID, pid_t, CGPoint)) {
     NSPoint point = NSEvent.mouseLocation;
     NSScreen *screen = screenAtPointer(point) ?: NSScreen.mainScreen;
@@ -295,7 +301,9 @@ JardSelectionPanel *JardAnnotationWindowPanel(NSDictionary<NSNumber *, NSNumber 
     JardWindowSelectionView *view = [[JardWindowSelectionView alloc] initWithFrame:NSZeroRect];
     view.owners = owners;
     view.choose = complete;
-    JardSelectionPanel *panel = selectionPanel(screen, view, @"Select a window to annotate", @"Click to record this display");
+    view.screenshot = screenshot;
+    JardSelectionPanel *panel = selectionPanel(screen, view, screenshot ? @"Select a window to capture" : @"Select a window to annotate",
+        screenshot ? @"Point to a window to capture" : @"Click to record this display");
     [view refreshAtPointer:point];
     __weak JardWindowSelectionView *weak = view;
     panel.tracking = [NSTimer timerWithTimeInterval:.04 repeats:YES block:^(NSTimer *timer) {

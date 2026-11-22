@@ -9,7 +9,7 @@ import { DesktopMeetingControls } from "@/components/desktop-meetings"
 import { DesktopUpdateControl, DesktopUpdateFeedback, DesktopUpdateSettings } from "@/components/desktop-update"
 import { DesktopApplicationSettings } from "@/components/desktop-application-settings"
 import { AgentSetupSettings } from "@/components/agent-setup-settings"
-import { hasLinuxDictation, LinuxDictationWorkspace } from "@/components/linux-dictation-workspace"
+import { hasPortableDictation, PortableDictationWorkspace } from "@/components/portable-dictation-workspace"
 import { useDesktopUpdate } from "@/desktop-update"
 import { useSystemDictation } from "./system-dictation"
 import { discardPortableRecording, finishPortableRecording, hasPortableAudio, portableRecordingDrafts, openPortableRecording, type PortableRecording, type SourceLevels } from "./portable-capture"
@@ -791,7 +791,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       meetingOptions={native ? { languages: selectedLanguages.map(language => language.code), elapsed, busy: updateBusy || status !== "ready" } : undefined}
       dictation={native ? ((destination, id) => <SystemDictationWorkspace key={id} destination={destination}
         controls={systemDictation} native={native} languages={languageOptions} />) :
-        hasLinuxDictation ? ((destination, id) => <LinuxDictationWorkspace key={id} destination={destination} />) : undefined}
+        hasPortableDictation ? ((destination, id) => <PortableDictationWorkspace key={id} destination={destination} />) : undefined}
       settings={native && {
         general: <div className="dictation-preferences">
           <DesktopUpdateSettings controls={desktopUpdate} busy={updateBusy} />

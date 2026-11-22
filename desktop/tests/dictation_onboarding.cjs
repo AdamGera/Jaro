@@ -28,6 +28,7 @@ async function run() {
       audioUrl: `/api/sessions/${annotationId}/audio`, annotation: { version: 1, strokeCount: 2,
         source: "area", frames: [.1, .6], manifestUrl: `${annotationRoute}/manifest`, contactSheetUrl: `${annotationRoute}/contact-sheet` } }
     const fixtureImages = new Map()
+    let attachmentError = ""
     let showSaved = false
     let showAnnotation = false
     let notesChunkMissing = false
@@ -67,6 +68,7 @@ async function run() {
       }
       if (pathname.endsWith("/images") && pathname.startsWith("/api/sessions/")) {
         if (route.request().method() === "POST") {
+          if (attachmentError) return route.fulfill({ status: 422, json: { detail: attachmentError } })
           const asset = { id: "fixture-image", url: `${pathname}/fixture-image` }
           const data = route.request().postDataBuffer()
           assert.equal(route.request().headers()["content-type"], "image/jpeg")
@@ -234,7 +236,7 @@ async function run() {
         : { phase: "current" }
       window.annotationFixture = localStorage.getItem("managedAnnotationFixture") === "true"
         ? { phase: "idle", busy: false, managed: true, message: "Screen annotation is managed by your organization." }
-        : { phase: "idle", busy: 0, recoverable: 0, message: "" }
+        : { phase: "idle", busy: 0, recoverable: 0, message: "", audio: { microphone: true, computerAudio: false } }
       window.annotationAccessFixture = { authorization: "off", canRepair: 0, busy: 0 }
       window.annotationAccessActions = []
       window.annotationFolder = { folder: "/fixture/Jaro/audio", custom: false, available: true }
@@ -257,6 +259,15 @@ async function run() {
           return { selected, resolved, choices: interfaceCatalog.choices, messages: interfaceCatalog.messages[resolved] ?? {} }
         }
         if (command === "jard.export") { window.lastExport = input; return { saved: true } }
+        if (command === "jard.sessionScreenshot") {
+          window.lastScreenshot = input.source
+          if (input.source === "display") return {}
+          const image = document.createElement("canvas")
+          image.width = 8
+          image.height = 8
+          image.getContext("2d").fillRect(0, 0, 8, 8)
+          return { jpeg: image.toDataURL("image/jpeg").split(",")[1] }
+        }
         if (command === "jard.copyMeetingTranscript") {
           if (window.failSavedMeetingCopy) throw new Error("The clipboard changed while preparing the meeting transcript.")
           window.meetingCopyRequests = [...(window.meetingCopyRequests ?? []), input]
@@ -433,6 +444,9 @@ async function run() {
             throw new Error("Screen annotation is managed by your organization.")
           }
           const sourcePrompts = { display: "Choose the display.", window: "Choose the window.", area: "Choose the display that contains the area.", phone: "Opening the wired screen mirror…" }
+          if (input.action === "setAudio") window.annotationFixture.audio = {
+            microphone: input.microphone, computerAudio: input.computerAudio,
+          }
           if (input.action === "start") {
             const hoverPicker = input.source === "window" && window.annotationAccessFixture.authorization === "granted"
             window.annotationFixture = { phase: hoverPicker ? "selecting" : input.source === "phone" ? "starting" : "picking", busy: true,
@@ -1094,6 +1108,14 @@ async function run() {
     await page.evaluate(() => { window.annotationShortcutTaken = false })
     await captureEnabled.check()
     await annotationSettings.getByRole("button", { name: "Choose Display…" }).waitFor()
+    const annotationAudio = annotationSettings.getByRole("region", { name: "Recording audio" })
+    const annotationMic = annotationAudio.getByRole("switch", { name: "Microphone narration" })
+    const annotationMac = annotationAudio.getByRole("switch", { name: "Mac audio" })
+    assert.equal(await annotationMic.isChecked(), true)
+    assert.equal(await annotationMac.isChecked(), false)
+    await annotationMac.check()
+    await annotationMic.uncheck()
+    assert.deepEqual(await page.evaluate(() => window.annotationFixture.audio), { microphone: false, computerAudio: true })
     assert.equal(await strayZeros(annotationSettings), 0)
     const screenAccess = annotationSettings.locator('[data-setting-title="Screen Recording"]')
     await screenAccess.getByText(/You can still choose a source/).waitFor()
@@ -1150,9 +1172,12 @@ async function run() {
     await button("Cancel").click()
     await button("Choose Area…").waitFor()
     await page.evaluate(() => {
-      window.annotationFixture = { phase: "recording", busy: true, message: "Recording the selected area." }
+      window.annotationFixture = { phase: "recording", busy: true, message: "Recording the selected area.",
+        audio: { microphone: false, computerAudio: true } }
       window.dispatchEvent(new CustomEvent("native-sdk:jard-annotation", { detail: window.annotationFixture }))
     })
+    assert.equal(await annotationMac.isDisabled(), true)
+    assert.equal(await annotationMic.isDisabled(), true)
     const showOverlays = annotationSettings.getByRole("switch", { name: "Show in screen recordings" })
     assert.equal(await showOverlays.isChecked(), false)
     await showOverlays.check()
@@ -2293,6 +2318,9 @@ async function run() {
     await annotationPanel.getByRole("button", { name: "Jump to 0:00.1", exact: true }).waitFor()
     const video = annotationPanel.locator("video")
     assert.equal(await video.getAttribute("src"), annotated.audioUrl)
+    const saveVideo = annotationPanel.getByRole("button", { name: "Save video…" })
+    await saveVideo.click()
+    assert.deepEqual(await page.evaluate(() => window.lastExport), { id: annotationId, kind: "audio" })
     await annotationPanel.getByRole("button", { name: "Jump to 0:00.6", exact: true }).click()
     await page.waitForFunction(() => Math.abs(document.querySelector("video")?.currentTime - .6) < .05)
     const savedVideo = annotated.audioUrl
@@ -2303,6 +2331,7 @@ async function run() {
     await page.evaluate(() => dispatchEvent(new Event("focus")))
     await annotationPanel.getByText(/Reconnect the Annotations folder/).waitFor()
     assert.equal(await video.count(), 0)
+    assert.equal(await saveVideo.count(), 0)
     annotated.annotationStorageUnavailable = undefined
     annotated.audioUrl = savedVideo
     annotated.annotation = savedAnnotation
@@ -2538,7 +2567,13 @@ async function run() {
     await page.getByRole("tabpanel", { name: "Overview" }).waitFor()
     assert.equal(new URL(page.url()).searchParams.get("tab"), "overview")
     const meetingImages = page.getByRole("region", { name: "Session images" })
-    await meetingImages.locator('input[type="file"]').setInputFiles({
+    const addImage = meetingImages.getByRole("button", { name: "Add images" })
+    await addImage.dispatchEvent("click", { detail: 0 })
+    const [chooser] = await Promise.all([
+      page.waitForEvent("filechooser"),
+      page.getByRole("menuitem", { name: "Choose image files…" }).click(),
+    ])
+    await chooser.setFiles({
       name: "reference.png", mimeType: "image/png",
       buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jL1sAAAAASUVORK5CYII=", "base64"),
     })
@@ -2552,6 +2587,27 @@ async function run() {
     await imageViewer.getByRole("button", { name: "Remove image" }).click()
     await imageViewer.waitFor({ state: "hidden" })
     await meetingImages.getByText("No images attached.").waitFor()
+    await addImage.click()
+    await page.getByRole("menuitem", { name: "Choose image files…" }).waitFor()
+    await page.getByRole("menuitem", { name: "Capture display…" }).click()
+    await meetingImages.getByText("No images attached.").waitFor()
+    assert.equal(await page.evaluate(() => window.lastScreenshot), "display")
+    attachmentError = "Each recording can have up to 16 images."
+    await addImage.click()
+    await page.getByRole("menuitem", { name: "Capture area…" }).click()
+    await meetingImages.getByRole("alert").getByText(attachmentError).waitFor()
+    assert.equal(await page.evaluate(() => window.lastScreenshot), "area")
+    assert.equal(fixtureImages.size, 0)
+    attachmentError = ""
+    await addImage.click()
+    await page.getByRole("menuitem", { name: "Capture window…" }).click()
+    await meetingImages.getByRole("status").getByText("Screenshot added.").waitFor()
+    assert.equal(await page.evaluate(() => window.lastScreenshot), "window")
+    assert.deepEqual([...fixtureImages.keys()], [`/api/sessions/${meetingId}/images/fixture-image`])
+    await meetingImages.getByRole("button", { name: "Image 1", exact: true }).click()
+    await imageViewer.getByRole("img", { name: "Image 1" }).waitFor()
+    await imageViewer.getByRole("button", { name: "Remove image" }).click()
+    await imageViewer.waitFor({ state: "hidden" })
     await page.evaluate(({ id, revision }) => sessionStorage.setItem(`jard.personalNotes.${id}`, JSON.stringify({
       revision, document: { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Recovered fixture draft" }] }] },
     })), { id: meetingId, revision: personalNotes.revision })

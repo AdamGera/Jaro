@@ -31,7 +31,8 @@ workspace = Path(__file__).resolve().parents[1]
 engine = workspace / "engine" if (workspace / "pyproject.toml").is_file() else workspace
 sys.path[:0] = [str(engine), str(workspace)] if engine != workspace else [str(engine)]
 from engine_lifecycle import HOST, PORT, URL, library_path, running_engine
-from annotation_assets import ASSETS as ANNOTATION_ASSETS, annotation_input, annotation_origin, staged_annotation_paths
+from annotation_assets import (ASSETS as ANNOTATION_ASSETS, annotation_input, annotation_movie_info,
+                               annotation_origin, staged_annotation_paths)
 from annotation_rollback import undo_annotation
 from annotation_routing import send_session_prompt
 from annotation_routing import (RouteUnavailable, capture_for_routing, correct_annotation, destinations as annotation_destinations,
@@ -1644,10 +1645,18 @@ class MacBridge:
                 if not ffmpeg:
                     raise ValueError("Could not find FFmpeg to attach the narration.")
                 try:
+                    packaged_probe = self.helpers / "ffprobe"
+                    _, has_audio = await annotation_movie_info(source, packaged_probe if packaged_probe.is_file() else "ffprobe")
+                    audio = ["-map", "1:a:0", "-af", "apad"]
+                    if has_audio:
+                        mix = ("[0:a:0]aresample=48000:async=1:first_pts=0[mac];"
+                               "[1:a:0]aresample=48000:async=1:first_pts=0[mic];"
+                               "[mac][mic]amix=inputs=2:duration=longest,apad[mix]")
+                        audio = ["-filter_complex", mix, "-map", "[mix]"]
                     await run_helper(ffmpeg, "-nostdin", "-v", "error", "-y", "-i", source, "-i", narration,
-                                     "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
-                                     "-af", "apad", "-shortest", "-movflags", "+faststart", "-f", "mp4", target)
-                except RuntimeError as error:
+                                     "-map", "0:v:0", *audio, "-c:v", "copy", "-c:a", "aac", "-shortest",
+                                     "-movflags", "+faststart", "-f", "mp4", target)
+                except (RuntimeError, OSError, ValueError) as error:
                     raise ValueError("Could not attach narration. The screen recording and narration are available in Finder.") from error
             await asyncio.to_thread(copy_annotation)
             location = {"annotation_location": self.annotation_location} if assets and self.annotation_location else {}

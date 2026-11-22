@@ -1,6 +1,6 @@
 import { useInterfaceLanguage } from "@/interface-language"
 import { useState } from "react"
-import { Check, Download, FileAudio, FileJson, Mic } from "lucide-react"
+import { Check, Download, FileAudio, FileJson, FileVideo, Mic } from "lucide-react"
 import { AlertDialog, DropdownMenu } from "radix-ui"
 
 import { desktopBridge } from "@/desktop"
@@ -74,6 +74,9 @@ export function Downloads({ item, compact = false, onAudioRemoved }: {
   const [transcriptCopy, setTranscriptCopy] = useState<"pending" | "copied">()
   if (!item) return null
   const bridge = item.saved ? desktopBridge() : undefined
+  const isVideo = !!item.saved?.annotation && !item.saved.annotation.missingVideo
+  const mediaLabel = t(isVideo ? "Download video" : "Download audio")
+  const MediaIcon = isVideo ? FileVideo : FileAudio
   const sessionId = item.id
   const settledMeeting = isSettledMeeting(item.saved)
   const revealRecording = settledMeeting && !!item.audioUrl && !!bridge
@@ -129,9 +132,9 @@ export function Downloads({ item, compact = false, onAudioRemoved }: {
       {!compact && <><span className="download-source" aria-hidden="true">{item.recording ? <Mic /> : <FileAudio />}</span>
       <span className="download-name" title={item.audioName || item.name} dir="auto">{item.audioName || item.name}</span></>}
       <div className="download-actions">
-        {bridge && item.audioUrl ? <Button variant="ghost" size="icon-sm" aria-label={`Download audio for ${item.name}`}
-          title="Download audio" onClick={() => void exportSaved("audio")}><FileAudio /></Button> : item.audioUrl ? <Button asChild variant="ghost" size="icon-sm">
-          <a href={item.audioUrl} download={item.audioName || item.name} aria-label={`Download audio for ${item.name}`} title="Download audio"><FileAudio /></a>
+        {bridge && item.audioUrl ? <Button variant="ghost" size="icon-sm" aria-label={`${mediaLabel} for ${item.name}`}
+          title={mediaLabel} onClick={() => void exportSaved("audio")}><MediaIcon /></Button> : item.audioUrl ? <Button asChild variant="ghost" size="icon-sm">
+          <a href={item.audioUrl} download={item.audioName || item.name} aria-label={`${mediaLabel} for ${item.name}`} title={mediaLabel}><MediaIcon /></a>
         </Button> : item.audio && <Button variant="ghost" size="icon-sm" aria-label={`Download audio for ${item.name}`}
           title="Download audio" onClick={() => downloadAudio(item.audio!, item.name)}><FileAudio /></Button>}
         {item.transcript && <Button variant="ghost" size="icon-sm" aria-label={`Download JSON transcript for ${item.name}`}

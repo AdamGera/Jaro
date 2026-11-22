@@ -1,4 +1,4 @@
-"""Local dictation capture and history shared by the Linux desktops."""
+"""Local dictation capture and history shared by the portable desktops."""
 import asyncio
 from contextlib import suppress
 import logging
@@ -10,14 +10,14 @@ from uuid import uuid4
 
 from starlette.concurrency import run_in_threadpool
 
-from linux_capture import SAMPLE_RATE, CaptureError, LinuxRecording
+from portable_capture import SAMPLE_RATE, CaptureError
 from portable_dictation_history import DEFAULT
 
 logger = logging.getLogger(__name__)
 HISTORY_ERRORS = (OSError, ValueError, sqlite3.Error)
 
 
-class LinuxDictation:
+class PortableDictation:
     platform = ""
     shortcut = ""
     authorizing = False
@@ -77,7 +77,7 @@ class LinuxDictation:
         try:
             saved, epoch = await run_in_threadpool(self.history.record, entry)
         except HISTORY_ERRORS:
-            logger.warning("Could not retain the Linux dictation.", exc_info=True)
+            logger.warning("Could not retain the dictation.", exc_info=True)
             return "Could not save dictation history."
         self.last_id, self.last_clear_epoch = key if saved else None, epoch
         return ""
@@ -115,7 +115,7 @@ class LinuxDictation:
                     return
                 self.phase = "starting"
                 self.folder = TemporaryDirectory(prefix=".dictation-", dir=state.library.root)
-                self.capture = LinuxRecording(uuid4(), Path(self.folder.name) / "speech.wav", "mic", seconds=120)
+                self.capture = state.portable_recorder(uuid4(), Path(self.folder.name) / "speech.wav", "mic", seconds=120)
                 await self.capture.start()
                 self.feedback = ""
                 self.phase = "recording"
@@ -124,7 +124,7 @@ class LinuxDictation:
             self.feedback = str(failure)
             self.phase = "idle"
         except Exception:
-            logger.exception("Linux dictation failed.")
+            logger.exception("Portable dictation failed.")
             self.feedback = "Could not finish the dictation."
             self.phase = "idle"
         finally:

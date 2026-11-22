@@ -241,7 +241,7 @@ class SessionStore:
                 raise
 
     def create(self, source, name, mime, options, duration, *, key=None, notes_draft=None, tracks=None, rolling=(),
-               annotation=None, annotation_location=None):
+               annotation=None, annotation_location=None, video_only=False):
         staged = key is not None
         if annotation_location is not None and (not annotation or not staged):
             raise ValueError("Only a staged annotation can use a separate storage folder.")
@@ -287,13 +287,18 @@ class SessionStore:
                 if annotation_location is not None:
                     meeting_retention.sync_directory(folder)
                 with self.connection() as db:
-                    db.execute("""INSERT INTO sessions(id,name,created,filename,mime,options,duration)
-                                  VALUES (?,?,?,?,?,?,?)""", (key, name, created, filename, mime, encode(options), duration))
+                    status = "complete" if video_only else "processing"
+                    processed = duration if video_only else 0
+                    db.execute("""INSERT INTO sessions(id,name,created,filename,mime,options,duration,status,processed)
+                                  VALUES (?,?,?,?,?,?,?,?,?)""",
+                               (key, name, created, filename, mime, encode(options), duration, status, processed))
                     db.executemany("INSERT INTO meeting_rolling VALUES(?,?,?,?)",
                                    ((key, start, end, encode(result)) for start, end, result in rolling))
                     if options.get("meeting", options.get("sourceSpeakerTurns")):
                         db.execute("INSERT INTO meeting_finalization(session_id) VALUES(?)", (key,))
                     personal_notes.attach(db, key, notes_draft)
+                    if video_only:
+                        session_notes.initialize(db, key)
                     if annotation_location is not None:
                         db.execute("DELETE FROM annotation_file_operations WHERE id=?", (key,))
             except BaseException:

@@ -60,8 +60,8 @@ const missingAnnotationVideo = {
   screenInterrupted: "The video source stopped before it saved a usable picture.",
 } as const
 
-function AnnotationPanel({ id, annotation, movie, videoExpired, unavailable, video, onPlay, onListen }: {
-  id: string; annotation: NonNullable<SavedSession["annotation"]>; movie: string | null
+function AnnotationPanel({ id, annotation, movie, movieName, videoExpired, unavailable, video, onPlay, onListen }: {
+  id: string; annotation: NonNullable<SavedSession["annotation"]>; movie: string | null; movieName: string
   videoExpired: boolean; unavailable: boolean; video: RefObject<HTMLVideoElement | null>; onPlay: () => void; onListen?: () => void
 }) {
   const { t } = useInterfaceLanguage()
@@ -71,7 +71,7 @@ function AnnotationPanel({ id, annotation, movie, videoExpired, unavailable, vid
   const [shareStatus, setShareStatus] = useState("")
   const native = desktopBridge()
 
-  async function save(kind: "annotation-manifest" | "annotation-contact-sheet") {
+  async function save(kind: "audio" | "annotation-manifest" | "annotation-contact-sheet") {
     if (!native) return
     setShareStatus("")
     setError("")
@@ -104,8 +104,15 @@ function AnnotationPanel({ id, annotation, movie, videoExpired, unavailable, vid
   ] as const
 
   return <div className="annotation-review">
-    {movie && <video ref={video} src={movie} controls playsInline preload="metadata" aria-label="Annotation recording"
-      onPlay={onPlay} onLoadedMetadata={() => setCanSeek(true)} />}
+    {movie && <>
+      <video ref={video} src={movie} controls playsInline preload="metadata" aria-label={t("Annotation recording")}
+        onPlay={onPlay} onLoadedMetadata={() => setCanSeek(true)} />
+      <div className="annotation-review-tools">
+        {native
+          ? <Button variant="outline" size="sm" disabled={busy} onClick={() => void save("audio")}><Download />{t("Save video…")}</Button>
+          : <Button asChild variant="outline" size="sm"><a href={movie} download={movieName}><Download />{t("Download video")}</a></Button>}
+      </div>
+    </>}
     {annotation.missingVideo && <p className="annotation-interruption">{t(missingAnnotationVideo[annotation.missingVideo])}</p>}
     {onListen && <div><Button variant="outline" size="sm" onClick={onListen}>{t("Open narration player")}</Button></div>}
     {videoExpired && <p className="annotation-interruption">{t(annotation.missingVideo
@@ -535,7 +542,7 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
         </div>}
         {!editing && <SessionImages key={session.id} session={session}>
           {session.annotation && <AnnotationPanel id={session.id} annotation={session.annotation}
-            movie={session.annotation.missingVideo ? null : session.audioUrl}
+            movie={session.annotation.missingVideo ? null : session.audioUrl} movieName={session.audioName}
             onListen={session.annotation.missingVideo && session.audioUrl ? openPlayer : undefined}
             videoExpired={!!session.audioRemovedAt} unavailable={!!session.annotationStorageUnavailable} video={video}
             onPlay={() => player.audio.current?.pause()} />}

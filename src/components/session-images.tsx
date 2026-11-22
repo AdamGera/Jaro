@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react"
-import { ChevronDown, ImagePlus, Images, X } from "lucide-react"
-import { Dialog } from "radix-ui"
-import { desktopBridge } from "@/desktop"
+import { AppWindow, ChevronDown, Crop, ImagePlus, Images, ScreenShare, X } from "lucide-react"
+import { Dialog, DropdownMenu } from "radix-ui"
+import { desktopBridge, type DesktopScreenshotSource } from "@/desktop"
 import { useInterfaceLanguage } from "@/interface-language"
 import { clock } from "@/speaker-activity"
 import type { SavedSession } from "@/audio"
@@ -49,12 +49,14 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
   const [assets, setAssets] = useState<ImageAsset[]>([])
   const [loading, setLoading] = useState(true)
   const [expanded, setExpanded] = useState(false)
+  const [imageMenuOpen, setImageMenuOpen] = useState(false)
   const [viewer, setViewer] = useState<Tile>()
   const [error, setError] = useState("")
   const [status, setStatus] = useState("")
   const [mutating, setMutating] = useState(false)
   const [revision, setRevision] = useState(0)
   const [managed, setManaged] = useState<boolean>()
+  const [screenshots, setScreenshots] = useState(false)
   const complete = session.status !== "processing" && !session.finalizationPending
 
   useEffect(() => {
@@ -72,6 +74,9 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
     let active = true
     void native.request("annotationRoutingPolicy").then(result => { if (active) setManaged(result.managed) })
       .catch(() => { if (active) setError("Could not check whether OpenCode is available.") })
+    void native.request("annotation", { action: "status" }).then(result => {
+      if (active) setScreenshots(!result.managed && result.enabled !== false)
+    }).catch(() => {})
     return () => { active = false }
   }, [native])
 
@@ -94,6 +99,16 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
     ...assets.map((asset, index) => ({ ...asset, label: `Image ${index + 1}`, removable: true })),
   ]
 
+  async function attach(body: ArrayBuffer) {
+    const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "image/jpeg" }, body })
+    if (!response.ok) {
+      const failure = await response.json().catch(() => ({}))
+      throw new Error(failure.detail || "Could not save the image.")
+    }
+    const image: ImageAsset = await response.json()
+    setAssets(current => current.some(item => item.id === image.id) ? current : [...current, image])
+  }
+
   async function add(files: File[]) {
     if (!files.length || mutating) return
     setMutating(true)
@@ -102,21 +117,30 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
     try {
       for (const file of files) {
         const blob = await jpeg(file)
-        const response = await fetch(endpoint, {
-          method: "POST", headers: { "Content-Type": "image/jpeg" }, body: await blob.arrayBuffer(),
-        })
-        if (!response.ok) {
-          const body = await response.json().catch(() => ({}))
-          throw new Error(body.detail || "Could not save the image.")
-        }
-        const image: ImageAsset = await response.json()
-        setAssets(current => current.some(item => item.id === image.id) ? current : [...current, image])
+        await attach(await blob.arrayBuffer())
       }
     } catch (failure) {
       setError(failure instanceof Error && failure.message ? failure.message : "Could not add the images.")
     } finally {
       setMutating(false)
     }
+  }
+
+  async function capture(source: DesktopScreenshotSource) {
+    if (!native || mutating) return
+    setMutating(true)
+    setError("")
+    setStatus("")
+    try {
+      const { jpeg } = await native.request("sessionScreenshot", { source })
+      if (!jpeg) return
+      const bytes = Uint8Array.from(atob(jpeg), character => character.charCodeAt(0))
+      await attach(bytes.buffer)
+      setExpanded(true)
+      setStatus(t("Screenshot added."))
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "Could not add the screenshot.")
+    } finally { setMutating(false) }
   }
 
   async function remove(tile: Tile) {
@@ -148,8 +172,25 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
             event.target.value = ""
             void add(files)
           }} />
-          <Button variant="outline" size="icon-sm" aria-label={t("Add images")} title={t("Add images")}
-            disabled={loading || mutating} onClick={() => input.current?.click()}><ImagePlus aria-hidden="true" /></Button>
+          {screenshots ? <DropdownMenu.Root open={imageMenuOpen} onOpenChange={setImageMenuOpen}>
+            <DropdownMenu.Trigger asChild>
+              <Button variant="outline" size="icon-sm" aria-label={t("Add images")} title={t("Add images")}
+                disabled={loading || mutating} onClick={event => {
+                  // Accessibility can activate a button with a click that has no pointer or key event.
+                  if (event.detail === 0) setImageMenuOpen(open => !open)
+                }}><ImagePlus aria-hidden="true" /></Button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content align="end" className="session-image-menu" sideOffset={5}>
+                <DropdownMenu.Item onSelect={() => input.current?.click()}><ImagePlus aria-hidden="true" />{t("Choose image files…")}</DropdownMenu.Item>
+                <DropdownMenu.Separator />
+                <DropdownMenu.Item onSelect={() => void capture("area")}><Crop aria-hidden="true" />{t("Capture area…")}</DropdownMenu.Item>
+                <DropdownMenu.Item onSelect={() => void capture("window")}><AppWindow aria-hidden="true" />{t("Capture window…")}</DropdownMenu.Item>
+                <DropdownMenu.Item onSelect={() => void capture("display")}><ScreenShare aria-hidden="true" />{t("Capture display…")}</DropdownMenu.Item>
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root> : <Button variant="outline" size="icon-sm" aria-label={t("Add images")} title={t("Add images")}
+            disabled={loading || mutating} onClick={() => input.current?.click()}><ImagePlus aria-hidden="true" /></Button>}
         </>}
         {native && complete && <AnnotationAgentPicker native={native} id={session.id}
           annotation={!!session.annotation} disabled={mutating} allowOpenCode={managed === false}

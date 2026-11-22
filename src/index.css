@@ -383,10 +383,12 @@ html:has(.workspace-settings)::-webkit-scrollbar,
 .download-name { text-align: start; flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: .84rem; }
 
 .download-actions { display: flex; gap: .15rem; color: var(--quiet); }
-.meeting-export-menu { z-index: 52; min-width: 10rem; padding: .3rem; border: 1px solid var(--line); border-radius: .7rem; background: var(--surface); box-shadow: var(--surface-shadow); }
-.meeting-export-menu [role="menuitem"] { display: block; border-radius: .4rem; padding: .4rem .55rem; font-size: .82rem; outline: none; cursor: default; }
-.meeting-export-menu [data-highlighted] { background: var(--muted); color: var(--foreground); }
-.meeting-export-menu [role="separator"] { height: 1px; margin-block: .22rem; background: var(--line); }
+:is(.meeting-export-menu, .session-image-menu) { z-index: 52; min-width: 10rem; padding: .3rem; border: 1px solid var(--line); border-radius: .7rem; background: var(--surface); box-shadow: var(--surface-shadow); }
+:is(.meeting-export-menu, .session-image-menu) [role="menuitem"] { display: block; border-radius: .4rem; padding: .4rem .55rem; font-size: .82rem; outline: none; cursor: default; }
+:is(.meeting-export-menu, .session-image-menu) [data-highlighted] { background: var(--muted); color: var(--foreground); }
+:is(.meeting-export-menu, .session-image-menu) [role="separator"] { height: 1px; margin-block: .22rem; background: var(--line); }
+.session-image-menu [role="menuitem"] { display: flex; align-items: center; gap: .45rem; white-space: nowrap; }
+.session-image-menu svg { width: .92rem; height: .92rem; flex: none; color: var(--quiet); }
 .download-button:hover { color: var(--live-ink); }
 
 

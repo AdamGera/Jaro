@@ -50,6 +50,7 @@ def open_workspace(host):
     environment = dict(os.environ)
     if os.name == "nt":
         environment["JARO_WINDOWS_CAPTURE"] = str(host.with_name("jaro-capture.exe"))
+        environment["JARO_WINDOWS_DICTATION"] = str(host.with_name("jaro-dictation.exe"))
     with owned_service(command, stderr=None, env=environment) as (record, engine):
         connection = HTTPConnection("127.0.0.1", record["port"], timeout=3)
         try:

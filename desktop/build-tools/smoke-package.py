@@ -498,6 +498,9 @@ def run(app, model_source):
         print("Clean model setup and default microphone:", helper("jard-capture", "devices").strip(), flush=True)
         for name in ("ffmpeg", "ffprobe"):
             assert "7.1.1" in helper(name, "-version")
+        filters = {line.split()[1] for line in helper("ffmpeg", "-filters").splitlines() if len(line.split()) > 1}
+        muxers = {line.split()[1] for line in helper("ffmpeg", "-muxers").splitlines() if len(line.split()) > 1}
+        assert {"amix", "apad"} <= filters and "mp4" in muxers
         if model_source is None:
             return
         assert json.loads(helper("jard-engine", "models", "--from", str(model_source.resolve())).splitlines()[-1])["ready"]

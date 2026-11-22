@@ -14,8 +14,8 @@ typedef NS_ENUM(NSUInteger, JardRegionChoice) {
 - (void)confirmSelection;
 @end
 
-JardSelectionPanel *JardAnnotationRegionPanel(NSScreen *screen, void (^complete)(JardRegionChoice, NSRect));
+JardSelectionPanel *JardAnnotationRegionPanel(NSScreen *screen, BOOL screenshot, void (^complete)(JardRegionChoice, NSRect));
 
 NSDictionary *JardAnnotationWindowAtPoint(CGPoint point, NSArray<NSDictionary *> *stack, NSDictionary<NSNumber *, NSNumber *> *owners);
-JardSelectionPanel *JardAnnotationWindowPanel(NSDictionary<NSNumber *, NSNumber *> *owners,
+JardSelectionPanel *JardAnnotationWindowPanel(NSDictionary<NSNumber *, NSNumber *> *owners, BOOL screenshot,
     void (^complete)(BOOL cancelled, CGWindowID window, pid_t owner, CGPoint pointer));

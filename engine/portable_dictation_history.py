@@ -37,11 +37,13 @@ class PortableDictationHistory:
 
     @contextmanager
     def connection(self, *, write=False, create=False, required=False):
-        flags = os.O_NOFOLLOW | os.O_NONBLOCK
+        flags = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
         flags |= os.O_RDWR if write else os.O_RDONLY
         if create:
             flags |= os.O_CREAT
         try:
+            if os.name == "nt" and self.path.is_symlink():
+                raise ValueError("Dictation history must be a private file owned by the current user.")
             fd = os.open(self.path, flags, 0o600)
         except FileNotFoundError:
             if create or required:
@@ -50,7 +52,9 @@ class PortableDictationHistory:
             return
         try:
             attributes = os.fstat(fd)
-            if not stat.S_ISREG(attributes.st_mode) or attributes.st_uid != os.geteuid() or attributes.st_mode & 0o077:
+            if not stat.S_ISREG(attributes.st_mode) or (
+                os.name != "nt" and (attributes.st_uid != os.geteuid() or attributes.st_mode & 0o077)
+            ) or (os.name == "nt" and attributes.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
                 raise ValueError("Dictation history must be a private file owned by the current user.")
         finally:
             os.close(fd)

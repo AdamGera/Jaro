@@ -45,8 +45,10 @@ def build(target, output):
             "--prefix", output,
         ], cwd=project, check=True)
         if target == "windows":
-            subprocess.run([zig, "cc", "-target", "x86_64-windows-gnu", "-O2", "-Wall", "-Wextra", "-Werror",
-                            HERE / "windows_capture.c", "-lole32", "-o", output / "bin/jaro-capture.exe"], check=True)
+            flags = [zig, "cc", "-target", "x86_64-windows-gnu", "-O2", "-Wall", "-Wextra", "-Werror"]
+            subprocess.run([*flags, HERE / "windows_capture.c", "-lole32", "-o", output / "bin/jaro-capture.exe"], check=True)
+            subprocess.run([*flags, HERE / "windows_hotkeys.c", HERE / "windows_clipboard.c",
+                            "-luser32", "-lgdi32", "-lole32", "-o", output / "bin/jaro-dictation.exe"], check=True)
 
 
 def main():

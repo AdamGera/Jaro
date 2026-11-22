@@ -7,19 +7,20 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs"
 import { SettingGroup, SettingRow } from "./settings-rows"
 import { DictationHistoryBrowser, HistoryRetention } from "./system-dictation"
 
-export const hasLinuxDictation = document.documentElement.hasAttribute("data-jaro-linux-dictation")
+export const hasPortableDictation = document.documentElement.hasAttribute("data-jaro-portable-dictation")
 
 type DictationStatus = {
   enabled: boolean
-  platform: "x11" | "wayland"
+  platform: "x11" | "wayland" | "windows"
   shortcut: string
+  recoveryShortcut?: string
   authorizing: boolean
   configurable: boolean
   keyboardAllowed?: boolean
   pasteAuthorizing?: boolean
   commandPrefix?: string
   commandMode?: boolean
-  phase: "idle" | "starting" | "recording" | "transcribing"
+  phase: "idle" | "starting" | "recording" | "transcribing" | "pasting"
   message: string
   text: string
   terminal: boolean
@@ -46,7 +47,7 @@ function loadHistory(query: string, offset: number) {
   return request<DictationHistory>("/history?" + params)
 }
 
-export function LinuxDictationWorkspace({ destination }: { destination: "dictation" | "history" | "output" }) {
+export function PortableDictationWorkspace({ destination }: { destination: "dictation" | "history" | "output" }) {
   const { t } = useInterfaceLanguage()
   const [tab, setTab] = useState(destination === "history" ? "history" : "general")
   const [status, setStatus] = useState<DictationStatus>()
@@ -124,11 +125,13 @@ export function LinuxDictationWorkspace({ destination }: { destination: "dictati
     }
   }
 
+  const windows = status?.platform === "windows"
   const activity = status?.phase === "starting" ? "Starting microphone…" :
     status?.phase === "recording" ? "Recording dictation…" :
     status?.phase === "transcribing" ? "Transcribing dictation…" :
+    status?.phase === "pasting" ? "Pasting last dictation…" :
     status?.pasteAuthorizing ? "Approve keyboard and clipboard access in the desktop dialog." :
-    status?.authorizing ? "Approve the shortcut in the desktop dialog." : status?.message
+    status?.authorizing ? (windows ? "Starting the keyboard shortcut…" : "Approve the shortcut in the desktop dialog.") : status?.message
   const message = status?.phase === "idle" ? feedback || activity : activity || feedback
   const wayland = status?.platform === "wayland"
   const shortcutConnected = status?.enabled || status?.configurable
@@ -147,7 +150,8 @@ export function LinuxDictationWorkspace({ destination }: { destination: "dictati
     <TabsContent value="general"><div className="dictation-preferences">
     <SettingGroup id="linux-dictation-title" title={t("System dictation")}>
       {!status?.commandMode && <SettingRow icon={Keyboard} title={status?.shortcut || t("Global shortcut")} label={false}
-        detail={t(wayland ? status.keyboardAllowed ? "Finish with the shortcut in the field where you want the text." :
+        detail={t(windows ? "Hold Left Alt to dictate. Release to paste into the same field." :
+          wayland ? status.keyboardAllowed ? "Finish with the shortcut in the field where you want the text." :
           "Press to start speaking, then press again to finish. Use Copy last to paste." :
           "Press to start speaking, then press again to paste into the same window.")}>
         {status?.configurable && <Button size="sm" variant="ghost" disabled={pending}
@@ -156,6 +160,10 @@ export function LinuxDictationWorkspace({ destination }: { destination: "dictati
           onClick={() => void configure(shortcutConnected || status?.authorizing ? "/disable" : "/enable")}>
           {t(status?.authorizing ? "Cancel approval" : shortcutConnected ? "Disable shortcut" : "Enable shortcut")}
         </Button>
+      </SettingRow>}
+      {status?.enabled && status.recoveryShortcut && <SettingRow icon={Keyboard} title={t("Paste last dictation")}
+        detail={t("Reinsert the last dictation at the current cursor.")} label={false}>
+        <kbd>{status.recoveryShortcut}</kbd>
       </SettingRow>}
       {wayland && status.commandPrefix && (!shortcutConnected || status.commandMode) && <SettingRow icon={Terminal}
         title={t("Desktop shortcut commands")} label={false}

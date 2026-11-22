@@ -6,7 +6,24 @@
 #import "jard_phone_annotation.h"
 #import <AVFoundation/AVFoundation.h>
 #import <Carbon/Carbon.h>
+#import <ImageIO/ImageIO.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+
+static NSData *screenshotJPEG(CGImageRef image) {
+    if (!image || CGImageGetWidth(image) > 1600 || CGImageGetHeight(image) > 1600) return nil;
+    for (NSNumber *quality in @[@.90, @.68, @.46, @.28]) {
+        NSMutableData *bytes = NSMutableData.data;
+        CGImageDestinationRef destination = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)bytes,
+            CFSTR("public.jpeg"), 1, NULL);
+        if (!destination) return nil;
+        NSDictionary *options = @{(__bridge NSString *)kCGImageDestinationLossyCompressionQuality: quality};
+        CGImageDestinationAddImage(destination, image, (__bridge CFDictionaryRef)options);
+        BOOL encoded = CGImageDestinationFinalize(destination);
+        CFRelease(destination);
+        if (encoded && bytes.length <= 512 * 1024) return bytes;
+    }
+    return nil;
+}
 
 BOOL JardCopyAnnotationHandoff(NSPasteboard *board, NSInteger expectedChangeCount, NSString *markdown, NSData *png, BOOL *includedImage) {
     if (includedImage) *includedImage = NO;
@@ -235,6 +252,7 @@ static NSVisualEffectView *annotationSurface(NSRect frame) {
 
 @interface JardAnnotation () <SCStreamDelegate, SCRecordingOutputDelegate>
 @property(nonatomic, copy) JardDictationSend send;
+@property(nonatomic, copy) JardDictationReply screenshotReply;
 @property(nonatomic, copy) void (^changed)(NSDictionary *);
 @property(nonatomic, copy) NSString *phase, *message, *identifier, *sessionID;
 @property(nonatomic, strong) NSImage *savedPreview;
@@ -272,6 +290,7 @@ static NSVisualEffectView *annotationSurface(NSRect frame) {
 @property(nonatomic) pid_t ownerPID;
 @property(nonatomic) BOOL acquiringLease, leased, closed, penLatched;
 @property(nonatomic) BOOL compositeInk;
+@property(nonatomic) BOOL recordingMicrophone, recordingComputerAudio;
 @property(nonatomic) BOOL screenStartRequested, narrationStarted, narrationRequested, narrationStopping, narrationFinished, awaitingNarration;
 @property(nonatomic) JardAnnotationKeys keys;
 @property(nonatomic) NSUInteger keyboardGeneration;
@@ -279,18 +298,36 @@ static NSVisualEffectView *annotationSurface(NSRect frame) {
 
 @implementation JardAnnotation
 
+static NSString *const annotationAudioPreference = @"JaroAnnotationAudio";
+
 - (instancetype)initWithSend:(JardDictationSend)send stateChanged:(void (^)(NSDictionary *))changed {
     if (!(self = [super init])) return nil;
     _send = [send copy];
     _changed = [changed copy];
     _phase = @"idle";
+    NSDictionary *audio = [NSUserDefaults.standardUserDefaults dictionaryForKey:annotationAudioPreference];
+    _recordingMicrophone = ![audio[@"microphone"] isKindOfClass:NSNumber.class] || [audio[@"microphone"] boolValue];
+    _recordingComputerAudio = [audio[@"computerAudio"] isKindOfClass:NSNumber.class] && [audio[@"computerAudio"] boolValue];
     return self;
 }
 
 - (BOOL)busy { return self.identifier != nil; }
 
+- (NSDictionary *)recordingAudio {
+    return @{@"microphone": @(self.recordingMicrophone), @"computerAudio": @(self.recordingComputerAudio)};
+}
+
+- (BOOL)setRecordingMicrophone:(BOOL)microphone computerAudio:(BOOL)computerAudio {
+    if (self.busy || self.closed) return NO;
+    self.recordingMicrophone = microphone;
+    self.recordingComputerAudio = computerAudio;
+    [NSUserDefaults.standardUserDefaults setObject:self.recordingAudio forKey:annotationAudioPreference];
+    if (self.changed) self.changed(self.status);
+    return YES;
+}
+
 - (void)refreshOverlaySharing {
-    NSWindowSharingType sharing = self.showOverlaysInRecordings ? NSWindowSharingReadOnly : NSWindowSharingNone;
+    NSWindowSharingType sharing = self.showOverlaysInRecordings && !self.screenshotReply ? NSWindowSharingReadOnly : NSWindowSharingNone;
     self.controls.sharingType = self.feedbackPanel.sharingType = self.selectionPanel.sharingType = sharing;
     // A display stream with visible overlays needs the live pen, even while a filter change is pending.
     BOOL liveInk = self.stream && (!self.compositeInk ||
@@ -317,7 +354,7 @@ static NSVisualEffectView *annotationSurface(NSRect frame) {
         @"session": self.sessionID ?: @"", @"recoverable": @(self.recovery != nil), @"busy": @(self.busy),
         @"capture": self.identifier ?: (id)NSNull.null, @"source": (self.busy ? self.source : nil) ?: (id)NSNull.null,
         @"elapsedSeconds": self.elapsed ?: (id)NSNull.null, @"last": self.lastOutcome ?: (id)NSNull.null,
-        @"sharedMicrophone": @(self.sharesMicrophone)};
+        @"sharedMicrophone": @(self.sharesMicrophone), @"audio": self.recordingAudio};
 }
 
 - (void)state:(NSString *)phase message:(NSString *)message {
@@ -328,6 +365,10 @@ static NSVisualEffectView *annotationSurface(NSRect frame) {
 }
 
 - (void)conclude:(NSString *)phase message:(NSString *)message {
+    if (self.screenshotReply) {
+        [self finishScreenshot:nil error:[phase isEqual:@"error"] ? message : nil];
+        return;
+    }
     if (self.identifier) {
         self.lastOutcome = @{@"id": self.identifier, @"phase": phase, @"source": self.source ?: (id)NSNull.null,
             @"elapsedSeconds": self.elapsed ?: (id)NSNull.null, @"session": self.sessionID ?: (id)NSNull.null,
@@ -335,6 +376,25 @@ static NSVisualEffectView *annotationSurface(NSRect frame) {
     }
     [self reset];
     [self state:phase message:message];
+}
+
+- (void)takeScreenshot:(NSString *)source reply:(JardDictationReply)reply {
+    if (self.busy || self.closed) { reply(nil, @"Finish the current screen capture first."); return; }
+    if (![@[@"area", @"window", @"display"] containsObject:source]) {
+        reply(nil, @"Choose an area, window, or display to capture.");
+        return;
+    }
+    self.screenshotReply = reply;
+    self.identifier = NSUUID.UUID.UUIDString.lowercaseString;
+    self.source = source;
+    [self beginSource:self.identifier quartzPointer:nil reply:nil];
+}
+
+- (void)finishScreenshot:(NSString *)jpeg error:(NSString *)error {
+    JardDictationReply reply = self.screenshotReply;
+    [self reset];
+    [self state:@"idle" message:@""];
+    if (reply) reply(jpeg ? @{@"jpeg": jpeg} : @{}, error);
 }
 
 - (void)start:(NSArray<NSString *> *)languages source:(NSString *)source microphone:(NSDictionary *)microphone
@@ -370,7 +430,8 @@ static NSVisualEffectView *annotationSurface(NSRect frame) {
             reply(nil, message);
             return;
         }
-        if ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] == AVAuthorizationStatusNotDetermined) {
+        if (self.recordingMicrophone &&
+            [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] == AVAuthorizationStatusNotDetermined) {
             reply([self status], nil);
             [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL allowed) {
                 dispatch_async(dispatch_get_main_queue(), ^{ [self beginSource:identifier quartzPointer:pointer reply:nil]; });
@@ -383,7 +444,8 @@ static NSVisualEffectView *annotationSurface(NSRect frame) {
 
 - (void)beginSource:(NSString *)identifier quartzPointer:(NSValue *)pointer reply:(JardDictationReply)reply {
     if (![self.identifier isEqual:identifier]) { if (reply) reply(nil, @"Annotation was cancelled."); return; }
-    if ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] != AVAuthorizationStatusAuthorized) {
+    if (!self.screenshotReply && self.recordingMicrophone &&
+        [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] != AVAuthorizationStatusAuthorized) {
         NSString *error = @"Allow microphone access in System Settings to record narration.";
         [self fail:error keepMovie:NO];
         if (reply) reply(nil, error);
@@ -432,6 +494,7 @@ static NSVisualEffectView *annotationSurface(NSRect frame) {
     [picker addObserver:observer];
     NSString *message = window ? @"Choose the window you want to annotate." : @"Choose the display you want to annotate.";
     if ([self.source isEqual:@"area"]) message = @"Choose the display that contains the area you want to annotate.";
+    if (self.screenshotReply) message = window ? @"Choose the window you want to capture." : @"Choose a display for the screenshot.";
     [self state:@"picking" message:message];
     [picker presentPickerUsingContentStyle:window ? SCShareableContentStyleWindow : SCShareableContentStyleDisplay];
     if (reply) reply([self status], nil);
@@ -459,7 +522,7 @@ static NSVisualEffectView *annotationSurface(NSRect frame) {
 - (void)selectRegionOnScreen:(NSScreen *)screen filter:(SCContentFilter *)filter {
     NSString *identifier = self.identifier;
     __weak typeof(self) weak = self;
-    self.selectionPanel = JardAnnotationRegionPanel(screen, ^(JardRegionChoice choice, NSRect area) {
+    self.selectionPanel = JardAnnotationRegionPanel(screen, self.screenshotReply != nil, ^(JardRegionChoice choice, NSRect area) {
         JardAnnotation *owner = weak;
         if (![owner.identifier isEqual:identifier] || ![owner.phase isEqual:@"selecting"]) return;
         if (choice == JardRegionCancelled) { [owner stop]; return; }
@@ -474,7 +537,8 @@ static NSVisualEffectView *annotationSurface(NSRect frame) {
     [self refreshOverlaySharing];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(regionScreenChanged:)
         name:NSApplicationDidChangeScreenParametersNotification object:NSApp];
-    [self state:@"selecting" message:@"Drag an area or click to record the display. Press Escape to cancel."];
+    [self state:@"selecting" message:self.screenshotReply ? @"Drag an area or click to capture the display. Press Escape to cancel."
+        : @"Drag an area or click to record the display. Press Escape to cancel."];
     [self.selectionPanel makeKeyAndOrderFront:nil];
 }
 
@@ -505,6 +569,7 @@ static NSTimeInterval annotationHostTime(void) {
 }
 
 - (void)prepareNarration:(dispatch_block_t)begin {
+    if (!self.recordingMicrophone) { begin(); return; }
     NSString *identifier = self.identifier;
     self.narration = [self.directory URLByAppendingPathComponent:@"Narration.wav"];
     NSMutableDictionary *payload = [self.microphone mutableCopy] ?: NSMutableDictionary.dictionary;
@@ -517,6 +582,7 @@ static NSTimeInterval annotationHostTime(void) {
 }
 
 - (void)beginNarrationAt:(NSTimeInterval)uptime ready:(dispatch_block_t)ready {
+    if (!self.recordingMicrophone) { ready(); return; }
     if (self.narrationRequested) return;
     NSString *identifier = self.identifier;
     NSTimeInterval age = fmax(0, NSProcessInfo.processInfo.systemUptime - uptime);
@@ -534,6 +600,7 @@ static NSTimeInterval annotationHostTime(void) {
 
 - (void)endNarration {
     if (self.narrationStopping || self.narrationFinished) return;
+    if (!self.recordingMicrophone) { self.narrationFinished = YES; return; }
     if (!self.narrationRequested) {
         self.narrationFinished = YES;
         self.narrationError = @"The screen stopped before microphone narration started.";
@@ -591,7 +658,8 @@ static NSTimeInterval annotationHostTime(void) {
         [owner.phone.panel addChildWindow:owner.overlay ordered:NSWindowAbove];
         [owner.controls orderFrontRegardless];
         [owner beginNarrationAt:uptime ready:^{
-            [owner state:@"recording" message:@"Recording the wired screen and your Mac microphone."];
+            [owner state:@"recording" message:owner.recordingMicrophone
+                ? @"Recording the wired screen and your Mac microphone." : @"Recording the wired screen."];
         }];
     };
     phone.pictureChanged = ^{
@@ -736,7 +804,9 @@ static NSScreen *screenForAnnotationWindow(NSRect target) {
             if (reply) reply(nil, @"Annotation was cancelled.");
             return;
         }
-        if (![self showWindowSelector:content message:@"Click a window to record it. Press Escape to cancel."]) {
+        NSString *hint = self.screenshotReply ? @"Click a window to capture it. Press Escape to cancel."
+            : @"Click a window to record it. Press Escape to cancel.";
+        if (![self showWindowSelector:content message:hint]) {
             [self presentPicker:identifier reply:reply];
         } else if (reply) reply(self.status, nil);
     }];
@@ -749,9 +819,10 @@ static NSScreen *screenForAnnotationWindow(NSRect target) {
         pid_t owner = window.owningApplication.processID;
         if (owner && window.windowID && window.windowLayer == NSNormalWindowLevel) owners[@(window.windowID)] = @(owner);
     }
+    if (self.screenshotReply && !owners.count) return NO;
     NSString *identifier = self.identifier;
     __weak typeof(self) weak = self;
-    self.selectionPanel = JardAnnotationWindowPanel(owners, ^(BOOL cancelled, CGWindowID window, pid_t pid, CGPoint pointer) {
+    self.selectionPanel = JardAnnotationWindowPanel(owners, self.screenshotReply != nil, ^(BOOL cancelled, CGWindowID window, pid_t pid, CGPoint pointer) {
         JardAnnotation *annotation = weak;
         if (![annotation.identifier isEqual:identifier] || ![annotation.phase isEqual:@"selecting"]) return;
         if (cancelled) { [annotation cancel]; return; }
@@ -780,6 +851,7 @@ static NSScreen *screenForAnnotationWindow(NSRect target) {
 
 - (void)resolveWindowSelection:(CGWindowID)window owner:(pid_t)pid pointer:(CGPoint)pointer identifier:(NSString *)identifier {
     if (!window) {
+        if (self.screenshotReply) { [self presentPicker:identifier reply:nil]; return; }
         self.source = @"display";
         [self beginDisplayAtPoint:pointer identifier:identifier reply:nil];
         return;
@@ -790,7 +862,8 @@ static NSScreen *screenForAnnotationWindow(NSRect target) {
         SCWindow *picked = [self selectedWindow:window owner:pid fromContent:content];
         SCContentFilter *filter = picked ? [self filterForSelectedWindow:picked] : nil;
         if (filter) [self beginRecording:filter content:content];
-        else if (![self showWindowSelector:content message:@"That window is unavailable. Choose another window or display."])
+        else if (![self showWindowSelector:content message:self.screenshotReply ? @"That window is unavailable. Choose another window."
+            : @"That window is unavailable. Choose another window or display."])
             [self presentPicker:identifier reply:nil];
     }];
 }
@@ -861,6 +934,10 @@ static NSScreen *screenForAnnotationWindow(NSRect target) {
             return;
         }
     }
+    if (self.screenshotReply) {
+        [self captureScreenshot:filter window:window != nil crop:sourceRect content:content];
+        return;
+    }
     self.windowID = window.windowID;
     self.ownerPID = window.owningApplication.processID;
     NSString *bundle = window.owningApplication.bundleIdentifier;
@@ -895,6 +972,44 @@ static NSScreen *screenForAnnotationWindow(NSRect target) {
     }];
 }
 
+- (void)captureScreenshot:(SCContentFilter *)filter window:(BOOL)window crop:(CGRect)crop content:(SCShareableContent *)content {
+    CGRect bounds = CGRectIsEmpty(crop) ? filter.contentRect : crop;
+    double width = CGRectGetWidth(bounds) * fmax(1, filter.pointPixelScale);
+    double height = CGRectGetHeight(bounds) * fmax(1, filter.pointPixelScale);
+    if (!isfinite(width) || !isfinite(height) || fmin(width, height) < 1) {
+        [self finishScreenshot:nil error:@"The selected source has no visible image."];
+        return;
+    }
+    double scale = fmin(1, 1600 / fmax(width, height));
+    SCStreamConfiguration *configuration = SCStreamConfiguration.new;
+    configuration.width = (size_t)fmax(1, round(width * scale));
+    configuration.height = (size_t)fmax(1, round(height * scale));
+    configuration.showsCursor = NO;
+    if (window) configuration.ignoreShadowsSingleWindow = YES;
+    if (!CGRectIsEmpty(crop)) configuration.sourceRect = crop;
+    [self state:@"starting" message:@"Capturing screenshot…"];
+    NSString *identifier = self.identifier;
+    void (^capture)(SCContentFilter *) = ^(SCContentFilter *selection) {
+        if (![self.identifier isEqual:identifier]) return;
+        [SCScreenshotManager captureImageWithFilter:selection configuration:configuration completionHandler:^(CGImageRef frame, NSError *error) {
+            NSData *image = error ? nil : screenshotJPEG(frame);
+            NSString *failure = error.localizedDescription ?: @"Could not prepare the screenshot.";
+            NSString *jpeg = [image base64EncodedStringWithOptions:0];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if ([self.identifier isEqual:identifier]) [self finishScreenshot:jpeg error:jpeg ? nil : failure];
+            });
+        }];
+    };
+    if (window) capture(filter);
+    else if (content) capture([self displayFilterExcludingOverlays:filter content:content]);
+    else [self loadScreenContent:^(SCShareableContent *available) {
+        capture([self displayFilterExcludingOverlays:filter content:available]);
+    }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if ([self.identifier isEqual:identifier]) [self finishScreenshot:nil error:@"The screenshot did not finish. Try again."];
+    });
+}
+
 - (void)startScreenStream:(SCContentFilter *)filter screen:(NSScreen *)screen target:(NSRect)target
     crop:(CGRect)sourceRect sizingFilter:(SCContentFilter *)sizingFilter {
     if (![self prepareMovie:self.compositeInk ? @"Screen capture.mp4" : @"Screen annotation.mp4"]) return;
@@ -911,7 +1026,8 @@ static NSScreen *screenForAnnotationWindow(NSRect target) {
     configuration.queueDepth = 5;
     configuration.showsCursor = YES;
     configuration.captureMicrophone = NO;
-    configuration.capturesAudio = NO;
+    configuration.capturesAudio = self.recordingComputerAudio;
+    configuration.excludesCurrentProcessAudio = YES;
     if (self.windowID) {
         configuration.ignoreShadowsSingleWindow = YES;
         configuration.preservesAspectRatio = NO;
@@ -1172,6 +1288,9 @@ static unsigned annotationModifiers(CGEventFlags flags) {
 - (void)stopButton:(id)sender { [self stop]; }
 
 - (NSString *)recordingScreenMessage {
+    if (self.recordingComputerAudio)
+        return self.recordingMicrophone ? @"Recording the screen, microphone, and Mac audio." : @"Recording the screen and Mac audio.";
+    if (!self.recordingMicrophone) return @"Recording the screen.";
     if (self.windowID) return @"Recording the selected window and your microphone.";
     if ([self.source isEqual:@"area"]) return @"Recording the selected area and your microphone.";
     return @"Recording the selected display and your microphone.";
@@ -1370,13 +1489,14 @@ static unsigned annotationModifiers(CGEventFlags flags) {
 
 - (BOOL)stop {
     if ([self.phase isEqual:@"picking"] || [self.phase isEqual:@"selecting"] ||
-        ([self.phase isEqual:@"starting"] && !self.screenStartRequested && !self.narrationRequested)) {
+        ([self.phase isEqual:@"starting"] && !self.screenStartRequested && !self.narrationRequested && !self.phone)) {
         return [self cancel];
     }
     if (![self.phase isEqual:@"recording"] && ![self.phase isEqual:@"starting"]) return NO;
     [self endNarration];
     [self hideRecordingControls];
-    [self state:@"saving" message:@"Saving the screen recording and transcribing narration…"];
+    [self state:@"saving" message:self.recordingMicrophone
+        ? @"Saving the screen recording and transcribing narration…" : @"Saving the screen recording…"];
     if (self.phone) {
         [self.phone stopDiscarding:NO];
         return YES;
@@ -1511,13 +1631,14 @@ static unsigned annotationModifiers(CGEventFlags flags) {
         [self fail:self.narrationError keepMovie:YES];
         return;
     }
-    [self state:@"saving" message:@"Transcribing narration and saving the annotation…"];
+    [self state:@"saving" message:self.recordingMicrophone
+        ? @"Transcribing narration and saving the annotation…" : @"Saving the annotation…"];
     NSString *identifier = self.identifier;
     NSURL *media = self.missingVideo ? self.narration : self.movie;
     NSMutableDictionary *payload = [@{@"id": identifier, @"path": media.path, @"languages": self.languages ?: @[],
         @"assets": @YES, @"routeOrigin": self.routingOrigin ?: @{}} mutableCopy];
     if (self.missingVideo) payload[@"narrationOnly"] = @YES;
-    else payload[@"narration"] = self.narration.path;
+    else if (self.narration) payload[@"narration"] = self.narration.path;
     self.send(@"jard.importAnnotation", payload, ^(id result, NSString *error) {
         if (![self.identifier isEqual:identifier]) return;
         if (error) { [self fail:error keepMovie:YES]; return; }
@@ -1555,6 +1676,10 @@ static unsigned annotationModifiers(CGEventFlags flags) {
 }
 
 - (void)fail:(NSString *)message keepMovie:(BOOL)keep {
+    if (self.screenshotReply) {
+        [self finishScreenshot:nil error:message ?: @"Could not capture the screenshot."];
+        return;
+    }
     NSNumber *size = nil;
     NSURL *recovery = nil;
     NSURL *media = self.missingVideo ? self.narration : self.movie;
@@ -1571,6 +1696,7 @@ static unsigned annotationModifiers(CGEventFlags flags) {
 }
 
 - (void)reset {
+    self.screenshotReply = nil;
     self.keyboardGeneration++;
     [self closeDiscardPrompt];
     // Keep key-up ownership if the picker or recorder stopped while its shortcut was down.

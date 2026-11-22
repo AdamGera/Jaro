@@ -38,6 +38,9 @@ async def smoke(root):
         (root / "jaro-transforms").symlink_to(Path(transform_helper).resolve())
     env["PATH"] = str(root) + os.pathsep + os.environ.get("PATH", os.defpath)
     agent_targets = install_agent_fixtures(root, env)
+    if codec_helpers := os.environ.get("JARD_TEST_CODEC_HELPERS"):
+        for name in ("ffmpeg", "ffprobe"):
+            (root / name).symlink_to(Path(codec_helpers).resolve() / name)
     base = f"http://127.0.0.1:{port}"
     audio = root/"review.wav"
     external_fixture = Path(os.environ.get("JARD_TEST_ANNOTATION_STORAGE", root)).resolve()
@@ -106,6 +109,8 @@ elif sys.argv[1]=="trash":
     trash=audio.parent/"Trash"
     trash.mkdir(exist_ok=True)
     print(json.dumps({"path":str(item.rename(trash/item.name))}))
+elif sys.argv[1]=="save" and (audio.parent/"cancel-export").exists():
+    print(json.dumps({"path":None}))
 else:
     print(json.dumps({"path":str(audio if sys.argv[1]=="open-audio" else audio.parent/("export-"+sys.argv[2]))}))
 """)
@@ -1582,6 +1587,11 @@ assert.equal(status.phase, "cancelled")
             print("Explicit agent handoff sent the selected chat the saved narration and included its contact sheet.", flush=True)
             assert "contact sheet is unavailable" in await rpc("annotationReview", id=str(uuid4()), expect_error=True)
             assert (await agent("annotate", "context", picked["id"], "--json"))["markdown"] == handoff["markdown"]
+            cancel_export = root / "cancel-export"
+            cancel_export.touch()
+            assert await rpc("export", id=picked["id"], kind="audio") is None
+            assert not (root / "export-Screen annotation.mp4").exists()
+            cancel_export.unlink()
             assert (await rpc("export", id=picked["id"], kind="audio"))["saved"]
             assert (root / "export-Screen annotation.mp4").read_bytes() == saved_movie
             assert not (await rpc("annotationLease", id=annotation, active=False))["active"]
@@ -1942,6 +1952,52 @@ assert.equal(status.phase, "cancelled")
             assert not (await agent("annotate", "list"))["annotations"]
             assert not (await rpc("annotationLease", id=annotation, active=False))["active"]
             print("Screen annotation movie, persistent strokes, contact sheet, native exports, and deletion passed.", flush=True)
+            for mode in ("silent", "mac", "both"):
+                capture = str(uuid4())
+                folder = root / ("jard-annotation-" + capture)
+                folder.mkdir(mode=0o700)
+                movie = folder / "Screen annotation.mp4"
+                sources = ["-f", "lavfi", "-i", "color=gray:s=160x90:r=12"]
+                if mode != "silent":
+                    audio_input = "sine=frequency=997:sample_rate=48000" if mode == "both" else str(audio)
+                    sources += (["-f", "lavfi"] if mode == "both" else []) + ["-i", audio_input]
+                    if mode == "both":
+                        sources += ["-af", "volume=0.12"]
+                subprocess.run(["ffmpeg", "-v", "error", *sources, "-t", str(seconds),
+                                "-c:v", "mpeg4", "-c:a", "aac", movie], check=True)
+                (folder / "annotation.json").write_bytes(manifest_bytes)
+                (folder / "contact-sheet.png").write_bytes(sheet.read_bytes())
+                assert (await rpc("annotationLease", id=capture, active=True))["active"]
+                inputs = {}
+                if mode == "both":
+                    narration = folder / "Narration.wav"
+                    await rpc("annotationAudio", id=capture, action="prepare", path=str(narration), inputDevice="FixtureWarmReady")
+                    await rpc("annotationAudio", id=capture, action="start", at=time.monotonic())
+                    await rpc("annotationAudio", id=capture, action="stop", at=time.monotonic())
+                    inputs["narration"] = str(narration)
+                assert (await rpc("importAnnotation", id=capture, path=str(movie), assets=True, languages=["en"], **inputs))["id"] == capture
+                await rpc("annotationLease", id=capture, active=False)
+                saved = await completed(capture)
+                assert abs(saved["transcript"]["durationSeconds"] - seconds) < .2, saved["transcript"]
+                exported = (await web.get(saved["audioUrl"])).raise_for_status().content
+                assert (await web.get(saved["annotation"]["contactSheetUrl"])).raise_for_status().content == sheet.read_bytes()
+                if mode == "silent":
+                    assert not saved["transcript"]["text"] and exported == movie.read_bytes()
+                else:
+                    assert "history books" in saved["transcript"]["text"].lower()
+                    if mode == "mac":
+                        assert exported == movie.read_bytes()
+                    else:
+                        final_movie = root / "annotation-audio-mix.mp4"
+                        final_movie.write_bytes(exported)
+                        decoded = subprocess.check_output(["ffmpeg", "-v", "error", "-i", final_movie,
+                            "-f", "f32le", "-ar", "48000", "-ac", "1", "-"])
+                        mixed = np.frombuffer(decoded, "<f4")
+                        tail = mixed[-24_000:]
+                        peak = np.argmax(abs(np.fft.rfft(tail * np.hanning(len(tail)))))
+                        assert abs(peak * 2 - 997) < 5 and np.max(np.abs(tail)) > .002
+                (await web.delete(f"/api/sessions/{capture}")).raise_for_status()
+            print("Annotations saved video-only, Mac audio only, and both audio sources, with local speech and a verified mix.", flush=True)
             seen.clear()
             forced_meeting = str(uuid4())
             await rpc("record", mode="both", meeting=forced_meeting, meetingLabel="Teams", languages=["en"])

@@ -173,11 +173,15 @@ With Paste output, Jard types into Windows App, Microsoft Remote Desktop, and ap
 
 If macOS enables Secure Event Input, Jard finishes any active dictation and keeps the text for recovery. The annotation chord can still start a screen capture. Paste shortcuts show feedback until you return to an editable field with secure input off.
 
-Saved display, area, window, and wired phone or tablet recordings have an **Annotation** tab in Sessions. Play the video, jump to a moment from the contact sheet, or save the sheet and the timestamped strokes as separate files. These remain available if narration transcription is interrupted. The strokes use normalized coordinates relative to the recorded source.
+Open a saved screen recording in **Sessions** and scroll down in **Overview** to its images and playback controls. Play the video, jump to a moment from the contact sheet, or use **Save video…** to save a copy as an MP4. You can also export the sheet and timestamped strokes. These controls remain available if narration transcription is interrupted.
+
+Use **Add images** in a saved session’s Overview to import files or capture an area, window, or display. Jaro adds the screenshot to that session’s Images gallery. From there you can open it or choose an agent to share the session and its images.
 
 If the video source produces no playable frame after narration starts, Jaro saves the narration and timed strokes in the session’s Overview. The annotation section explains why the picture is missing and opens the narration player. The annotation’s record retention applies to this audio.
 
 Open **Settings → Annotate** to choose a display, window, area, or USB-connected device. The **Current capture** row shows the status and lets you cancel selection, save, or discard a recording. The separate **Shortcuts** card explains how to start, draw, and save from the keyboard.
+
+In **Recording audio**, choose **Microphone narration**, **Mac audio**, or both. Turn both off to save a silent video. Jaro remembers the choices for the next recording and transcribes the audio included in the saved video. Wired iPhone or iPad recordings use the microphone choice.
 
 After choosing a display in **Choose Area…**, drag to preview the crop and its dimensions. A click, **Return**, or the Annotate shortcut records the entire display when no crop is active. **Esc** cancels the selection.
 

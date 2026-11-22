@@ -6,7 +6,7 @@ import os
 from Xlib import X, XK, display, error
 
 from linux_capture import CaptureError
-from linux_dictation import LinuxDictation
+from portable_dictation import PortableDictation
 from x11_paste import X11Paste
 
 
@@ -15,7 +15,7 @@ def supported():
                 and os.environ.get("XDG_SESSION_TYPE", "x11").lower() == "x11")
 
 
-class X11Dictation(LinuxDictation):
+class X11Dictation(PortableDictation):
     platform = "x11"
     shortcut = "Ctrl+Alt+Shift+D"
 

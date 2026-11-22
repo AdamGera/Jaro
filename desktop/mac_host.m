@@ -887,6 +887,17 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         }];
         return;
     }
+    if (self.showingApp && [origin isEqual:self.origin] && [command isEqual:@"jard.sessionScreenshot"]) {
+        if (self.annotationManaged) { [self reject:request reason:annotationManagedMessage]; return; }
+        if (!self.systemDictation.annotationEnabled) { [self reject:request reason:@"Annotate is turned off in Settings."]; return; }
+        if (![self canStartAnnotation]) { [self reject:request reason:@"Finish the current recording or update first."]; return; }
+        NSDictionary *payload = [message[@"payload"] isKindOfClass:NSDictionary.class] ? message[@"payload"] : @{};
+        [self.annotation takeScreenshot:payload[@"source"] reply:^(id result, NSString *error) {
+            if (error) [self reject:request reason:error];
+            else [self respond:@{@"id": request, @"ok": @YES, @"result": result}];
+        }];
+        return;
+    }
     if (self.showingApp && [origin isEqual:self.origin] && [command isEqual:@"jard.annotationAccess"]) {
         NSDictionary *payload = [message[@"payload"] isKindOfClass:NSDictionary.class] ? message[@"payload"] : @{};
         NSString *action = [payload[@"action"] isKindOfClass:NSString.class] ? payload[@"action"] : @"";
@@ -1480,6 +1491,21 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
 
 - (void)controlAnnotation:(NSString *)action parameters:(NSDictionary *)parameters quartzPointer:(NSValue *)pointer
     reply:(JardDictationReply)reply {
+    if ([action isEqual:@"setAudio"]) {
+        if (self.annotationManaged) { reply(nil, annotationManagedMessage); return; }
+        id microphone = parameters[@"microphone"], computerAudio = parameters[@"computerAudio"];
+        if (![microphone isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)microphone) != CFBooleanGetTypeID() ||
+            ![computerAudio isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)computerAudio) != CFBooleanGetTypeID()) {
+            reply(nil, @"Choose which audio sources to include.");
+            return;
+        }
+        if (![self.annotation setRecordingMicrophone:[microphone boolValue] computerAudio:[computerAudio boolValue]]) {
+            reply(nil, @"Finish the current annotation before changing its audio.");
+            return;
+        }
+        reply(self.annotation.status, nil);
+        return;
+    }
     if ([action isEqual:@"start"]) {
         if (self.annotationManaged) { reply(nil, annotationManagedMessage); return; }
         if (!self.systemDictation.annotationEnabled) { reply(nil, @"Annotate is turned off in Settings."); return; }

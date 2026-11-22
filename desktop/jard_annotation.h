@@ -8,8 +8,10 @@ BOOL JardCopyAnnotationHandoff(NSPasteboard *board, NSInteger expectedChangeCoun
 @property(nonatomic, copy) void (^saved)(NSString *session, NSImage *preview, NSDictionary *routing);
 - (instancetype)initWithSend:(JardDictationSend)send stateChanged:(void (^)(NSDictionary *))changed;
 - (NSDictionary *)status;
+- (BOOL)setRecordingMicrophone:(BOOL)microphone computerAudio:(BOOL)computerAudio;
 - (BOOL)busy;
 - (BOOL)sharesMicrophone;
+- (void)takeScreenshot:(NSString *)source reply:(JardDictationReply)reply;
 - (void)start:(NSArray<NSString *> *)languages source:(NSString *)source microphone:(NSDictionary *)microphone
     origin:(NSDictionary *)origin quartzPointer:(NSValue *)pointer reply:(JardDictationReply)reply;
 - (BOOL)handleEvent:(CGEventType)type event:(CGEventRef)event shortcut:(JardAnnotationShortcut)shortcut

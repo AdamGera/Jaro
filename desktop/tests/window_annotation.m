@@ -42,6 +42,7 @@
 @property(nonatomic) BOOL displayFilterPending;
 @property(nonatomic, copy) NSDictionary *originSnapshot;
 @property(nonatomic) BOOL screenStartRequested, narrationRequested;
+@property(nonatomic) BOOL narrationFinished;
 @property(nonatomic, strong, readonly) NSPanel *overlay;
 @property(nonatomic, strong, readonly) NSPanel *controls;
 @property(nonatomic, strong, readonly) NSPanel *feedbackPanel;
@@ -56,6 +57,9 @@
 - (SCDisplay *)displayAtPoint:(CGPoint)pointer fromDisplays:(NSArray<SCDisplay *> *)displays;
 - (void)beginDisplayAtPoint:(CGPoint)pointer identifier:(NSString *)identifier reply:(JardDictationReply)reply;
 - (void)beginWindowSelection:(NSString *)identifier reply:(JardDictationReply)reply;
+- (void)prepareNarration:(dispatch_block_t)begin;
+- (void)beginNarrationAt:(NSTimeInterval)uptime ready:(dispatch_block_t)ready;
+- (void)endNarration;
 - (void)resolveWindowSelection:(CGWindowID)window owner:(pid_t)pid pointer:(CGPoint)pointer identifier:(NSString *)identifier;
 - (void)state:(NSString *)phase message:(NSString *)message;
 - (void)expireDiscardPromptAt:(NSTimeInterval)now pointer:(NSPoint)pointer;
@@ -124,6 +128,60 @@
     if (reply) reply(self.status, nil);
 }
 @end
+
+static void testAnnotationAudioSettings(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSString *key = @"JaroAnnotationAudio";
+    id original = [defaults objectForKey:key];
+    [defaults removeObjectForKey:key];
+    __block BOOL pickerReached = NO;
+    AnnotationPointerFixture *annotation = [[AnnotationPointerFixture alloc] initWithSend:^(NSString *command,
+        NSDictionary *payload, JardDictationReply reply) {
+        assert([command isEqual:@"jard.annotationLease"]);
+        if (reply) reply(@{}, nil);
+    } stateChanged:nil];
+    assert([annotation.status[@"audio"][@"microphone"] boolValue] && ![annotation.status[@"audio"][@"computerAudio"] boolValue]);
+    assert([annotation setRecordingMicrophone:NO computerAudio:YES]);
+    JardAnnotation *reopened = [[JardAnnotation alloc] initWithSend:nil stateChanged:nil];
+    assert(![reopened.status[@"audio"][@"microphone"] boolValue] && [reopened.status[@"audio"][@"computerAudio"] boolValue]);
+    [annotation start:@[] source:@"display" microphone:nil origin:nil quartzPointer:nil reply:^(id result, NSString *error) {
+        pickerReached = result != nil && !error;
+    }];
+    assert(pickerReached && annotation.pickerRequests == 1);
+    assert(![annotation setRecordingMicrophone:YES computerAudio:NO]);
+    __block BOOL prepared = NO, ready = NO;
+    [annotation prepareNarration:^{ prepared = YES; }];
+    [annotation beginNarrationAt:NSProcessInfo.processInfo.systemUptime ready:^{ ready = YES; }];
+    [annotation endNarration];
+    assert(prepared && ready && annotation.narrationFinished && !annotation.narrationRequested && !annotation.narration);
+    assert([annotation cancel]);
+    if (original) [defaults setObject:original forKey:key];
+    else [defaults removeObjectForKey:key];
+    puts("Annotate preserves audio choices, locks them during a take, and skips microphone preparation when disabled.");
+}
+
+static void testScreenshotSelection(void) {
+    AnnotationPointerFixture *annotation = [[AnnotationPointerFixture alloc] initWithSend:^(NSString *command,
+        NSDictionary *payload, JardDictationReply reply) {
+        assert(NO && "A screenshot should not open an annotation or audio lease");
+    } stateChanged:nil];
+    __block NSUInteger replies = 0;
+    [annotation takeScreenshot:@"window" reply:^(id result, NSString *error) {
+        assert([result isEqual:@{}] && !error);
+        replies++;
+    }];
+    assert(annotation.busy && annotation.loaded && !replies);
+    [annotation takeScreenshot:@"display" reply:^(id result, NSString *error) { assert(!result && error); }];
+    NSString *identifier = annotation.identifier;
+    annotation.loaded(nil);
+    assert(annotation.pickerRequests == 1);
+    [annotation resolveWindowSelection:0 owner:0 pointer:CGPointZero identifier:identifier];
+    assert(annotation.pickerRequests == 2 && [annotation.source isEqual:@"window"] && !annotation.pickedDisplay);
+    assert([annotation cancel] && !annotation.busy && replies == 1);
+    annotation.loaded(nil);
+    assert(annotation.pickerRequests == 2 && replies == 1 && annotation.status[@"last"] == NSNull.null);
+    puts("Screenshots bypassed audio leases, kept strict window scope, and discarded stale selection callbacks.");
+}
 
 static void testPointerDisplaySelection(void) {
     AnnotationPointerFixture *annotation = [[AnnotationPointerFixture alloc] initWithSend:nil stateChanged:nil];
@@ -1068,7 +1126,7 @@ static void testAreaSelection(void) {
     __block JardRegionChoice choice = JardRegionCancelled;
     __block NSUInteger selections = 0;
     JardSelectionPanel *(^makePanel)(void) = ^{
-        return JardAnnotationRegionPanel(screen, ^(JardRegionChoice next, NSRect result) {
+        return JardAnnotationRegionPanel(screen, NO, ^(JardRegionChoice next, NSRect result) {
             choice = next;
             selected = result;
             selections++;
@@ -1115,7 +1173,9 @@ static void testAreaSelection(void) {
     assert(annotationKey(annotation, kCGEventKeyUp, annotationFixtureCode, annotationFixtureFlags, NO, nil));
     assert(selections == 4);
     assert(!annotationKey(annotation, kCGEventFlagsChanged, kVK_Option, 0, NO, nil));
-    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.04]];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1];
+    while (selections < 5 && deadline.timeIntervalSinceNow > 0)
+        [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.02]];
     assert(selections == 5 && choice == JardRegionDisplay);
     assert([annotation cancel]);
     puts("The area selector clipped the crop, kept short and reversed drags open, and handled click, Return, Escape and the shortcut.");
@@ -1298,6 +1358,8 @@ int main(int argc, const char *argv[]) {
         assert(NSEqualPoints(JardAnnotationUnitPoint(NSMakePoint(100, 30), NSMakeSize(400, 120)), NSMakePoint(.25, .25)));
         assert(NSEqualPoints(JardAnnotationUnitPoint(NSMakePoint(-10, 200), NSMakeSize(400, 120)), NSMakePoint(0, 1)));
         testPhonePicture();
+        testAnnotationAudioSettings();
+        testScreenshotSelection();
         testRoutingOrigin();
         testAreaSelection();
         testAnnotationKeys();

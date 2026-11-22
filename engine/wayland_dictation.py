@@ -9,7 +9,7 @@ from starlette.concurrency import run_in_threadpool
 
 from linux_capture import CaptureError
 from linux_desktop_portal import PATH, DesktopPortal, PortalResponseError
-from linux_dictation import HISTORY_ERRORS, LinuxDictation
+from portable_dictation import HISTORY_ERRORS, PortableDictation
 from wayland_paste import PASTE_FALLBACK, WaylandPaste
 
 
@@ -89,7 +89,7 @@ class GlobalShortcuts(DesktopPortal):
                     self.held = False
 
 
-class WaylandDictation(LinuxDictation):
+class WaylandDictation(PortableDictation):
     platform = "wayland"
 
     def __init__(self, state, transcribe, history):
