@@ -326,6 +326,20 @@ html:has(.workspace-settings)::-webkit-scrollbar,
   stroke-width: 1.5;
 }
 
+.portable-model-setup {
+  align-items: center;
+  justify-content: center;
+  gap: .8rem;
+  height: auto;
+  min-height: 19rem;
+  padding: 2rem 1.5rem;
+  text-align: center;
+}
+.portable-model-setup h1 { font-size: 1.4rem; font-weight: 620; }
+.portable-model-setup p { max-width: 33rem; color: var(--quiet); }
+.portable-model-setup [role="alert"] { color: var(--recording-ink); }
+.portable-model-progress { width: min(100%, 20rem); display: grid; gap: .6rem; }
+
 .processing-indicator { width: min(100%, 19rem); min-width: min(13rem, 100%); }
 .processing-caption, .analytics-title, .share-heading {
   display: flex; align-items: baseline; justify-content: space-between; gap: 1rem;
@@ -1010,6 +1024,43 @@ html:has(.workspace-settings)::-webkit-scrollbar,
 .native-permission-link:disabled { opacity: .55; }
 .capture-meter { gap: .3rem; }
 .native-recovery { margin-top: .75rem; color: var(--quiet); font-size: .8rem; }
+.screen-recovery {
+  margin: 0 0 .75rem; padding: .4rem .6rem;
+  background: var(--surface); border: 1px solid var(--line); border-radius: .85rem;
+}
+.portable-screen-recording {
+  z-index: 22; width: min(20rem, var(--radix-popover-content-available-width));
+  padding: .85rem; border: 1px solid var(--line); border-radius: .9rem;
+  background: var(--surface); box-shadow: var(--surface-shadow);
+}
+.portable-screen-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }
+.portable-screen-actions label { display: flex; align-items: center; width: 100%; gap: .4rem; font-size: .85rem; }
+.portable-screen-actions label small { color: var(--quiet); margin-inline-start: auto; }
+.portable-screen-sources { display: flex; flex-wrap: wrap; gap: .35rem; }
+.portable-screen-sources button[data-slot=button] { padding-inline: .5rem; }
+.portable-screen-picker-title { font-size: .85rem; font-weight: 600; }
+.portable-screen-targets { width: 100%; max-height: 13rem; overflow-y: auto; }
+.portable-screen-targets button[data-slot=button] { width: 100%; justify-content: start; }
+.portable-screen-targets button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.portable-screen-targets p { margin: .35rem 0; color: var(--quiet); font-size: .85rem; }
+.portable-screen-levels { display: grid; width: 100%; gap: .25rem; color: var(--quiet); }
+.portable-screen-levels meter { width: 6rem; margin-inline-start: auto; }
+.screen-area-dialog { width: min(60rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem); overflow: auto; }
+.screen-area-preview {
+  position: relative; margin: .8rem auto 0;
+  overflow: hidden; touch-action: none; user-select: none; cursor: crosshair;
+}
+.screen-area-preview img { display: block; width: 100%; height: auto; }
+.screen-area-selection { position: absolute; pointer-events: none; border: 2px solid white; box-shadow: 0 0 0 200vmax #0c0b15aa; }
+.screen-area-dialog .note-language-actions { align-items: center; flex-wrap: wrap; }
+.screen-area-size { margin-inline-end: auto; color: var(--quiet); font-size: .82rem; font-variant-numeric: tabular-nums; }
+.screencast-drawing svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.screencast-drawing path { fill: none; stroke: #ff6638; stroke-width: 4; stroke-linecap: round; stroke-linejoin: round; }
+.screencast-finished-stroke { animation: screencast-ink-fade .65s ease-out .65s forwards; }
+@keyframes screencast-ink-fade { to { opacity: 0; } }
+@media (max-width: 560px) {
+  .workspace-actions :is([aria-label="Record screen"], [aria-label="Manage screen recording"]) span { display: none; }
+}
 .native-recovery-row { display: flex; gap: .4rem; flex-wrap: wrap; align-items: center; justify-content: center; padding: .3rem; }
 
 .recording-access-dialog {

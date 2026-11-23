@@ -1,7 +1,21 @@
 import { useEffect, useRef, useState } from "react"
 import type { DesktopBridge, DesktopUpdate, DesktopUpdateAction } from "@/desktop"
 
-export function useDesktopUpdate(native: DesktopBridge | undefined) {
+export const portableUpdates = document.documentElement.hasAttribute("data-jaro-portable-updates")
+
+async function requestUpdate(native: DesktopBridge | undefined, client: string, action: DesktopUpdateAction) {
+  if (native) return native.request("update", action)
+  const status = action.action === "status"
+  const path = status ? "" : `/${action.action}?client=${client}`
+  const response = await fetch("/api/portable/updates" + path, { method: status ? "GET" : "POST", cache: "no-store" })
+  if (!response.ok) {
+    const failure = await response.json().catch(() => ({}))
+    throw new Error(typeof failure.detail === "string" ? failure.detail : "Could not complete the update request.")
+  }
+  return await response.json() as DesktopUpdate
+}
+
+export function useDesktopUpdate(native: DesktopBridge | undefined, client: string) {
   const [update, setUpdate] = useState<DesktopUpdate>()
   const [pending, setPending] = useState<DesktopUpdateAction["action"]>()
   const [manual, setManual] = useState(false)
@@ -11,7 +25,7 @@ export function useDesktopUpdate(native: DesktopBridge | undefined) {
   const latestMenuRequest = useRef<string>(undefined)
 
   useEffect(() => {
-    if (!native) return
+    if (!native && !portableUpdates) return
     let active = true
     const initial = revision.current
     const receive = (event: WindowEventMap["native-sdk:jard-update"]) => {
@@ -22,21 +36,21 @@ export function useDesktopUpdate(native: DesktopBridge | undefined) {
       setUpdate(event.detail)
     }
     window.addEventListener("native-sdk:jard-update", receive)
-    void native.request("update", { action: "status" }).then(status => {
+    void requestUpdate(native, client, { action: "status" }).then(status => {
       if (active && initial === revision.current) setUpdate(status)
     }).catch(() => { if (active && initial === revision.current) setUpdate({ phase: "unavailable" }) })
     return () => { active = false; window.removeEventListener("native-sdk:jard-update", receive) }
-  }, [native])
+  }, [native, client])
 
   async function run(action: DesktopUpdateAction) {
-    if (!native || requestPending.current) return
+    if ((!native && !portableUpdates) || requestPending.current) return
     requestPending.current = true
     const initial = ++revision.current
     setPending(action.action)
     setManual(action.action === "check")
     setError("")
     try {
-      const result = await native.request("update", action)
+      const result = await requestUpdate(native, client, action)
       if (initial === revision.current) setUpdate(result)
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Could not complete the update request.")

@@ -104,9 +104,11 @@ def copy_engine(resources):
         "meeting_mcp.py", "meeting_brief.py", "meeting_exports.py", "meeting_retention.py", "meeting_rolling.py", "meeting_search.py", "saved_dictations.py", "saved_meetings.py",
         "linux_capture.py", "managed_preferences.py", "portable_capture.py", "portable_workspace.py", "sdk_discovery.py", "sdk_embedded.py", "speaker_alignment.py", "transcription_pieces.py", "title_words.py", "writing_api.py", "writing_cache.py",
         "overview_autonyms.json", "overview_languages.json", "place_names.json", "windows_job.py",
+        "dictation_input.py", "stupase_runner.py", "portable_dictation_sounds.py", "portable_audio_control.py",
     ):
         shutil.copy2(ENGINE / name, target)
     shutil.copytree(REPO / "dist", target / "dist")
+    shutil.copytree(ENGINE / "stupase_model", target / "stupase_model", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copytree(DESKTOP / "transforms" / "starter", target / "transform-starter")
     shutil.copytree(REPO / "licenses", resources / "licenses")
     for name in ("LICENSE", "NOTICE"):

@@ -166,7 +166,7 @@ static void serve_clipboard(UINT duration) {
     }
 }
 
-int paste_dictation(DictationTarget target, bool terminal) {
+int paste_dictation(DictationTarget target, bool terminal, const volatile LONG *activity, DWORD expected) {
     HGLOBAL text = transcript_data();
     if (!text) return 2;
     int result = PASTE_TARGET_LOST;
@@ -182,6 +182,10 @@ int paste_dictation(DictationTarget target, bool terminal) {
         Sleep(12);
     }
     if (!can_send(target) || shell_without_editor(target)) goto done;
+    if (activity && (DWORD)*activity != expected) {
+        result = PASTE_CONTINUATION_CHANGED;
+        goto done;
+    }
     result = PASTE_CLIPBOARD_UNAVAILABLE;
     owner = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
     if (!owner || !open_clipboard(owner)) goto done;
@@ -200,7 +204,8 @@ int paste_dictation(DictationTarget target, bool terminal) {
             goto done;
         }
         if (!text && GetClipboardSequenceNumber() == sequence && can_send(target)) {
-            result = send_paste(terminal) ? 0 : PASTE_INPUT_UNAVAILABLE;
+            if (activity && (DWORD)*activity != expected) result = PASTE_CONTINUATION_CHANGED;
+            else result = send_paste(terminal) ? 0 : PASTE_INPUT_UNAVAILABLE;
             if (result == 0) serve_clipboard(RESTORE_MS);
         } else if (!text) {
             result = PASTE_TARGET_LOST;

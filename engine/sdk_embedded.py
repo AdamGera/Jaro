@@ -51,7 +51,7 @@ def run_embedded(router, inference_factory, model_factory):
     return run_owned_service(build_app)
 
 
-def run_owned_service(build_app):
+def run_owned_service(build_app, *, allow_audio_restore=False):
     import uvicorn
 
     if os.isatty(0) or os.isatty(1):
@@ -59,7 +59,7 @@ def run_owned_service(build_app):
     if os.name == "nt":
         from windows_job import own_process_tree
 
-        own_process_tree()
+        own_process_tree(allow_audio_restore=allow_audio_restore)
     elif os.getpgrp() != os.getpid():
         os.setsid()
     finished = Event()

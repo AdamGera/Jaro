@@ -41,12 +41,13 @@ export function meetingTimeFormat(locale: string, weekday?: "short") {
   })
 }
 
-export function useDesktopMeeting(native: DesktopBridge) {
+export function useDesktopMeeting(native?: DesktopBridge) {
   const [meeting, setMeeting] = useState<DesktopMeeting>()
   const [pending, setPending] = useState(false)
   const [feedback, setFeedback] = useState("")
 
   useEffect(() => {
+    if (!native) return
     let active = true
     let received = false
     function receive(event: WindowEventMap["native-sdk:jard-meetings"]) {
@@ -66,6 +67,7 @@ export function useDesktopMeeting(native: DesktopBridge) {
   }, [native])
 
   async function act(request: DesktopMeetingAction) {
+    if (!native) return
     setFeedback("")
     setPending(true)
     try {

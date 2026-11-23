@@ -15,26 +15,31 @@ CREATE INDEX IF NOT EXISTS session_images_owner ON session_images(session_id);
 """
 
 
-def valid_jpeg(image):
-    """Check the normalized browser JPEG has a bounded frame."""
+def jpeg_dimensions(image):
+    """Read the dimensions of a baseline or progressive JPEG frame."""
     if not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
-        return False
+        return None
     position = 2
     while position + 4 <= len(image) and image[position] == 0xff:
         marker = image[position + 1]
         size = int.from_bytes(image[position + 2:position + 4], "big")
         if size < 2 or position + 2 + size > len(image):
-            return False
+            return None
         if marker in (0xc0, 0xc2):
             if size < 11:
-                return False
+                return None
             height = int.from_bytes(image[position + 5:position + 7], "big")
             width = int.from_bytes(image[position + 7:position + 9], "big")
-            return 0 < width <= 1600 and 0 < height <= 1600
+            return (width, height) if width and height else None
         if marker == 0xda:
-            return False
+            return None
         position += 2 + size
-    return False
+    return None
+
+
+def valid_jpeg(image):
+    dimensions = jpeg_dimensions(image)
+    return dimensions is not None and all(edge <= 1600 for edge in dimensions)
 
 
 def list_images(db, key):

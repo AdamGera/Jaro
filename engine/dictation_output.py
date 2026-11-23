@@ -7,6 +7,7 @@ from functools import lru_cache
 import hashlib
 from itertools import chain, groupby
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ import stat
 import sys
 import tempfile
 import time
+from unicodedata import category, normalize
 
 import httpx
 import regex
@@ -24,6 +26,7 @@ from output_transform_policy import DISABLED_MESSAGE, PROGRAM_MESSAGE, Transform
 from output_transform_runtime import execute_config, is_embedded_config
 
 
+logger = logging.getLogger(__name__)
 STEPS = {
     "trim", "replace", "fillers", "format", "symbols", "sentence", "compact", "script", "rewrite",
     "lowercase", "spongebob-case", "no-trailing-punctuation",
@@ -145,6 +148,51 @@ def vocabulary_terms(value):
     return tuple(term.strip() for term in value if term.strip())
 
 
+def validate_dictation_vocabulary(entries):
+    def clean(value, minimum):
+        if not isinstance(value, str):
+            raise ValueError("Vocabulary terms and alternate spellings must be text.")
+        value = normalize("NFC", value.strip())
+        if (any(category(letter) in ("Cc", "Cs") for letter in value)
+                or not minimum * 2 <= len(value.encode("utf-16-le")) <= 160):
+            raise ValueError("Use up to 80 characters per term and 2 to 80 per alternate spelling.")
+        return value
+
+    if not isinstance(entries, list) or len(entries) > MAX_VOCABULARY:
+        raise ValueError("Use up to 32 vocabulary terms.")
+    cleaned = []
+    terms = set()
+    for entry in entries:
+        if (not isinstance(entry, dict) or set(entry) != {"term", "soundsLike"}
+                or not isinstance(entry["soundsLike"], list)):
+            raise ValueError("Vocabulary entries need a term and a list of alternate spellings.")
+        term = clean(entry["term"], 1)
+        key = term.casefold()
+        if key in terms:
+            raise ValueError("Each vocabulary term must be unique.")
+        terms.add(key)
+        if len(entry["soundsLike"]) > 8:
+            raise ValueError("Use up to eight alternate spellings per term.")
+        spellings = {}
+        for alternative in entry["soundsLike"]:
+            alias = clean(alternative, 2)
+            if alias.casefold() != key:
+                spellings.setdefault(alias.casefold(), alias)
+        cleaned.append({"term": term, "soundsLike": list(spellings.values())})
+    return cleaned
+
+
+def dictation_vocabulary_aliases(entries):
+    seen = {entry["term"].casefold() for entry in entries}
+    pairs = []
+    for entry in entries:
+        for alias in entry["soundsLike"]:
+            if alias.casefold() not in seen:
+                seen.add(alias.casefold())
+                pairs.append((alias, entry["term"]))
+    return pairs
+
+
 def merge_vocabulary(scoped, shared):
     terms = {}
     for term in (*scoped, *shared):
@@ -152,16 +200,16 @@ def merge_vocabulary(scoped, shared):
     return list(terms.values())[:MAX_VOCABULARY]
 
 
-def correction_rules(value):
+def correction_rules(value, *, scope="profile"):
     if not isinstance(value, str) or len(value) > MAX_PROFILE_CORRECTIONS:
-        raise ValueError("Enter up to 4,000 characters of profile replacements.")
+        raise ValueError(f"Enter up to 4,000 characters of {scope} replacements.")
     rules = []
     for number, line in enumerate(value.splitlines(), 1):
         if not line.strip():
             continue
         before, separator, after = line.partition("=>")
         if not separator or not before.strip():
-            raise ValueError(f"Invalid profile replacement on line {number}. Use phrase => replacement.")
+            raise ValueError(f"Invalid {scope} replacement on line {number}. Use phrase => replacement.")
         rules.append((before.strip(), after.strip()))
     return rules
 
@@ -172,7 +220,7 @@ def parse_profiles(definition):
     if definition.lstrip().startswith("["):
         try:
             rows = json.loads(definition)
-        except json.JSONDecodeError as error:
+        except (json.JSONDecodeError, RecursionError) as error:
             raise ValueError("The output profile definition is invalid.") from error
         profiles = []
         for number, row in enumerate(rows, 1):
@@ -214,6 +262,18 @@ def parse_profiles(definition):
 def valid_target(target):
     scope, sep, name = target.casefold().partition(":")
     return scope == "default" and not sep or scope in ("app", "site") and bool(name.strip())
+
+
+def parse_portable_profiles(definition):
+    profiles = parse_profiles(definition)
+    for profile in profiles:
+        if profile.target.casefold().startswith("site:") or any(map(is_script_step, profile.steps)):
+            raise ValueError("Use default or application profiles with built-in steps on this desktop.")
+        if profile.steps.count("rewrite") > 1:
+            raise ValueError("Add at most one local Qwen step per profile.")
+        if "rewrite" in profile.steps and not profile.instruction:
+            raise ValueError("Enter instructions for the local Qwen step.")
+    return profiles
 
 
 def canonical_host(value):
@@ -416,6 +476,36 @@ def keeps_rewrite_numbers(source, output):
     source_digits = {match.span("label") for match in cues if match["label"].isdecimal()}
     source_values = [match[0] for match in NUMERIC_LITERAL.finditer(source) if match.span() not in source_digits]
     return source_values == NUMERIC_LITERAL.findall(NUMBERED_LINE.sub("", output))
+
+
+async def rewrite_locally(insights, text, instruction, vocabulary, deadline, *, application="", browser_host=""):
+    if not text.strip() or len(text) > 8000:
+        raise ValueError("Rewrite a dictation of up to 8,000 characters.")
+    schema = {"type": "object", "properties": {"text": {"type": "string"}},
+              "required": ["text"], "additionalProperties": False}
+    messages = rewrite_messages(text, instruction, vocabulary,
+                                application=application, browser_host=browser_host)
+    model = insights.model
+    insights.chat_count += 1
+    try:
+        async with asyncio.timeout(deadline), model.lock:
+            await model.ready()
+            await model.fit_prompt(messages, 1200)
+            rewritten = json.loads("".join([piece async for piece in model.generate(messages, schema=schema, limit=1200)]))
+        output = rewritten["text"].strip()
+        if not output:
+            raise ValueError("The rewrite returned no text.")
+    except TimeoutError as error:
+        logger.info("Local dictation rewrite exceeded its deadline of %d seconds.", deadline)
+        raise ValueError(f"The local rewrite exceeded its {deadline}-second deadline.") from error
+    except Exception as error:
+        logger.warning("Local dictation rewrite did not complete (%s).", type(error).__name__)
+        raise ValueError("The local rewrite could not preserve the dictation.") from error
+    finally:
+        insights.chat_count -= 1
+    if not keeps_rewrite_numbers(text, output):
+        raise ValueError("The local rewrite changed a number. The original wording was kept.")
+    return output
 
 
 def translate_spoken(text, keywords):
@@ -675,7 +765,7 @@ def _output_stages(steps):
         yield transforms
 
 
-async def process(text, steps, replacements="", script=None, preview=False, rewrite=None, *, corrections="",
+async def process(text, steps, replacements="", script=None, preview=False, rewrite=None, *, corrections="", global_corrections="",
                   builtins_only=False, aliases=(), script_digest=None, script_allowed=None, script_context=None, script_runtime=None, script_grants=None):
     warnings = []
     fallbacks = []
@@ -689,7 +779,7 @@ async def process(text, steps, replacements="", script=None, preview=False, rewr
     except ValueError as error:
         warnings.append(str(error))
     stages = _output_stages(steps)
-    if corrections and "replace" not in steps:
+    if (corrections or global_corrections) and "replace" not in steps:
         stages = chain((("replace",),), stages)
     for stage in stages:
         attempted = set()
@@ -697,7 +787,7 @@ async def process(text, steps, replacements="", script=None, preview=False, rewr
         try:
             # Assign only after every step in this stage has succeeded.
             text = await _apply_steps(text, stage, replacements, script, script_digest, script_allowed, script_context, script_runtime, script_grants,
-                                      preview, rewrite, corrections, builtins_only, attempted)
+                                      preview, rewrite, corrections, global_corrections, builtins_only, attempted)
         except (ValueError, OSError) as error:
             reason = str(error) or "The output step did not finish."
             if reason not in warnings:
@@ -715,7 +805,7 @@ async def process(text, steps, replacements="", script=None, preview=False, rewr
 
 
 async def _apply_steps(text, steps, replacements, script, script_digest, script_allowed, script_context, script_runtime, script_grants,
-                       preview, rewrite, corrections, builtins_only, attempted):
+                       preview, rewrite, corrections, global_corrections, builtins_only, attempted):
     for step in steps:
         if is_transform_step(step):
             if current_policy() == TransformPolicy.DISABLED or (is_script_step(step) and (preview or builtins_only)):
@@ -725,6 +815,8 @@ async def _apply_steps(text, steps, replacements, script, script_digest, script_
             text = text.strip()
         elif step == "replace":
             text = replace_words(text, replacements)
+            if global_corrections:
+                text = scoped_replacements(text, global_corrections)
             if corrections:
                 text = scoped_replacements(text, corrections)
         elif step == "fillers":

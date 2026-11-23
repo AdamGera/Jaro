@@ -1,11 +1,43 @@
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { Power } from "lucide-react"
 import type { DesktopBridge, DesktopLoginAction, DesktopLoginItem } from "@/desktop"
 import { useInterfaceLanguage } from "@/interface-language"
-import { SettingRow, type SettingControlLabels } from "./settings-rows"
+import { SettingGroup, SettingRow, type SettingControlLabels } from "./settings-rows"
 import { Button } from "./ui/button"
 
+type LoginRequest = (action: DesktopLoginAction) => Promise<DesktopLoginItem>
+
 export function LaunchAtLogin({ native, onboarding = false }: { native: DesktopBridge; onboarding?: boolean }) {
+  const request = useCallback<LoginRequest>(action => native.request("loginItem", action), [native])
+  return <LoginSwitch request={request} onboarding={onboarding} />
+}
+
+export const portableLogin = document.documentElement.hasAttribute("data-jaro-portable-login")
+
+async function requestPortableLogin(action: DesktopLoginAction): Promise<DesktopLoginItem> {
+  const response = await fetch("/api/portable/login-item", {
+    cache: "no-store",
+    ...(action.action === "set" ? {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: action.enabled }),
+    } : {}),
+  })
+  if (!response.ok) {
+    const failure = await response.json().catch(() => ({}))
+    throw new Error(typeof failure.detail === "string" ? failure.detail : "Could not access Launch at Login.")
+  }
+  return await response.json() as DesktopLoginItem
+}
+
+export function PortableApplicationSettings() {
+  const { t } = useInterfaceLanguage()
+  return <SettingGroup id="desktop-application-title" title={t("Application")}>
+    <LoginSwitch request={requestPortableLogin} description={t("Start Jaro in the background when you sign in.")} />
+  </SettingGroup>
+}
+
+function LoginSwitch({ request, onboarding, description }: { request: LoginRequest; onboarding?: boolean; description?: string }) {
   const { t } = useInterfaceLanguage()
   const [status, setStatus] = useState<DesktopLoginItem>()
   const [requested, setRequested] = useState<boolean>()
@@ -23,7 +55,7 @@ export function LaunchAtLogin({ native, onboarding = false }: { native: DesktopB
       reading = true
       const version = revision.current
       try {
-        const result = await native.request("loginItem", { action: "status" })
+        const result = await request({ action: "status" })
         if (active && version === revision.current) setStatus(result)
       } catch {
         if (active && version === revision.current) setStatus(previous => previous ?? { state: "unknown" })
@@ -41,7 +73,7 @@ export function LaunchAtLogin({ native, onboarding = false }: { native: DesktopB
       window.removeEventListener("focus", refresh)
       document.removeEventListener("visibilitychange", refresh)
     }
-  }, [native])
+  }, [request])
 
   async function change(action: DesktopLoginAction) {
     const version = ++revision.current
@@ -49,14 +81,14 @@ export function LaunchAtLogin({ native, onboarding = false }: { native: DesktopB
     setRequested(action.action === "set" ? action.enabled : undefined)
     setActionError("")
     try {
-      const result = await native.request("loginItem", action)
+      const result = await request(action)
       if (mounted.current && version === revision.current) {
         setStatus(result)
         setActionError(result.message ?? "")
       }
     } catch (error) {
       if (mounted.current && version === revision.current)
-        setActionError(error instanceof Error ? error.message : "macOS could not change Launch at Login.")
+        setActionError(error instanceof Error ? error.message : "Could not change Launch at Login.")
     } finally {
       if (mounted.current && version === revision.current) {
         changing.current = false
@@ -69,13 +101,13 @@ export function LaunchAtLogin({ native, onboarding = false }: { native: DesktopB
   const error = actionError || (status?.state === "unknown" ? status.message : undefined)
   if (status?.state === "enabled" || status?.state === "disabled") {
     const input = (labels?: SettingControlLabels) => <input {...labels} type="checkbox" role={onboarding ? undefined : "switch"}
-      checked={requested ?? (status.state === "enabled")}
+      checked={requested ?? (status.state === "enabled")} disabled={requested !== undefined}
       onChange={event => void change({ action: "set", enabled: event.target.checked })} />
     if (onboarding) return <>
       <label className="dictation-login">{input()}{title}</label>
       {error && <p className="dictation-error" role="alert">{t(error)}</p>}
     </>
-    return <SettingRow icon={Power} title={title} detail={error && <span className="dictation-error" role="alert">{t(error)}</span>}>
+    return <SettingRow icon={Power} title={title} detail={error ? <span className="dictation-error" role="alert">{t(error)}</span> : description}>
       {input}
     </SettingRow>
   }

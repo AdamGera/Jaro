@@ -135,6 +135,8 @@ void CGEventTapEnable(CFMachPortRef port, bool enabled) {
 @property(nonatomic, strong) NSMutableDictionary *settings;
 @property(nonatomic, strong) NSMutableArray *pendingJobs;
 @property(nonatomic, strong) NSMutableArray *history;
+@property(nonatomic, strong) AVAudioPlayer *historyAudioPlayer;
+- (void)sweepHistoryAudioAt:(NSTimeInterval)now;
 @property(nonatomic, copy) NSDictionary *capturePreferences;
 @property(nonatomic, copy) NSString *captureID, *lastText, *phase;
 @property(nonatomic, copy) NSString *message;
@@ -3890,6 +3892,126 @@ static NSMutableArray *historyRows(NSUInteger count, NSString *text, NSString *r
     return rows;
 }
 
+static void testHistoryAudio(void) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSFileManager *files = NSFileManager.defaultManager;
+    NSString *key = @"JardSystemDictationHistory";
+    NSArray *before = [defaults arrayForKey:key];
+    const char *existing = getenv("RUMBLE_DATA_DIR");
+    NSString *priorRoot = existing ? @(existing) : nil;
+    NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    setenv("RUMBLE_DATA_DIR", root.fileSystemRepresentation, 1);
+    [defaults removeObjectForKey:key];
+    NSString *staging = [root stringByAppendingPathComponent:@"staging"];
+    assert([files createDirectoryAtPath:staging withIntermediateDirectories:YES attributes:nil error:nil]);
+    NSString *clipRoot = [root stringByAppendingPathComponent:@"dictation-history-audio"];
+    AVAudioFormat *format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatInt16
+        sampleRate:48000 channels:1 interleaved:YES];
+    AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format frameCapacity:48000];
+    buffer.frameLength = 48000;
+    memset(buffer.int16ChannelData[0], 0, buffer.frameLength * sizeof(int16_t));
+    buffer.int16ChannelData[0][1000] = 17;
+    NSString *sample = [root stringByAppendingPathComponent:@"sample.wav"];
+    AVAudioFile *writer = [[AVAudioFile alloc] initForWriting:[NSURL fileURLWithPath:sample] settings:format.settings
+        commonFormat:format.commonFormat interleaved:YES error:nil];
+    assert([writer writeFromBuffer:buffer error:nil]);
+    writer = nil;
+    NSData *original = [NSData dataWithContentsOfFile:sample];
+    assert(original.length > 44);
+
+    __block NSString *text = @"Retained dictation";
+    DictationDeliveryFixture *(^open)(void) = ^{
+        DictationDeliveryFixture *owner = [[DictationDeliveryFixture alloc] initWithSend:^(NSString *command,
+            NSDictionary *payload, JardDictationReply reply) {
+            if (![payload[@"action"] isEqual:@"transcribe"]) return;
+            [files removeItemAtPath:[staging stringByAppendingPathComponent:payload[@"id"]] error:nil];
+            reply(@{@"text": text}, nil);
+        }];
+        owner.settings[@"sound"] = @NO;
+        owner.settings[@"placement"] = @"off";
+        owner.settings[@"output"] = @"copy";
+        owner.board = NSPasteboard.pasteboardWithUniqueName;
+        return owner;
+    };
+    NSString *(^take)(DictationDeliveryFixture *, BOOL) = ^(DictationDeliveryFixture *owner, BOOL record) {
+        NSString *stage = NSUUID.UUID.UUIDString.lowercaseString;
+        if (record) assert([files createFileAtPath:[staging stringByAppendingPathComponent:stage]
+            contents:original attributes:@{NSFilePosixPermissions: @0600}]);
+        finishTake(owner, stage, NO);
+        return owner.history.firstObject[@"id"];
+    };
+    NSString *(^clip)(NSString *) = ^(NSString *identifier) {
+        return [clipRoot stringByAppendingPathComponent:[identifier stringByAppendingPathExtension:@"wav"]];
+    };
+    DictationDeliveryFixture *owner = open();
+    assert([owner.settings[@"retention"] isEqual:@7]);
+    NSString *first = take(owner, YES);
+    assert([[NSData dataWithContentsOfFile:clip(first)] isEqual:original]);
+    assert([[files attributesOfItemAtPath:clipRoot error:nil] filePosixPermissions] == 0700);
+    assert([[files attributesOfItemAtPath:clip(first) error:nil] filePosixPermissions] == 0600);
+    NSTimeInterval expires = [owner.history.firstObject[@"audioExpiresAt"] doubleValue];
+    assert(fabs(expires - NSDate.date.timeIntervalSince1970 - 86400) < 2);
+    [owner request:@{@"action": @"playHistoryAudio", @"id": first} reply:^(id result, NSString *error) {
+        assert(!error && [result[@"playingHistoryID"] isEqual:first] && owner.historyAudioPlayer.playing);
+    }];
+    [owner request:@{@"action": @"bulkHistory", @"operation": @"delete", @"ids": @[first]} reply:^(id result, NSString *error) {
+        assert(!error && !result[@"playingHistoryID"]);
+    }];
+    assert(!owner.history.count && ![files fileExistsAtPath:clip(first)]);
+
+    NSString *timed = take(owner, YES);
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    NSMutableDictionary *row = [owner.history.firstObject mutableCopy];
+    row[@"audioExpiresAt"] = @(now + 0.06);
+    owner.history[0] = row;
+    [owner sweepHistoryAudioAt:now];
+    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.18]];
+    assert(![files fileExistsAtPath:clip(timed)] && [owner.history.firstObject[@"text"] isEqual:text]);
+    [owner request:@{@"action": @"playHistoryAudio", @"id": timed} reply:^(id result, NSString *error) {
+        assert(!result && [error containsString:@"no longer available"]);
+    }];
+
+    NSString *launchExpired = take(owner, YES);
+    row = [owner.history.firstObject mutableCopy];
+    row[@"audioExpiresAt"] = @(NSDate.date.timeIntervalSince1970 - 1);
+    owner.history[0] = row;
+    [defaults setObject:[owner.history copy] forKey:key];
+    NSString *orphan = [clipRoot stringByAppendingPathComponent:[NSUUID.UUID.UUIDString stringByAppendingPathExtension:@"pending"]];
+    assert([files createFileAtPath:orphan contents:original attributes:@{NSFilePosixPermissions: @0600}]);
+    [owner shutdown];
+    owner = open();
+    assert(![files fileExistsAtPath:orphan] && ![files fileExistsAtPath:clip(launchExpired)] && owner.history.count == 2);
+
+    owner.settings[@"retention"] = @0;
+    take(owner, YES);
+    assert(owner.history.count == 2 && [[files contentsOfDirectoryAtPath:clipRoot error:nil] count] == 0);
+    assert([[owner.board stringForType:NSPasteboardTypeString] isEqual:text]);
+    owner.settings[@"retention"] = @7;
+    NSString *missing = take(owner, NO);
+    assert(![files fileExistsAtPath:clip(missing)] && !owner.history.firstObject[@"audioExpiresAt"]);
+    assert([[owner.board stringForType:NSPasteboardTypeString] isEqual:text]);
+
+    NSString *invalid = take(owner, YES);
+    assert([files createFileAtPath:clip(invalid) contents:[NSMutableData dataWithLength:90] attributes:@{NSFilePosixPermissions: @0600}]);
+    [owner request:@{@"action": @"playHistoryAudio", @"id": invalid} reply:^(id result, NSString *error) {
+        assert(!result && [error containsString:@"Could not play"]);
+    }];
+    NSString *remaining = take(owner, YES);
+    text = @"";
+    take(owner, YES);
+    assert([owner.history.firstObject[@"id"] isEqual:remaining]);
+    assert([[files contentsOfDirectoryAtPath:clipRoot error:nil] count] == 2);
+    [owner request:@{@"action": @"clearHistory"} reply:^(id result, NSString *error) { assert(!error); }];
+    assert(!owner.history.count && [[files contentsOfDirectoryAtPath:clipRoot error:nil] count] == 0);
+    [owner shutdown];
+    [files removeItemAtPath:root error:nil];
+    if (priorRoot) setenv("RUMBLE_DATA_DIR", priorRoot.fileSystemRepresentation, 1);
+    else unsetenv("RUMBLE_DATA_DIR");
+    if (before) [defaults setObject:before forKey:key];
+    else [defaults removeObjectForKey:key];
+    puts("History played the original WAV, expired clips at launch and while open, and removed audio on delete and clear.");
+}
+
 static void testLargeHistory(void) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     NSString *key = @"JardSystemDictationHistory";
@@ -3994,6 +4116,7 @@ int main(void) {
         testWarmMicrophoneWhenAway();
         testWindowOnlyDictationTarget();
         testHistoryTiming();
+        testHistoryAudio();
         testLargeHistory();
         testCancelShortcuts();
         testAnnotationShortcut();

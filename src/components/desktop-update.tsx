@@ -39,7 +39,7 @@ function updateControl(controls: DesktopUpdateControls, busy: boolean, t: Return
     : error || update.restartError || (unavailable ? "Updates are disabled for this installation."
     : checking ? (ready ? checking : "")
     : phase === "error" ? (manual ? message || "Could not check for updates." : "")
-    : phase === "current" && manual ? "Jard is up to date."
+    : phase === "current" ? (manual ? message || "Jard is up to date." : "")
     : message || "")
   const available = version && staged ? t("Jard {version} is ready to install.", { version }) : undefined
   return {

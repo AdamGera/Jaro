@@ -22,6 +22,7 @@
 #import <math.h>
 #import <stdio.h>
 #import <stdatomic.h>
+#import <stdlib.h>
 #import <string.h>
 #import <sys/file.h>
 #import <sys/stat.h>
@@ -39,6 +40,7 @@ BOOL JardShowDockIconEnabled(void) {
 
 static NSString *const repairedPreferencesWarning = @"Jard used defaults for some invalid dictation settings. Saving will preserve the original values.";
 static NSString *const historyKey = @"JardSystemDictationHistory";
+static const NSTimeInterval historyAudioLifetime = 24 * 60 * 60;
 static const NSUInteger historyEntryLimit = 10000;
 static const NSUInteger historyTextLimit = 16 * 1024;
 static const NSUInteger historyTotalTextLimit = 16 * 1024 * 1024;
@@ -371,6 +373,8 @@ static dispatch_queue_t startCueQueue(void) {
 @property(nonatomic, copy) NSString *mode, *outputProfile, *raw, *processed, *error, *warning;
 @property(nonatomic, copy) NSString *historyID;
 @property(nonatomic, copy) NSString *stageID;
+@property(nonatomic, strong) NSURL *pendingHistoryAudio;
+@property(nonatomic) NSTimeInterval captureEndedAt;
 @property(nonatomic, strong) NSNumber *inferenceMs;
 @property(nonatomic, copy) NSDictionary *processing;
 @property(nonatomic) NSTimeInterval submittedAt;
@@ -388,7 +392,15 @@ static dispatch_queue_t startCueQueue(void) {
 @end
 
 @implementation JardDictationJob
-- (void)dealloc { if (_focus) CFRelease(_focus); }
+- (void)discardPendingHistoryAudio {
+    if (!self.pendingHistoryAudio) return;
+    unlink(self.pendingHistoryAudio.fileSystemRepresentation);
+    self.pendingHistoryAudio = nil;
+}
+- (void)dealloc {
+    [self discardPendingHistoryAudio];
+    if (_focus) CFRelease(_focus);
+}
 @end
 
 @interface JardPressContext : NSObject
@@ -482,7 +494,7 @@ static BOOL JardMaintainEventTap(JardEventTap *tap, CGEventTapLocation location,
     return interrupted;
 }
 
-@interface JardSystemDictation () {
+@interface JardSystemDictation () <AVAudioPlayerDelegate> {
     JardEventTap _sessionTap, _physicalKeyTap, _modifierFilter;
     NSTimeInterval _physicalChordTimes[8];
     NSTimeInterval _modifierSidePress[4][2];
@@ -530,6 +542,11 @@ static BOOL JardMaintainEventTap(JardEventTap *tap, CGEventTapLocation location,
 @property(nonatomic) NSTimeInterval nextPreferencesRead;
 @property(nonatomic) BOOL preferencesReadInFlight;
 @property(nonatomic, strong) NSMutableArray<NSDictionary *> *history;
+@property(nonatomic, strong) NSURL *historyAudioDirectory;
+@property(nonatomic, strong) NSTimer *historyAudioTimer;
+@property(nonatomic) NSUInteger historyAudioRevision;
+@property(nonatomic, strong) AVAudioPlayer *historyAudioPlayer;
+@property(nonatomic, copy) NSString *playingHistoryID;
 @property(nonatomic, strong) NSMutableArray<JardDictationJob *> *pendingJobs;
 @property(nonatomic, strong) JardDictationJob *lastInsertion;
 @property(nonatomic) NSUInteger inputRevision, takeInputRevision;
@@ -775,7 +792,8 @@ static NSDictionary *JardDefaultPreferences(void) {
                   @"retention": @7, @"previousRetention": @7, @"sound": @YES,
                   @"placement": @"top", @"output": @"paste", @"fillerWords": @NO,
                   @"spokenFormatting": @NO, @"replacements": @"", @"appRules": @"",
-                  @"languages": @[], @"inputDevice": @"", @"avoidBluetooth": @YES, @"vocabulary": @"", @"vocabularySoundsLike": @{}, @"livePreview": @NO, @"keepMicrophoneReady": @NO, @"outputProfiles": @"", @"outputScript": @"", @"outputScriptApproval": @{}, @"rewriteInstructions": @"",
+                  @"languages": @[], @"inputDevice": @"", @"avoidBluetooth": @YES, @"vocabulary": @"", @"vocabularySoundsLike": @{}, @"livePreview": @NO, @"keepMicrophoneReady": @NO, @"noiseCleanup": @NO, @"boostMicrophone": @NO,
+                  @"outputProfiles": @"", @"outputScript": @"", @"outputScriptApproval": @{}, @"rewriteInstructions": @"",
                   @"soundSet": @"classic", @"soundVolume": @70, @"audioWhileDictating": @"none", @"lowerAudioPercent": @20};
 }
 
@@ -801,11 +819,18 @@ static NSDictionary *JardDefaultPreferences(void) {
     _deferHistoryExpiry = _preferencesUnreadable || [invalid containsObject:@"retention"] || [invalid containsObject:@"previousRetention"];
     _pendingJobs = NSMutableArray.array;
     _history = [[NSUserDefaults.standardUserDefaults arrayForKey:historyKey] mutableCopy] ?: NSMutableArray.array;
+    const char *configuredLibrary = getenv("RUMBLE_DATA_DIR");
+    NSString *library = configuredLibrary && *configuredLibrary
+        ? [[NSString stringWithUTF8String:configuredLibrary] stringByExpandingTildeInPath]
+        : [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/Rumble"];
+    if (library.length) _historyAudioDirectory = [[NSURL fileURLWithPath:library isDirectory:YES]
+        URLByAppendingPathComponent:@"dictation-history-audio" isDirectory:YES];
     _shortcutCandidate = _ignoredRelease = _cancelRelease = -1;
     _phase = @"idle";
     _message = @"";
     [self applyShortcutMode];
     if (!_preferencesWarning) [self trimHistory];
+    [self sweepHistoryAudioAt:NSDate.date.timeIntervalSince1970];
     for (NSDictionary *entry in _history) {
         if ([entry[@"kind"] isEqual:@"printed"]) continue;
         _lastText = entry[@"text"];
@@ -984,6 +1009,111 @@ static NSString *JardBoundHistoryText(NSString *text) {
     return [text substringToIndex:(NSUInteger)converted];
 }
 
+static BOOL JardHistoryAudioID(id value) {
+    return [value isKindOfClass:NSString.class] && [value length] == 36 &&
+        [[NSUUID alloc] initWithUUIDString:value] != nil;
+}
+
+static BOOL JardPrivateHistoryFile(NSURL *url) {
+    struct stat info;
+    return url && lstat(url.fileSystemRepresentation, &info) == 0 && S_ISREG(info.st_mode) &&
+        info.st_uid == geteuid() && !(info.st_mode & 077) && info.st_size > 44;
+}
+
+- (BOOL)historyAudioDirectoryAvailableCreating:(BOOL)create {
+    const char *path = self.historyAudioDirectory.fileSystemRepresentation;
+    if (!path || (create && mkdir(path, 0700) != 0 && errno != EEXIST)) return NO;
+    struct stat info;
+    return lstat(path, &info) == 0 && S_ISDIR(info.st_mode) && info.st_uid == geteuid() && !(info.st_mode & 077);
+}
+
+- (NSURL *)historyAudioURLForID:(NSString *)identifier {
+    return JardHistoryAudioID(identifier) ? [[self.historyAudioDirectory URLByAppendingPathComponent:identifier]
+        URLByAppendingPathExtension:@"wav"] : nil;
+}
+
+- (void)holdHistoryAudioForJob:(JardDictationJob *)job {
+    if (job.practice || [self.settings[@"retention"] integerValue] <= 0 || !JardHistoryAudioID(job.stageID) ||
+        ![self historyAudioDirectoryAvailableCreating:YES]) return;
+    NSURL *staging = [[self.historyAudioDirectory URLByDeletingLastPathComponent]
+        URLByAppendingPathComponent:@"staging" isDirectory:YES];
+    NSURL *original = [staging URLByAppendingPathComponent:job.stageID];
+    NSURL *pending = [[self.historyAudioDirectory URLByAppendingPathComponent:job.stageID]
+        URLByAppendingPathExtension:@"pending"];
+    if (JardPrivateHistoryFile(original) && link(original.fileSystemRepresentation, pending.fileSystemRepresentation) == 0)
+        job.pendingHistoryAudio = pending;
+}
+
+- (void)scheduleHistoryAudioSweepAt:(NSTimeInterval)deadline {
+    if (self.closed || (self.historyAudioTimer.valid && self.historyAudioTimer.fireDate.timeIntervalSince1970 <= deadline)) return;
+    [self.historyAudioTimer invalidate];
+    __weak typeof(self) weakSelf = self;
+    self.historyAudioTimer = [[NSTimer alloc] initWithFireDate:[NSDate dateWithTimeIntervalSince1970:deadline]
+        interval:0 repeats:NO block:^(NSTimer *timer) {
+            [weakSelf sweepHistoryAudioAt:NSDate.date.timeIntervalSince1970];
+        }];
+    [NSRunLoop.mainRunLoop addTimer:self.historyAudioTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)sweepHistoryAudioAt:(NSTimeInterval)now {
+    [self.historyAudioTimer invalidate];
+    self.historyAudioTimer = nil;
+    if (![self historyAudioDirectoryAvailableCreating:NO]) return;
+    NSMutableDictionary<NSString *, NSNumber *> *deadlines = NSMutableDictionary.dictionary;
+    for (NSDictionary *entry in self.history) {
+        id expiry = entry[@"audioExpiresAt"], identifier = entry[@"id"];
+        if ([expiry isKindOfClass:NSNumber.class] && JardHistoryAudioID(identifier))
+            deadlines[identifier] = expiry;
+    }
+    NSTimeInterval next = INFINITY;
+    NSArray *files = [NSFileManager.defaultManager contentsOfDirectoryAtURL:self.historyAudioDirectory
+        includingPropertiesForKeys:@[] options:0 error:nil];
+    if (!files) next = now + 60;
+    NSMutableSet<NSURL *> *pending = NSMutableSet.set;
+    for (JardDictationJob *job in self.pendingJobs)
+        if (job.pendingHistoryAudio) [pending addObject:job.pendingHistoryAudio];
+    BOOL playingAvailable = NO;
+    for (NSURL *file in files) {
+        NSString *identifier = file.lastPathComponent.stringByDeletingPathExtension;
+        BOOL clip = [file.pathExtension isEqual:@"wav"];
+        if (!JardHistoryAudioID(identifier) || !(clip || [file.pathExtension isEqual:@"pending"])) continue;
+        if (!clip && [pending containsObject:file]) continue;
+        NSTimeInterval deadline = clip ? deadlines[identifier].doubleValue : 0;
+        if (isfinite(deadline) && deadline > now) {
+            next = MIN(next, deadline);
+            if ([self.playingHistoryID isEqual:identifier]) playingAvailable = YES;
+            continue;
+        }
+        if (clip) self.historyAudioRevision++;
+        if (unlink(file.fileSystemRepresentation) != 0 && errno != ENOENT) next = MIN(next, now + 60);
+    }
+    if (self.playingHistoryID && !playingAvailable) [self stopHistoryAudio];
+    if (isfinite(next)) [self scheduleHistoryAudioSweepAt:next];
+}
+
+- (NSURL *)availableHistoryAudio:(NSDictionary *)entry {
+    id expiry = entry[@"audioExpiresAt"];
+    if (![expiry isKindOfClass:NSNumber.class] || !isfinite([expiry doubleValue]) ||
+        [expiry doubleValue] <= NSDate.date.timeIntervalSince1970 || ![self historyAudioDirectoryAvailableCreating:NO]) return nil;
+    NSURL *url = [self historyAudioURLForID:entry[@"id"]];
+    return JardPrivateHistoryFile(url) ? url : nil;
+}
+
+- (void)stopHistoryAudio {
+    self.historyAudioPlayer.delegate = nil;
+    [self.historyAudioPlayer stop];
+    self.historyAudioPlayer = nil;
+    self.playingHistoryID = nil;
+}
+
+- (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
+    if (player == self.historyAudioPlayer) [self stopHistoryAudio];
+}
+
+- (void)audioPlayerDecodeErrorDidOccur:(AVAudioPlayer *)player error:(NSError *)error {
+    if (player == self.historyAudioPlayer) [self stopHistoryAudio];
+}
+
 - (BOOL)pruneHistory {
     NSInteger days = [self.settings[@"retention"] integerValue] ?: [self.settings[@"previousRetention"] integerValue];
     NSTimeInterval since = NSDate.date.timeIntervalSince1970 - days * 86400;
@@ -1005,6 +1135,7 @@ static NSString *JardBoundHistoryText(NSString *text) {
     }
     if (!old.count) return NO;
     [self.history removeObjectsAtIndexes:old];
+    [self sweepHistoryAudioAt:NSDate.date.timeIntervalSince1970];
     return YES;
 }
 
@@ -1038,6 +1169,7 @@ static NSString *JardBoundHistoryText(NSString *text) {
         return nil;
     }
     [self.history removeAllObjects];
+    [self sweepHistoryAudioAt:NSDate.date.timeIntervalSince1970];
     [self forgetLastDictation];
     return @{@"changed": @(changed), @"removed": @(removed)};
 }
@@ -1074,7 +1206,10 @@ static NSString *JardBoundHistoryText(NSString *text) {
 
 - (void)setSDKCaptureActive:(BOOL)active {
     self.sdkRecording = active;
-    if (active) [self stopSoundPreview];
+    if (active) {
+        [self stopSoundPreview];
+        [self stopHistoryAudio];
+    }
     [self refresh];
 }
 
@@ -1109,6 +1244,7 @@ static NSString *JardBoundHistoryText(NSString *text) {
     if (active) {
         if ([self.shortcutTarget isEqual:@"annotate"]) self.choosingShortcut = NO;
         [self stopSoundPreview];
+        [self stopHistoryAudio];
     }
     [self refresh];
 }
@@ -1148,6 +1284,7 @@ static NSString *JardBoundHistoryText(NSString *text) {
     for (JardDictationJob *job in self.pendingJobs.copy) {
         if (job.meetingExcerpt && !includingMeetings) continue;
         job.cancelled = YES;
+        [job discardPendingHistoryAudio];
         [self.pendingJobs removeObject:job];
         if (job.waitingToSubmit) [self discardUnsubmittedStage:job];
         if (job.pasteCompletion) job.pasteCompletion(NO);
@@ -1157,7 +1294,10 @@ static NSString *JardBoundHistoryText(NSString *text) {
 
 - (void)pauseForUpdate:(BOOL)paused {
     self.updatePaused = paused;
-    if (paused) [self stopSoundPreview];
+    if (paused) {
+        [self stopSoundPreview];
+        [self stopHistoryAudio];
+    }
     if (paused && self.annotationPasteReply) [self finishAnnotationPaste:@"Jard is preparing to restart."];
     [self refresh];
 }
@@ -1803,6 +1943,9 @@ static NSString *annotationTerminalDirectory(AXUIElementRef element) {
     NSDictionary *latest = self.history.firstObject;
     visible[@"historyRevision"] = latest[@"totalMs"]
         ? [NSString stringWithFormat:@"%@:%@", latest[@"id"], latest[@"totalMs"]] : latest[@"id"] ?: @"";
+    if (self.historyAudioRevision) visible[@"historyRevision"] = [NSString stringWithFormat:@"%@:audio:%lu",
+        visible[@"historyRevision"], (unsigned long)self.historyAudioRevision];
+    visible[@"playingHistoryID"] = self.playingHistoryID;
     return visible;
 }
 
@@ -2484,6 +2627,7 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
 - (void)begin {
     if (self.captureID || self.transcribing || self.sdkRecording || self.annotationPasteReply) return;
     [self stopSoundPreview];
+    [self stopHistoryAudio];
     JardPressContext *queued = self.tailPress;
     self.tailPress = nil;
     NSDictionary *preferences = queued.preferences ?: self.settings;
@@ -2929,9 +3073,19 @@ static NSDictionary *JardHistoryProcessing(id value) {
             entry[@"inferenceMs"] = job.inferenceMs;
             if (!awaitingOutput) entry[@"totalMs"] = JardTotalMilliseconds(job);
         }
+        NSTimeInterval expires = job.captureEndedAt + historyAudioLifetime;
+        if (job.pendingHistoryAudio && expires > NSDate.date.timeIntervalSince1970) {
+            NSURL *clip = [self historyAudioURLForID:job.historyID];
+            if (clip && renamex_np(job.pendingHistoryAudio.fileSystemRepresentation, clip.fileSystemRepresentation, RENAME_EXCL) == 0) {
+                job.pendingHistoryAudio = nil;
+                entry[@"audioExpiresAt"] = @(expires);
+                [self scheduleHistoryAudioSweepAt:expires];
+            }
+        }
         [self.history insertObject:entry atIndex:0];
         [self saveHistory];
     }
+    [job discardPendingHistoryAudio];
 }
 
 static BOOL postKeyPair(CGKeyCode key, CGEventFlags flags, int64_t marker, void (^post)(CGEventRef)) {
@@ -3627,6 +3781,7 @@ static NSString *JardCorrectVocabulary(NSString *text, NSDictionary *preferences
 - (void)submitStage:(NSString *)stage interrupted:(BOOL)interrupted microphoneLoss:(NSString *)microphoneLoss duration:(double)duration {
     JardDictationJob *job = JardDictationJob.new;
     job.stageID = stage;
+    job.captureEndedAt = NSDate.date.timeIntervalSince1970;
     job.submittedAt = NSProcessInfo.processInfo.systemUptime;
     job.destination = self.destination;
     job.focus = self.focusedElement ? (AXUIElementRef)CFRetain(self.focusedElement) : NULL;
@@ -3698,8 +3853,10 @@ static NSString *JardCorrectVocabulary(NSString *text, NSDictionary *preferences
         profile = output;
     }
     NSArray *vocabulary = JardVocabulary(job.rawOutput ? @"" : job.preferences[@"vocabulary"]);
+    [self holdHistoryAudioForJob:job];
     self.send(@"jard.dictation", @{@"action": @"transcribe", @"id": job.stageID, @"cleanupOnFailure": @YES,
-        @"languages": job.preferences[@"languages"], @"vocabulary": vocabulary, @"outputProfile": profile}, ^(id result, NSString *error) {
+        @"languages": job.preferences[@"languages"], @"vocabulary": vocabulary, @"outputProfile": profile,
+        @"noiseCleanup": job.preferences[@"noiseCleanup"] ?: @NO, @"boostMicrophone": job.preferences[@"boostMicrophone"] ?: @NO}, ^(id result, NSString *error) {
         if (self.closed || job.cancelled) return;
         job.raw = result[@"text"] ?: @"";
         job.processed = result[@"processed"];
@@ -3730,6 +3887,7 @@ static NSString *JardCorrectVocabulary(NSString *text, NSDictionary *preferences
     JardDictationJob *job = self.pendingJobs.lastObject;
     if (!job) return;
     job.cancelled = YES;
+    [job discardPendingHistoryAudio];
     [self.pendingJobs removeLastObject];
     if (job.waitingToSubmit) [self discardUnsubmittedStage:job];
     [job.printRequest finish:nil error:@"Dictation was cancelled."];
@@ -4863,7 +5021,7 @@ static NSDictionary *JardPreferenceCatalog(void) {
             @"languages": @{@"type": @"array", @"maxItems": @25},
         } mutableCopy];
         for (NSString *key in @[@"enabled", @"sound", @"fillerWords", @"spokenFormatting", @"avoidBluetooth",
-                                @"livePreview", @"keepMicrophoneReady"]) {
+                                @"livePreview", @"keepMicrophoneReady", @"noiseCleanup", @"boostMicrophone"]) {
             fields[key] = @{@"type": @"boolean"};
         }
         NSDictionary *limits = @{@"inputDevice": @1024, @"rewriteInstructions": @2500, @"outputProfiles": @48000,
@@ -5938,7 +6096,13 @@ static NSString *JardOutputPolicy(id result) {
                 if (query.length && ![entry[@"text"] localizedCaseInsensitiveContainsString:query] &&
                     ![entry[@"raw"] localizedCaseInsensitiveContainsString:query] &&
                     ![entry[@"app"] localizedCaseInsensitiveContainsString:query]) continue;
-                if (matches++ >= MAX(0, offset) && page.count < 15) [page addObject:entry];
+                if (matches++ >= MAX(0, offset) && page.count < 15) {
+                    if (entry[@"audioExpiresAt"] && ![self availableHistoryAudio:entry]) {
+                        NSMutableDictionary *textOnly = [entry mutableCopy];
+                        [textOnly removeObjectForKey:@"audioExpiresAt"];
+                        [page addObject:textOnly];
+                    } else [page addObject:entry];
+                }
                 NSString *text = entry[@"text"];
                 [text enumerateSubstringsInRange:NSMakeRange(0, text.length) options:NSStringEnumerationByWords | NSStringEnumerationSubstringNotRequired
                     usingBlock:^(NSString *word, NSRange wordRange, NSRange enclosing, BOOL *stop) {
@@ -5950,6 +6114,31 @@ static NSString *JardOutputPolicy(id result) {
             dispatch_async(dispatch_get_main_queue(), ^{ reply(result, nil); });
         });
         return;
+    } else if ([action isEqual:@"playHistoryAudio"] || [action isEqual:@"stopHistoryAudio"]) {
+        NSString *identifier = parameters[@"id"];
+        if ([action isEqual:@"stopHistoryAudio"]) {
+            if ([self.playingHistoryID isEqual:identifier]) [self stopHistoryAudio];
+        } else {
+            if (self.closed || self.updatePaused || self.captureID || self.sdkRecording || self.annotationActive) {
+                reply(nil, @"Finish the current recording or update to play dictation audio.");
+                return;
+            }
+            NSUInteger index = [self.history indexOfObjectPassingTest:^BOOL(NSDictionary *entry, NSUInteger index, BOOL *stop) {
+                return [entry[@"id"] isEqual:identifier];
+            }];
+            NSURL *clip = index == NSNotFound ? nil : [self availableHistoryAudio:self.history[index]];
+            if (!clip) {
+                self.historyAudioRevision++;
+                reply(nil, @"This dictation audio is no longer available.");
+                return;
+            }
+            [self stopHistoryAudio];
+            AVAudioPlayer *player = [[AVAudioPlayer alloc] initWithContentsOfURL:clip error:NULL];
+            if (![player play]) { reply(nil, @"Could not play this dictation audio."); return; }
+            player.delegate = self;
+            self.historyAudioPlayer = player;
+            self.playingHistoryID = identifier;
+        }
     } else if ([action isEqual:@"clearHistory"]) {
         NSString *failure = nil;
         if (![self clearHistoryWithError:&failure]) { reply(nil, failure); return; }
@@ -5973,6 +6162,7 @@ static NSString *JardOutputPolicy(id result) {
         } else if ([operation isEqual:@"delete"]) {
             if (self.lastHistoryID && [selected containsObject:self.lastHistoryID]) [self forgetLastDictation];
             [self.history removeObjectsAtIndexes:indices];
+            [self sweepHistoryAudioAt:NSDate.date.timeIntervalSince1970];
             [self saveHistory];
         }
     } else if ([action isEqual:@"copyLast"]) {
@@ -6099,6 +6289,9 @@ static NSString *JardOutputPolicy(id result) {
     if (self.closed) return;
     self.closed = YES;
     [self stopSoundPreview];
+    [self stopHistoryAudio];
+    [self.historyAudioTimer invalidate];
+    self.historyAudioTimer = nil;
     [self finishAnnotationPaste:@"Jard is closing."];
     [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:self];
     [NSDistributedNotificationCenter.defaultCenter removeObserver:self];

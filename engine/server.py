@@ -12,10 +12,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import wave
 import webbrowser
 from collections import deque
 from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
-from datetime import datetime, timedelta
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Thread
 from typing import Annotated, Literal
@@ -32,7 +34,9 @@ from annotation_assets import annotation_movie_info, read_staged_annotation, sta
 from diagnostics import PROCESS_LOG, log_directory, maintain_logs, open_log
 from native_recordings import capture_active, is_meeting_stage, list_drafts, meeting_title_path, read_meeting_title, read_wav_header, recording_marker, recording_metadata, recover_wav, recover_tracks, source_tracks
 from managed_preferences import ManagedFeatureError, annotate_managed, meetings_managed, require_annotation, require_meetings
-from dictation_output import MAX_REWRITE_DEADLINE, keeps_rewrite_numbers, rewrite_deadline, rewrite_messages, vocabulary_terms
+from dictation_output import (MAX_PROFILE_CORRECTIONS, MAX_PROFILE_DOCUMENT, MAX_REWRITE_DEADLINE, MAX_VOCABULARY, correction_rules,
+                              parse_portable_profiles, profile_for, rewrite_deadline, rewrite_locally, validate_dictation_vocabulary,
+                              vocabulary_terms)
 from meeting_rolling import MIXED_SPEAKERS, SOURCE_LABELS, read_rolling, rolling_path
 from meeting_retention import readable_source
 from meeting_transcript import FRAME as MEETING_FRAME, RATE as MEETING_RATE, read_window, merge_sources
@@ -43,7 +47,7 @@ from sdk_discovery import SDK_MAX_REQUESTS, SDK_MAX_UPLOAD, SDK_VERSION, publish
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -51,9 +55,13 @@ from starlette.requests import ClientDisconnect
 
 from audio_file import (
     DURATION_ERROR, FILE_ERROR, MAX_AUDIO_SECONDS, PAUSE_AWARE_CHUNKING, audio_blocks, audio_duration, dictation_has_signal,
-    make_playable,
+    codec_binary, make_playable,
 )
 from insights import Insights
+from dictation_input import CleanupFailed, MIC_GAIN, StuPASECleanup, boost_microphone, replace_mixed_microphone
+from portable_audio_control import AudioBehavior
+from portable_dictation_sounds import SoundStyle
+from model_installation import install_workspace_models, model_status
 from writing_api import router as writing_routes
 from rumble_model import DIARIZATION_ID, DIARIZATION_REVISION, REVISION, LANGUAGES, MAX_SAMPLES, MODEL_ID, SAMPLE_RATE, RumbleModel, prepare_model
 
@@ -121,6 +129,52 @@ async def load_model(app: FastAPI):
         app.state.status = "ready"
 
 
+async def load_speech(app):
+    app.state.status = "loading"
+    async with app.state.insights.model.audio_priority():
+        await load_model(app)
+
+
+async def start_workspace_speech(app):
+    state = app.state
+    await load_speech(app)
+    if state.status == "ready":
+        state.model_setup = None
+        if ready := getattr(state, "portable_shortcut_ready", None):
+            ready.set()
+        return
+    try:
+        installed = await asyncio.to_thread(model_status, all_models=True)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        logger.exception("Could not check the desktop model installer.")
+        state.model_setup = {"phase": "unavailable"}
+        return
+    state.model_setup = {"phase": "load-error" if installed["ready"] else "needed", "total": installed["bytes"]}
+
+
+async def setup_workspace_speech(app, download):
+    state = app.state
+    if download:
+        def report(completed, total):
+            if type(completed) is int and type(total) is int and 0 <= completed <= total and total > 0:
+                state.model_setup.update(completed=completed, total=total)
+
+        try:
+            await install_workspace_models(report)
+        except (AttributeError, KeyError, OSError, RuntimeError, ValueError):
+            logger.exception("Could not install the desktop model set.")
+            state.model_setup["phase"] = "download-error"
+            return
+    state.model_setup["phase"] = "starting"
+    await load_speech(app)
+    if state.status == "ready":
+        state.model_setup = None
+        if ready := getattr(state, "portable_shortcut_ready", None):
+            ready.set()
+    else:
+        state.model_setup["phase"] = "load-error"
+
+
 async def open_portable_dictation(state, root):
     try:
         if sys.platform == "win32":
@@ -141,7 +195,36 @@ async def open_portable_dictation(state, root):
         await run_in_threadpool(history.initialize)
     except (OSError, ValueError, sqlite3.Error):
         logger.exception("Portable dictation history could not open.")
-    return Dictation(state, transcribe_portable_dictation, history)
+    dictation = Dictation(state, transcribe_portable_dictation, history)
+    if dictation.noise_cleanup:
+        stupase_cleanup(state).prepare()
+    return dictation
+
+
+async def enable_portable_shortcut(dictation, *, restoring=False):
+    if dictation.platform == "windows":
+        await dictation.enable()
+    elif dictation.platform == "wayland":
+        dictation.enable(restoring=restoring)
+    else:
+        dictation.enable()
+
+
+async def restore_portable_shortcut(state):
+    from portable_capture import CaptureError
+
+    await state.portable_shortcut_ready.wait()
+    dictation = state.portable_dictation
+    async with dictation.control:
+        if state.status != "ready" or state.draining:
+            return
+        if dictation.platform == "wayland" and dictation.command_mode:
+            dictation.restore_paste()
+        elif dictation.shortcut_requested and not dictation.enabled and not dictation.authorizing:
+            try:
+                await enable_portable_shortcut(dictation, restoring=True)
+            except CaptureError as failure:
+                dictation.feedback = str(failure)
 
 
 @asynccontextmanager
@@ -149,25 +232,42 @@ async def lifespan(app: FastAPI):
     app.state.status = "loading"
     app.state.inference = SpeechInference()
     app.state.diarizer = None
+    app.state.stupase_cleanup = None
+    app.state.portable_screencast = None
     app.state.live_speakers = {}
     app.state.meeting_subscriber = None
     root = library_path()
     app.state.jobs = set()
     portable = getattr(app.state, "portable_workspace", False)
+    app.state.model_setup = {"phase": "checking"} if portable else None
+    app.state.portable_shortcut_ready = asyncio.Event() if portable else None
     linux_audio = portable and sys.platform == "linux"
+    windows_audio = portable and sys.platform == "win32"
+    windows_screen = False
     recorder = None
+    meeting_recorder = None
+    browser_pages = None
     if linux_audio:
-        from linux_capture import LinuxRecording
+        from linux_capture import LinuxRecording, microphone_users, playback_users
+        from linux_meeting_audio import LinuxMeetingRecording
 
         recorder = LinuxRecording
-    elif portable and sys.platform == "win32":
-        from windows_capture import WindowsRecording, helper_path
+        meeting_recorder = LinuxMeetingRecording
+    elif windows_audio:
+        from windows_capture import WindowsMeetingRecording, WindowsRecording, browser_call_pages
+        from windows_capture import helper_path, microphone_users, playback_users
+        from windows_screencast import helper_path as windows_screen_helper
 
         if helper_path() is not None:
             recorder = WindowsRecording
+            meeting_recorder = WindowsMeetingRecording
+            browser_pages = browser_call_pages
+            windows_screen = windows_screen_helper() is not None
     with open_library(root) as library:
         app.state.library = library
+        app.state.screen_draft_dir = None
         app.state.portable_recorder = recorder
+        app.state.portable_meeting_recorder = meeting_recorder
         app.state.portable_recording = None
         app.state.portable_dictation = None
         if recorder is not None:
@@ -178,6 +278,9 @@ async def lifespan(app: FastAPI):
         app.state.native_token = os.urandom(32).hex() if portable else install_token(root)
         app.state.staging = root / "staging"
         app.state.staging.mkdir(mode=0o700, exist_ok=True)
+        if linux_audio or windows_screen:
+            app.state.screen_draft_dir = root / "screen-drafts"
+            app.state.screen_draft_dir.mkdir(mode=0o700, exist_ok=True)
         app.state.submitting = set()
         app.state.annotation_expiry_due = time.monotonic() + 90
         app.state.annotation_expiry = None
@@ -190,16 +293,50 @@ async def lifespan(app: FastAPI):
         app.state.insights = Insights(library, meetings_managed=managed_meetings)
         if not portable:
             start_job(app.state, publish_meeting_exports(app.state))
-        async def load_speech():
-            async with app.state.insights.model.audio_priority():
-                await load_model(app)
-
-        loading = asyncio.create_task(load_speech())
+        loading = asyncio.create_task(start_workspace_speech(app) if portable else load_speech(app))
         state = app.state
         state.startup_recovery = False
+        state.portable_calls = None
         background = []
+        call_tasks = []
+        if meeting_recorder and not managed_meetings:
+            from portable_calls import PROVIDERS, CallWatcher, recording_label
+            from portable_call_surface import watch_desktop_calls
+
+            async def start_call(languages, call):
+                source = PROVIDERS.get(call.source)
+                binaries = source.binaries if windows_audio and source else ()
+                reply = await begin_portable_recording(state, "both", True, languages,
+                                                       provider=recording_label(call), call_binaries=binaries)
+                return reply["id"]
+
+            async def finish_call(key):
+                await finish_portable_capture(state, key, (), diarization=True)
+
+            state.portable_calls = CallWatcher(state, microphone_users, playback_users, start_call, finish_call,
+                                              lambda: state.status == "ready" and not portable_capture_busy(state),
+                                              browser_pages=browser_pages)
+            call_tasks = [asyncio.create_task(state.portable_calls.run()),
+                          asyncio.create_task(watch_desktop_calls(state.portable_calls))]
+            tray_directory = Path(os.environ.get("JARO_DESKTOP_TRAY", ""))
+            if tray_directory.is_absolute() and tray_directory.is_dir():
+                from portable_tray import MeetingTray
+
+                def latest_meeting():
+                    with library.connection() as db:
+                        row = db.execute(f"""SELECT s.id FROM {readable_source(db)} s
+                            WHERE s.status='complete' AND trim(s.search_text)!=''
+                            AND coalesce(json_extract(s.options,'$.meeting'),json_extract(s.options,'$.sourceSpeakerTurns'),0)
+                            ORDER BY s.created DESC,s.id LIMIT 1""").fetchone()
+                    return row[0] if row else None
+
+                tray = MeetingTray(state, tray_directory, lambda: portable_capture_busy(state), latest_meeting,
+                                   lambda key: saved_meeting_clipboard(library, key), finish_call)
+                call_tasks.append(asyncio.create_task(tray.run()))
         if not portable:
             background.append(asyncio.create_task(watch_idle(app)))
+        if updater := getattr(state, "portable_updater", None):
+            background.append(asyncio.create_task(updater.watch()))
         if state.portable_dictation is not None:
             background.append(asyncio.create_task(expire_portable_dictations(state.portable_dictation.history)))
         if not portable or recorder is not None:
@@ -208,6 +345,7 @@ async def lifespan(app: FastAPI):
             state.startup_recovery = not managed_meetings and bool(state.startup_stranded or library.has_pending_meetings())
             background.append(asyncio.create_task(resume_meetings(state)))
         command_listener = None
+        shortcut_restore = None
         try:
             if getattr(state, "sdk_port", None):
                 state.sdk = publish_sdk(root, state.sdk_port)
@@ -216,11 +354,24 @@ async def lifespan(app: FastAPI):
 
                 try:
                     command_listener = await listen(root, state.portable_dictation.run_command)
-                    await state.portable_dictation.restore_command_preference(command_prefix(root))
+                    await state.portable_dictation.restore_command_preference(command_prefix(root), root)
                 except OSError:
                     logger.warning("Could not start the Wayland dictation command listener.", exc_info=True)
+            if state.portable_dictation is not None:
+                shortcut_restore = asyncio.create_task(restore_portable_shortcut(state))
             yield
         finally:
+            for task in call_tasks:
+                task.cancel()
+            await asyncio.gather(*call_tasks, return_exceptions=True)
+            if shortcut_restore is not None:
+                shortcut_restore.cancel()
+                await asyncio.gather(shortcut_restore, return_exceptions=True)
+            if screencast := state.portable_screencast:
+                try:
+                    await screencast.shutdown()
+                except OSError:
+                    logger.warning("Could not finalize the interrupted screen recording.", exc_info=True)
             if command_listener is not None:
                 command_listener.close()
                 await command_listener.wait_closed()
@@ -239,6 +390,8 @@ async def lifespan(app: FastAPI):
             for job in jobs:
                 job.cancel()
             await asyncio.gather(*jobs, return_exceptions=True)
+            if cleanup := getattr(state, "stupase_cleanup", None):
+                await cleanup.close()
             await app.state.insights.close()
             await loading
 
@@ -256,7 +409,8 @@ async def watch_idle(app):
                 and (state.annotation_expiry is None or state.annotation_expiry.done())):
             state.annotation_expiry_due = now + 3600
             state.annotation_expiry = start_job(state, sweep_annotation_retention(state))
-        busy = (state.jobs or state.submitting or state.sdk_pending or state.insights.active_job or state.insights.chat_count
+        busy = (state.jobs or state.submitting or state.sdk_pending or getattr(state, "screenshot_pending", False)
+                or state.insights.active_job or state.insights.chat_count
                 or state.insights.model.audio_users or state.insights.wake.is_set())
         if state.leases.idle(busy) and getattr(state, "request_shutdown", None):
             state.request_shutdown()
@@ -303,7 +457,7 @@ async def resume_meetings(state):
     try:
         while state.startup_recovery:
             await asyncio.sleep(2)
-            if state.status == "error":
+            if state.status == "error" and not getattr(state, "model_setup", None):
                 return
             if not available():
                 continue
@@ -375,7 +529,25 @@ async def status(request: Request, challenge: str = Query("", max_length=64)):
         "libraryId": library_id(request.app.state.library.root), "proof": proof,
         "status": request.app.state.status, "model": MODEL_ID, "languages": LANGUAGE_OPTIONS, "apiVersion": API_VERSION,
         "diarization": request.app.state.diarizer is not None,
+        **({"modelSetup": setup} if (setup := getattr(request.app.state, "model_setup", None)) else {}),
     }
+
+
+@app.post("/api/portable/models", status_code=202)
+async def start_model_setup(request: Request):
+    state = request.app.state
+    if not getattr(state, "portable_workspace", False):
+        raise HTTPException(404, "Desktop model setup is unavailable.")
+    if request.headers.get("origin") != URL:
+        raise HTTPException(403, "Open Jaro’s desktop workspace to set up the models.")
+    if state.draining:
+        raise HTTPException(409, "Jaro is preparing to close.")
+    setup = state.model_setup
+    if setup and setup["phase"] in ("needed", "download-error", "load-error"):
+        download = setup["phase"] != "load-error"
+        setup.update(phase="downloading" if download else "starting", completed=0)
+        start_job(state, setup_workspace_speech(request.app, download))
+    return {"modelSetup": setup}
 
 
 def check_client(request):
@@ -409,10 +581,22 @@ async def connect_browser(key: UUID, request: Request):
         # An empty stream lets EventSource reconnect after a committed restart.
         if state.draining:
             return
-        with state.leases.browser_connection():
-            while True:
-                yield ": Jaro connected\n\n"
-                await asyncio.sleep(20)
+        updater = getattr(state, "portable_updater", None)
+        previous = None
+        with state.leases.browser_connection(str(key)):
+            while not state.draining:
+                updated = updater.changed if updater else None
+                status = updater.status() if updater else None
+                if status != previous:
+                    previous = status
+                    yield f"event: update\ndata: {json.dumps(status)}\n\n"
+                else:
+                    yield ": Jaro connected\n\n"
+                if updated:
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(updated.wait(), timeout=20)
+                else:
+                    await asyncio.sleep(20)
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
 
@@ -552,6 +736,364 @@ def remove_session_image(request: Request, key: UUID, image_id: UUID):
     return Response(status_code=204)
 
 
+def linux_capture_workspace(request):
+    state = request.app.state
+    if sys.platform != "linux" or not getattr(state, "portable_workspace", False):
+        raise HTTPException(404, "Desktop screen capture is unavailable.")
+    return state
+
+
+@app.get("/api/portable/screenshots")
+async def screenshot_targets(request: Request):
+    if sys.platform == "win32":
+        screencast_workspace(request)
+        from windows_screencast import sources
+
+        return JSONResponse({"targets": await sources(), "picker": "workspace"}, headers={"Cache-Control": "no-store"})
+    linux_capture_workspace(request)
+    from linux_desktop_portal import CaptureError, DBusError, ScreenshotPortal
+
+    portal = ScreenshotPortal()
+    try:
+        await portal.connect()
+        targets = await portal.targets()
+    except (CaptureError, DBusError, EOFError, OSError, TimeoutError, ValueError):
+        targets = []
+    finally:
+        await portal.close()
+    return JSONResponse({"targets": targets}, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/portable/screenshots")
+async def portable_screenshot(request: Request, source: Literal["picker", "area", "window", "display"],
+                              target: Annotated[str, Query(max_length=27)] = ""):
+    state = screencast_workspace(request)
+    if request.headers.get("origin") != URL:
+        raise HTTPException(403, "Take screenshots from Jaro’s desktop workspace.")
+    if state.draining or getattr(state, "screenshot_pending", False):
+        raise HTTPException(409, "Finish the current screenshot or restart first.")
+    if sys.platform == "win32":
+        if source not in ("window", "display"):
+            raise HTTPException(422, "Choose a display or window in Jaro’s capture picker.")
+        return await windows_screenshot(state, source, target)
+
+    from linux_desktop_portal import CaptureError, DBusError, PortalResponseError, ScreenshotPortal, read_screenshot
+
+    state.screenshot_pending = True
+    portal = ScreenshotPortal()
+    try:
+        await portal.connect()
+        path = await portal.screenshot(source)
+        image, mime = await run_in_threadpool(read_screenshot, path)
+    except PortalResponseError as error:
+        if error.code == 1:
+            return Response(status_code=204)
+        raise HTTPException(503, str(error)) from error
+    except CaptureError as error:
+        raise HTTPException(422, str(error)) from error
+    except TimeoutError as error:
+        raise HTTPException(504, "The desktop screenshot request timed out.") from error
+    except (DBusError, EOFError, OSError, ValueError) as error:
+        raise HTTPException(503, "Could not get a screenshot from the desktop.") from error
+    finally:
+        try:
+            await portal.close()
+        finally:
+            state.screenshot_pending = False
+    return Response(image, media_type=mime, headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+async def windows_screenshot(state, source, target):
+    from portable_capture import CaptureError
+    from windows_screencast import snapshot
+
+    if not getattr(state, "screen_draft_dir", None):
+        raise HTTPException(503, "The screen recorder is unavailable.")
+    async with state.portable_recording_lock:
+        if state.draining or getattr(state, "screenshot_pending", False) or state.portable_screencast:
+            raise HTTPException(409, "Finish the current screen capture first.")
+        state.screenshot_pending = True
+    try:
+        await require_windows_target(source, target)
+        if source == "display":
+            await asyncio.sleep(3)
+        picture = await snapshot(source, target)
+    except CaptureError as error:
+        raise HTTPException(422, str(error)) from error
+    except TimeoutError as error:
+        raise HTTPException(504, "The desktop screenshot request timed out.") from error
+    except OSError as error:
+        raise HTTPException(503, "Could not get a screenshot from the desktop.") from error
+    finally:
+        state.screenshot_pending = False
+    return Response(picture.jpeg, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@app.get("/api/portable/screencast/sources")
+async def screencast_sources(request: Request):
+    if sys.platform == "win32":
+        screencast_workspace(request)
+        from windows_screencast import sources
+
+        return JSONResponse({"sources": await sources(), "picker": "workspace"},
+                            headers={"Cache-Control": "no-store"})
+    linux_capture_workspace(request)
+    from linux_desktop_portal import DBusError, ScreenCastPortal
+    from linux_screencast import supported
+
+    if not supported():
+        return {"sources": []}
+    portal = ScreenCastPortal(lambda: None)
+    try:
+        await portal.connect()
+        sources = await portal.sources()
+        return {"sources": [*sources, "area"] if "display" in sources else sources}
+    except (DBusError, OSError, EOFError, TimeoutError, ValueError):
+        return {"sources": []}
+    finally:
+        await portal.close()
+
+
+def screencast_workspace(request):
+    state = request.app.state
+    if sys.platform not in ("linux", "win32") or not getattr(state, "portable_workspace", False):
+        raise HTTPException(404, "Desktop screen capture is unavailable.")
+    return state
+
+
+def screencast_action(request):
+    state = screencast_workspace(request)
+    if request.headers.get("origin") != URL:
+        raise HTTPException(403, "Record the screen from Jaro’s desktop workspace.")
+    return state
+
+
+@app.get("/api/portable/screencast")
+async def screencast_status(request: Request):
+    take = screencast_workspace(request).portable_screencast
+    return JSONResponse(take.status() if take else {"phase": "idle"}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/portable/screencast/targets")
+async def screencast_targets(request: Request, source: Literal["display", "window"]):
+    state = screencast_workspace(request)
+    if sys.platform != "win32" or not state.screen_draft_dir:
+        raise HTTPException(404, "This desktop provides its own capture picker.")
+    from portable_capture import CaptureError
+    from windows_screencast import targets
+
+    try:
+        available = await targets(source)
+    except CaptureError as error:
+        raise HTTPException(503, str(error)) from error
+    return JSONResponse({"targets": available}, headers={"Cache-Control": "no-store"})
+
+
+async def require_windows_target(source, target):
+    from portable_capture import CaptureError
+    from windows_screencast import validate_target
+
+    try:
+        await validate_target(source, target)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    except LookupError as error:
+        raise HTTPException(409, str(error)) from error
+    except CaptureError as error:
+        raise HTTPException(503, str(error)) from error
+
+
+@app.post("/api/portable/screencast", status_code=202)
+async def begin_screencast(request: Request, source: Literal["display", "window", "area"],
+                           microphone: bool = False, computer_audio: bool = False,
+                           target: Annotated[str, Query(max_length=27)] = ""):
+    state = screencast_action(request)
+    if not state.screen_draft_dir:
+        raise HTTPException(503, "The screen recorder is unavailable.")
+    async with state.portable_recording_lock:
+        if state.draining or state.portable_screencast or state.portable_recording or getattr(state.portable_dictation, "busy", False):
+            raise HTTPException(409, "Finish the current recording or dictation first.")
+        if sys.platform == "win32":
+            from windows_screencast import WindowsScreenRecording
+
+            if getattr(state, "screenshot_pending", False):
+                raise HTTPException(409, "Finish the current screenshot first.")
+            await require_windows_target("display" if source == "area" else source, target)
+            if microphone or computer_audio:
+                transcription_languages(request)
+            take = WindowsScreenRecording(state.screen_draft_dir, source, target, microphone, computer_audio)
+        else:
+            from linux_screencast import ScreenRecording, supported
+
+            if not supported():
+                raise HTTPException(503, "Install GStreamer and the PipeWire plugin to record the screen.")
+            if microphone or computer_audio:
+                transcription_languages(request)
+            take = ScreenRecording(state.screen_draft_dir, source, microphone, computer_audio)
+        state.portable_screencast = take
+        take.task = start_job(state, take.record())
+    return take.status()
+
+
+class ScreencastRegion(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+@app.get("/api/portable/screencast/area/{key}")
+async def screencast_preview(request: Request, key: UUID):
+    take = screencast_workspace(request).portable_screencast
+    if not take or take.preview_id != str(key) or take.phase != "selecting" or take.preview is None:
+        raise HTTPException(404, "This display preview has expired.")
+    return Response(take.preview, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@app.post("/api/portable/screencast/area/{key}", status_code=202)
+async def set_screencast_region(request: Request, key: UUID, region: ScreencastRegion | None = None):
+    from portable_capture import CaptureError
+
+    take = screencast_action(request).portable_screencast
+    if not take or take.preview_id != str(key) or take.saving:
+        raise HTTPException(409, "This display preview has expired.")
+    try:
+        take.select_region((region.x, region.y, region.width, region.height) if region else None)
+    except ValueError as failure:
+        raise HTTPException(422, str(failure)) from failure
+    except CaptureError as failure:
+        raise HTTPException(409, str(failure)) from failure
+    return take.status()
+
+
+@app.get("/api/portable/screencast/{key}/preview")
+async def live_screencast_preview(request: Request, key: UUID):
+    from screencast_ink import FRAME_BOUNDARY
+
+    take = screencast_workspace(request).portable_screencast
+    if not take or take.draft.key != str(key) or take.phase != "recording" or take.saving:
+        raise HTTPException(404, "The live drawing preview has ended.")
+    if take.drawing.token is not None or getattr(getattr(take, "pen", None), "active", False):
+        raise HTTPException(409, "The live drawing preview is open in another view.")
+    frames = take.drawing.stream(lambda: take.phase == "recording" and not take.saving)
+    return StreamingResponse(frames, media_type=f"multipart/x-mixed-replace; boundary={FRAME_BOUNDARY}",
+                             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@app.delete("/api/portable/screencast/{key}/preview", status_code=204)
+async def close_live_screencast_preview(request: Request, key: UUID):
+    take = screencast_action(request).portable_screencast
+    if take and take.draft.key == str(key):
+        take.drawing.close_view()
+    return Response(status_code=204)
+
+
+class ScreencastInk(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+    time: float
+    points: list[Annotated[list[float], Field(min_length=3, max_length=3)]] = Field(max_length=1024)
+
+
+@app.post("/api/portable/screencast/{key}/pen")
+@app.delete("/api/portable/screencast/{key}/pen")
+async def screencast_pen(request: Request, key: UUID):
+    from portable_capture import CaptureError
+
+    take = screencast_action(request).portable_screencast
+    if not take or take.draft.key != str(key) or take.phase != "recording" or take.saving:
+        raise HTTPException(409, "This screen recording has stopped.")
+    pen = getattr(take, "pen", None)
+    if pen is None:
+        raise HTTPException(409, "Use the recording preview to draw on this desktop.")
+    if take.stopped or take.started is None:
+        raise HTTPException(409, "This screen recording has stopped.")
+    if request.method == "DELETE":
+        await pen.close()
+    else:
+        try:
+            await pen.open(take.started, take.region)
+        except CaptureError as failure:
+            raise HTTPException(409, str(failure)) from failure
+    return take.status()
+
+
+@app.post("/api/portable/screencast/{key}/ink", status_code=204)
+async def append_screencast_ink(request: Request, key: UUID, ink: ScreencastInk):
+    take = screencast_action(request).portable_screencast
+    if not take or take.draft.key != str(key) or take.started is None or take.phase != "recording" or take.saving:
+        raise HTTPException(409, "This screen recording has stopped.")
+    if getattr(getattr(take, "pen", None), "active", False):
+        raise HTTPException(409, "Finish drawing on the desktop before using the preview.")
+    try:
+        take.drawing.add(ink.points, ink.time, take.recording_time() + .5)
+    except ValueError as failure:
+        raise HTTPException(422, str(failure)) from failure
+    except OSError as failure:
+        raise HTTPException(503, "Could not keep this drawing in the recording.") from failure
+    return Response(status_code=204)
+
+
+async def save_screen_draft(state, draft, languages):
+    from portable_capture import CaptureError
+    from screencast_ink import load_events
+
+    if await run_in_threadpool(state.library.exists, draft.key):
+        with suppress(OSError):
+            await run_in_threadpool(draft.discard)
+        return JSONResponse({"id": draft.key}, status_code=202)
+    try:
+        events = await run_in_threadpool(load_events, draft.ink)
+        movie = await draft.prepare_movie(events)
+        staged_annotation_paths(movie)["manifest"].write_text(json.dumps({
+            "version": 1, "source": draft.source, "coordinateSpace": "normalized-bottom-left", "events": events, "frames": [],
+        }))
+        annotation = await run_in_threadpool(read_staged_annotation, movie)
+        result = await accept_audio(state, movie, "Screen recording", "video/mp4", languages,
+                                    True, len(draft.audio_sources) == 2, False, True, stage_id=draft.key, annotation=annotation)
+    except (CaptureError, ValueError) as failure:
+        raise HTTPException(422, str(failure)) from failure
+    except OSError as failure:
+        raise HTTPException(503, "Could not save the screen recording.") from failure
+    with suppress(OSError):
+        await run_in_threadpool(draft.discard)
+    return result
+
+
+@app.post("/api/portable/screencast/finish")
+async def finish_screencast(request: Request):
+    state = screencast_action(request)
+    take = state.portable_screencast
+    if not take or take.phase not in ("recording", "recorded") or take.saving:
+        raise HTTPException(409, "There is no screen recording ready to save.")
+    languages = transcription_languages(request, require_ready=bool(take.draft.audio_sources))
+    take.saving = True
+    try:
+        await take.stop()
+        result = await save_screen_draft(state, take.draft, languages)
+        state.portable_screencast = None
+        return result
+    finally:
+        take.saving = False
+
+
+@app.delete("/api/portable/screencast", status_code=204)
+async def discard_screencast(request: Request):
+    state = screencast_action(request)
+    take = state.portable_screencast
+    if take:
+        if take.saving:
+            raise HTTPException(409, "Wait for the screen recording to finish saving.")
+        take.saving = True
+        try:
+            await take.discard()
+        finally:
+            state.portable_screencast = None
+    return Response(status_code=204)
+
+
 @app.get("/api/sessions/{key}/audio")
 def session_audio(request: Request, key: UUID, track: Literal["mic", "system"] | None = None):
     path, mime = request.app.state.library.media(str(key), track=track)
@@ -677,13 +1219,13 @@ def locate_meeting_export(request: Request, key: UUID):
 
 
 @app.get("/api/native/meetings/{key}/recording-files")
-def native_meeting_recording_folder(request: Request, key: UUID):
+def native_meeting_recording_files(request: Request, key: UUID):
     check_native(request)
     try:
-        folder = request.app.state.library.meeting_recording_folder(str(key))
+        recording = request.app.state.library.meeting_recording_file(str(key))
     except MissingSession as error:
         raise HTTPException(404, "This meeting's recording files are no longer available.") from error
-    return JSONResponse({"folder": str(folder)}, headers={"Cache-Control": "no-store"})
+    return JSONResponse({"folder": str(recording.parent), "path": str(recording)}, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/native/meetings/{key}/excerpt")
@@ -831,7 +1373,7 @@ def get_automatic_meeting_notes(request: Request):
 @app.put("/api/meetings/automatic-notes")
 def set_automatic_meeting_notes(request: Request, enabled: Annotated[bool, Body(embed=True, strict=True)]):
     if request.headers.get("origin") != URL:
-        raise HTTPException(403, "Change meeting notes from Jaro on this Mac.")
+        raise HTTPException(403, "Change meeting notes from the Jaro workspace.")
     require_meetings()
     state = request.app.state
     if state.draining:
@@ -845,7 +1387,7 @@ def set_automatic_meeting_notes(request: Request, enabled: Annotated[bool, Body(
 @app.put("/api/meetings/retention")
 async def set_meeting_retention(request: Request, days: int):
     if request.headers.get("origin") != URL:
-        raise HTTPException(403, "Change retention from Jaro on this Mac.")
+        raise HTTPException(403, "Change retention from the Jaro workspace.")
     if days not in (0, 1, 7, 30):
         raise HTTPException(400, "Choose one of the meeting retention periods.")
     state = request.app.state
@@ -863,6 +1405,8 @@ async def set_meeting_retention(request: Request, days: int):
 @app.put("/api/meetings/audio-retention")
 async def set_audio_retention(request: Request, days: int):
     check_client(request)
+    if getattr(request.app.state, "portable_workspace", False) and request.headers.get("origin") != URL:
+        raise HTTPException(403, "Change retention from the Jaro workspace.")
     if days not in (-1, 0, 1, 7, 30):
         raise HTTPException(400, "Choose one of the meeting audio retention periods.")
     state = request.app.state
@@ -985,9 +1529,9 @@ async def decode_pcm(state, pcm: bytes, languages, speakers=None, offset=0, live
     return await run_inference(state, inference, dictation=dictation)
 
 
-async def resample_capture(data):
+async def resample_capture(data, rate=MEETING_RATE):
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-v", "error", "-f", "s16le", "-ar", str(MEETING_RATE), "-ac", "1", "-i", "pipe:0",
+        codec_binary("ffmpeg"), "-v", "error", "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
         "-ar", str(SAMPLE_RATE), "-f", "f32le", "pipe:1", stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
@@ -1121,7 +1665,7 @@ async def accept_audio(state, source, name, mime, languages, recording, diarizat
                        notes_draft=None, tracks=None, meeting_provider=None, meeting_calendar=None, meeting_started=None,
                        rolling=(), applies_retention=True, annotation=None, annotation_location=None,
                        provisional_title=None, meeting_title=None,
-                       meeting_microphone_warning=None):
+                       meeting_microphone_warning=None, meeting_voice_input=None):
     library = state.library
     if state.draining:
         raise HTTPException(409, "Jard is preparing to restart.")
@@ -1149,6 +1693,8 @@ async def accept_audio(state, source, name, mime, languages, recording, diarizat
                 options["meetingTitle"] = meeting_title
             if meeting_microphone_warning == "digitalSilence":
                 options["meetingMicrophoneWarning"] = meeting_microphone_warning
+            if meeting_voice_input and tracks and "mic" in tracks:
+                options["meetingVoiceInput"] = meeting_voice_input
         if meeting_started:
             options["meetingStartedAt"] = meeting_started.isoformat()
             if duration is not None:
@@ -1216,23 +1762,135 @@ def portable_capture_state(request):
     return state
 
 
-@app.post("/api/portable/recording", status_code=201)
-async def start_portable_recording(request: Request, mode: Literal["mic", "system", "both"] = "mic"):
-    from portable_capture import CaptureError
+def portable_capture_busy(state):
+    return (state.draining or state.portable_recording or state.portable_screencast
+            or (state.portable_dictation and state.portable_dictation.busy))
 
+
+@app.post("/api/portable/recording", status_code=201)
+async def start_portable_recording(request: Request, mode: Literal["mic", "system", "both"] = "mic", meeting: bool = False):
     state = portable_capture_state(request)
-    transcription_languages(request)
+    return await begin_portable_recording(state, mode, meeting, transcription_languages(request))
+
+
+async def begin_portable_recording(state, mode, meeting, languages, *, provider="Meeting", call_binaries=()):
+    from portable_capture import CaptureError, save_draft_metadata
+    from recording_power import keep_awake_until
+
+    if meeting:
+        require_meetings()
+        if mode != "both":
+            raise HTTPException(400, "Meeting recording uses the microphone and computer audio.")
     async with state.portable_recording_lock:
-        if state.draining or state.portable_recording or (state.portable_dictation and state.portable_dictation.busy):
+        if portable_capture_busy(state):
             raise HTTPException(409, "Finish or recover the current recording first.")
         key = uuid4()
-        capture = state.portable_recorder(key, state.portable_recording_dir / f"{key}.wav", mode)
+        path = state.portable_recording_dir / f"{key}.wav"
+        recorder = state.portable_meeting_recorder if meeting else state.portable_recorder
+        capture = recorder(key, path, mode, call_binaries=call_binaries) if call_binaries else recorder(key, path, mode)
+        capture.meeting = meeting
         try:
+            if meeting:
+                voice = await run_in_threadpool(read_meeting_voice_input, state)
+                metadata = {"meetingProvider": provider, "meetingStartedAt": datetime.now(timezone.utc).isoformat(),
+                            "languageHints": list(languages), "meetingVoiceInput": voice}
+                try:
+                    await run_in_threadpool(save_draft_metadata, path, metadata)
+                except OSError as error:
+                    raise HTTPException(503, "Could not prepare the meeting draft.") from error
+                if voice["noiseCleanup"]:
+                    stupase_cleanup(state).prepare()
             await capture.start()
         except CaptureError as error:
             raise HTTPException(503, str(error)) from error
+        finally:
+            if meeting and not capture.frames:
+                with suppress(OSError):
+                    recording_marker(path).unlink(missing_ok=True)
         state.portable_recording = capture
+        keep_awake_until(capture.worker, "Jaro is recording audio")
     return {"id": key, "sampleRate": SAMPLE_RATE}
+
+
+def portable_call_watcher(request):
+    state = portable_capture_state(request)
+    if watcher := getattr(state, "portable_calls", None):
+        return watcher
+    raise HTTPException(404, "Call detection is unavailable.")
+
+
+class PortableCallSettings(BaseModel):
+    enabled: StrictBool
+    autoStop: StrictBool
+    policies: dict[str, Literal["ask", "never", "auto"]]
+
+
+@app.get("/api/portable/calls")
+async def portable_call_status(request: Request):
+    return JSONResponse(portable_call_watcher(request).status(), headers={"Cache-Control": "no-store"})
+
+
+@app.put("/api/portable/calls/settings")
+async def change_portable_call_settings(request: Request, preferences: PortableCallSettings):
+    watcher = portable_call_watcher(request)
+    if watcher.state.draining:
+        raise HTTPException(409, "Jard is preparing to restart.")
+    async with watcher.transition:
+        watcher.settings(preferences.model_dump())
+        return watcher.status()
+
+
+@app.post("/api/portable/calls/offer/{token}/{action}")
+async def answer_portable_offer(request: Request, token: str, action: Literal["record", "dismiss", "more", "back", "always", "never"]):
+    watcher = portable_call_watcher(request)
+    languages = transcription_languages(request) if action in ("record", "always") else ()
+    await watcher.answer(token, action, languages)
+    return watcher.status()
+
+
+@app.post("/api/portable/calls/recording/{key}/{action}")
+async def act_on_portable_call(request: Request, key: UUID, action: Literal["stop", "keep"]):
+    watcher = portable_call_watcher(request)
+    if action == "stop":
+        await watcher.stop(key)
+    else:
+        watcher.keep_recording(key)
+    return watcher.status()
+
+
+def read_meeting_voice_input(state):
+    with state.library.connection() as db:
+        row = db.execute("SELECT noiseCleanup, boostMicrophone FROM meeting_voice_input WHERE id=1").fetchone()
+    return {"noiseCleanup": bool(row and row[0]), "boostMicrophone": bool(row and row[1])}
+
+
+@app.get("/api/portable/meeting-voice-input")
+def get_portable_meeting_voice_input(request: Request):
+    return read_meeting_voice_input(portable_capture_state(request))
+
+
+class MeetingVoiceInputChange(BaseModel):
+    setting: Literal["noiseCleanup", "boostMicrophone"]
+    enabled: StrictBool
+
+
+@app.put("/api/portable/meeting-voice-input")
+async def change_portable_meeting_voice_input(request: Request, change: MeetingVoiceInputChange):
+    require_meetings()
+    state = portable_capture_state(request)
+    if state.draining:
+        raise HTTPException(409, "Jard is preparing to restart.")
+
+    def update():
+        with state.library.connection() as db:
+            db.execute("INSERT OR IGNORE INTO meeting_voice_input(id) VALUES(1)")
+            db.execute(f"UPDATE meeting_voice_input SET {change.setting}=? WHERE id=1", (int(change.enabled),))
+        return read_meeting_voice_input(state)
+
+    voice = await run_in_threadpool(update)
+    if change.setting == "noiseCleanup" and change.enabled:
+        stupase_cleanup(state).prepare(retry=True)
+    return voice
 
 
 @app.get("/api/portable/dictation")
@@ -1247,13 +1905,352 @@ def portable_dictation(request):
     return dictation
 
 
-async def expire_portable_dictations(history):
-    while True:
-        await asyncio.sleep(60)
+async def portable_microphone_options(dictation):
+    from portable_capture import CaptureError
+
+    if dictation.platform == "windows":
+        from windows_capture import microphone_inputs
+    else:
+        from linux_capture import microphone_inputs
+    try:
+        inputs = await microphone_inputs()
+    except CaptureError:
+        return {"selected": dictation.microphone, "inputs": [], "available": False}
+    return {"selected": dictation.microphone, "inputs": inputs, "available": True}
+
+
+class PortableMicrophoneChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selected: str = Field(max_length=1024)
+
+
+@app.get("/api/portable/dictation/microphone")
+async def portable_microphone(request: Request):
+    result = await portable_microphone_options(portable_dictation(request))
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/portable/dictation/microphone")
+async def change_portable_microphone(request: Request, change: PortableMicrophoneChange):
+    dictation = portable_dictation(request)
+    async with dictation.control:
+        if dictation.state.draining:
+            raise HTTPException(409, "Jaro is preparing to restart.")
+        if change.selected:
+            options = await portable_microphone_options(dictation)
+            if not options["available"]:
+                raise HTTPException(503, "Could not read the available microphones.")
+            if not any(device["id"] == change.selected for device in options["inputs"]):
+                raise HTTPException(400, "The selected microphone is unavailable.")
+        if dictation.busy or dictation.state.draining:
+            raise HTTPException(409, "Finish the current dictation before changing the microphone.")
         try:
-            await run_in_threadpool(history.expire)
+            await run_in_threadpool(dictation.history.configure, microphone=change.selected)
+        except (OSError, ValueError, sqlite3.Error) as failure:
+            raise HTTPException(503, "Could not save the dictation microphone.") from failure
+        dictation.microphone = change.selected
+    return {"selected": change.selected}
+
+
+class PortableLanguageChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    language: str = Field(max_length=16)
+
+
+@app.post("/api/portable/dictation/language")
+async def change_portable_language(request: Request, change: PortableLanguageChange):
+    dictation = portable_dictation(request)
+    if change.language and change.language not in LANGUAGES:
+        raise HTTPException(400, "Choose a language from the list.")
+    async with dictation.control:
+        if dictation.state.draining:
+            raise HTTPException(409, "Jaro is preparing to restart.")
+        if dictation.busy:
+            raise HTTPException(409, "Finish the current dictation before changing the language.")
+        try:
+            await run_in_threadpool(dictation.history.configure, language=change.language)
+        except (OSError, ValueError, sqlite3.Error) as failure:
+            raise HTTPException(503, "Could not save the dictation language.") from failure
+        dictation.language = change.language
+        return dictation.snapshot()
+
+class PortableVocabularyEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    term: str = Field(max_length=80)
+    soundsLike: list[Annotated[str, Field(max_length=80)]] = Field(max_length=8)
+
+
+class PortableVocabularyChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base: list[PortableVocabularyEntry] = Field(max_length=MAX_VOCABULARY)
+    entries: list[PortableVocabularyEntry] = Field(max_length=MAX_VOCABULARY)
+
+
+@app.post("/api/portable/dictation/vocabulary")
+async def change_portable_vocabulary(request: Request, change: PortableVocabularyChange):
+    dictation = portable_dictation(request)
+    try:
+        base = validate_dictation_vocabulary([entry.model_dump() for entry in change.base])
+        entries = validate_dictation_vocabulary([entry.model_dump() for entry in change.entries])
+    except ValueError as failure:
+        raise HTTPException(400, str(failure)) from failure
+    async with dictation.control:
+        if dictation.state.draining:
+            raise HTTPException(409, "Jaro is preparing to restart.")
+        try:
+            saved = await run_in_threadpool(dictation.history.save_vocabulary, base, entries)
+        except (OSError, ValueError, sqlite3.Error) as failure:
+            raise HTTPException(503, "Could not save the dictation vocabulary.") from failure
+        if not saved:
+            raise HTTPException(409, "Vocabulary changed in another window. Reopen the editor to load the saved terms.")
+        dictation.vocabulary_entries = entries
+    return await run_in_threadpool(dictation.snapshot)
+
+
+class PortableReplacementChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(max_length=MAX_PROFILE_CORRECTIONS)
+
+
+@app.post("/api/portable/dictation/replacements")
+async def change_portable_replacements(request: Request, change: PortableReplacementChange):
+    dictation = portable_dictation(request)
+    try:
+        correction_rules(change.text, scope="word")
+    except ValueError as failure:
+        raise HTTPException(400, str(failure)) from failure
+    if "\0" in change.text:
+        raise HTTPException(400, "Use text for word replacements.")
+    async with dictation.control:
+        if dictation.state.draining:
+            raise HTTPException(409, "Jaro is preparing to restart.")
+        try:
+            await run_in_threadpool(dictation.history.save_replacements, change.text)
+        except (OSError, ValueError, sqlite3.Error) as failure:
+            raise HTTPException(503, "Could not save word replacements.") from failure
+        dictation.replacements = change.text
+    return await run_in_threadpool(dictation.snapshot)
+
+
+
+class PortableProfileDefinition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profiles: str = Field(max_length=MAX_PROFILE_DOCUMENT)
+
+    def parsed(self):
+        try:
+            return parse_portable_profiles(self.profiles)
+        except ValueError as failure:
+            raise HTTPException(400, str(failure)) from failure
+
+
+class PortableProfileChange(PortableProfileDefinition):
+    base: str = Field(max_length=MAX_PROFILE_DOCUMENT)
+
+
+class PortableProfilePreview(PortableProfileDefinition):
+    text: str = Field(max_length=8000)
+    app: str = Field(default="", max_length=300)
+
+
+@app.post("/api/portable/dictation/output-profiles")
+async def change_portable_profiles(request: Request, change: PortableProfileChange):
+    dictation = portable_dictation(request)
+    profiles = change.parsed()
+    async with dictation.control:
+        if dictation.state.draining:
+            raise HTTPException(409, "Jaro is preparing to restart.")
+        try:
+            saved = await run_in_threadpool(dictation.history.save_output_profiles, change.base, change.profiles)
+        except (OSError, ValueError, sqlite3.Error) as failure:
+            raise HTTPException(503, "Could not save output profiles.") from failure
+        if not saved:
+            raise HTTPException(409, "Profiles changed in another window. Reload the saved profiles before editing.")
+        dictation.profiles = profiles
+        dictation.output_profiles = change.profiles
+    return await run_in_threadpool(dictation.snapshot)
+
+
+@app.post("/api/portable/dictation/output-profiles/describe")
+def describe_portable_profiles(request: Request, definition: PortableProfileDefinition):
+    portable_dictation(request)
+    return {"profiles": definition.parsed()}
+
+
+@app.post("/api/portable/dictation/output-profiles/preview")
+async def preview_portable_profiles(request: Request, change: PortableProfilePreview):
+    from portable_dictation import output_vocabulary, transform_output
+
+    dictation = portable_dictation(request)
+    application = "" if dictation.platform == "wayland" else change.app
+    profile = profile_for(change.parsed(), application)
+    entries = dictation.vocabulary_entries
+    result = await transform_output(dictation.state, change.text, entries, dictation.replacements, profile, preview=True)
+    steps = profile.steps if profile else ()
+    return {"text": result.text, "warnings": result.warnings, "steps": steps, "profile": profile.target if profile else "",
+            "vocabulary": output_vocabulary(entries, profile), "skipped": [step for step in steps if step == "rewrite"]}
+
+
+class PortableVoiceInputChange(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    setting: Literal["noiseCleanup", "boostMicrophone"]
+    enabled: bool
+
+
+class PortableIndicatorPositionChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    position: Literal["top", "bottom", "off"]
+
+
+@app.post("/api/portable/dictation/indicator")
+async def change_portable_indicator(request: Request, change: PortableIndicatorPositionChange):
+    dictation = portable_dictation(request)
+    async with dictation.control:
+        if dictation.state.draining:
+            raise HTTPException(409, "Jaro is preparing to restart.")
+        if dictation.busy:
+            raise HTTPException(409, "Finish the current dictation before changing the indicator.")
+        try:
+            await run_in_threadpool(dictation.history.configure, indicator_position=change.position)
+        except (OSError, ValueError, sqlite3.Error) as failure:
+            raise HTTPException(503, "Could not save the dictation indicator position.") from failure
+        dictation.indicator_position = change.position
+    return dictation.snapshot()
+
+
+@app.post("/api/portable/dictation/voice-input")
+async def change_portable_voice_input(request: Request, change: PortableVoiceInputChange):
+    dictation = portable_dictation(request)
+    field = "noise_cleanup" if change.setting == "noiseCleanup" else "boost_microphone"
+    async with dictation.control:
+        if dictation.state.draining:
+            raise HTTPException(409, "Jaro is preparing to restart.")
+        if dictation.busy:
+            raise HTTPException(409, "Finish the current dictation before changing voice input.")
+        try:
+            await run_in_threadpool(dictation.history.configure, **{field: change.enabled})
+        except (OSError, ValueError, sqlite3.Error) as failure:
+            raise HTTPException(503, "Could not save dictation voice input.") from failure
+        setattr(dictation, field, change.enabled)
+        if change.setting == "noiseCleanup" and change.enabled:
+            stupase_cleanup(dictation.state).prepare(retry=True)
+        return dictation.snapshot()
+
+
+class PortableSoundChange(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    enabled: bool | None = None
+    style: SoundStyle | None = None
+    volume: int | None = Field(default=None, ge=0, le=100)
+
+
+@app.post("/api/portable/dictation/sound")
+async def change_portable_sound(request: Request, change: PortableSoundChange):
+    dictation = portable_dictation(request)
+    async with dictation.control:
+        if dictation.state.draining:
+            raise HTTPException(409, "Jaro is preparing to restart.")
+        if dictation.busy:
+            raise HTTPException(409, "Finish the current dictation before changing sound settings.")
+        settings = replace(dictation.sound, **change.model_dump(exclude_none=True))
+        try:
+            await run_in_threadpool(dictation.history.save_sound_preferences, settings)
+        except (OSError, ValueError, sqlite3.Error) as failure:
+            raise HTTPException(503, "Could not save the dictation sound settings.") from failure
+        dictation.sound = settings
+        if not settings.enabled or settings.volume == 0:
+            await dictation.sounds.stop()
+    return dictation.snapshot()
+
+
+@app.post("/api/portable/dictation/sound/preview")
+async def preview_portable_sound(request: Request):
+    dictation = portable_dictation(request)
+    state = dictation.state
+    async with dictation.control:
+        async with state.portable_recording_lock:
+            if state.draining or dictation.busy or state.portable_recording or getattr(state, "portable_screencast", None):
+                raise HTTPException(409, "Finish recording before auditioning a dictation sound.")
+            settings = replace(dictation.sound, enabled=True, volume=dictation.sound.volume or 50)
+            task = dictation.sounds.play("start", settings)
+    if task is None:
+        raise HTTPException(503, "Dictation sound playback is unavailable.")
+    try:
+        if not await asyncio.shield(task):
+            raise HTTPException(503, "Could not play the dictation sound.")
+    except asyncio.CancelledError:
+        if not task.cancelled():
+            raise
+    return dictation.snapshot()
+
+
+class PortableAudioChange(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    behavior: AudioBehavior | None = None
+    percent: int | None = Field(default=None, ge=0, le=100)
+
+
+@app.post("/api/portable/dictation/other-audio")
+async def change_portable_audio(request: Request, change: PortableAudioChange):
+    dictation = portable_dictation(request)
+    async with dictation.control:
+        if dictation.state.draining or dictation.busy:
+            raise HTTPException(409, "Finish the current dictation before changing playback settings.")
+        if change.behavior is not None and change.behavior not in dictation.audio_control.modes:
+            raise HTTPException(400, "That playback control is unavailable on this desktop.")
+        settings = replace(dictation.audio_preferences, **change.model_dump(exclude_none=True))
+        try:
+            await run_in_threadpool(dictation.history.save_audio_preferences, settings)
+        except (OSError, ValueError, sqlite3.Error) as failure:
+            raise HTTPException(503, "Could not save the dictation playback settings.") from failure
+        dictation.audio_preferences = settings
+    return dictation.snapshot()
+
+
+async def expire_portable_dictations(history):
+    delay = 0
+    while True:
+        await asyncio.sleep(delay)
+        delay = 60
+        try:
+            next_expiry = await run_in_threadpool(history.expire)
+            if next_expiry is not None:
+                delay = min(delay, max(.1, next_expiry - time.time()))
         except (OSError, ValueError, sqlite3.Error):
             logger.warning("Could not expire Portable dictation history.", exc_info=True)
+
+
+class PortableShortcutModeChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["hold", "tap", "holdDouble", "doubleTap"]
+
+
+@app.post("/api/portable/dictation/shortcut-mode")
+async def change_portable_shortcut_mode(request: Request, change: PortableShortcutModeChange):
+    from portable_capture import CaptureError
+
+    dictation = portable_dictation(request)
+    if dictation.platform == "wayland" and dictation.command_mode:
+        raise HTTPException(409, "Shortcut mode uses compositor shortcuts. Configure command bindings in the desktop settings.")
+    async with dictation.control:
+        if dictation.state.draining:
+            raise HTTPException(409, "Jaro is preparing to restart.")
+        try:
+            await dictation.change_mode(change.mode)
+        except CaptureError as failure:
+            raise HTTPException(409, str(failure)) from failure
+    return await run_in_threadpool(dictation.snapshot)
 
 
 class PortableHistoryChange(BaseModel):
@@ -1269,10 +2266,34 @@ def portable_history(request: Request, query: str = Query("", max_length=512),
                      offset: int = Query(0, ge=0, le=10_000)):
     history = portable_dictation(request).history
     try:
-        result = history.page(query=query.strip() or None, offset=offset, limit=15, legacy=True, include_timing=True)
+        result = history.page(query=query.strip() or None, offset=offset, limit=15, legacy=True,
+                              include_timing=True, include_audio=True)
     except (OSError, ValueError, sqlite3.Error) as failure:
         raise HTTPException(503, "Could not read dictation history.") from failure
     return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/portable/dictation/history/{key}/audio")
+def portable_history_audio(request: Request, key: UUID):
+    history = portable_dictation(request).history
+    headers = {"Cache-Control": "no-store", "Accept-Ranges": "bytes", "X-Content-Type-Options": "nosniff",
+               "Cross-Origin-Resource-Policy": "same-origin"}
+    try:
+        with history.open_audio(str(key)) as (clip, size):
+            # WebKit probes WAVs with a small byte range before fetching the rest.
+            requested = re.fullmatch(r"bytes=([0-9]{0,12})-([0-9]{0,12})", request.headers.get("range", ""))
+            if requested and any(requested.groups()):
+                first, last = requested.groups()
+                start = int(first) if first else max(0, size - int(last))
+                end = min(size, int(last) + 1) if first and last else size
+                if start >= end:
+                    return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
+                clip.seek(start)
+                return Response(clip.read(end - start), 206, headers={**headers, "Content-Range": f"bytes {start}-{end-1}/{size}"},
+                                media_type="audio/wav")
+            return Response(clip.read(size), headers=headers, media_type="audio/wav")
+    except (OSError, ValueError, sqlite3.Error):
+        return Response(status_code=404, headers=headers)
 
 
 @app.post("/api/portable/dictation/history")
@@ -1292,8 +2313,8 @@ def change_portable_history(request: Request, change: PortableHistoryChange):
 
 @app.post("/api/portable/dictation/{action}")
 async def change_portable_dictation(request: Request, action: Literal[
-                                   "enable", "disable", "paste-shortcut", "configure", "toggle", "allow-paste",
-                                   "disable-paste", "enable-commands"],
+                                   "enable", "disable", "paste-shortcut", "configure", "toggle", "cancel", "allow-paste",
+                                   "disable-paste", "enable-commands", "add-gnome-shortcuts", "remove-gnome-shortcuts"],
                                terminal: bool = False):
     from portable_capture import CaptureError
 
@@ -1301,14 +2322,26 @@ async def change_portable_dictation(request: Request, action: Literal[
     dictation = portable_dictation(request)
     async with dictation.control:
         if action == "disable":
-            if dictation.platform == "wayland" and dictation.command_mode:
+            if dictation.platform == "wayland" and (dictation.command_mode or dictation.gnome_enabled):
                 try:
-                    await dictation.save_command_preference(False)
+                    await dictation.disable_commands()
                 except CaptureError as failure:
                     raise HTTPException(503, str(failure)) from failure
-            await dictation.disable()
+            try:
+                try:
+                    await dictation.remember_shortcut(False)
+                finally:
+                    if dictation.platform == "wayland":
+                        await dictation.disable(forget_paste=True)
+                    else:
+                        await dictation.disable()
+            except CaptureError as failure:
+                raise HTTPException(503, str(failure)) from failure
         elif state.draining:
             raise HTTPException(409, "Jaro is preparing to restart.")
+        elif action == "cancel":
+            if not await dictation.cancel_dictation():
+                raise HTTPException(409, "There’s no dictation left to cancel.")
         elif action == "paste-shortcut":
             if dictation.platform == "wayland" and not dictation.keyboard_allowed:
                 raise HTTPException(404, "Automatic paste is unavailable on this desktop.")
@@ -1317,11 +2350,15 @@ async def change_portable_dictation(request: Request, action: Literal[
             except (OSError, ValueError, sqlite3.Error) as failure:
                 raise HTTPException(503, "Could not save the paste shortcut.") from failure
             dictation.terminal = terminal
-        elif action in ("configure", "toggle", "allow-paste", "disable-paste", "enable-commands"):
+        elif action in ("configure", "toggle", "allow-paste", "disable-paste", "enable-commands",
+                        "add-gnome-shortcuts", "remove-gnome-shortcuts"):
             if dictation.platform != "wayland":
                 raise HTTPException(404, "This action uses the Wayland desktop.")
             if action == "disable-paste":
-                await dictation.disable_paste()
+                try:
+                    await dictation.disable_paste()
+                except CaptureError as failure:
+                    raise HTTPException(503, str(failure)) from failure
                 dictation.feedback = ""
             elif action == "allow-paste":
                 try:
@@ -1338,26 +2375,66 @@ async def change_portable_dictation(request: Request, action: Literal[
                     await dictation.enable_commands()
                 except CaptureError as failure:
                     raise HTTPException(409, str(failure)) from failure
-            elif dictation.authorizing or dictation.paste_authorizing or dictation.phase not in ("idle", "recording"):
+            elif action in ("add-gnome-shortcuts", "remove-gnome-shortcuts"):
+                if dictation.busy:
+                    raise HTTPException(409, "Finish the current dictation action first.")
+                try:
+                    if action == "add-gnome-shortcuts":
+                        await dictation.add_gnome_shortcuts()
+                    else:
+                        await dictation.remove_gnome_shortcuts()
+                except CaptureError as failure:
+                    raise HTTPException(409, str(failure)) from failure
+            elif dictation.queue_full:
+                from portable_dictation import QUEUE_FULL
+
+                raise HTTPException(409, QUEUE_FULL)
+            elif (dictation.authorizing or dictation.paste_authorizing or dictation.action_pending()
+                  or (dictation.phase != "recording" and not dictation.can_start_recording)):
                 raise HTTPException(409, "Finish the current dictation action first.")
             else:
                 dictation.schedule()
         else:
             try:
-                if dictation.platform == "windows":
-                    await dictation.enable()
+                if dictation.platform == "wayland":
+                    if not dictation.command_mode and not dictation.gnome_enabled:
+                        await dictation.remember_shortcut(True)
+                    await enable_portable_shortcut(dictation)
                 else:
-                    dictation.enable()
+                    await enable_portable_shortcut(dictation)
+                    try:
+                        await dictation.remember_shortcut(True)
+                    except CaptureError:
+                        await dictation.disable()
+                        raise
             except CaptureError as failure:
                 raise HTTPException(409, str(failure)) from failure
     return await run_in_threadpool(dictation.snapshot)
 
 
 @app.get("/api/portable/recording/drafts")
-def portable_recording_drafts(request: Request):
-    from portable_capture import draft_frames
-
+async def portable_recording_drafts(request: Request):
     state = portable_capture_state(request)
+    saved, recordings = await run_in_threadpool(audio_recording_drafts, state)
+    if folder := getattr(state, "screen_draft_dir", None):
+        from screen_draft import ScreenDraft
+
+        active = state.portable_screencast
+        for path in folder.iterdir():
+            if (active and path.name == active.draft.key) or path.name in saved:
+                continue
+            if draft := ScreenDraft.read(path):
+                try:
+                    seconds, _ = await annotation_movie_info(draft.movie)
+                except (OSError, ValueError):
+                    continue
+                recordings.append({"id": draft.key, "seconds": seconds, "screen": True})
+    return recordings
+
+
+def audio_recording_drafts(state):
+    from portable_capture import draft_frames, draft_metadata
+
     capture = state.portable_recording
     with state.library.connection() as db:
         saved = {row[0] for row in db.execute("SELECT id FROM sessions")}
@@ -1370,9 +2447,20 @@ def portable_recording_drafts(request: Request):
         if path.stem != key or key in saved or (capture and str(capture.key) == key):
             continue
         if frames := draft_frames(path):
-            meeting = any(track.is_file() for track in source_tracks(path).values())
+            meeting = (bool(draft_metadata(path).get("meetingProvider"))
+                       or any(track.is_file() for track in source_tracks(path).values()))
             recordings.append({"id": key, "seconds": frames / SAMPLE_RATE, "meeting": meeting})
-    return recordings
+    return saved, recordings
+
+
+def screen_draft_for_action(state, key):
+    if folder := getattr(state, "screen_draft_dir", None):
+        from screen_draft import ScreenDraft
+
+        if state.portable_screencast and state.portable_screencast.draft.key == str(key):
+            raise HTTPException(409, "Finish the active screen recording first.")
+        return ScreenDraft.read(folder / str(key))
+    return None
 
 
 @app.get("/api/portable/recording/{key}/frames")
@@ -1405,11 +2493,17 @@ async def stop_portable_recording(state, key):
 @app.post("/api/portable/recording/{key}/finish")
 async def save_portable_recording(request: Request, key: UUID, name: str = "", diarization: bool = False,
                                 live: bool = False, session: UUID | None = None):
-    from portable_capture import clear_draft, draft_frames, draft_tracks
-
     state = portable_capture_state(request)
-    languages = transcription_languages(request)
+    return await finish_portable_capture(state, key, transcription_languages(request), name=name,
+                                         diarization=diarization, live=live, session=session)
+
+
+async def finish_portable_capture(state, key, languages, *, name="", diarization=False, live=False, session=None):
+    from portable_capture import clear_draft, draft_frames, draft_metadata, draft_tracks
+
     async with state.portable_recording_lock:
+        if screen := screen_draft_for_action(state, key):
+            return await save_screen_draft(state, screen, languages)
         await stop_portable_recording(state, key)
         if session:
             state.live_speakers.pop(session, None)
@@ -1424,10 +2518,29 @@ async def save_portable_recording(request: Request, key: UUID, name: str = "", d
         if not frames:
             raise HTTPException(404, "No captured audio is available to save.")
         tracks = await run_in_threadpool(draft_tracks, path, frames)
-        meeting = any(track.is_file() for track in source_tracks(path).values())
+        metadata = await run_in_threadpool(draft_metadata, path)
+        provider = metadata.get("meetingProvider")
+        explicit_meeting = isinstance(provider, str) and bool(provider)
+        meeting = explicit_meeting or any(track.is_file() for track in source_tracks(path).values())
+        started = None
+        voice = None
+        if explicit_meeting:
+            require_meetings()
+            with suppress(TypeError, ValueError):
+                value = datetime.fromisoformat(metadata.get("meetingStartedAt"))
+                if value.utcoffset() == timedelta(0) and 2000 <= value.year < 9999:
+                    started = value
+            saved_languages = metadata.get("languageHints")
+            if isinstance(saved_languages, list) and all(isinstance(code, str) and code in LANGUAGES for code in saved_languages):
+                languages = tuple(dict.fromkeys(saved_languages))
+            if isinstance(inputs := metadata.get("meetingVoiceInput"), dict):
+                voice = {key: True for key in ("noiseCleanup", "boostMicrophone") if inputs.get(key) is True}
+            if provider != "Meeting":
+                name = f"{provider} meeting"
+            name = name or "Meeting"
         accepted = await accept_audio(state, path, name, "audio/wav", languages, True, diarization, live, True,
-                                      stage_id=str(key), tracks=tracks, meeting_provider="Meeting" if meeting else None,
-                                      applies_retention=False)
+                                      stage_id=str(key), tracks=tracks, meeting_provider=(provider or "Meeting") if meeting else None,
+                                      meeting_started=started, meeting_voice_input=voice, applies_retention=explicit_meeting)
         with suppress(OSError):
             clear_draft(path)
         return accepted
@@ -1439,8 +2552,11 @@ async def discard_portable_recording(request: Request, key: UUID):
 
     state = portable_capture_state(request)
     async with state.portable_recording_lock:
-        await stop_portable_recording(state, key)
-        clear_draft(state.portable_recording_dir / f"{key}.wav")
+        if screen := screen_draft_for_action(state, key):
+            await run_in_threadpool(screen.discard)
+        else:
+            await stop_portable_recording(state, key)
+            clear_draft(state.portable_recording_dir / f"{key}.wav")
     return Response(status_code=204)
 
 
@@ -1500,6 +2616,38 @@ async def process_saved_audio(state, key, source, options, duration, *, tracks=N
             emit(error=message)
 
 
+async def meeting_recognition_audio(state, path, pcm, offset, voice):
+    def read_source():
+        with wave.open(str(path), "rb") as stream:
+            rate = stream.getframerate()
+            if rate not in (SAMPLE_RATE, MEETING_RATE) or (stream.getnchannels(), stream.getsampwidth()) != (1, 2):
+                raise ValueError("Unrecognized meeting microphone track.")
+            ratio = rate // SAMPLE_RATE
+            frames = len(pcm) // 4 * ratio
+            stream.setpos(offset * ratio)
+            return stream.readframes(frames), frames, rate
+
+    try:
+        data, frames, rate = await run_in_threadpool(read_source)
+        if len(data) != frames * 2 or data.count(0) == len(data):
+            return pcm, None
+        microphone = await resample_capture(data, rate)
+    except (EOFError, OSError, ValueError, wave.Error):
+        return pcm, None
+    if len(microphone) != len(pcm):
+        return pcm, None
+
+    boost = voice.get("boostMicrophone") is True
+    fallback = replace_mixed_microphone(pcm, microphone, boost_microphone(microphone)) if boost else pcm
+    if voice.get("noiseCleanup") is True:
+        try:
+            clean = await stupase_cleanup(state).clean(microphone)
+        except CleanupFailed:
+            return fallback, None
+        return replace_mixed_microphone(pcm, microphone, boost_microphone(clean) if boost else clean), fallback
+    return fallback, None
+
+
 async def process_mixed_audio(state, key, source, options, duration, *, checkpoint, progress_only, emit, vocabulary):
     languages = options["languageHints"]
     meeting = options.get("meeting", options.get("sourceSpeakerTurns", False))
@@ -1509,9 +2657,15 @@ async def process_mixed_audio(state, key, source, options, duration, *, checkpoi
     samples = 0
     conversion = MEETING_RATE // SAMPLE_RATE
     resume_at = checkpoint // conversion
+    voice = options.get("meetingVoiceInput") if meeting else None
 
     async def transcript(pcm, offset):
+        fallback = None
+        if voice:
+            pcm, fallback = await meeting_recognition_audio(state, source.with_name("mic.wav"), pcm, offset, voice)
         result = await decode_pcm(state, pcm, languages, speakers, offset, vocabulary=vocabulary)
+        if fallback is not None and not result["text"].strip():
+            result = await decode_pcm(state, fallback, languages, speakers, offset, vocabulary=vocabulary)
         end = offset + len(pcm) // 4
         seconds = end / SAMPLE_RATE
         if meeting:
@@ -1578,31 +2732,11 @@ async def rewrite_dictation(request: Request):
         deadline = rewrite_deadline(payload.get("deadline", MAX_REWRITE_DEADLINE))
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
-    schema = {"type": "object", "properties": {"text": {"type": "string"}},
-              "required": ["text"], "additionalProperties": False}
-    messages = rewrite_messages(text, instruction, vocabulary,
-                                application=payload.get("application"), browser_host=payload.get("browserHost"))
-    state = request.app.state
-    model = state.insights.model
-    state.insights.chat_count += 1
     try:
-        async with asyncio.timeout(deadline), model.lock:
-            await model.ready()
-            await model.fit_prompt(messages, 1200)
-            rewritten = json.loads("".join([piece async for piece in model.generate(messages, schema=schema, limit=1200)]))
-        output = rewritten["text"].strip()
-        if not output:
-            raise ValueError("The rewrite returned no text.")
-    except TimeoutError as error:
-        logger.info("Local dictation rewrite exceeded its deadline of %d seconds.", deadline)
-        raise HTTPException(422, f"The local rewrite exceeded its {deadline}-second deadline.") from error
-    except Exception as error:
-        logger.warning("Local dictation rewrite did not complete (%s).", type(error).__name__)
-        raise HTTPException(422, "The local rewrite could not preserve the dictation.") from error
-    finally:
-        state.insights.chat_count -= 1
-    if not keeps_rewrite_numbers(text, output):
-        raise HTTPException(422, "The local rewrite changed a number. The original wording was kept.")
+        output = await rewrite_locally(request.app.state.insights, text, instruction, vocabulary, deadline,
+                                       application=payload.get("application"), browser_host=payload.get("browserHost"))
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
     return {"text": output}
 
 
@@ -1610,17 +2744,106 @@ async def rewrite_dictation(request: Request):
 async def quiesce_update(request: Request, client: UUID):
     check_native(request)
     state = request.app.state
-    now = time.monotonic()
-    if state.leases.streams or any(key != str(client) and expiry > now for key, expiry in state.leases.deadlines.items()):
-        raise HTTPException(409, "Close other Jard windows or browser tabs before restarting.")
-    if (state.draining or state.jobs or state.submitting or state.insights.active_job or state.insights.chat_count or
-            state.insights.model.audio_users or state.status == "loading" or getattr(state, "sdk_pending", 0)):
-        raise HTTPException(409, "Wait for the local engine to finish its current work.")
+    require_update_idle(state, str(client))
     shutdown = getattr(state, "request_shutdown", None)
     if shutdown is None:
         raise HTTPException(503, "The local engine could not be restarted.")
     state.draining = True
     return Response(status_code=202, background=BackgroundTask(shutdown))
+
+
+def require_update_idle(state, client, *, allow_browser=False):
+    now = time.monotonic()
+    other_stream = any(key != client or not allow_browser for key, _ in state.leases.streams)
+    if other_stream or any(key != client and expiry > now for key, expiry in state.leases.deadlines.items()):
+        raise HTTPException(409, "Close other Jard windows or browser tabs before restarting.")
+    if (state.draining or state.jobs or state.submitting or getattr(state, "screenshot_pending", False)
+            or state.insights.active_job or state.insights.chat_count or
+            state.insights.model.audio_users or state.status == "loading" or getattr(state, "sdk_pending", 0)):
+        raise HTTPException(409, "Wait for the local engine to finish its current work.")
+
+
+def workspace_updater(request):
+    state = request.app.state
+    updater = getattr(state, "portable_updater", None)
+    if not getattr(state, "portable_workspace", False) or updater is None:
+        raise HTTPException(404, "Updates are unavailable for this build.")
+    return updater
+
+
+class LaunchAtLoginChange(BaseModel):
+    enabled: StrictBool
+
+
+def portable_login_state(request, enabled=None):
+    login = getattr(request.app.state, "portable_login", None)
+    if not getattr(request.app.state, "portable_workspace", False) or login is None:
+        raise HTTPException(404, "Launch at login is unavailable for this build.")
+    if enabled is not None and request.headers.get("origin") != URL:
+        raise HTTPException(403, "Open Jaro’s desktop workspace to change Launch at Login.")
+    try:
+        return login.set_state(enabled)
+    except OSError as error:
+        logger.warning("Could not access desktop startup registration: %s", error)
+        raise HTTPException(503, "Could not access Jaro’s startup registration.") from error
+
+
+@app.get("/api/portable/login-item")
+def get_portable_login(request: Request):
+    return portable_login_state(request)
+
+
+@app.post("/api/portable/login-item")
+def change_portable_login(request: Request, change: LaunchAtLoginChange):
+    return portable_login_state(request, change.enabled)
+
+
+def require_portable_update_idle(state, client):
+    require_update_idle(state, client, allow_browser=True)
+    recording_lock = getattr(state, "portable_recording_lock", None)
+    if (state.portable_recording or state.portable_screencast or getattr(state.portable_dictation, "busy", False)
+            or (recording_lock and recording_lock.locked())
+            or (state.model_setup or {}).get("phase") in ("checking", "downloading", "starting")):
+        raise HTTPException(409, "Finish the current recording, dictation, or model setup before restarting.")
+
+
+@app.get("/api/portable/updates")
+async def portable_update_status(request: Request):
+    return JSONResponse(workspace_updater(request).status(), headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/portable/updates/{action}")
+async def portable_update_action(request: Request, action: Literal["check", "download", "restart"], client: UUID):
+    updater = workspace_updater(request)
+    if request.headers.get("origin") != URL:
+        raise HTTPException(403, "Check for updates from Jaro’s desktop workspace.")
+    if updater.status().get("updatesDisabled"):
+        raise HTTPException(403, "Updates are managed by your organization.")
+    if action == "check":
+        return await updater.check()
+    if action == "download":
+        try:
+            return await updater.download()
+        except (OSError, ValueError) as error:
+            raise HTTPException(409, "Could not open the Jaro download.") from error
+    state = request.app.state
+    require_portable_update_idle(state, str(client))
+    shutdown = getattr(state, "request_shutdown", None)
+    if shutdown is None:
+        raise HTTPException(503, "The local engine could not be restarted.")
+    try:
+        await updater.confirm_restart()
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    require_portable_update_idle(state, str(client))
+    if updater.status().get("updatesDisabled"):
+        raise HTTPException(403, "Updates are managed by your organization.")
+    try:
+        updater.prepare_restart()
+    except (OSError, ValueError) as error:
+        raise HTTPException(409, "Could not prepare Jaro to restart.") from error
+    state.draining = True
+    return JSONResponse(updater.status(), status_code=202, background=BackgroundTask(shutdown))
 
 
 def calendar_details(value):
@@ -1639,7 +2862,7 @@ def calendar_details(value):
 @app.post("/api/native/staging", status_code=201)
 async def new_stage(request: Request, recording: bool = False, dictation: bool = False, meeting: bool = False,
                     provider: str = Query("Meeting", min_length=1, max_length=80), calendar: dict | None = Body(None),
-                    annotation_id: UUID | None = None):
+                    annotation_id: UUID | None = None, noise_cleanup: bool = False, boost_microphone_input: bool = False):
     check_native(request)
     if annotation_id is not None:
         require_annotation()
@@ -1650,6 +2873,8 @@ async def new_stage(request: Request, recording: bool = False, dictation: bool =
     if meeting and (not recording or dictation):
         raise HTTPException(400, "A meeting must use a two-source recording stage.")
     metadata = {"meetingProvider": provider, "retentionApplies": True}
+    if meeting and (noise_cleanup or boost_microphone_input):
+        metadata["meetingVoiceInput"] = {"noiseCleanup": noise_cleanup, "boostMicrophone": boost_microphone_input}
     if calendar is not None:
         if not meeting:
             raise HTTPException(400, "Calendar details require a meeting.")
@@ -1766,6 +2991,7 @@ async def submit_staged_audio(state, key, languages, *, recording, diarization, 
             if (mime == "audio/wav") != bool(annotation_info.get("missingVideo")):
                 raise HTTPException(400, "The annotation manifest does not match its media.")
         meeting_provider = meeting_calendar = meeting_started = meeting_title = meeting_microphone_warning = None
+        meeting_voice_input = None
         applies_retention = False
         if recover and recording_marker(source).is_file():
             with recording_marker(source).open("rb") as marker:
@@ -1776,6 +3002,9 @@ async def submit_staged_audio(state, key, languages, *, recording, diarization, 
                 meeting_provider = value
                 meeting_title = metadata.get("meetingTitle")
                 meeting_microphone_warning = metadata.get("meetingMicrophoneWarning")
+                voice = metadata.get("meetingVoiceInput")
+                if isinstance(voice, dict):
+                    meeting_voice_input = {key: True for key in ("noiseCleanup", "boostMicrophone") if voice.get(key) is True}
                 saved_languages = metadata.get("languageHints")
                 if not languages and isinstance(saved_languages, list) and all(isinstance(code, str) and code in LANGUAGES for code in saved_languages):
                     languages = tuple(dict.fromkeys(saved_languages))[:4]
@@ -1812,6 +3041,7 @@ async def submit_staged_audio(state, key, languages, *, recording, diarization, 
                                     meeting_started=meeting_started, rolling=rolling, applies_retention=applies_retention,
                                     annotation=annotation_info, annotation_location=annotation_location, meeting_title=meeting_title,
                                     meeting_microphone_warning=meeting_microphone_warning,
+                                    meeting_voice_input=meeting_voice_input,
                                     provisional_title=read_meeting_title(source) if meeting_provider else None)
         clear_recording_stage(source)
         return result
@@ -1836,13 +3066,26 @@ async def dictate_audio(request, source, languages, vocabulary=None, *, sdk=Fals
                                      release_frame=release_frame)
 
 
-async def transcribe_portable_dictation(state, source):
-    return await transcribe_dictation(state, source, (), screen_nonspeech=True, measure_inference=True)
+async def transcribe_portable_dictation(state, source, languages=(), *, vocabulary=None, noise_cleanup=False, boost=False):
+    return await transcribe_with_voice_input(state, source, languages, vocabulary, noise_cleanup=noise_cleanup, boost=boost,
+                                             screen_nonspeech=True, measure_inference=True)
+
+
+async def transcribe_with_voice_input(state, source, languages, vocabulary=None, *, noise_cleanup=False, **options):
+    if noise_cleanup:
+        try:
+            result = await transcribe_dictation(state, source, languages, vocabulary,
+                                                cleanup=stupase_cleanup(state), **options)
+            if result["text"]:
+                return result
+        except CleanupFailed:
+            logger.info("StuPASE unavailable for this dictation. Transcribing the original audio.")
+    return await transcribe_dictation(state, source, languages, vocabulary, **options)
 
 
 async def transcribe_dictation(state, source, languages, vocabulary=None, *, sdk=False, disconnected=None,
                                measure_inference=False, screen_recording=False, screen_nonspeech=False,
-                               release_frame=None):
+                               release_frame=None, cleanup=None, boost=False):
     parts = []
     samples = 0
     inference_ns = 0
@@ -1852,7 +3095,8 @@ async def transcribe_dictation(state, source, languages, vocabulary=None, *, sdk
         if vocabulary is None:
             vocabulary = await speech_vocabulary(state)
         async with audio_priority:
-            if screen_recording and not await run_in_threadpool(dictation_has_signal, source, release_frame):
+            gain = MIC_GAIN if boost else 1.0
+            if screen_recording and not await run_in_threadpool(dictation_has_signal, source, release_frame, gain):
                 return {"text": "", "inferenceMs": 0}
             async with aclosing(audio_blocks(source, multilingual=len(languages) > 1, pause_aware=True)) as blocks:
                 async for pcm in blocks:
@@ -1870,6 +3114,10 @@ async def transcribe_dictation(state, source, languages, vocabulary=None, *, sdk
                         if 0 < before_release < count:
                             options["speech_prefix_samples"] = before_release
                         before_release = max(0, before_release - count)
+                    if cleanup is not None:
+                        pcm = await cleanup.clean(pcm, wait=False)
+                    if boost:
+                        pcm = boost_microphone(pcm)
                     result = await decode_pcm(state, pcm, languages, live=True, vocabulary=vocabulary, dictation=not sdk,
                                               measure_inference=measure_inference,
                                               screen_nonspeech=screen_recording or screen_nonspeech, **options)
@@ -1879,7 +3127,7 @@ async def transcribe_dictation(state, source, languages, vocabulary=None, *, sdk
                         parts.append(result["text"].strip())
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
-    except ClientDisconnect:
+    except (ClientDisconnect, CleanupFailed):
         raise
     except Exception as error:
         logger.exception("Dictation inference failed.")
@@ -2028,9 +3276,23 @@ async def sdk_transcribe(request: Request, speech_screen: bool = False):
 app.include_router(sdk_router)
 
 
+def stupase_cleanup(state):
+    if (cleanup := getattr(state, "stupase_cleanup", None)) is None:
+        cleanup = state.stupase_cleanup = StuPASECleanup(state.library.root)
+    return cleanup
+
+
+@app.post("/api/native/dictation-cleanup")
+async def native_dictation_cleanup(request: Request, action: Literal["status", "prepare"] = "status"):
+    check_native(request)
+    cleanup = stupase_cleanup(request.app.state)
+    return {"status": cleanup.prepare(retry=True) if action == "prepare" else cleanup.status()}
+
+
 @app.post("/api/native/staging/{key}/dictate")
 async def native_dictation(request: Request, key: UUID,
-                           release_frame: Annotated[int | None, Query(ge=0, le=3 * 3600 * 48_000)] = None):
+                           release_frame: Annotated[int | None, Query(ge=0, le=3 * 3600 * 48_000)] = None,
+                           noise_cleanup: bool = False, boost_microphone_input: bool = False):
     check_native(request)
     languages = transcription_languages(request)
     path = stage_path(request.app.state, key)
@@ -2039,8 +3301,9 @@ async def native_dictation(request: Request, key: UUID,
     vocabulary = tuple(dict.fromkeys(word.strip() for word in request.query_params.getlist("vocabulary") if word.strip()))
     if len(vocabulary) > 32 or any(len(word) > 80 for word in vocabulary):
         raise HTTPException(400, "Use up to 32 vocabulary entries of at most 80 characters.")
-    return await dictate_audio(request, path, languages, vocabulary, screen_recording=True, measure_inference=True,
-                               release_frame=release_frame)
+    return await transcribe_with_voice_input(request.app.state, path, languages, vocabulary,
+                                             noise_cleanup=noise_cleanup, boost=boost_microphone_input,
+                                             screen_recording=True, measure_inference=True, release_frame=release_frame)
 
 
 def staged_meeting_title_rows(path, through):
@@ -2200,10 +3463,16 @@ def workspace_page(request: Request):
                         status_code=503, media_type="text/plain", headers=headers)
     if getattr(request.app.state, "portable_workspace", False):
         html = html.replace(b"<html", b"<html data-jaro-portable-workspace", 1)
+        if getattr(request.app.state, "portable_updater", None) is not None:
+            html = html.replace(b"<html ", b"<html data-jaro-portable-updates ", 1)
+        if getattr(request.app.state, "portable_login", None) is not None:
+            html = html.replace(b"<html ", b"<html data-jaro-portable-login ", 1)
         if request.app.state.portable_recorder is not None:
             html = html.replace(b"<html ", b"<html data-jaro-portable-audio ", 1)
         if request.app.state.portable_dictation is not None:
             html = html.replace(b"<html ", b'<html data-jaro-portable-dictation ', 1)
+        if getattr(request.app.state, "screen_draft_dir", None):
+            html = html.replace(b"<html ", b"<html data-jaro-screen-recording ", 1)
         if sys.platform == "linux":
             html = html.replace(b"<html ", b'<html data-jaro-linux-audio ', 1)
             if request.app.state.portable_dictation is not None:
@@ -2239,6 +3508,8 @@ def main():
         except (OSError, RuntimeError) as error:
             parser.exit(1, str(error) + "\n")
     if args.portable_workspace:
+        from portable_login import load_login
+        from portable_update import load_updater
         from portable_workspace import configure_workspace
         from sdk_embedded import run_owned_service
 
@@ -2249,11 +3520,13 @@ def main():
             global URL
             URL = f"http://{HOST}:{record['port']}"
             configure_workspace(app, record, URL)
+            app.state.portable_updater = load_updater()
+            app.state.portable_login = load_login(WORKSPACE_ROOT)
             app.mount("/", StaticFiles(directory=DIST, html=True), name="ui")
             return app
 
         try:
-            raise SystemExit(run_owned_service(build_app))
+            raise SystemExit(run_owned_service(build_app, allow_audio_restore=True))
         except (OSError, RuntimeError) as error:
             parser.exit(1, str(error) + "\n")
     if os.name == "nt":

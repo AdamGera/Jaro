@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import signal
 import subprocess
 import sys
 import tarfile
@@ -159,7 +160,8 @@ def fetch(item, partial, report):
     curl = "/usr/bin/curl" if sys.platform == "darwin" else "curl"
     with subprocess.Popen([curl, "--fail", "--location", "--silent", "--show-error",
                            "--retry", "3", "--retry-all-errors", "--continue-at", "-", "--output",
-                           str(partial), item["url"]]) as child:
+                           str(partial), item["url"]], stdout=subprocess.DEVNULL,
+                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0) as child:
         try:
             while child.poll() is None:
                 if partial.exists():
@@ -233,18 +235,25 @@ def install(source, speech_only=False, portable=False):
                 partial.replace(destination)
             completed += item["size"]
             emit(event="progress", file=name, completed=completed, total=total)
+        if portable:
+            install_runtime(root)
         revision = root / "revision.tmp"
         revision.write_text(SPEECH_REVISION + "\n")
         revision.replace(root / "revision")
-        if portable:
-            install_runtime(root)
         marker = root / (marker_name + ".tmp")
         marker.write_text(SET_ID)
         marker.replace(root / marker_name)
     emit(event="ready", **status(speech_only, portable))
 
 
+def stop_installation(_signum, _frame):
+    # Unwind the download and lock handlers, leaving partial files resumable.
+    raise SystemExit(1)
+
+
 if __name__ == "__main__":
+    if os.name != "nt":
+        signal.signal(signal.SIGTERM, stop_installation)
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["model-status", "models", "model-path"])
     parser.add_argument("--from", dest="source", type=Path)

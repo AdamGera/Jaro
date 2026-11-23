@@ -1,8 +1,9 @@
-"""Whole-meeting retention admission and recoverable macOS Trash snapshots."""
+"""Whole-meeting retention admission and recoverable Trash snapshots."""
 import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 SCHEMA = """
@@ -15,6 +16,14 @@ CREATE TABLE IF NOT EXISTS meeting_trash (
 );
 CREATE TABLE IF NOT EXISTS meeting_audio_policy (
     id INTEGER PRIMARY KEY CHECK(id=1), days INTEGER NOT NULL CHECK(days IN (-1,0,1,7,30))
+);
+CREATE TABLE IF NOT EXISTS meeting_voice_input (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    noiseCleanup INTEGER NOT NULL DEFAULT 0 CHECK(noiseCleanup IN (0,1)),
+    boostMicrophone INTEGER NOT NULL DEFAULT 0 CHECK(boostMicrophone IN (0,1))
+);
+CREATE TABLE IF NOT EXISTS portable_call_preferences (
+    id INTEGER PRIMARY KEY CHECK(id=1), preferences TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meeting_audio_trash (
     id TEXT PRIMARY KEY
@@ -69,6 +78,16 @@ def readable_source(db):
 
 
 def trash_path(path):
+    if sys.platform == "win32":
+        recycle_windows(path)
+        return
+    if sys.platform == "linux":
+        try:
+            subprocess.run(["/usr/bin/gio", "trash", "--", str(path.absolute())], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        except (subprocess.SubprocessError, OSError) as error:
+            raise OSError("Could not move the meeting to the desktop Trash.") from error
+        return
     helper = shutil.which("jard-dialog")
     if helper is None:
         # The source checkout has no bundled helper. JXA calls Foundation directly.
@@ -88,6 +107,57 @@ function run(argv) {
         raise OSError("Could not move the meeting to the macOS Trash.") from error
 
 
+def recycle_windows(path):
+    import ctypes as c
+    from ctypes import wintypes
+    from uuid import UUID
+
+    # The shell operation is local to this worker thread.
+    ole = c.OleDLL("ole32")
+    shell = c.OleDLL("shell32")
+    pointer = c.c_void_p
+    ole.CoInitializeEx.argtypes = (pointer, wintypes.DWORD)
+    ole.CoUninitialize.argtypes = ()
+    ole.CoUninitialize.restype = None
+    ole.CoInitializeEx(None, 2)  # COINIT_APARTMENTTHREADED
+    operation, item = pointer(), pointer()
+
+    def guid(value):
+        return (c.c_ubyte * 16).from_buffer_copy(UUID(value).bytes_le)
+
+    def method(instance, slot, result, *types):
+        vtable = c.cast(instance, c.POINTER(c.POINTER(pointer)))[0]
+        return c.WINFUNCTYPE(result, pointer, *types)(vtable[slot])
+
+    def call(slot, types=(), values=()):
+        result = method(operation, slot, c.c_long, *types)(operation, *values)
+        if result < 0:
+            raise OSError(f"Recycle Bin operation failed (0x{result & 0xFFFFFFFF:08x}).")
+
+    try:
+        ole.CoCreateInstance.argtypes = (pointer, pointer, wintypes.DWORD, pointer, c.POINTER(pointer))
+        # CLSID_FileOperation, IID_IFileOperation, IID_IShellItem
+        ole.CoCreateInstance(guid("3ad05575-8857-4850-9277-11b85bdb8e09"), None, 1,
+                             guid("947aab5f-0a5c-4c13-b4d6-4bf7836fc9f8"), c.byref(operation))
+        shell.SHCreateItemFromParsingName.argtypes = (wintypes.LPCWSTR, pointer, pointer, c.POINTER(pointer))
+        shell.SHCreateItemFromParsingName(str(path.absolute()), None, guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"),
+                                          c.byref(item))
+        recycle_on_delete = 0x00080000  # FOFX_RECYCLEONDELETE
+        silent, no_confirmation, no_error_ui = 0x0004, 0x0010, 0x0400
+        call(5, (wintypes.DWORD,), (recycle_on_delete | silent | no_confirmation | no_error_ui,))
+        call(18, (pointer, pointer), (item, None))  # DeleteItem
+        call(21)  # PerformOperations
+        aborted = wintypes.BOOL()
+        call(22, (c.POINTER(wintypes.BOOL),), (c.byref(aborted),))  # GetAnyOperationsAborted
+        if aborted.value or path.exists():
+            raise OSError("Could not move the meeting to the Recycle Bin.")
+    finally:
+        for instance in (item, operation):
+            if instance:
+                method(instance, 2, wintypes.ULONG)(instance)  # IUnknown::Release
+        ole.CoUninitialize()
+
+
 def write_snapshot(db, identifier, directory, source_audio, transcript, notes):
     tables = {
         table: [dict(row) for row in db.execute(f"SELECT * FROM {table} WHERE {column}=?", (identifier,))]
@@ -104,8 +174,8 @@ def write_snapshot(db, identifier, directory, source_audio, transcript, notes):
 def write_archive(directory, files, source_media, *, media_folder):
     directory.mkdir(mode=0o700)
     for name, text in files.items():
-        with (directory / name).open("x", encoding="utf8") as output:
-            os.fchmod(output.fileno(), 0o600)
+        descriptor = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf8") as output:
             output.write(text)
             output.flush()
             os.fsync(output.fileno())
@@ -123,6 +193,9 @@ def write_archive(directory, files, source_media, *, media_folder):
 
 
 def sync_directory(path):
+    if sys.platform == "win32":
+        # Windows file handles support fsync, while directory handles do not.
+        return
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)

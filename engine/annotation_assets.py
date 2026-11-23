@@ -6,6 +6,10 @@ import math
 from pathlib import Path, PurePosixPath
 import re
 import struct
+import subprocess
+import sys
+
+from audio_file import codec_binary
 
 ASSETS = {
     "manifest": ("annotation.json", ".annotation.json", "application/json", 24 * 1024 * 1024),
@@ -23,11 +27,13 @@ def staged_annotation_paths(source):
     return {kind: source.with_suffix(extension) for kind, (_, extension, _, _) in ASSETS.items()}
 
 
-async def annotation_movie_info(path, probe="ffprobe"):
+async def annotation_movie_info(path, probe=None):
+    options = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
     process = await asyncio.create_subprocess_exec(
-        probe, "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov",
+        probe or codec_binary("ffprobe"), "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov",
         "-show_entries", "stream=codec_type,duration:format=duration", "-of", "json", path,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        **options,
     )
     try:
         output, _ = await process.communicate()

@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+case "$1" in
+    upgrade|failed-upgrade|remove|deconfigure)
+        # Keep new launches out between the lock check and the final dpkg hook.
+        mkdir -p /run/jaro-package-changing
+        exec 9</usr/lib/jaro/in-use
+        if ! /usr/bin/flock --exclusive --nonblock 9; then
+            rmdir /run/jaro-package-changing
+            echo "Open Jaro from the desktop menu and close its window. Wait for any jardctl jobs to finish, then retry." >&2
+            exit 1
+        fi
+        ;;
+esac

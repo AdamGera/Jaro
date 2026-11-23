@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import suppress
 import os
+import shutil
 
 from dbus_fast import Variant
 from dbus_fast.errors import DBusError
@@ -13,10 +14,38 @@ from linux_desktop_portal import PATH, DesktopPortal, close_descriptors
 REMOTE = "org.freedesktop.portal.RemoteDesktop"
 CLIPBOARD = "org.freedesktop.portal.Clipboard"
 KEYBOARD = 1
+PERSIST_UNTIL_REVOKED = 2
 CLIPBOARD_LIMIT = 32 * 1024 * 1024
 RESTORE_DELAY = .5
 PASTE_FALLBACK = "Dictation is ready. Use Copy last to paste it into your app."
 TRANSFER_ERRORS = (DBusError, OSError, TimeoutError, EOFError, CaptureError)
+INITIAL_CLIPBOARD_TIMEOUT = .8
+EMPTY_RESTORE_FORMAT = "application/octet-stream"
+
+
+async def clipboard_is_empty():
+    tool = shutil.which("wl-paste") if os.environ.get("WAYLAND_DISPLAY") else None
+    if tool is None:
+        return False
+    try:
+        process = await asyncio.create_subprocess_exec(
+            tool, "--list-types", env={**os.environ, "LC_ALL": "C"}, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, limit=512,
+        )
+    except OSError:
+        return False
+    try:
+        async with asyncio.timeout(INITIAL_CLIPBOARD_TIMEOUT):
+            report = await process.stderr.readline()
+            return (report == b"Nothing is copied\n" and not await process.stderr.read(1)
+                    and await process.wait() == 1)
+    except (OSError, TimeoutError, ValueError):
+        return False
+    finally:
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.kill()
+        await process.communicate()
 
 
 async def fd_ready(fd, *, writing=False):
@@ -74,6 +103,8 @@ class WaylandPaste(DesktopPortal):
         super().__init__(self.revoke, negotiate_fds=True)
         self.revoked = revoked
         self.ready = False
+        self.closing = False
+        self.restore_token = ""
         self.formats = None
         self.selection_revision = 0
         self.owns_selection = False
@@ -86,7 +117,7 @@ class WaylandPaste(DesktopPortal):
     def active(self):
         return self.ready and self.session is not None and self.bus is not None and self.bus.connected
 
-    async def approve(self):
+    async def approve(self, restore_token=""):
         await self.connect()
         try:
             devices = await self.property(REMOTE, "AvailableDeviceTypes")
@@ -95,14 +126,34 @@ class WaylandPaste(DesktopPortal):
             raise CaptureError("This desktop doesn't offer keyboard and clipboard access for paste.") from failure
         if not devices & KEYBOARD:
             raise CaptureError("This desktop doesn't offer keyboard access for paste.")
+        version = 0
+        with suppress(DBusError):
+            version = await self.property(REMOTE, "version")
+        options = {"types": Variant("u", KEYBOARD)}
+        if version >= 2:
+            options["persist_mode"] = Variant("u", PERSIST_UNTIL_REVOKED)
+            if restore_token:
+                options["restore_token"] = Variant("s", restore_token)
+        elif restore_token:
+            raise CaptureError("The desktop could not restore automatic paste. Choose Allow paste to approve it again.")
         await self.create_session(REMOTE)
-        await self.request(REMOTE, "SelectDevices", "oa{sv}", [self.session], {"types": Variant("u", KEYBOARD)})
+        await self.request(REMOTE, "SelectDevices", "oa{sv}", [self.session], options)
         await self.call(CLIPBOARD, "RequestClipboard", "oa{sv}", [self.session, {}])
         approved = await self.request(REMOTE, "Start", "osa{sv}", [self.session, ""], seconds=90)
-        if ("devices" not in approved or not approved["devices"].value & KEYBOARD
-                or "clipboard_enabled" not in approved or not approved["clipboard_enabled"].value):
+        devices, clipboard = approved.get("devices"), approved.get("clipboard_enabled")
+        if (self.session is None or devices is None or devices.signature != "u" or not devices.value & KEYBOARD
+                or clipboard is None or clipboard.signature != "b" or not clipboard.value):
             raise CaptureError("Paste needs both keyboard and clipboard permission.")
-        self.ready = True
+        token = approved.get("restore_token")
+        if version >= 2 and token is not None and token.signature == "s" and 0 < len(token.value) <= 1024:
+            self.restore_token = token.value
+        # Some desktops announce only clipboard changes. Check once during
+        # interactive approval, before a take targets an external editor.
+        revision = self.selection_revision
+        if (self.formats is None and not restore_token and await clipboard_is_empty()
+                and self.session is not None and self.selection_revision == revision):
+            self.formats = ()
+        self.ready = self.session is not None
 
     def revoke(self):
         self.ready = False
@@ -110,7 +161,8 @@ class WaylandPaste(DesktopPortal):
         self.owns_selection = False
         self.data = {}
         self.changed.set()
-        self.revoked()
+        if not self.closing:
+            self.revoked()
 
     def signal(self, message):
         if not super().signal(message) or message.interface != CLIPBOARD or message.path != PATH:
@@ -186,6 +238,33 @@ class WaylandPaste(DesktopPortal):
             self.data = previous
             raise
 
+    async def wait_for_selection(self, revision):
+        async with asyncio.timeout(.45):
+            while self.selection_revision == revision and self.active:
+                await self.changed.wait()
+                self.changed.clear()
+
+    async def restore(self, original):
+        if self.session is None or not self.owns_selection:
+            return
+        desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower().split(":")
+        if not original and "gnome" in desktop:
+            # Mutter keeps a copy of the latest text selection after its owner
+            # releases it. An empty binary offer drops that stored text.
+            revision = self.selection_revision
+            self.changed.clear()
+            await self.publish({EMPTY_RESTORE_FORMAT: b""})
+            try:
+                await self.wait_for_selection(revision)
+            except TimeoutError:
+                # Releasing this session's offer cannot clear another owner.
+                if self.active and self.owns_selection:
+                    await self.publish({})
+                return
+            if self.formats != (EMPTY_RESTORE_FORMAT,) or not self.active or not self.owns_selection:
+                return
+        await self.publish(original)
+
     async def key(self, keysym, pressed):
         await self.call(REMOTE, "NotifyKeyboardKeysym", "oa{sv}iu",
                         [self.session, {}, keysym, int(pressed)])
@@ -227,10 +306,7 @@ class WaylandPaste(DesktopPortal):
         self.changed.clear()
         try:
             await self.publish(transcript)
-            async with asyncio.timeout(.45):
-                while self.selection_revision == revision and self.active:
-                    await self.changed.wait()
-                    self.changed.clear()
+            await self.wait_for_selection(revision)
             if not self.owns_selection or set(self.formats or ()) != transcript.keys() or not can_send() or not self.active:
                 return PASTE_FALLBACK
             claimed = self.selection_revision
@@ -239,11 +315,11 @@ class WaylandPaste(DesktopPortal):
                 return PASTE_FALLBACK
             await asyncio.sleep(RESTORE_DELAY)
         finally:
-            if self.session is not None and self.owns_selection:
-                await self.publish(original)
+            await self.restore(original)
         return "Paste shortcut sent."
 
     async def close(self):
+        self.closing = True
         self.ready = False
         self.changed.set()
         async with self.delivery:

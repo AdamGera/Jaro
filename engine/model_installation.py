@@ -1,4 +1,5 @@
 """Prepare the pinned speech model through the desktop's verified installer."""
+import asyncio
 from contextlib import suppress
 import json
 import os
@@ -35,7 +36,8 @@ def model_environment():
 
 def model_status(*, all_models=False):
     result = subprocess.run(model_command("model-status", all_models=all_models),
-                            env=model_environment(), capture_output=True, timeout=10)
+                            env=model_environment(), capture_output=True, timeout=10,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     try:
         status = json.loads(result.stdout)
         if result.returncode or type(status["ready"]) is not bool or type(status["bytes"]) is not int:
@@ -43,6 +45,39 @@ def model_status(*, all_models=False):
         return status
     except (TypeError, KeyError, ValueError) as error:
         raise RuntimeError("Could not read the pinned Jaro model status.") from error
+
+
+async def install_workspace_models(report):
+    # Descendants stay in the desktop's owned process group or Windows Job.
+    process = await asyncio.create_subprocess_exec(
+        *model_command("models", all_models=True), env=model_environment(),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    ready = False
+    failure = None
+    try:
+        async for line in process.stdout:
+            event = json.loads(line)
+            match event.get("event"):
+                case "progress":
+                    report(event["completed"], event["total"])
+                case "error":
+                    failure = event.get("message")
+                case "ready":
+                    ready = event.get("ready") is True
+        if await process.wait() or not ready:
+            raise RuntimeError(failure or "Could not verify the installed models.")
+    finally:
+        if process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.terminate()
+            try:
+                await asyncio.wait_for(process.communicate(), timeout=2)
+            except TimeoutError:
+                with suppress(ProcessLookupError):
+                    process.kill()
+                await process.communicate()
 
 
 def install_model(source=None, *, progress=False, all_models=False):

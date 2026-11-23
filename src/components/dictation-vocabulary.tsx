@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { BookOpen, ChevronRight, Plus, X } from "lucide-react"
 import { Dialog } from "radix-ui"
 import { useInterfaceLanguage } from "@/interface-language"
-import type { DictationVocabularyEntry, SystemDictationControls } from "@/system-dictation"
+import type { DictationVocabularyEntry } from "@/system-dictation"
 import { SettingRow } from "./settings-rows"
 import { Button } from "./ui/button"
 
@@ -67,10 +67,13 @@ function project(rows: Row[]) {
   return { entries: [...terms.values()] }
 }
 
-export function DictationVocabulary({ controls }: { controls: SystemDictationControls }) {
+export type SaveDictationVocabulary = (base: DictationVocabularyEntry[], entries: DictationVocabularyEntry[]) => Promise<DictationVocabularyEntry[]>
+
+export function DictationVocabulary({ saved, saveVocabulary }: {
+  saved: DictationVocabularyEntry[] | undefined
+  saveVocabulary: SaveDictationVocabulary
+}) {
   const { t } = useInterfaceLanguage()
-  const { status, saveVocabulary } = controls
-  const saved = status?.vocabularyEntries
   const [editor, setEditor] = useState<Editor>()
   const [saving, setSaving] = useState(false)
   const [closing, setClosing] = useState(false)

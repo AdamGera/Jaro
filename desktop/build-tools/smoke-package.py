@@ -279,7 +279,9 @@ def verify_manual_meeting_trash(library, helper, api, base, status):
     try:
         with api(f"/api/native/meetings/{identifier}/recording-files",
                  headers={"X-Jard-Token": (library / ".native-token").read_text().strip()}) as response:
-            assert Path(json.load(response)["folder"]) == source.parent.resolve()
+            files = json.load(response)
+            assert Path(files["folder"]) == source.parent.resolve()
+            assert Path(files["path"]) == source.resolve()
         with api(f"/api/sessions/{identifier}/transcript-clipboard") as response:
             assert response.read().decode() == f"**00:00 · You**  \n{text}"
         with api(f"/api/sessions/{identifier}", headers={"Origin": base}, method="DELETE") as response:

@@ -905,6 +905,10 @@ class MacBridge:
             stage_options = {"dictation" if dictation else "recording": "true"}
             if meeting:
                 stage_options.update(meeting="true", provider=meeting_label)
+                if args.get("noiseCleanup") is True:
+                    stage_options["noise_cleanup"] = "true"
+                if args.get("boostMicrophone") is True:
+                    stage_options["boost_microphone_input"] = "true"
             calendar = args.get("meetingCalendar") if meeting else None
             title = normalize_meeting_title(args["meetingTitle"]) if meeting and "meetingTitle" in args else None
             stage = await self.api("POST", "native/staging", params=stage_options, **({"json": calendar} if calendar else {}))
@@ -1445,12 +1449,24 @@ class MacBridge:
         await asyncio.to_thread(write)
         return {"saved": True}
 
+    async def reveal_session_media(self, args):
+        key = str(UUID(args["id"]))
+        library = SessionStore(self.root, read_only=True)
+        try:
+            source, _ = await asyncio.to_thread(library.media, key)
+        except MissingSession as error:
+            raise ValueError("The recording file is no longer available.") from error
+        await run_helper("/usr/bin/open", "-R", str(source))
+
     async def meeting_exports(self, args):
         action = args.get("action")
         if action == "revealFiles":
             key = str(UUID(args["id"]))
             result = await self.api("GET", f"native/meetings/{key}/recording-files")
-            await run_helper("/usr/bin/open", result["folder"])
+            if recording := result.get("path"):
+                await run_helper("/usr/bin/open", "-R", recording)
+            else:
+                await self.reveal_session_media(args)
             return result
         if action == "reveal" and args.get("id"):
             key = str(UUID(args["id"]))
@@ -2179,6 +2195,8 @@ class MacBridge:
                 await self.stop(take)
                 await asyncio.shield(take.job)
             return None
+        if command == "jard.dictationCleanup":
+            return await self.api("POST", "native/dictation-cleanup", params={"action": args.get("action", "status")})
         if command == "jard.dictation":
             action = args.get("action")
             key = str(UUID(args["id"]))
@@ -2216,6 +2234,10 @@ class MacBridge:
                             warning = str(error)
                     vocabulary = merge_vocabulary(profile.vocabulary if profile else (), vocabulary)
                     params = {**self.options(args), "vocabulary": vocabulary}
+                    if args.get("noiseCleanup") is True:
+                        params["noise_cleanup"] = "true"
+                    if args.get("boostMicrophone") is True:
+                        params["boost_microphone_input"] = "true"
                     if key in self.dictation_release_frames:
                         params["release_frame"] = self.dictation_release_frames[key]
                     result = await self.api("POST", "native/staging/" + key + "/dictate",
@@ -2280,6 +2302,8 @@ class MacBridge:
             return None
         if command == "jard.openAudio":
             return await self.open_audio(args)
+        if command == "jard.revealSessionMedia":
+            return await self.reveal_session_media(args)
         if command == "jard.export":
             return await self.export(args)
         if command == "jard.open":

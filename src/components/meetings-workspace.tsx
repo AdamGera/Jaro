@@ -10,6 +10,16 @@ import { Button } from "./ui/button"
 
 export type MeetingWorkspaceOptions = { languages: string[]; elapsed: number; busy: boolean }
 
+export type PortableMeetingControls = {
+  phase: "idle" | "starting" | "recording" | "transcribing"
+  elapsed: number
+  canStart: boolean
+  feedback: string
+  start: () => void
+  stop: () => void
+  showLive: () => void
+}
+
 function midnight(date: Date) {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()
 }
@@ -18,17 +28,20 @@ function meetingStart(row: SessionSummary) {
   return row.meetingStartedAt ?? row.created
 }
 
-export function MeetingsWorkspace({ native, options, busy, currentId, query, onQuery, onOpen, onTrash, onSettings }: {
-  native: DesktopBridge; options: MeetingWorkspaceOptions; busy: boolean; currentId?: string
+export function MeetingsWorkspace({ native, options, portable, busy, currentId, query, onQuery, onOpen, onTrash, onSettings, onShowLive }: {
+  native?: DesktopBridge; options?: MeetingWorkspaceOptions; portable?: PortableMeetingControls; busy: boolean; currentId?: string
   query: string; onQuery: (query: string) => void; onOpen: (id: string) => void
-  onTrash: (row: SessionSummary, trigger: HTMLButtonElement) => void; onSettings: () => void
+  onTrash: (row: SessionSummary, trigger: HTMLButtonElement) => void; onSettings: () => void; onShowLive: () => void
 }) {
   const { t, locale } = useInterfaceLanguage()
   const { meeting, act, pending, feedback } = useDesktopMeeting(native)
-  const recording = meeting?.phase === "recording" || meeting?.phase === "callEnded"
+  const recording = portable ? portable.phase === "recording" : meeting?.phase === "recording" || meeting?.phase === "callEnded"
   const audioWarning = meetingAudioWarning(meeting)
-  const saving = meeting?.phase === "starting" || meeting?.phase === "saving"
-  const list = useSessionList(true, query, [currentId, meeting?.session, meeting?.phase].join(":"), true)
+  const phase = portable ? (portable.phase === "transcribing" ? "saving" : portable.phase) : meeting?.phase
+  const saving = phase === "starting" || phase === "saving"
+  const disabled = portable ? saving || (!recording && !portable.canStart)
+    : !meeting || pending || saving || (!recording && (busy || options?.busy || meeting.busy || !!meeting.permission || !!meeting.recoveryAvailable))
+  const list = useSessionList(true, query, [currentId, meeting?.session, phase].join(":"), true)
   const [copying, setCopying] = useState("")
   const [copied, setCopied] = useState("")
   const [copyError, setCopyError] = useState("")
@@ -62,20 +75,22 @@ export function MeetingsWorkspace({ native, options, busy, currentId, query, onQ
     <div className="meeting-workspace-controls">
       {meeting?.managed ? <p role="status">{t("Meetings are managed by your organization.")}</p> : <>
         {recording && <span className="meeting-live-time" aria-label={t("Meeting recording time")}>
-          <span aria-hidden="true" /><bdi>{clock(options.elapsed)}</bdi>
+          <span aria-hidden="true" /><bdi>{clock(portable?.elapsed ?? options?.elapsed ?? 0)}</bdi>
         </span>}
         {recording && <Button variant="outline" size="sm" disabled={pending}
-          onClick={() => void act({ action: "showLiveTranscript" })}>{t("View live transcript")}</Button>}
+          onClick={() => portable ? onShowLive() : void act({ action: "showLiveTranscript" })}>{t("View live transcript")}</Button>}
         <Button size="sm" variant={recording ? "outline" : "default"}
-          disabled={!meeting || pending || saving || (!recording && (busy || options.busy || meeting.busy || !!meeting.permission || !!meeting.recoveryAvailable))}
-          onClick={() => void act(recording ? { action: "stop" } : { action: "start", languages: options.languages })}>
+          disabled={disabled}
+          onClick={() => portable ? (recording ? portable.stop() : portable.start())
+            : void act(recording ? { action: "stop" } : { action: "start", languages: options?.languages ?? [] })}>
           {recording ? <Square aria-hidden="true" /> : <AudioLines aria-hidden="true" />}
-          {meeting?.phase === "saving" ? t("Saving…") : meeting?.phase === "starting" ? t("Starting…") :
+          {phase === "saving" ? t("Saving…") : phase === "starting" ? t("Starting…") :
             recording ? t("Stop & Save") : t("Record Meeting")}
         </Button>
       </>}
     </div>
-    {(feedback || meeting?.message) && <p className="meeting-status" role="status">{feedback || meeting?.message}</p>}
+    {(portable?.feedback || feedback || meeting?.message) && <p className="meeting-status" role="status">
+      {portable?.feedback || feedback || meeting?.message}</p>}
     {audioWarning && <p className="meeting-status" role="alert">{t(audioWarning)}</p>}
     {meeting && (!!meeting.permission || !!meeting.recoveryAvailable) && !meeting.busy && <Button size="sm" variant="outline" onClick={onSettings}>
       {t("Open Meeting Settings")}

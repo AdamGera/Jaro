@@ -2,6 +2,28 @@ import { useCallback, useEffect, useState } from "react"
 import type { DesktopBridge } from "./desktop"
 
 export type DictationStep = "welcome" | "access" | "practice" | "ready" | "done" | "later"
+export function useNoiseCleanup(native: DesktopBridge, enabled: boolean) {
+  const [status, setStatus] = useState<"notInstalled" | "downloading" | "ready" | "error">()
+  useEffect(() => {
+    if (!enabled) return
+    let active = true
+    let timer: number
+    async function check(action: "prepare" | "status") {
+      try {
+        const result = await native.request("dictationCleanup", { action })
+        if (!active) return
+        setStatus(result.status)
+        if (result.status === "downloading") timer = window.setTimeout(() => void check("status"), 2200)
+      } catch {
+        if (active) setStatus("error")
+      }
+    }
+    void check("prepare")
+    return () => { active = false; window.clearTimeout(timer) }
+  }, [native, enabled])
+  return enabled ? status : undefined
+}
+
 export type DictationShortcutSide = "left" | "either" | "right"
 export const dictationSoundStyles = [
   { id: "classic", title: "Classic", done: false },
@@ -32,6 +54,8 @@ export type DictationPreferences = {
   vocabulary: string
   livePreview: boolean
   keepMicrophoneReady: boolean
+  noiseCleanup: boolean
+  boostMicrophone: boolean
   outputProfiles: string
   rewriteInstructions: string
   soundSet: typeof dictationSoundStyles[number]["id"] | "soft" | "glass"
@@ -79,6 +103,7 @@ export type DictationStatus = DictationPreferences & {
   choosingShortcut: boolean
   hasLast: boolean
   historyRevision: string
+  playingHistoryID?: string
 }
 export type DictationHistoryEntry = {
   id: string
@@ -96,6 +121,7 @@ export type DictationHistoryEntry = {
   seconds?: number
   inferenceMs?: number
   totalMs?: number
+  audioExpiresAt?: number
 }
 export type DictationHistory = { entries: DictationHistoryEntry[]; total: number; words: number; seconds: number }
 export type DictationOutputProfile = {
@@ -143,6 +169,7 @@ export type DictationAction =
   | { action: "setShortcutSide"; value: DictationShortcutSide }
   | { action: "bulkHistory"; operation: "copy" | "delete"; ids: string[] }
   | { action: "clearHistory" }
+  | { action: "playHistoryAudio" | "stopHistoryAudio"; id: string }
   | { action: "previewOutput"; text: string; profiles: string; app: string; site: string }
   | { action: "tryOutput"; text: string }
   | { action: "describeOutputProfiles"; profiles: string }

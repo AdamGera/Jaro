@@ -6,7 +6,7 @@ import wave
 
 import numpy as np
 
-from audio_file import FILE_ERROR, INPUT_OPTIONS, quiet_sample_boundary
+from audio_file import FILE_ERROR, INPUT_OPTIONS, codec_binary, quiet_sample_boundary
 from rumble_model import MAX_SAMPLES, SAMPLE_RATE
 
 SAMPLE_BYTES = 2
@@ -32,7 +32,7 @@ def audio_pieces(path):
         raise ValueError(FILE_ERROR)
     validate_file(path)
     with subprocess.Popen([
-        "ffmpeg", "-v", "error", "-nostdin", "-xerror", *INPUT_OPTIONS, "-i", str(path),
+        codec_binary("ffmpeg"), "-v", "error", "-nostdin", "-xerror", *INPUT_OPTIONS, "-i", str(path),
         "-map", "0:a:0", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1",
     ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as decoder:
         limit = MAX_PIECE_BYTES + SAMPLE_BYTES

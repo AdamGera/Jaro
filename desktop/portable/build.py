@@ -16,6 +16,8 @@ SDK_VERSION = "0.11.1"
 def build(target, output):
     if target == "linux" and (sys.platform != "linux" or platform.machine() != "x86_64"):
         raise RuntimeError("Build the Linux shell on an x86-64 Linux system with GTK4 and WebKitGTK 6.0 development libraries.")
+    if target == "linux" and not shutil.which("cc"):
+        raise RuntimeError("Install a system C compiler for the Linux meeting controls.")
     native = shutil.which("native")
     if not native or not subprocess.check_output([native, "--version"], text=True).startswith(f"native {SDK_VERSION} "):
         raise RuntimeError(f"Install @native-sdk/cli@{SDK_VERSION}.")
@@ -46,9 +48,32 @@ def build(target, output):
         ], cwd=project, check=True)
         if target == "windows":
             flags = [zig, "cc", "-target", "x86_64-windows-gnu", "-O2", "-Wall", "-Wextra", "-Werror"]
-            subprocess.run([*flags, HERE / "windows_capture.c", "-lole32", "-o", output / "bin/jaro-capture.exe"], check=True)
+            subprocess.run([*flags, HERE / "windows_capture.c", HERE / "windows_browser_pages.c",
+                            "-municode", "-lole32", "-loleaut32", "-luser32", "-o", output / "bin/jaro-capture.exe"], check=True)
+            subprocess.run([*flags, HERE / "windows_screen.c", HERE / "windows_pen.c", "-ld3d11", "-ldxgi", "-ldwmapi", "-lgdi32",
+                            "-luser32", "-lole32", "-o", output / "bin/jaro-screen.exe"], check=True)
             subprocess.run([*flags, HERE / "windows_hotkeys.c", HERE / "windows_clipboard.c",
                             "-luser32", "-lgdi32", "-lole32", "-o", output / "bin/jaro-dictation.exe"], check=True)
+            subprocess.run([*flags, HERE / "windows_indicator.c", "-municode", "-Wl,--subsystem,windows",
+                            "-luser32", "-lgdi32", "-lshcore", "-o", output / "bin/jaro-indicator.exe"], check=True)
+            subprocess.run([*flags, HERE / "windows_call_surface.c", "-municode", "-Wl,--subsystem,windows",
+                            "-luser32", "-lgdi32", "-lshcore", "-o", output / "bin/jaro-call-surface.exe"], check=True)
+            subprocess.run([*flags, HERE / "windows_tray.c", "-municode", "-Wl,--subsystem,windows", "-luser32",
+                            "-lshell32", "-o", output / "bin/jaro-tray.exe"], check=True)
+            shutil.copyfile(HERE / "windows/Jaro.ico", output / "bin/jaro-tray.ico")
+            subprocess.run([*flags, HERE / "windows_audio_control.c", HERE / "windows_media_control.c",
+                            "-lole32", "-lapi-ms-win-core-winrt-l1-1-0", "-lapi-ms-win-core-winrt-string-l1-1-0",
+                            "-o", output / "bin/jaro-audio-control.exe"], check=True)
+        else:
+            flags = subprocess.check_output(["pkg-config", "--cflags", "--libs", "gtk4-layer-shell-0", "gtk4"], text=True).split()
+            subprocess.run([zig, "cc", "-O2", "-Wall", "-Wextra", "-Werror", HERE / "linux/pen.c",
+                            *flags, "-lm", "-o", output / "bin/jaro-pen"], check=True)
+            x11 = subprocess.check_output(["pkg-config", "--libs", "x11", "xext"], text=True).split()
+            subprocess.run([zig, "cc", "-O2", "-Wall", "-Wextra", "-Werror", HERE / "linux/indicator.c",
+                            *flags, *x11, "-lm", "-o", output / "bin/jaro-indicator"], check=True)
+            # Use the distro linker for the GTK notification helper's ELF layout.
+            subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", HERE / "linux/call_surface.c",
+                            *flags, *x11, "-o", output / "bin/jaro-call-surface"], check=True)
 
 
 def main():

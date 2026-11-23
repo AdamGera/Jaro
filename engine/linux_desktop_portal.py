@@ -2,6 +2,8 @@
 import asyncio
 from contextlib import suppress
 import os
+import stat
+from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 from dbus_fast import Message, MessageType, Variant
@@ -17,6 +19,11 @@ DBUS = "org.freedesktop.DBus"
 REQUEST = "org.freedesktop.portal.Request"
 SESSION = "org.freedesktop.portal.Session"
 REGISTRY = "org.freedesktop.host.portal.Registry"
+SCREENSHOT = "org.freedesktop.portal.Screenshot"
+SCREENCAST = "org.freedesktop.portal.ScreenCast"
+VIDEO_SOURCES = {"display": 1, "window": 2}
+SCREENSHOT_TARGETS = {"area": 4, "window": 2, "display": 1}
+MAX_SCREENSHOT_BYTES = 30 * 1024 * 1024
 APP_ID = "local.jardaudio.desktop"
 
 
@@ -166,3 +173,95 @@ class DesktopPortal:
             self.session = None
             self.bus.disconnect()
             self.bus = None
+
+
+class ScreenshotPortal(DesktopPortal):
+    def __init__(self):
+        super().__init__(lambda: None)
+
+    async def targets(self):
+        version = await self.property(SCREENSHOT, "version")
+        if version < 2:
+            return []
+        if version < 3:
+            return ["picker"]
+        targets = await self.property(SCREENSHOT, "AvailableTargets")
+        return [source for source, bit in SCREENSHOT_TARGETS.items() if targets & bit] or ["picker"]
+
+    async def screenshot(self, source):
+        if source not in await self.targets():
+            raise CaptureError("That screenshot choice is unavailable on this desktop.")
+        options = {"interactive": Variant("b", True)}
+        if source != "picker":
+            options["target"] = Variant("u", SCREENSHOT_TARGETS[source])
+        try:
+            result = await self.request(SCREENSHOT, "Screenshot", "sa{sv}", [""], options, seconds=90)
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
+            raise CaptureError("The desktop screenshot service disconnected.") from None
+        uri = result.get("uri")
+        if uri is None or uri.signature != "s":
+            raise CaptureError("The desktop did not return a screenshot.")
+        return uri.value
+
+
+class ScreenCastPortal(DesktopPortal):
+    def __init__(self, closed):
+        super().__init__(closed, negotiate_fds=True)
+        self.display_properties = None
+
+    async def sources(self):
+        available = await self.property(SCREENCAST, "AvailableSourceTypes")
+        return [source for source, bit in VIDEO_SOURCES.items() if available & bit]
+
+    async def select(self, source):
+        if source not in await self.sources():
+            raise CaptureError("That source is unavailable for screen recording.")
+        await self.create_session(SCREENCAST)
+        options = {"types": Variant("u", VIDEO_SOURCES[source]), "multiple": Variant("b", False)}
+        if await self.property(SCREENCAST, "AvailableCursorModes") & 2:
+            options["cursor_mode"] = Variant("u", 2)
+        await self.request(SCREENCAST, "SelectSources", "oa{sv}", [self.session], options)
+        result = await self.request(SCREENCAST, "Start", "osa{sv}", [self.session, ""], seconds=90)
+        streams = result.get("streams")
+        if streams is None or streams.signature != "a(ua{sv})" or len(streams.value) != 1:
+            raise CaptureError("The desktop did not provide a screen recording stream.")
+        node, properties = streams.value[0]
+        self.display_properties = properties if source == "display" else None
+        serial = properties.get("pipewire-serial")
+        return f"target-object={serial.value}" if serial is not None and serial.signature == "t" else f"path={node}"
+
+    async def open_remote(self):
+        if self.session is None:
+            raise CaptureError("The desktop ended screen sharing.")
+        reply = await self.reply(SCREENCAST, "OpenPipeWireRemote", "oa{sv}", [self.session, {}], fd=True)
+        try:
+            if reply.signature != "h" or len(reply.body) != 1 or not 0 <= reply.body[0] < len(reply.unix_fds):
+                raise CaptureError("The desktop did not provide a PipeWire connection.")
+            return os.dup(reply.unix_fds[reply.body[0]])
+        finally:
+            close_descriptors(reply)
+
+
+def read_screenshot(uri):
+    url = urlsplit(uri)
+    path = unquote(url.path, errors="strict")
+    if (url.scheme != "file" or url.netloc not in ("", "localhost") or url.query or url.fragment
+            or not os.path.isabs(path) or "\0" in path):
+        raise CaptureError("The desktop returned an invalid screenshot location.")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as file:
+        info = os.fstat(file.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise CaptureError("The desktop returned a screenshot Jaro cannot open.")
+        if info.st_size > MAX_SCREENSHOT_BYTES:
+            raise CaptureError("The screenshot exceeds the 30 MB size limit.")
+        image = file.read(MAX_SCREENSHOT_BYTES + 1)
+    if len(image) > MAX_SCREENSHOT_BYTES:
+        raise CaptureError("The screenshot exceeds the 30 MB size limit.")
+    if image.startswith(b"\x89PNG\r\n\x1a\n"):
+        return image, "image/png"
+    if image.startswith(b"\xff\xd8\xff"):
+        return image, "image/jpeg"
+    raise CaptureError("The desktop returned an unsupported screenshot format.")

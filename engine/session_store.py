@@ -534,7 +534,7 @@ class SessionStore:
                 raise MissingSession(key)
             return path, row["mime"]
 
-    def meeting_recording_folder(self, key):
+    def meeting_recording_file(self, key):
         with self.connection() as db:
             source = meeting_retention.readable_source(db)
             row = db.execute(f"""SELECT filename FROM {source} s WHERE s.id=? AND s.status IN ('complete','interrupted')
@@ -547,7 +547,7 @@ class SessionStore:
         media = folder / row["filename"]
         if folder.is_symlink() or media.parent != folder or media.is_symlink() or not media.is_file():
             raise MissingSession(key)
-        return folder
+        return media
 
     def annotations(self, *, limit=20, prefix=""):
         if self.read_only and not self.path.is_file():

@@ -1,5 +1,7 @@
-import { useId, type ReactNode } from "react"
+import { useId, useState, type ReactNode } from "react"
 import { ChevronDown, type LucideIcon } from "lucide-react"
+import { useInterfaceLanguage } from "@/interface-language"
+import { Button } from "./ui/button"
 
 export type SettingControlLabels = { "aria-labelledby": string; "aria-describedby"?: string }
 
@@ -48,4 +50,22 @@ export function SettingDisclosure({ icon: Icon, title, openInitially, onToggle, 
     <summary><Icon aria-hidden="true" /><span>{title}</span><ChevronDown aria-hidden="true" /></summary>
     <div className="dictation-preference-group">{children}</div>
   </details>
+}
+
+export function RuleEditor({ label, help, value, save, maxLength = 16000, disabled = false }: {
+  label: string; help: string; value: string; save: (value: string) => Promise<boolean>; maxLength?: number; disabled?: boolean
+}) {
+  const { t } = useInterfaceLanguage()
+  const [draft, setDraft] = useState<string>()
+  async function commit() {
+    if (draft !== undefined && await save(draft)) setDraft(current => current === draft ? undefined : current)
+  }
+  return <div className="dictation-rule" data-setting-title={label} data-setting-description={help}>
+    <label><strong>{label}</strong><small>{help}</small>
+      <textarea dir="auto" rows={3} maxLength={maxLength} value={draft ?? value} disabled={disabled}
+        onChange={event => setDraft(event.target.value)} />
+    </label>
+    <Button variant="outline" size="sm" disabled={disabled || draft === undefined || draft === value}
+      onClick={() => void commit()}>{t("Save")}</Button>
+  </div>
 }

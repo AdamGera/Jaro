@@ -19,13 +19,14 @@ async function run() {
     meetingStart.setHours(14, 5, 0, 0)
     const saved = { id: meetingId, name: "Fixture meeting", created: new Date().toISOString(), meetingStartedAt: meetingStart.toISOString(), status: "complete", processed: 10,
       meeting: true, meetingProvider: "Zoom", recording: true, languageHints: ["en"], audioUrl: `/api/sessions/${meetingId}/audio`,
+      recordingTracks: { mic: `/api/sessions/${meetingId}/audio?track=mic`, system: `/api/sessions/${meetingId}/audio?track=system` },
       meetingMicrophoneWarning: "digitalSilence",
       transcript: { text: "Start here. Review the agenda.", durationSeconds: 10, detectedLanguages: ["English"], words: [],
         segments: [{ speaker: 1, start: 0, end: 2, text: "Start here." }, { speaker: 2, start: 7, end: 10, text: "Review the agenda." }],
         speakerNames: { 1: "You", 2: "Them" }, speakerActivity: null } }
     const annotationRoute = `/api/sessions/${annotationId}/annotation`
     const annotated = { ...saved, id: annotationId, name: "Fixture annotation", meeting: false, annotationCustomStorage: true,
-      audioUrl: `/api/sessions/${annotationId}/audio`, annotation: { version: 1, strokeCount: 2,
+      audioUrl: `/api/sessions/${annotationId}/audio`, recordingTracks: undefined, annotation: { version: 1, strokeCount: 2,
         source: "area", frames: [.1, .6], manifestUrl: `${annotationRoute}/manifest`, contactSheetUrl: `${annotationRoute}/contact-sheet` } }
     const fixtureImages = new Map()
     let attachmentError = ""
@@ -220,7 +221,7 @@ async function run() {
       const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1, 12).getTime() / 1000
       window.historyFixture = [
         { id: "fixture", text: "A practice dictation about history books.", raw: "A practice dictation about history books.",
-          app: "TextEdit", time: today.getTime() / 1000, seconds: 4 },
+          app: "TextEdit", time: today.getTime() / 1000, seconds: 4, audioExpiresAt: today.getTime() / 1000 + 86400 },
         { id: "next", text: "Send the revised notes to the team.", raw: "Um, send the revised notes to the team.",
           app: "Notes", time: yesterday, seconds: 3.5, mode: "default", inferenceMs: 203, totalMs: 364,
           processing: { latencyMs: 118, model: "Qwen3.5-2B", fallbacks: ["transformations"] } },
@@ -259,6 +260,12 @@ async function run() {
           return { selected, resolved, choices: interfaceCatalog.choices, messages: interfaceCatalog.messages[resolved] ?? {} }
         }
         if (command === "jard.export") { window.lastExport = input; return { saved: true } }
+        if (command === "jard.workspaceToolbar") { window.toolbarInset = input.inset; return null }
+        if (command === "jard.revealSessionMedia") {
+          if (window.recordingMissing) throw new Error("The recording file is no longer available.")
+          window.revealedSessionMedia = input.id
+          return null
+        }
         if (command === "jard.sessionScreenshot") {
           window.lastScreenshot = input.source
           if (input.source === "display") return {}
@@ -385,6 +392,7 @@ async function run() {
           const meeting = window.meetingsFixture
           if (meeting.managed && input.action !== "status") throw new Error("Meetings are managed by your organization.")
           if (input.action === "detection") meeting.detection = input.enabled
+          if (input.action === "noiseCleanup" || input.action === "boostMicrophone") meeting[input.action] = input.enabled
           if (input.action === "indicator") meeting.showIndicator = input.enabled
           if (input.action === "indicatorCorner") meeting.indicatorCorner = input.corner
           if (input.action === "recordingPrivacy") window.recordingPrivacy = meeting.permission
@@ -502,6 +510,10 @@ async function run() {
           return { state: window.fixtureLoginState }
         }
         if (command === "jard.microphoneLevel") return { peak: window.fixtureMicrophonePeak ?? null }
+        if (command === "jard.dictationCleanup") {
+          window.fixtureCleanupAction = input.action
+          return { status: "ready" }
+        }
         if (command === "jard.inputDevices") {
           window.fixtureInputReads++
           const snapshot = window.fixtureInputDevices
@@ -594,6 +606,13 @@ async function run() {
             const entries = window.historyFixture.filter(item => item.text.includes(input.query))
             return { entries: entries.slice(input.offset, input.offset + 15), total: entries.length, words: 7, seconds: 4 }
           }
+          case "playHistoryAudio":
+            if (input.id !== "fixture") throw new Error("Wrong history clip.")
+            state.playingHistoryID = input.id
+            break
+          case "stopHistoryAudio":
+            if (state.playingHistoryID === input.id) delete state.playingHistoryID
+            break
           case "bulkHistory":
             if (input.operation === "delete") {
               window.deletedHistory = input.ids
@@ -1292,6 +1311,18 @@ async function run() {
     await page.getByRole("tab", { name: "Général", exact: true }).click()
     await translatedInterface.selectOption("system")
     await page.getByRole("tab", { name: "Meetings", exact: true }).click()
+    const voiceInput = page.getByRole("region", { name: "Voice input", exact: true })
+    const meetingCleanup = voiceInput.getByRole("switch", { name: "Noise cleanup (StuPASE)" })
+    const meetingBoost = voiceInput.getByRole("switch", { name: "Boost microphone (+6 dB)" })
+    assert.equal(await meetingCleanup.isChecked(), false)
+    assert.equal(await meetingBoost.isChecked(), false)
+    await meetingBoost.check()
+    assert.equal(await meetingCleanup.isChecked(), false)
+    await meetingCleanup.check()
+    await voiceInput.getByText("Cleans the microphone audio locally for the final transcript of new meetings.").waitFor()
+    await meetingBoost.uncheck()
+    assert.equal(await meetingCleanup.isChecked(), true)
+    await meetingCleanup.uncheck()
     await calendarClock.filter({ hasText: /2:05\s*PM/ }).waitFor()
     await page.getByRole("combobox", { name: "Reminder time" }).selectOption("5")
     await page.getByRole("region", { name: "Calendar", exact: true }).getByText("Calendars (1 of 1)").click()
@@ -1583,6 +1614,17 @@ async function run() {
     await button("Change Paste Last shortcut (⌥⇧V)").waitFor()
     await page.getByText("Paste Last uses ⌥⇧V.", { exact: true }).waitFor()
     await page.getByRole("region", { name: "Voice input" }).getByRole("combobox", { name: "Language" }).waitFor()
+    const cleanup = page.getByRole("switch", { name: "Noise cleanup (StuPASE)", exact: true })
+    const boost = page.getByRole("switch", { name: "Boost microphone (+6 dB)", exact: true })
+    assert.equal(await cleanup.isChecked(), false)
+    assert.equal(await boost.isChecked(), false)
+    await cleanup.check()
+    await page.waitForFunction(() => window.fixtureCleanupAction === "prepare")
+    assert.equal(await boost.isChecked(), false)
+    await boost.check()
+    await cleanup.uncheck()
+    assert.equal(await boost.isChecked(), true)
+    await boost.uncheck()
     const keepMicrophone = page.getByRole("switch", { name: "Keep microphone ready", exact: true })
     assert.equal(await descriptionOf(keepMicrophone), "macOS shows the mic in use while Jard is ready to dictate.")
     const micRowColor = () => keepMicrophone.evaluate(node => getComputedStyle(node.closest(".dictation-setting-row")).backgroundColor)
@@ -1927,6 +1969,15 @@ async function run() {
     assert.deepEqual(await list.locator(".dictation-history-day").allTextContents(), ["Today", "Yesterday"])
     assert.equal(await firstEntry.getAttribute("aria-pressed"), "true")
     await detail.getByText("TextEdit").waitFor()
+    await detail.getByRole("button", { name: "Play dictation audio" }).click()
+    await detail.getByRole("button", { name: "Stop dictation audio" }).click()
+    await detail.getByRole("button", { name: "Play dictation audio" }).waitFor()
+    await page.evaluate(() => {
+      delete window.historyFixture[0].audioExpiresAt
+      window.dictationFixture.historyRevision++
+    })
+    await detail.getByRole("button", { name: "Play dictation audio" }).waitFor({ state: "detached" })
+    await detail.getByText("A practice dictation about history books.").waitFor()
     const secondEntry = list.getByRole("button", { name: /Send the revised notes/ })
     assert.equal(await list.locator('button[tabindex="0"]').count(), 1)
     const historySearch = page.getByRole("searchbox", { name: "Search dictation history" })
@@ -1937,6 +1988,7 @@ async function run() {
     assert.equal(await firstEntry.evaluate(node => node === document.activeElement), true)
     await firstEntry.press("ArrowDown")
     assert.equal(await secondEntry.getAttribute("aria-pressed"), "true")
+    assert.equal(await detail.getByRole("button", { name: "Play dictation audio" }).count(), 0)
     assert.equal(await secondEntry.evaluate(node => node === document.activeElement), true)
     assert.equal(await firstEntry.getAttribute("tabindex"), "-1")
     assert.equal(await secondEntry.getAttribute("tabindex"), "0")
@@ -2231,14 +2283,33 @@ async function run() {
     await button("Meeting exports").click()
     await page.getByRole("menuitem", { name: "Notes (.md)" }).click()
     assert.deepEqual(await page.evaluate(() => window.lastExport), { id: meetingId, kind: "notes" })
+    const openPlayer = button("Open audio player")
+    if (await openPlayer.count()) await openPlayer.click()
+    const playbackSource = page.getByRole("combobox", { name: "Playback source" })
+    await playbackSource.selectOption("mic")
+    const revealAudio = page.getByRole("button", { name: /^Show combined audio in Finder for / })
+    const revealCombinedFromMenu = page.getByRole("menuitem", { name: "Show combined audio in Finder" })
+    await page.waitForFunction(() => {
+      const toolbar = document.querySelector(".workspace-actions")
+      return toolbar && window.toolbarInset === Math.ceil(window.innerWidth - toolbar.getBoundingClientRect().left)
+    })
     await page.evaluate(() => { window.recordingMissing = true })
-    await button("Meeting exports").click()
-    await page.getByRole("menuitem", { name: "Reveal files" }).click()
+    await revealAudio.click()
+    await page.getByRole("alert").getByText("The recording file is no longer available.").waitFor()
+    await page.evaluate(() => { window.recordingMissing = false })
+    await revealAudio.click()
+    assert.equal(await page.evaluate(() => window.revealedSessionMedia), meetingId)
+    assert.deepEqual(await page.evaluate(() => window.lastExport), { id: meetingId, kind: "notes" })
+    await page.evaluate(() => { window.recordingMissing = true })
+    await button("Meeting exports").dispatchEvent("click", { detail: 0 })
+    await revealCombinedFromMenu.click()
     await page.getByRole("alert").getByText("This meeting's recording files are no longer available.").waitFor()
     await page.evaluate(() => { window.recordingMissing = false })
     await button("Meeting exports").click()
-    await page.getByRole("menuitem", { name: "Reveal files" }).click()
+    await revealCombinedFromMenu.click()
     assert.equal(await page.evaluate(() => window.revealedRecording), meetingId)
+    assert.equal(await playbackSource.inputValue(), "mic")
+    await button("Close audio player").click()
     await button("Meeting exports").click()
     await page.getByRole("menuitem", { name: "Move meeting audio to Trash…" }).click()
     await button("Move to Trash").click()
@@ -2246,7 +2317,7 @@ async function run() {
     assert.equal(await button("Open audio player").count(), 0)
     await button("Meeting exports").click()
     await page.getByRole("menuitem", { name: "Notes (.md)" }).waitFor()
-    assert.equal(await page.getByRole("menuitem", { name: "Reveal files" }).count(), 0)
+    assert.equal(await revealCombinedFromMenu.count(), 0)
     await page.keyboard.press("Escape")
     await page.evaluate(() => sessionStorage.setItem("fixtureOnboarded", "true"))
     await page.goto(`http://127.0.0.1:18997/?session=${meetingId}&tab=transcript&at=7`)
@@ -2318,6 +2389,8 @@ async function run() {
     await annotationPanel.getByRole("button", { name: "Jump to 0:00.1", exact: true }).waitFor()
     const video = annotationPanel.locator("video")
     assert.equal(await video.getAttribute("src"), annotated.audioUrl)
+    await page.getByRole("button", { name: /^Show video in Finder for / }).click()
+    assert.equal(await page.evaluate(() => window.revealedSessionMedia), annotationId)
     const saveVideo = annotationPanel.getByRole("button", { name: "Save video…" })
     await saveVideo.click()
     assert.deepEqual(await page.evaluate(() => window.lastExport), { id: annotationId, kind: "audio" })
@@ -2970,7 +3043,7 @@ async function run() {
     await page.getByRole("menuitem", { name: "Copy transcript" }).waitFor()
     assert.equal(await page.getByRole("menuitem", { name: "Move meeting audio to Trash…" }).count(), 0)
     await page.evaluate(() => { window.revealedRecording = null })
-    await page.getByRole("menuitem", { name: "Reveal files" }).click()
+    await revealCombinedFromMenu.click()
     assert.equal(await page.evaluate(() => window.revealedRecording), meetingId)
     await button("Copy transcript").click()
     await button("Copied").waitFor()

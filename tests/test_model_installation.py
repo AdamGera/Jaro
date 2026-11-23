@@ -100,6 +100,11 @@ class ModelInstallationTests(unittest.TestCase):
         with (patch.dict(os.environ, {"JARD_MODEL_DIR": str(self.install_dir)}),
               patch("sys.platform", "linux"), patch.object(installer, "emit")):
             self.assertFalse(installer.status(portable=True)["ready"])
+            with patch.object(installer, "install_runtime", side_effect=RuntimeError("interrupted extraction")):
+                with self.assertRaisesRegex(RuntimeError, "interrupted extraction"):
+                    installer.install(self.source, portable=True)
+            self.assertFalse((self.install_dir / "revision").exists())
+            self.assertFalse(installer.status(portable=True)["ready"])
             installer.install(self.source, portable=True)
             self.assertTrue(installer.status(portable=True)["ready"])
             self.assertFalse((runtime / "other-cli").exists())

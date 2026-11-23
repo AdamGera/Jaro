@@ -127,6 +127,28 @@ html[data-native-window] .workspace-actions { height: var(--window-header-height
 .meeting-workspace-controls p, .meeting-workspace-list p { color: var(--quiet); font-size: .85rem; }
 .meeting-live-time { display: inline-flex; align-items: center; gap: .5rem; font-variant-numeric: tabular-nums; }
 .meeting-live-time > span { width: .45rem; height: .45rem; border-radius: 50%; background: var(--destructive); }
+.portable-call-bar {
+  position: fixed;
+  z-index: 24;
+  inset-block-start: 4rem;
+  inset-inline-end: 1rem;
+  max-width: min(38rem, calc(100vw - 2rem));
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: .65rem 1rem;
+  padding: .55rem .7rem;
+  border: 1px solid var(--border);
+  border-radius: .85rem;
+  background: var(--background);
+  box-shadow: 0 .45rem 1.5rem rgb(0 0 0 / 16%);
+  font-size: .85rem;
+}
+.portable-call-description { display: flex; gap: .5rem; align-items: center; }
+.portable-call-description svg { flex: none; width: 1.05rem; height: 1.05rem; color: var(--quiet); }
+.portable-call-description small { display: block; color: var(--quiet); }
+.portable-call-bar .dictation-row-actions { flex-wrap: wrap; max-width: 100%; }
+.portable-call-bar [role="alert"] { flex-basis: 100%; color: var(--destructive); }
 .meeting-workspace-search { display: flex; align-items: center; gap: .55rem; padding-inline: .75rem; border: 1px solid var(--line); border-radius: .65rem; }
 .meeting-workspace-search:focus-within { outline: 2px solid var(--ring); outline-offset: 2px; }
 .meeting-workspace-search svg { width: 1rem; height: 1rem; color: var(--quiet); }

@@ -52,7 +52,8 @@ export function QuitButton({ recording, recoverable = false, onQuit }: {
         <AlertDialog.Description>
           {recording && (native ? "The Mac app will save your recording first. "
             : recoverable ? "You can recover your recording when you reopen Jaro. " : "Quitting will discard this browser recording. ")}
-          This stops the shared engine and active jobs for all clients. To leave other clients working, close this {native ? t("window") : "tab"}.
+          {recoverable ? "This stops Jaro’s local engine." :
+            `This stops the shared engine and active jobs for all clients. To leave other clients working, close this ${native ? t("window") : "tab"}.`}
         </AlertDialog.Description>
         {error && <p role="alert">{error}</p>}
         <div className="note-language-actions">

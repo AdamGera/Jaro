@@ -103,6 +103,7 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 @property(nonatomic, copy) NSString *controlExitID;
 @property(nonatomic, weak) NSWindow *window;
 @property(nonatomic, strong) id dragMonitor;
+@property(nonatomic) CGFloat workspaceToolbarInset;
 @property(nonatomic, strong) NSMapTable<NSMenuItem *, NSString *> *menuLabels;
 @property(nonatomic, copy) NSString *menuLanguage, *selectedInterfaceLanguage;
 - (NSApplicationTerminateReply)requestSystemTermination;
@@ -658,8 +659,9 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         NSPoint point = [window.contentView convertPoint:event.locationInWindow fromView:nil];
         NSRect bounds = window.contentView.bounds;
         CGFloat y = window.contentView.isFlipped ? point.y : NSMaxY(bounds) - point.y;
-        // The React header reserves this middle strip; system lights and all app buttons stay outside it.
-        if (point.x < 208 || point.x > NSWidth(bounds) - 250 || y < 2 || y > 42) return event;
+        // The workspace reports its measured action area so wider toolbars keep receiving clicks.
+        CGFloat toolbarInset = app.showingApp ? app.workspaceToolbarInset : 250;
+        if (toolbarInset <= 0 || point.x < 208 || point.x >= NSWidth(bounds) - toolbarInset || y < 2 || y > 42) return event;
         if (event.clickCount >= 2) native_sdk_appkit_start_window_drag(app.host, 1);
         else [window performWindowDragWithEvent:event];
         return nil;
@@ -923,6 +925,17 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         [self respond:@{@"id": request, @"ok": @YES, @"result": snapshot}];
         return;
     }
+    if (self.showingApp && [origin isEqual:self.origin] && [command isEqual:@"jard.workspaceToolbar"]) {
+        id inset = [message[@"payload"] isKindOfClass:NSDictionary.class] ? message[@"payload"][@"inset"] : nil;
+        double width = [inset isKindOfClass:NSNumber.class] ? [inset doubleValue] : -1;
+        if (!isfinite(width) || width < 0) {
+            [self reject:request reason:@"The workspace toolbar bounds are invalid."];
+            return;
+        }
+        self.workspaceToolbarInset = width;
+        [self respond:@{@"id": request, @"ok": @YES, @"result": NSNull.null}];
+        return;
+    }
     if (self.showingApp && [origin isEqual:self.origin] && [command isEqual:@"jard.loginItem"]) {
         if (self.updating || self.closing) { [self reject:request reason:@"Jaro is preparing to close."]; return; }
         NSDictionary *payload = [message[@"payload"] isKindOfClass:NSDictionary.class] ? message[@"payload"] : @{};
@@ -971,7 +984,8 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         return;
     }
     NSArray *commands = self.showingApp
-        ? @[@"jard.devices", @"jard.inputDevices", @"jard.microphoneLevel", @"jard.record", @"jard.stop", @"jard.dictation", @"jard.live", @"jard.openAudio", @"jard.export", @"jard.meetingExports", @"jard.annotationStorage", @"jard.annotationRoutingPolicy", @"jard.annotationDestinations", @"jard.annotationRoute", @"jard.rememberAnnotationDestination", @"jard.forgetAnnotationDestination", @"jard.sendAnnotation", @"jard.annotationAgentDestinations", @"jard.sendAnnotationToAgent", @"jard.sendSessionToAgent", @"jard.annotationDeliveries", @"jard.undoAnnotationDelivery", @"jard.correctAnnotationDelivery", @"jard.recover", @"jard.discard", @"jard.open"]
+        ? @[@"jard.devices", @"jard.inputDevices", @"jard.microphoneLevel", @"jard.record", @"jard.stop", @"jard.dictation",
+            @"jard.dictationCleanup", @"jard.live", @"jard.openAudio", @"jard.revealSessionMedia", @"jard.export", @"jard.meetingExports", @"jard.annotationStorage", @"jard.annotationRoutingPolicy", @"jard.annotationDestinations", @"jard.annotationRoute", @"jard.rememberAnnotationDestination", @"jard.forgetAnnotationDestination", @"jard.sendAnnotation", @"jard.annotationAgentDestinations", @"jard.sendAnnotationToAgent", @"jard.sendSessionToAgent", @"jard.annotationDeliveries", @"jard.undoAnnotationDelivery", @"jard.correctAnnotationDelivery", @"jard.recover", @"jard.discard", @"jard.open"]
         : @[@"jard.prepare", @"jard.setup"];
     if (![origin isEqual:(self.showingApp ? self.origin : @"zero://inline")] || ![commands containsObject:command]) {
         [self reject:request reason:@"This command is unavailable in this view."];
@@ -999,7 +1013,7 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     if (([command isEqual:@"jard.record"] || [command isEqual:@"jard.dictation"]) && [payload isKindOfClass:NSDictionary.class]) {
         NSMutableDictionary *publicOptions = [payload mutableCopy];
         [publicOptions removeObjectsForKeys:@[@"global", @"keep", @"preRoll", @"inputDevice", @"avoidBluetooth",
-            @"outputProfile", @"cleanupOnFailure", @"releaseTail", @"meeting", @"meetingLabel", @"meetingCalendar", @"meetingTitle",
+            @"outputProfile", @"cleanupOnFailure", @"releaseTail", @"noiseCleanup", @"boostMicrophone", @"meeting", @"meetingLabel", @"meetingCalendar", @"meetingTitle",
             @"meetingApplication", @"meetingSystemAudio"]];
         payload = publicOptions;
     }

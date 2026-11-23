@@ -71,3 +71,8 @@ class WaylandDictationCommandTests(unittest.IsolatedAsyncioTestCase):
         args = shlex.split(command_prefix(self.root))
         self.assertEqual(args[1], f"RUMBLE_DATA_DIR={self.root}")
         self.assertEqual(args[-1], "dictation")
+
+    async def test_gnome_commands_are_identifiable_to_the_workspace(self):
+        self.assertEqual(await asyncio.to_thread(dispatch, self.root, "toggle", gnome=True), {"status": "recording"})
+        self.assertEqual(await asyncio.to_thread(dispatch, self.root, "cancel", gnome=True), {"status": "recording"})
+        self.assertEqual(self.actions, ["gnome-toggle", "gnome-cancel"])

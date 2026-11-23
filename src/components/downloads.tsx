@@ -72,21 +72,35 @@ export function Downloads({ item, compact = false, onAudioRemoved }: {
   const [confirm, setConfirm] = useState(false)
   const [removing, setRemoving] = useState(false)
   const [transcriptCopy, setTranscriptCopy] = useState<"pending" | "copied">()
+  const [meetingExportsOpen, setMeetingExportsOpen] = useState(false)
   if (!item) return null
   const bridge = item.saved ? desktopBridge() : undefined
   const isVideo = !!item.saved?.annotation && !item.saved.annotation.missingVideo
-  const mediaLabel = t(isVideo ? "Download video" : "Download audio")
+  const tracks = item.saved?.recordingTracks
+  const hasCombinedAudio = !!tracks?.mic && !!tracks.system
+  const revealLabel = t(isVideo ? "Show video in Finder" : hasCombinedAudio ? "Show combined audio in Finder" : "Show audio in Finder")
+  const mediaLabel = bridge ? revealLabel : t(isVideo ? "Download video" : "Download audio")
   const MediaIcon = isVideo ? FileVideo : FileAudio
   const sessionId = item.id
   const settledMeeting = isSettledMeeting(item.saved)
   const revealRecording = settledMeeting && !!item.audioUrl && !!bridge
   const removeRecording = settledMeeting && item.saved?.status === "complete" && !!item.audioUrl && !!onAudioRemoved
-  async function exportSaved(kind: "audio" | "json" | typeof meetingFormats[number][0]) {
+  async function exportSaved(kind: "json" | typeof meetingFormats[number][0]) {
     setExportError("")
     try {
       await bridge!.request("export", { id: sessionId, kind })
     } catch (reason) {
       setExportError(reason instanceof Error ? reason.message : "Could not save the export.")
+    }
+  }
+
+  async function revealMedia() {
+    if (!bridge) return
+    setExportError("")
+    try {
+      await bridge.request("revealSessionMedia", { id: sessionId })
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : t("Could not show the recording in Finder."))
     }
   }
 
@@ -133,16 +147,21 @@ export function Downloads({ item, compact = false, onAudioRemoved }: {
       <span className="download-name" title={item.audioName || item.name} dir="auto">{item.audioName || item.name}</span></>}
       <div className="download-actions">
         {bridge && item.audioUrl ? <Button variant="ghost" size="icon-sm" aria-label={`${mediaLabel} for ${item.name}`}
-          title={mediaLabel} onClick={() => void exportSaved("audio")}><MediaIcon /></Button> : item.audioUrl ? <Button asChild variant="ghost" size="icon-sm">
+          title={mediaLabel} onClick={() => void revealMedia()}><MediaIcon /></Button> : item.audioUrl ? <Button asChild variant="ghost" size="icon-sm">
           <a href={item.audioUrl} download={item.audioName || item.name} aria-label={`${mediaLabel} for ${item.name}`} title={mediaLabel}><MediaIcon /></a>
         </Button> : item.audio && <Button variant="ghost" size="icon-sm" aria-label={`Download audio for ${item.name}`}
           title="Download audio" onClick={() => downloadAudio(item.audio!, item.name)}><FileAudio /></Button>}
         {item.transcript && <Button variant="ghost" size="icon-sm" aria-label={`Download JSON transcript for ${item.name}`}
           title="Download transcript as JSON" onClick={() => bridge ? void exportSaved("json") : downloadTranscript(item)}><FileJson /></Button>}
-        {item.saved?.meeting && <DropdownMenu.Root onOpenChange={open => {
+        {item.saved?.meeting && <DropdownMenu.Root open={meetingExportsOpen} onOpenChange={open => {
+          setMeetingExportsOpen(open)
           if (open && transcriptCopy === "copied") setTranscriptCopy(undefined)
         }}>
-          <DropdownMenu.Trigger asChild><Button variant="ghost" size="icon-sm" title="Meeting exports" aria-label="Meeting exports">
+          <DropdownMenu.Trigger asChild><Button variant="ghost" size="icon-sm" title="Meeting exports" aria-label="Meeting exports"
+            onClick={event => {
+              // macOS accessibility can activate the button through a click alone.
+              if (event.detail === 0) setMeetingExportsOpen(open => !open)
+            }}>
             {transcriptCopy === "copied" ? <Check aria-hidden="true" /> : <Download aria-hidden="true" />}
           </Button></DropdownMenu.Trigger>
           <DropdownMenu.Portal><DropdownMenu.Content align="end" className="meeting-export-menu" sideOffset={5}>
@@ -153,7 +172,7 @@ export function Downloads({ item, compact = false, onAudioRemoved }: {
               <DropdownMenu.Item key={kind} asChild><a download href={`/api/sessions/${sessionId}/export?kind=${kind}`}>{label}</a></DropdownMenu.Item>)}
             {(revealRecording || removeRecording) && <>
               <DropdownMenu.Separator />
-              {revealRecording && <DropdownMenu.Item onSelect={() => void revealFiles()}>{t("Reveal files")}</DropdownMenu.Item>}
+              {revealRecording && <DropdownMenu.Item onSelect={() => void revealFiles()}>{revealLabel}</DropdownMenu.Item>}
               {removeRecording && <DropdownMenu.Item onSelect={() => setConfirm(true)}>Move meeting audio to Trash…</DropdownMenu.Item>}
             </>}
           </DropdownMenu.Content></DropdownMenu.Portal>

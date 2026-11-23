@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+root=/usr/lib/jaro
+exec 9<"$root/in-use"
+if ! /usr/bin/flock --shared --nonblock 9 || [ -d /run/jaro-package-changing ]; then
+    echo "Jaro is being installed or removed. Try again after the package operation finishes." >&2
+    exit 1
+fi
+
+unset PYTHONHOME PYTHONPATH PYTHONUSERBASE
+export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+
+case "${0##*/}" in
+  jaro)
+    exec "$root/venv/bin/python" "$root/desktop/portable/open_workspace.py" --installed "$root/bin/jaro" "$@"
+    ;;
+  jardctl)
+    if [ "${JARO_GNOME_SHORTCUT:-}" = 1 ] && [ "$#" -eq 2 ] && [ "$1" = dictation ]; then
+        exec "$root/venv/bin/python" "$root/engine/wayland_dictation_commands.py" "$2"
+    fi
+    exec "$root/venv/bin/python" "$root/engine/jardctl.py" "$@"
+    ;;
+esac

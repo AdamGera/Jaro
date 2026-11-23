@@ -12,6 +12,8 @@ static NSString *const detectionKey = @"JardDetectMeetings";
 static NSString *const policyKey = @"JardMeetingProviderPolicies";
 static NSString *const lastSessionKey = @"JardLastMeetingSession";
 static NSString *const autoStopKey = @"JardMeetingAutoStop";
+static NSString *const noiseCleanupKey = @"JardMeetingNoiseCleanup";
+static NSString *const boostMicrophoneKey = @"JardMeetingBoostMicrophone";
 static NSString *const indicatorKey = @"JardShowMeetingIndicator";
 static NSString *const cornerKey = @"JardMeetingIndicatorCorner";
 static NSString *const displayKey = @"JardMeetingIndicatorDisplay";
@@ -175,6 +177,8 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
         @"systemAudioUnavailable": @(self.recording && self.systemAudioUnavailable),
         @"microphone": self.recording && !self.microphoneUnavailable ? self.microphoneName ?: @"" : @"",
         @"autoStop": @(self.autoStop), @"autoStopSeconds": @(self.autoStopAt > 0 ? ceil(MAX(0, self.autoStopAt - NSProcessInfo.processInfo.systemUptime)) : 0),
+        @"noiseCleanup": @([NSUserDefaults.standardUserDefaults boolForKey:noiseCleanupKey]),
+        @"boostMicrophone": @([NSUserDefaults.standardUserDefaults boolForKey:boostMicrophoneKey]),
         @"calendar": [self.calendar statusAt:NSDate.date] ?: @{}, @"showIndicator": @(self.showIndicator), @"indicatorCorner": self.panelCorner,
         @"permission": self.permissionSource ?: @"", @"recoveryAvailable": @(self.recoveryDraft != nil)};
 }
@@ -647,6 +651,8 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
     [self state:@"starting" message:automatic ? @"Starting automatically…" : @"Starting meeting recording…"];
     NSMutableDictionary *options = [@{@"meeting": identifier, @"meetingLabel": self.providerLabel, @"languages": languages,
         @"mode": @"both", @"live": @YES, @"diarization": @YES} mutableCopy];
+    if ([NSUserDefaults.standardUserDefaults boolForKey:noiseCleanupKey]) options[@"noiseCleanup"] = @YES;
+    if ([NSUserDefaults.standardUserDefaults boolForKey:boostMicrophoneKey]) options[@"boostMicrophone"] = @YES;
     if (event) options[@"meetingCalendar"] = @{@"title": event.title, @"attendees": event.attendees};
     if (self.meetingTitle) options[@"meetingTitle"] = self.meetingTitle;
     if (self.activeCall.captureApplication.length) options[@"meetingApplication"] = self.activeCall.captureApplication;
@@ -1089,6 +1095,13 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
                 if (self.autoStopAt) [self keepButton:nil];
             }
         }
+    } else if ([action isEqual:@"noiseCleanup"] || [action isEqual:@"boostMicrophone"]) {
+        NSNumber *enabled = request[@"enabled"];
+        if (enabled != (__bridge NSNumber *)kCFBooleanTrue && enabled != (__bridge NSNumber *)kCFBooleanFalse) {
+            reply(nil, @"Choose whether to enable this meeting setting."); return;
+        }
+        [NSUserDefaults.standardUserDefaults setBool:enabled.boolValue
+            forKey:[action isEqual:@"noiseCleanup"] ? noiseCleanupKey : boostMicrophoneKey];
     } else if ([action isEqual:@"detection"]) {
         NSNumber *enabled = request[@"enabled"];
         if (enabled != (__bridge NSNumber *)kCFBooleanTrue && enabled != (__bridge NSNumber *)kCFBooleanFalse) {

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Jaro
+Comment=Local recordings and dictation
+Exec=/usr/bin/jaro
+TryExec=/usr/bin/jaro
+Icon=local.jardaudio.desktop
+Terminal=false
+StartupNotify=true
+StartupWMClass=local.jardaudio.desktop
+Categories=AudioVideo;Audio;

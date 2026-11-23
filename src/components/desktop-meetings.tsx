@@ -1,16 +1,91 @@
 import { useInterfaceLanguage } from "@/interface-language"
 import { useEffect, useState } from "react"
-import { AudioLines, Bell, BookOpen, CalendarDays, Clock, FileText, Folder, HardDrive, History, Monitor, Pencil, Phone, SlidersHorizontal, Sparkles, Square, Video } from "lucide-react"
+import { Activity, AudioLines, Bell, BookOpen, CalendarDays, Clock, FileText, Folder, HardDrive, History, Monitor, Pencil, Phone, SlidersHorizontal, Sparkles, Square, Video } from "lucide-react"
 import { AlertDialog } from "radix-ui"
 import { meetingAudioWarning, meetingTimeFormat, useDesktopMeeting } from "@/desktop-meeting"
 import type { DesktopBridge, DesktopMeetingAction, DesktopMeetingCalendar, MeetingIndicatorCorner, MeetingRecordingPolicy } from "@/desktop"
+import { useNoiseCleanup } from "@/system-dictation"
 import { MeetingAudioAccess } from "./meeting-audio-access"
+import type { PortableCallControls } from "@/portable-calls"
+import { PortableCallSettings } from "./portable-call-controls"
+import type { PortableMeetingControls } from "./meetings-workspace"
 import { SettingDisclosure, SettingGroup, SettingRow } from "./settings-rows"
 import { Button } from "./ui/button"
+
+export function PortableMeetingSettings({ controls, calls }: { controls: PortableMeetingControls; calls: PortableCallControls }) {
+  const { t } = useInterfaceLanguage()
+  type VoiceInput = { noiseCleanup: boolean; boostMicrophone: boolean }
+  const [voice, setVoice] = useState<VoiceInput>()
+  const [pending, setPending] = useState(false)
+  const [error, setError] = useState("")
+  const endpoint = "/api/portable/meeting-voice-input"
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void fetch(endpoint, { cache: "no-store", signal: controller.signal }).then(async response => {
+      if (!response.ok) throw new Error()
+      const current = await response.json()
+      if (!controller.signal.aborted) setVoice(current)
+    }).catch(() => {
+      if (!controller.signal.aborted) setError("Could not read the meeting voice settings.")
+    })
+    return () => controller.abort()
+  }, [endpoint])
+
+  async function change(setting: keyof VoiceInput, enabled: boolean) {
+    setPending(true)
+    setError("")
+    try {
+      const response = await fetch(endpoint, { method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ setting, enabled }) })
+      const result = await response.json()
+      if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "Could not change the meeting voice setting.")
+      setVoice(result)
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : "Could not change the meeting voice setting.")
+    } finally { setPending(false) }
+  }
+
+  const recording = controls.phase === "recording"
+  return <section className="dictation-settings dictation-preferences meetings-settings" data-setting-group="Meetings">
+    <SettingGroup id="meeting-recording-title" title={t("Recording")}>
+      <SettingRow icon={Video} title={t("Meeting audio")} label={false}
+        detail={t("Record your microphone and computer audio across playback devices. Find the transcript in Sessions.")}>
+        <Button size="sm" variant="outline" disabled={!recording && !controls.canStart}
+          onClick={recording ? controls.stop : controls.start}>
+          {recording ? <Square /> : <AudioLines />}
+          {controls.phase === "transcribing" ? t("Saving…") : controls.phase === "starting" ? t("Starting…") :
+            recording ? t("Stop & Save") : t("Record Meeting")}
+        </Button>
+      </SettingRow>
+      {controls.feedback && <p className="meeting-status" role="status">{controls.feedback}</p>}
+    </SettingGroup>
+    <SettingGroup id="meeting-voice-title" title={t("Voice input")}>
+      <SettingRow icon={Sparkles} title={t("Noise cleanup (StuPASE)")}
+        detail={t("Cleans microphone audio for the final transcript. Downloads 2.3 GB the first time.")}>
+        {labels => <input {...labels} type="checkbox" role="switch" checked={voice?.noiseCleanup ?? false} disabled={!voice || pending}
+          onChange={event => void change("noiseCleanup", event.target.checked)} />}
+      </SettingRow>
+      <SettingRow icon={Activity} title={t("Boost microphone (+6 dB)")}
+        detail={t("Raises quiet microphone audio and limits loud peaks for the final transcript of new meetings.")}>
+        {labels => <input {...labels} type="checkbox" role="switch" checked={voice?.boostMicrophone ?? false} disabled={!voice || pending}
+          onChange={event => void change("boostMicrophone", event.target.checked)} />}
+      </SettingRow>
+      {error && <p className="meeting-status" role="alert">{t(error)}</p>}
+    </SettingGroup>
+    <SettingGroup id="meeting-after-title" title={t("After a meeting")}>
+      <MeetingWritingPreference portable />
+      <RetentionPreference kind="meeting" portable />
+      <RetentionPreference kind="audio" portable />
+    </SettingGroup>
+    <PortableCallSettings calls={calls} />
+  </section>
+}
 
 export function DesktopMeetingControls({ native, busy, languages }: { native: DesktopBridge; busy: boolean; languages: string[] }) {
   const { t } = useInterfaceLanguage()
   const { meeting, pending, feedback, act } = useDesktopMeeting(native)
+  const cleanup = useNoiseCleanup(native, !meeting?.managed && meeting?.noiseCleanup === true)
 
   if (!meeting?.phase) return null
   if (meeting.managed) return <section className="dictation-settings dictation-preferences meetings-settings" data-setting-group="Meetings">
@@ -64,6 +139,21 @@ export function DesktopMeetingControls({ native, busy, languages }: { native: De
           <Button size="sm" variant="outline" disabled={pending || meeting.copying} onClick={() => void act({ action: "copyAll" })}>{t("Copy All")}</Button>
         </div>
       </SettingRow>}
+    </SettingGroup>
+    <SettingGroup id="meeting-voice-title" title={t("Voice input")}>
+      <SettingRow icon={Sparkles} title={t("Noise cleanup (StuPASE)")}
+        detail={cleanup === "downloading" ? t("Downloading 2.3 GB. Meetings can still be recorded.")
+          : cleanup === "error" ? t("Download failed. Turn this setting off and on to retry.")
+          : cleanup === "ready" ? t("Cleans the microphone audio locally for the final transcript of new meetings.")
+          : t("Cleans microphone audio for the final transcript. Downloads 2.3 GB the first time.")}>
+        {labels => <input {...labels} type="checkbox" role="switch" checked={meeting.noiseCleanup ?? false} disabled={pending}
+          onChange={event => void act({ action: "noiseCleanup", enabled: event.target.checked })} />}
+      </SettingRow>
+      <SettingRow icon={Activity} title={t("Boost microphone (+6 dB)")}
+        detail={t("Raises quiet microphone audio and limits loud peaks for the final transcript of new meetings.")}>
+        {labels => <input {...labels} type="checkbox" role="switch" checked={meeting.boostMicrophone ?? false} disabled={pending}
+          onChange={event => void act({ action: "boostMicrophone", enabled: event.target.checked })} />}
+      </SettingRow>
     </SettingGroup>
     <SettingGroup id="meeting-after-title" title={t("After a meeting")}>
       <MeetingWritingPreference />
@@ -246,7 +336,7 @@ function MeetingExportPreference({ native }: { native: DesktopBridge }) {
   </>
 }
 
-function MeetingWritingPreference() {
+function MeetingWritingPreference({ portable = false }: { portable?: boolean }) {
   const [enabled, setEnabled] = useState<boolean>()
   const [pending, setPending] = useState(false)
   const [error, setError] = useState("")
@@ -281,7 +371,9 @@ function MeetingWritingPreference() {
   }
 
   return <>
-    <SettingRow icon={Sparkles} title="Automatic titles and summaries" detail="Write a live title and short meeting summary with local Qwen.">
+    <SettingRow icon={Sparkles} title="Automatic titles and summaries" detail={portable
+      ? "Write a title and short summary after the meeting with local Qwen."
+      : "Write a live title and short meeting summary with local Qwen."}>
       {labels => (
         <input {...labels} type="checkbox" role="switch" checked={enabled ?? false} disabled={enabled === undefined || pending}
           onChange={event => void change(event.target.checked)} />
@@ -291,7 +383,7 @@ function MeetingWritingPreference() {
   </>
 }
 
-function RetentionPreference({ kind }: { kind: "meeting" | "audio" }) {
+function RetentionPreference({ kind, portable = false }: { kind: "meeting" | "audio"; portable?: boolean }) {
   const { t } = useInterfaceLanguage()
   const audio = kind === "audio"
   const endpoint = audio ? "/api/meetings/audio-retention" : "/api/meetings/retention"
@@ -300,6 +392,7 @@ function RetentionPreference({ kind }: { kind: "meeting" | "audio" }) {
   const [pending, setPending] = useState(false)
   const [error, setError] = useState("")
   const duration = choice === 1 ? "24 hours" : `${choice} days`
+  const trash = portable ? "the system Trash" : "the macOS Trash"
 
   useEffect(() => {
     const controller = new AbortController()
@@ -332,7 +425,7 @@ function RetentionPreference({ kind }: { kind: "meeting" | "audio" }) {
   return <>
     <SettingRow icon={audio ? HardDrive : FileText} title={audio ? "Keep meeting audio" : t("Keep meetings")} find="Meeting retention and expiry"
       detail={audio ? "Move expired audio to Trash. Transcripts and notes remain until the meeting expires."
-        : "Expired meetings move to the macOS Trash with their audio, transcripts, and notes."}>
+        : `Expired meetings move to ${trash} with their audio, transcripts, and notes.`}>
       {labels => (
         <select {...labels} value={days ?? (audio ? 0 : "default")} disabled={pending} onChange={event => {
           const next = Number(event.target.value)
@@ -353,8 +446,8 @@ function RetentionPreference({ kind }: { kind: "meeting" | "audio" }) {
         <AlertDialog.Content className="note-language-confirm">
           <AlertDialog.Title>{audio ? "Set meeting audio retention?" : "Set meeting retention?"}</AlertDialog.Title>
           <AlertDialog.Description>{audio
-            ? `Audio from completed meetings older than ${duration} moves to the macOS Trash. Transcripts and notes stay in Sessions while the meeting is kept.`
-            : `Completed meetings older than ${duration}, including existing meetings, will move to the macOS Trash with their audio, transcripts, and notes.`}</AlertDialog.Description>
+            ? `Audio from completed meetings older than ${duration} moves to ${trash}. Transcripts and notes stay in Sessions while the meeting is kept.`
+            : `Completed meetings older than ${duration}, including existing meetings, will move to ${trash} with their audio, transcripts, and notes.`}</AlertDialog.Description>
           <div className="note-language-actions">
             <AlertDialog.Cancel asChild><Button variant="outline" disabled={pending}>{t("Cancel")}</Button></AlertDialog.Cancel>
             <Button variant="destructive" disabled={pending} onClick={() => { if (choice !== undefined) void change(choice) }}>Set retention</Button>

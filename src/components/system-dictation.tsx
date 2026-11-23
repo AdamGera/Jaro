@@ -1,15 +1,15 @@
 import { useInterfaceLanguage } from "@/interface-language"
 import { MicrophoneLevel } from "./microphone-level"
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react"
-import { Activity, ArrowLeft, ArrowRight, Bluetooth, Check, ChevronLeft, ChevronRight, CircleAlert, Clipboard, Clock, Copy, FileText, Keyboard, Languages, LockKeyhole, Mic, Search, ShieldCheck, SlidersHorizontal, Sparkles, Trash2, Type, Volume2, Zap } from "lucide-react"
+import { Activity, ArrowLeft, ArrowRight, Bluetooth, Check, ChevronLeft, ChevronRight, CircleAlert, Clipboard, Clock, Copy, FileText, Keyboard, Languages, LockKeyhole, Mic, Play, Search, ShieldCheck, SlidersHorizontal, Sparkles, Square, Trash2, Type, Volume2, Zap } from "lucide-react"
 import { AlertDialog, Dialog } from "radix-ui"
 import type { DesktopBridge, DesktopInputDevices } from "@/desktop"
-import { profileName, type DictationHistory, type DictationHistoryEntry, type DictationPreferences, type DictationShortcutSide, type DictationStep, type SystemDictationControls } from "@/system-dictation"
+import { profileName, useNoiseCleanup, type DictationHistory, type DictationHistoryEntry, type DictationPreferences, type DictationShortcutSide, type DictationStep, type SystemDictationControls } from "@/system-dictation"
 import { OutputOverview, OutputProfiles } from "./dictation-output-profiles"
 import { DictationSoundPicker } from "./dictation-sound-picker"
 import { DictationVocabulary } from "./dictation-vocabulary"
 import { LaunchAtLogin } from "./launch-at-login"
-import { SettingDisclosure, SettingGroup, SettingRow } from "./settings-rows"
+import { RuleEditor, SettingDisclosure, SettingGroup, SettingRow } from "./settings-rows"
 import { SettingsSearch } from "./settings-search"
 import { Button } from "./ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs"
@@ -299,6 +299,7 @@ export function SystemDictationSettings({ controls, native, languages, monitor =
   const [devices, setDevices] = useState<DesktopInputDevices>()
   const refreshDevices = useRef<(() => void) | null>(null)
   const [feedbackVisible, setFeedbackVisible] = useState(false)
+  const cleanupStatus = useNoiseCleanup(native, visible && status?.noiseCleanup === true)
   const stopSoundPreview = useCallback(() => {
     void native.request("systemDictation", { action: "stopSoundPreview" }).catch(() => {})
   }, [native])
@@ -459,7 +460,7 @@ export function SystemDictationSettings({ controls, native, languages, monitor =
           </select>
         )}
       </SettingRow>
-      <DictationVocabulary controls={controls} />
+      <DictationVocabulary saved={status.vocabularyEntries} saveVocabulary={controls.saveVocabulary} />
       <SettingRow icon={Mic} title={t("Microphone")} anchor="dictation-microphone"
         detail={fallbackMicrophone ? t("Using {microphone} for dictation.", { microphone: fallbackMicrophone })
           : lidBlocksInput ? t("The built-in microphone is off while the lid is closed. Open the lid or connect a microphone.") : undefined}>
@@ -477,6 +478,18 @@ export function SystemDictationSettings({ controls, native, languages, monitor =
             </select>
           </span>
         )}
+      </SettingRow>
+      <SettingRow icon={Sparkles} title={t("Noise cleanup (StuPASE)")}
+        detail={status.noiseCleanup && cleanupStatus === "downloading" ? t("Downloading 2.3 GB. Dictation is available during setup.")
+          : status.noiseCleanup && cleanupStatus === "error" ? t("Download failed. Turn this setting off and on to retry.")
+          : status.noiseCleanup && cleanupStatus === "ready" ? t("Cleans up background noise locally before transcription.")
+          : t("Downloads 2.3 GB the first time you turn it on.")}>
+        {labels => <input {...labels} type="checkbox" role="switch" checked={status.noiseCleanup ?? false} disabled={pending}
+          onChange={event => void set("noiseCleanup", event.target.checked)} />}
+      </SettingRow>
+      <SettingRow icon={Activity} title={t("Boost microphone (+6 dB)")} detail={t("Raises quiet audio and limits loud peaks before transcription.")}>
+        {labels => <input {...labels} type="checkbox" role="switch" checked={status.boostMicrophone ?? false} disabled={pending}
+          onChange={event => void set("boostMicrophone", event.target.checked)} />}
       </SettingRow>
       <SettingRow icon={Zap} title="Keep microphone ready" find={t("Turn off the mic when not dictating")} detail="macOS shows the mic in use while Jard is ready to dictate.">
         {labels => (
@@ -583,7 +596,7 @@ export function SystemDictationSettings({ controls, native, languages, monitor =
         <RuleEditor label="Rewrite instructions" help="Used by the rewrite step with Jard’s local writing model." value={status.rewriteInstructions ?? ""}
           maxLength={2500} save={value => set("rewriteInstructions", value)} />
         <OutputProfiles native={native} value={status.outputProfiles ?? ""} script={status.outputScriptName} pending={pending}
-          save={async value => { await set("outputProfiles", value) }} run={run} />
+          save={value => set("outputProfiles", value)} run={run} />
         <SettingRow icon={LockKeyhole} title={t("Browser tab access")} label={false}
           detail={status.browserAccessMessage ||
             (status.browserAccessTarget ? t("Use the active tab’s hostname in website profiles and local output steps.") :
@@ -663,28 +676,19 @@ function DictationHistoryTab({ controls, native }: Pick<SettingsProps, "controls
     if (!("entries" in result)) throw new Error("Could not read dictation history.")
     return result
   }, [native])
+  const stopAudio = useCallback((id: string) => {
+    void native.request("systemDictation", { action: "stopHistoryAudio", id }).catch(() => {})
+  }, [native])
 
   return <section className="dictation-history-tab" aria-label={t("Dictation history")}>
     <DictationHistoryBrowser loadHistory={loadHistory} pending={pending}
       copyHistory={ids => run({ action: "bulkHistory", operation: "copy", ids })}
       deleteHistory={ids => run(ids ? { action: "bulkHistory", operation: "delete", ids } : { action: "clearHistory" })}
+      audio={{ playingID: status?.playingHistoryID, stop: stopAudio,
+        toggle: id => run({ action: status?.playingHistoryID === id ? "stopHistoryAudio" : "playHistoryAudio", id }) }}
       historyRevision={[status?.historyRevision, status?.retention].join(":")} />
     {error && <p className="dictation-error" role="alert">{error}</p>}
   </section>
-}
-
-function RuleEditor({ label, help, value, save, maxLength = 16000 }: { label: string; help: string; value: string; save: (value: string) => Promise<boolean>; maxLength?: number }) {
-  const { t } = useInterfaceLanguage()
-  const [draft, setDraft] = useState<string>()
-  async function commit() {
-    if (draft !== undefined && await save(draft)) setDraft(current => current === draft ? undefined : current)
-  }
-  return <div className="dictation-rule" data-setting-title={label} data-setting-description={help}>
-    <label><strong>{label}</strong><small>{help}</small>
-      <textarea dir="auto" rows={3} maxLength={maxLength} value={draft ?? value} onChange={event => setDraft(event.target.value)} />
-    </label>
-    <Button variant="outline" size="sm" disabled={draft === undefined || draft === value} onClick={() => void commit()}>{t("Save")}</Button>
-  </div>
 }
 
 function relativeTime(timestamp: number) {
@@ -717,12 +721,13 @@ function HistoryProcessing({ processing }: Pick<DictationHistoryEntry, "processi
   return <div><dt>{t("Processing")}</dt><dd>{summary}</dd></div>
 }
 
-export function DictationHistoryBrowser({ loadHistory, copyHistory, deleteHistory, pending, historyRevision }: {
+export function DictationHistoryBrowser({ loadHistory, copyHistory, deleteHistory, pending, historyRevision, audio }: {
   loadHistory: (query: string, offset: number) => Promise<DictationHistory>
   copyHistory: (ids: string[], text: string) => Promise<boolean>
   deleteHistory: (ids?: string[]) => Promise<boolean>
   pending: boolean
   historyRevision: string
+  audio?: { playingID?: string; toggle: (id: string) => Promise<boolean>; stop: (id: string) => void }
 }) {
   const { t } = useInterfaceLanguage()
   const [query, setQuery] = useState("")
@@ -734,6 +739,7 @@ export function DictationHistoryBrowser({ loadHistory, copyHistory, deleteHistor
   const [focused, setFocused] = useState<string>()
   const [confirm, setConfirm] = useState<{ ids: string[] } | "all">()
   const [copied, setCopied] = useState<string>()
+  const [expiredAudio, setExpiredAudio] = useState<string>()
   const listRef = useRef<HTMLUListElement>(null)
   const pointerRange = useRef<{ id: number; start: string; x: number; y: number; end?: string }>(null)
   const suppressPointerClick = useRef(false)
@@ -766,6 +772,17 @@ export function DictationHistoryBrowser({ loadHistory, copyHistory, deleteHistor
   const yesterdayKey = yesterday.toDateString()
   const days = entries.map(item => new Date(item.time * 1000).toDateString())
   const entry = selected.length <= 1 ? entries.find(item => item.id === selected[0]) ?? entries[0] : undefined
+  const audioExpiry = entry?.audioExpiresAt
+  const audioID = audioExpiry && entry.id !== expiredAudio ? entry.id : undefined
+  const stopAudio = audio?.stop
+  useEffect(() => {
+    if (!audioID || !audioExpiry || !stopAudio) return
+    const timer = window.setTimeout(() => setExpiredAudio(audioID), Math.max(0, audioExpiry * 1000 - Date.now()))
+    return () => {
+      window.clearTimeout(timer)
+      stopAudio(audioID)
+    }
+  }, [audioID, audioExpiry, stopAudio])
   const tabStop = entries.find(item => item.id === focused)?.id ?? entry?.id ?? entries[0]?.id
   const affected = selected.length ? selected : entry ? [entry.id] : []
   const selectedIDs = new Set(affected)
@@ -931,6 +948,12 @@ export function DictationHistoryBrowser({ loadHistory, copyHistory, deleteHistor
             dateTime={new Date(entry.time * 1000).toISOString()}>{historyDate.format(entry.time * 1000)}</time></>
             : <h2>{selected.length} dictations selected</h2>}</div>
           <div className="dictation-row-actions">
+            {audio && audioID && <Button variant="outline" size="sm" disabled={pending}
+              aria-label={t(audio.playingID === audioID ? "Stop dictation audio" : "Play dictation audio")}
+              title={t("Original microphone audio is kept locally for 24 hours.")}
+              onClick={() => void audio.toggle(audioID)}>
+              {audio.playingID === audioID ? <><Square />{t("Stop")}</> : <><Play />{t("Play")}</>}
+            </Button>}
             <Button variant="outline" size="icon-sm" aria-label="Copy selected dictation" title={copied === detailCopyKey ? t("Copied") : t("Copy")}
               disabled={pending} onClick={() => void copy(affected, detailCopyKey)}>
               {copied === detailCopyKey ? <Check /> : <Copy />}

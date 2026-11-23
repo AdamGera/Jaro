@@ -6,7 +6,8 @@ import type { DesktopBridge, DictationDestination, WindowNavigation } from "@/de
 import { readSession, type SavedSession } from "@/audio"
 import { useSessionList, type SessionSummary } from "@/session-list"
 import { SessionSearch } from "./session-search"
-import { MeetingsWorkspace, type MeetingWorkspaceOptions } from "./meetings-workspace"
+import { MeetingsWorkspace, type MeetingWorkspaceOptions, type PortableMeetingControls } from "./meetings-workspace"
+import { PortableCallBar, type PortableCallBarProps } from "./portable-call-controls"
 import { revealSetting, SettingsSearch } from "./settings-search"
 import { WhatsNewSettings, type HighlightDestination } from "./whats-new-settings"
 import { Button } from "./ui/button"
@@ -61,9 +62,11 @@ type Props = {
   onHome: () => void
   onSelect: (session: SavedSession) => void
   onDelete: (id: string) => void
-  settings?: Record<Exclude<SettingsPage, "dictation">, ReactNode> & { dictation: (visible: boolean) => ReactNode }
+  settings?: Partial<Record<Exclude<SettingsPage, "dictation">, ReactNode>> & { dictation?: (visible: boolean) => ReactNode }
   native?: DesktopBridge
   meetingOptions?: MeetingWorkspaceOptions
+  portableMeeting?: PortableMeetingControls
+  callBar?: PortableCallBarProps
   dictation?: (destination: DictationDestination, navigationId?: string) => ReactNode
   update?: ReactNode
   openUpdateSettings?: string
@@ -71,7 +74,7 @@ type Props = {
   children: ReactNode
 }
 
-export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, settings, native, meetingOptions, dictation, update, openUpdateSettings, installedVersion, children }: Props) {
+export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, settings, native, meetingOptions, portableMeeting, callBar, dictation, update, openUpdateSettings, installedVersion, children }: Props) {
   const { t } = useInterfaceLanguage()
   const [compact, setCompact] = useState(() => matchMedia(compactWindow).matches)
   const [pinned, setPinned] = useState(() => {
@@ -153,7 +156,7 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
     setSelectionError("")
     setOverlay(false)
     setPane(next)
-  }, [])
+  }, [setSelectionError, setOverlay, setPane])
   function openHighlight(destination: HighlightDestination) {
     if (destination === "meetings") {
       openPane("meetings")
@@ -327,7 +330,7 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
       }}>
       <Mic aria-hidden="true" />{t("Dictation")}
     </button>}
-    {native && meetingOptions && <button type="button" ref={meetingsButton} className="sidebar-home"
+    {(meetingOptions || portableMeeting) && <button type="button" ref={meetingsButton} className="sidebar-home"
       aria-current={pane === "meetings" ? "page" : undefined} onClick={() => openPane("meetings")}>
       <UsersRound aria-hidden="true" />{t("Meetings")}
     </button>}
@@ -361,6 +364,7 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
     </div>}
   </nav>
 
+  const visibleSettings = settingsPages.filter(({ id }) => settings?.[id])
   return <Tooltip.Provider delayDuration={360} skipDelayDuration={100}><div ref={workspaceFrame} className="workspace-frame"
     data-sidebar={expanded && !compact} onPointerMove={event => {
       if (event.pointerType !== "touch") scrollPointer.current = [event.clientX, event.clientY]
@@ -384,6 +388,7 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
       </Dialog.Portal>
     </Dialog.Root>
     <div className="workspace-content" hidden={!!pane}>{children}</div>
+    {callBar && <PortableCallBar {...callBar} onView={call => { openPane(undefined); callBar.onView(call) }} />}
     {pane && <main className="workspace-settings" data-pane={pane}>
       <button type="button" className="settings-back" onClick={() => {
         setPane(undefined)
@@ -399,18 +404,20 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
         }} />}
       </div>
       {pane === "dictation" && dictation?.(dictationRoute?.pane ?? "dictation", dictationRoute?.id)}
-      {pane === "meetings" && native && meetingOptions && <MeetingsWorkspace native={native} options={meetingOptions}
+      {pane === "meetings" && (meetingOptions || portableMeeting) &&
+        <MeetingsWorkspace native={native} options={meetingOptions} portable={portableMeeting}
+          onShowLive={() => { portableMeeting?.showLive(); openPane(undefined) }}
         busy={busy} currentId={currentId} query={meetingQuery} onQuery={setMeetingQuery} onOpen={id => void select(id)}
         onTrash={confirmTrash} onSettings={() => { setSettingsPage("meetings"); openPane("settings") }} />}
       {pane === "settings" && settings && <Tabs value={settingsPage} onValueChange={setSettingsPage} className="workspace-settings-tabs">
         <TabsList variant="line" aria-label={t("Settings")}>
-          {settingsPages.map(({ id, label }) => <TabsTrigger key={id} value={id}>{t(label)}</TabsTrigger>)}
-          <TabsTrigger value="whats-new">{t("What's new")}</TabsTrigger>
+          {visibleSettings.map(({ id, label }) => <TabsTrigger key={id} value={id}>{t(label)}</TabsTrigger>)}
+          {native && <TabsTrigger value="whats-new">{t("What's new")}</TabsTrigger>}
         </TabsList>
         <div ref={settingsScope}>
-          {settingsPages.map(({ id, label }) => <TabsContent key={id} value={id} forceMount hidden={settingsPage !== id}
+          {visibleSettings.map(({ id, label }) => <TabsContent key={id} value={id} forceMount hidden={settingsPage !== id}
             data-settings-page={id} data-setting-group={id === "general" ? t(label) : undefined}>
-            {id === "dictation" ? settings.dictation(settingsPage === id) : settings[id]}
+            {id === "dictation" ? settings.dictation?.(settingsPage === id) : settings[id]}
           </TabsContent>)}
           <TabsContent value="whats-new">
             <WhatsNewSettings version={installedVersion} onOpen={openHighlight} />

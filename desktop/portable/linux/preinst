@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+case "$1" in
+    install|upgrade) mkdir -p /run/jaro-package-changing ;;
+esac

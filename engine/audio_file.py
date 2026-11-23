@@ -1,11 +1,13 @@
 import asyncio
 import json
 from pathlib import Path
+import sys
 import wave
 
 import numpy as np
 
 from rumble_model import MAX_SAMPLES, SAMPLE_RATE
+from engine_paths import WORKSPACE_ROOT
 
 MAX_AUDIO_SECONDS = 3 * 60 * 60
 FILE_ERROR = "This audio could not be opened. Try a WAV, MP3, or M4A file."
@@ -19,6 +21,14 @@ INPUT_OPTIONS = (
 )
 
 
+def codec_binary(name):
+    if sys.platform == "win32":
+        bundled = WORKSPACE_ROOT / "bin" / f"{name}.exe"
+        if bundled.is_file():
+            return str(bundled)
+    return name
+
+
 async def stop_process(process: asyncio.subprocess.Process):
     if process.returncode is None:
         try:
@@ -30,7 +40,7 @@ async def stop_process(process: asyncio.subprocess.Process):
 
 async def audio_duration(path: Path) -> float | None:
     process = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "error", *INPUT_OPTIONS, "-select_streams", "a:0",
+        codec_binary("ffprobe"), "-v", "error", *INPUT_OPTIONS, "-select_streams", "a:0",
         "-show_entries", "stream=index,duration:format=duration", "-of", "json", path,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
@@ -84,7 +94,7 @@ def quiet_sample_boundary(samples):
 
 async def audio_blocks(path: Path, *, multilingual=False, pause_aware=False):
     process = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-v", "error", "-nostdin", *INPUT_OPTIONS, "-i", path,
+        codec_binary("ffmpeg"), "-v", "error", "-nostdin", *INPUT_OPTIONS, "-i", path,
         "-map", "0:a:0", "-t", str(MAX_AUDIO_SECONDS + 1), "-ac", "1",
         "-ar", str(SAMPLE_RATE), "-f", "f32le", "pipe:1",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -122,9 +132,9 @@ async def audio_blocks(path: Path, *, multilingual=False, pause_aware=False):
         await stop_process(process)
 
 
-def dictation_has_signal(path: Path, through_frames: int | None = None) -> bool:
+def dictation_has_signal(path: Path, through_frames: int | None = None, gain: float = 1.0) -> bool:
     """Reject near-silent recorder output before decoding or speech recognition."""
-    full_scale = 32768
+    full_scale = 32768 / gain
     fixed = full_scale * 10 ** (-50 / 20)
     level_floor = full_scale * 10 ** (-120 / 20)
     minimum_relative = full_scale * 10 ** (-66 / 20)
@@ -182,7 +192,7 @@ async def make_playable(source: Path, target: Path):
     if duration and duration > MAX_AUDIO_SECONDS + 1:
         raise ValueError(DURATION_ERROR)
     process = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-v", "error", "-nostdin", *INPUT_OPTIONS, "-i", source,
+        codec_binary("ffmpeg"), "-v", "error", "-nostdin", *INPUT_OPTIONS, "-i", source,
         "-map", "0:a:0", "-t", str(MAX_AUDIO_SECONDS + 1), "-c:a", "aac",
         "-b:a", "96k", "-ac", "2", "-movflags", "+faststart", target,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,

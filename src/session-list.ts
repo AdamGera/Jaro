@@ -47,6 +47,7 @@ export function useSessionList(open: boolean, query: string, refreshKey: string 
     window.addEventListener("jard-meeting-retention", refresh)
     window.addEventListener("jard-annotation-retention", refresh)
     window.addEventListener("jard-meeting-brief", refresh)
+    window.addEventListener("jaro-portable-meeting-saved", refresh)
     window.addEventListener("native-sdk:jard-annotation", annotationSaved)
     return () => {
       abort.abort()
@@ -55,6 +56,7 @@ export function useSessionList(open: boolean, query: string, refreshKey: string 
       window.removeEventListener("jard-meeting-retention", refresh)
       window.removeEventListener("jard-annotation-retention", refresh)
       window.removeEventListener("jard-meeting-brief", refresh)
+      window.removeEventListener("jaro-portable-meeting-saved", refresh)
       window.removeEventListener("native-sdk:jard-annotation", annotationSaved)
     }
   }, [open, query, refreshKey, refresh, version, meetingsOnly])

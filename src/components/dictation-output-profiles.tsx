@@ -1,5 +1,5 @@
 import { useInterfaceLanguage } from "@/interface-language"
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { ArrowDown, ArrowUp, FileCode, FolderOpen, Plus, Sparkles, Trash2 } from "lucide-react"
 import type { DesktopBridge } from "@/desktop"
 import type { DictationLocalTransform, DictationOutputPreview, DictationOutputProfile, DictationScriptReview, DictationTransformGrants, DictationStatus, SystemDictationControls } from "@/system-dictation"
@@ -290,14 +290,11 @@ function OutputScriptApproval({ native, name, onCatalog }: {
 
 export function OutputProfiles({ native, value, script, pending, save, run }: {
   native: DesktopBridge; value: string; script: string; pending: boolean
-  save: (value: string) => Promise<void>; run: SystemDictationControls["run"]
+  save: (value: string) => Promise<boolean>; run: SystemDictationControls["run"]
 }) {
-  const { t } = useInterfaceLanguage()
   const [open, setOpen] = useState(false)
   const [catalog, setCatalog] = useState<{ script: string; items: DictationLocalTransform[] }>()
   const transforms = catalog && catalog.script === script ? catalog.items : []
-  const stepOptions = [...Object.entries(stepNames), ...transforms.map(item => [`local:${item.id}`, item.name])]
-
   useEffect(() => {
     if (!open || !script) return
     let active = true
@@ -318,6 +315,39 @@ export function OutputProfiles({ native, value, script, pending, save, run }: {
     const timer = window.setInterval(refresh, embeddedConfig(script) ? 400 : 2500)
     return () => { active = false; window.clearInterval(timer) }
   }, [native, open, script])
+
+  const describe = useCallback(async (profiles: string) => {
+    const result = await native.request("systemDictation", { action: "describeOutputProfiles", profiles })
+    if ("profiles" in result) return result.profiles
+    throw new Error("Could not load profiles.")
+  }, [native])
+  const preview = useCallback<PreviewOutput>(async input => {
+    const result = await native.request("systemDictation", { action: "previewOutput", ...input })
+    if ("steps" in result) return result
+    throw new Error("Could not preview profiles.")
+  }, [native])
+
+  return <OutputProfileEditor value={value} pending={pending} save={save} describe={describe} previewOutput={preview}
+    onOpenChange={setOpen} nativeScript={{ path: script, transforms, run }} />
+}
+
+type PreviewOutput = (input: { text: string; profiles: string; app: string; site: string }) => Promise<DictationOutputPreview>
+
+export function OutputProfileEditor({ value, pending, save, describe, previewOutput, nativeScript, onOpenChange, wayland }: {
+  value: string
+  pending: boolean
+  save: (value: string, base: string) => Promise<boolean | void>
+  describe: (value: string) => Promise<DictationOutputProfile[]>
+  previewOutput: PreviewOutput
+  nativeScript?: { path: string; transforms: DictationLocalTransform[]; run: SystemDictationControls["run"] }
+  onOpenChange?: (open: boolean) => void
+  wayland?: boolean
+}) {
+  const { t } = useInterfaceLanguage()
+  const [open, setOpen] = useState(false)
+  const transforms = nativeScript?.transforms ?? []
+  const stepOptions = [...Object.entries(stepNames).filter(([step]) => nativeScript || step !== "script"),
+    ...transforms.map(item => [`local:${item.id}`, item.name])]
   const [saved, setSaved] = useState<{ value: string; rows: DictationOutputProfile[] }>()
   const [draft, setDraft] = useState<DictationOutputProfile[]>()
   const [selected, setSelected] = useState(0)
@@ -337,18 +367,18 @@ export function OutputProfiles({ native, value, script, pending, save, run }: {
   })))
 
   useEffect(() => {
-    if (!open || saved?.value === value) return
+    if (!open || draft || saved?.value === value) return
     let active = true
-    void native.request("systemDictation", { action: "describeOutputProfiles", profiles: value }).then(result => {
-      if (active && "profiles" in result) {
-        setSaved({ value, rows: result.profiles })
+    void describe(value).then(rows => {
+      if (active) {
+        setSaved({ value, rows })
         setLoadError("")
       }
     }).catch(failure => {
       if (active) setLoadError(failure instanceof Error ? failure.message : "Could not load profiles.")
     })
     return () => { active = false }
-  }, [native, open, saved?.value, value])
+  }, [describe, draft, open, saved?.value, value])
 
   function update(patch: Partial<DictationOutputProfile>) {
     setDraft(rows?.map((row, index) => index === selected ? { ...row, ...patch } : row))
@@ -377,11 +407,12 @@ export function OutputProfiles({ native, value, script, pending, save, run }: {
     setWorking(true)
     try {
       if (write) {
-        await native.request("systemDictation", { action: "describeOutputProfiles", profiles: definition })
-        await save(definition)
+        const normalized = await describe(definition)
+        if (await save(definition, saved?.value ?? value) === false) return
+        setSaved({ value: definition, rows: normalized })
+        setDraft(undefined)
       } else {
-        const result = await native.request("systemDictation", { action: "previewOutput", text: sample, profiles: definition, app, site })
-        if ("steps" in result) setPreview(result)
+        setPreview(await previewOutput({ text: sample, profiles: definition, app, site }))
       }
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Could not apply output profiles.")
@@ -391,8 +422,13 @@ export function OutputProfiles({ native, value, script, pending, save, run }: {
   }
 
   const scope = profile?.target.toLowerCase().split(":")[0] || "default"
-  return <details className="dictation-history" data-setting-title="Ordered output profiles" data-setting-description="App and website rules, scripts and rewriting"
-    onToggle={event => setOpen(event.currentTarget.open)}>
+  return <details className="dictation-history" data-setting-title="Ordered output profiles"
+    data-setting-description={nativeScript ? "App and website rules, scripts and rewriting" : "Application rules and local rewriting"}
+    onToggle={event => {
+      const open = event.currentTarget.open
+      setOpen(open)
+      onOpenChange?.(open)
+    }}>
     <summary data-setting-control>Ordered output profiles</summary>
     {open && <div className="dictation-options dictation-profile-editor">
       {!rows && (loadError ? <>
@@ -408,14 +444,16 @@ export function OutputProfiles({ native, value, script, pending, save, run }: {
           </label>}
           <Button type="button" size="sm" variant="outline" disabled={busy} onClick={add}><Plus />Add profile</Button>
         </div>
-        {script && <p className="dictation-output-note">Review the selected version in Dictation → Output.</p>}
+        {nativeScript?.path && <p className="dictation-output-note">Review the selected version in Dictation → Output.</p>}
         {profile && <fieldset className="dictation-profile-card" disabled={busy} aria-label="Profile settings">
           <label>Applies to
+            {wayland && <small>Application profiles are used on Windows and X11. This Wayland session uses the default profile.</small>}
             <select value={scope} onChange={event => update({ target: event.target.value === "default" ? "default" : event.target.value + ":" })}>
-              <option value="default">{t("Default")}</option><option value="app">{t("Application")}</option><option value="site">Website</option>
+              <option value="default">{t("Default")}</option><option value="app">{t("Application")}</option>
+              {nativeScript && <option value="site">Website</option>}
             </select>
           </label>
-          {scope !== "default" && <label>{scope === "app" ? "App name or bundle ID" : "Website host or URL"}
+          {scope !== "default" && <label>{scope === "app" ? nativeScript ? "App name or bundle ID" : "Application name" : "Website host or URL"}
             <input value={profile.target.slice(scope.length + 1)} maxLength={300}
               placeholder={scope === "site" ? "example.com or *.example.com" : undefined}
               onChange={event => update({ target: scope + ":" + event.target.value })} />
@@ -454,13 +492,14 @@ export function OutputProfiles({ native, value, script, pending, save, run }: {
             <textarea dir="auto" rows={3} maxLength={4000} value={profile.corrections}
               onChange={event => update({ corrections: event.target.value })} />
           </label>
-          <label>Profile rewrite instructions
-            <small>Applies when this profile uses the local Qwen step. Leave empty to use shared instructions.</small>
+          {(nativeScript || profile.steps.includes("rewrite")) && <label>Profile rewrite instructions
+            <small>{nativeScript ? "Applies when this profile uses the local Qwen step. Leave empty to use shared instructions."
+              : "Qwen runs locally before pasting. Describe how the text should read."}</small>
             <textarea dir="auto" rows={3} maxLength={2500} value={profile.instruction}
               onChange={event => update({ instruction: event.target.value })} />
-          </label>
+          </label>}
           {profile.steps.includes("rewrite") && <label>Rewrite deadline (seconds)
-            <small>Jard keeps the text and continues if the rewrite takes longer.</small>
+            <small>Jaro pastes the text from before the rewrite if the deadline expires.</small>
             <input type="number" min={1} max={60} step={1} value={profile.deadline || ""}
               onChange={event => update({ deadline: Number(event.target.value) })} />
           </label>}
@@ -470,22 +509,22 @@ export function OutputProfiles({ native, value, script, pending, save, run }: {
             setPreview(undefined)
           }}>Remove profile</Button>
         </fieldset>}
-        <div className="dictation-profile-toolbar">
-          <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void run({ action: "chooseOutputScript" })}>
-            {script || "Choose a local script…"}
+        {nativeScript && <div className="dictation-profile-toolbar">
+          <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void nativeScript.run({ action: "chooseOutputScript" })}>
+            {nativeScript.path || "Choose a local script…"}
           </Button>
-          {script && <Button type="button" size="sm" variant="ghost" disabled={busy}
-            onClick={() => void run({ action: "clearOutputScript" })}>Remove script</Button>}
-        </div>
+          {nativeScript.path && <Button type="button" size="sm" variant="ghost" disabled={busy}
+            onClick={() => void nativeScript.run({ action: "clearOutputScript" })}>Remove script</Button>}
+        </div>}
         <details><summary>Preview with sample text</summary>
           <div className="dictation-options dictation-profile-card">
             <label>Sample<textarea dir="auto" rows={3} value={sample} disabled={busy}
               onChange={event => { setSample(event.target.value); setPreview(undefined) }} maxLength={8000} /></label>
-            <label>Sample app name or bundle ID<input value={app} disabled={busy}
-              onChange={event => { setApp(event.target.value); setPreview(undefined) }} maxLength={300} /></label>
-            <label>Sample website host or URL<input value={site} disabled={busy}
-              onChange={event => { setSite(event.target.value); setPreview(undefined) }} maxLength={300} /></label>
-            <small>Preview skips the executable script.</small>
+            {!wayland && <label>{nativeScript ? "Sample app name or bundle ID" : "Sample application name"}<input value={app} disabled={busy}
+              onChange={event => { setApp(event.target.value); setPreview(undefined) }} maxLength={300} /></label>}
+            {nativeScript && <label>Sample website host or URL<input value={site} disabled={busy}
+              onChange={event => { setSite(event.target.value); setPreview(undefined) }} maxLength={300} /></label>}
+            <small>{nativeScript ? "Preview skips the executable script." : "Preview runs the text steps. Qwen runs during dictation."}</small>
             <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void apply(false)}>Preview</Button>
             {preview && <div className="dictation-profile-preview" aria-live="polite">
               <strong>{preview.profile ? profileName(preview.profile) : "No matching profile"}</strong>
@@ -495,8 +534,16 @@ export function OutputProfiles({ native, value, script, pending, save, run }: {
             </div>}
           </div>
         </details>
-        <Button type="button" size="sm" variant="outline" disabled={busy || !draft || definition === JSON.stringify(saved?.rows) || definition === value}
-          onClick={() => void apply(true)}>Save profiles</Button>
+        <div className="dictation-profile-toolbar">
+          <Button type="button" size="sm" variant="outline" disabled={busy || !draft || definition === JSON.stringify(saved?.rows) || definition === value}
+            onClick={() => void apply(true)}>Save profiles</Button>
+          {draft && <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => {
+            setDraft(undefined)
+            setSelected(0)
+            setPreview(undefined)
+            setError("")
+          }}>Discard changes</Button>}
+        </div>
       </>}
       {error && <p role="alert" className="dictation-error">{error}</p>}
     </div>}

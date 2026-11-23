@@ -7,6 +7,17 @@ export const hasPortableAudio = document.documentElement.hasAttribute("data-jaro
 
 export type PortableRecording = AudioFrames & { captureId: string; close: () => void }
 export type SourceLevels = { microphone: number; computerAudio: number }
+export type CaptureTarget = { id: string; label: string }
+export type ScreenArea = { x: number; y: number; width: number; height: number }
+
+export async function portableScreenTargets(source: "display" | "window", signal?: AbortSignal): Promise<CaptureTarget[]> {
+  const response = await fetch(`/api/portable/screencast/targets?source=${source}`, { cache: "no-store", signal })
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}))
+    throw new Error(typeof error.detail === "string" ? error.detail : "Could not list available screen sources.")
+  }
+  return (await response.json()).targets
+}
 
 async function request(path = "", options?: RequestInit) {
   const response = await fetch(endpoint + path, { cache: "no-store", ...options })
@@ -21,8 +32,22 @@ export async function openPortableRecording(
   mode: RecordingMode,
   onFrame: (audio: AudioFrames, samples: Float32Array, levels?: SourceLevels) => void,
   onEnded: () => void,
+  meetingLanguages?: readonly string[],
 ): Promise<PortableRecording> {
-  const { id, sampleRate }: { id: string; sampleRate: number } = await (await request(`?mode=${mode}`, { method: "POST" })).json()
+  const parameters = new URLSearchParams({ mode })
+  if (meetingLanguages) {
+    parameters.set("meeting", "true")
+    for (const code of meetingLanguages) parameters.append("language", code)
+  }
+  const { id, sampleRate }: { id: string; sampleRate: number } = await (await request(`?${parameters}`, { method: "POST" })).json()
+  return followPortableRecording(id, sampleRate, mode, onFrame, onEnded)
+}
+
+export function followPortableRecording(
+  id: string, sampleRate: number, mode: RecordingMode,
+  onFrame: (audio: AudioFrames, samples: Float32Array, levels?: SourceLevels) => void,
+  onEnded: () => void,
+): PortableRecording {
   const history = previewFrames(sampleRate)
   const controller = new AbortController()
   let timer: number

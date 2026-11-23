@@ -28,7 +28,7 @@ class ExtendedLimitInformation(ctypes.Structure):
     ]
 
 
-def own_process_tree():
+def own_process_tree(*, allow_audio_restore=False):
     """Enroll before starting any child. Windows closes the job on process exit."""
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
@@ -47,6 +47,9 @@ def own_process_tree():
         raise ctypes.WinError(ctypes.get_last_error())
     limits = ExtendedLimitInformation()
     limits.basic.limit_flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if allow_audio_restore:
+        # The portable playback worker restores external audio on its owner's EOF.
+        limits.basic.limit_flags |= 0x0800  # JOB_OBJECT_LIMIT_BREAKAWAY_OK
     info_class = 9  # JobObjectExtendedLimitInformation
     if (not kernel.SetInformationJobObject(job, info_class, ctypes.byref(limits), ctypes.sizeof(limits))
             or not kernel.AssignProcessToJobObject(job, kernel.GetCurrentProcess())):

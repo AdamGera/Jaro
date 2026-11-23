@@ -142,6 +142,8 @@ export type DesktopMeeting = {
   copying?: boolean
   copyPartial?: boolean
   autoStop?: boolean
+  noiseCleanup?: boolean
+  boostMicrophone?: boolean
   autoStopSeconds?: number
   calendar?: DesktopMeetingCalendar
   showIndicator?: boolean
@@ -168,6 +170,7 @@ export type DesktopMeetingAction =
   | { action: "setPolicy"; provider: string; policy: MeetingRecordingPolicy }
   | { action: "keepRecording" | "calendarConnect" | "calendarDisconnect" | "calendarSettings" }
   | { action: "autoStop" | "calendarReminders"; enabled: boolean }
+  | { action: "noiseCleanup" | "boostMicrophone"; enabled: boolean }
   | { action: "calendarLead"; minutes: number }
   | { action: "calendarInclude"; enabled: boolean; id: string }
   | { action: "calendarEvent"; id: string; choice: "join" | "record" | "joinRecord" | "dismiss" }
@@ -182,7 +185,7 @@ function applyWindowChrome(chrome: WindowChrome) {
 }
 
 type CaptureOptions = { diarization: boolean; languages: string[] }
-export type RecordingDraft = { id: string; seconds: number; meeting?: boolean }
+export type RecordingDraft = { id: string; seconds: number; meeting?: boolean; screen?: boolean }
 type ActiveCapture = { dictation?: string; meeting?: string; warm?: boolean; mode: RecordingMode; live: boolean; seconds?: number; text?: string; segments?: SpeakerSegment[] }
 export type DictationDestination = "dictation" | "history" | "output"
 export type WindowNavigation = {
@@ -193,6 +196,7 @@ export type WindowNavigation = {
 type Requests = {
   microphoneLevel: undefined
   windowNavigation: undefined
+  workspaceToolbar: { inset: number }
   annotation: DesktopAnnotationAction
   sessionScreenshot: { source: DesktopScreenshotSource }
   annotationAccess: { action: "status" | "allow" | "repair" | "restart" }
@@ -220,6 +224,7 @@ type Requests = {
   interfaceLanguage: { action: "status" } | { action: "set"; selected: string }
   update: DesktopUpdateAction
   systemDictation: DictationAction
+  dictationCleanup: { action: "status" | "prepare" }
   permission: { source: CaptureSource; prompt: boolean }
   openPrivacy: { source: CaptureSource }
   revealApp: undefined
@@ -230,6 +235,7 @@ type Requests = {
   dictation: { action: "stop" | "cancel" | "discard" | "transcribe"; id: string; languages?: string[] }
   live: { enabled: boolean }
   openAudio: CaptureOptions
+  revealSessionMedia: { id: string }
   recover: CaptureOptions & { id: string }
   discard: { id: string }
   export: { id: string; kind: "audio" | "json" | "md" | "notes" | "srt" | "vtt" | "annotation-manifest" | "annotation-contact-sheet" }
@@ -240,6 +246,7 @@ type Requests = {
 type Responses = {
   microphoneLevel: { peak: number | null }
   windowNavigation: { navigation?: WindowNavigation }
+  workspaceToolbar: null
   annotation: DesktopAnnotation
   sessionScreenshot: { jpeg?: string }
   annotationAccess: DesktopAnnotationAccess
@@ -267,6 +274,7 @@ type Responses = {
   interfaceLanguage: DesktopInterfaceLanguage
   update: DesktopUpdate
   systemDictation: DictationStatus | DictationHistory | DictationOutputPreview | DictationOutputProfiles | DictationScriptReview
+  dictationCleanup: { status: "notInstalled" | "downloading" | "ready" | "error" }
   permission: { status: PermissionStatus }
   openPrivacy: unknown
   revealApp: unknown
@@ -277,6 +285,7 @@ type Responses = {
   dictation: { text: string } | null
   live: unknown
   openAudio: { id: string } | null
+  revealSessionMedia: null
   recover: { id: string }
   discard: unknown
   export: unknown

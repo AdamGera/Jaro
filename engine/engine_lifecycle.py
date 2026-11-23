@@ -119,8 +119,8 @@ class ClientLeases:
         self.deadlines.pop(client, None)
 
     @contextmanager
-    def browser_connection(self):
-        connection = object()
+    def browser_connection(self, client=None):
+        connection = (client, object())
         self.streams.add(connection)
         self.last_activity = time.monotonic()
         try:

@@ -3,27 +3,40 @@ import { AppWindow, ChevronDown, Crop, ImagePlus, Images, ScreenShare, X } from 
 import { Dialog, DropdownMenu } from "radix-ui"
 import { desktopBridge, type DesktopScreenshotSource } from "@/desktop"
 import { useInterfaceLanguage } from "@/interface-language"
+import { portableScreenTargets, type CaptureTarget, type ScreenArea } from "@/portable-capture"
 import { clock } from "@/speaker-activity"
 import type { SavedSession } from "@/audio"
 import { AnnotationAgentPicker, AnnotationDeliveryLog } from "./annotation-destinations"
 import { Button } from "./ui/button"
+import { ScreenAreaDialog } from "./screen-area-dialog"
 
 type ImageAsset = { id: string; url: string }
 type Tile = ImageAsset & { label: string; crop?: CSSProperties; removable?: boolean }
+type ScreenshotSource = DesktopScreenshotSource | "picker"
+type ScreenshotPreview = { target: CaptureTarget; file: File; url: string; width: number; height: number }
+const screenshotOptions = [
+  { source: "area", icon: Crop, label: "Capture area…" },
+  { source: "window", icon: AppWindow, label: "Capture window…" },
+  { source: "display", icon: ScreenShare, label: "Capture display…" },
+  { source: "picker", icon: ScreenShare, label: "Capture screenshot…" },
+] as const
+const hasPortableScreenshots = document.documentElement.hasAttribute("data-jaro-screen-recording")
+  || document.documentElement.hasAttribute("data-jaro-linux-audio")
 
-async function jpeg(file: File) {
+async function jpeg(file: File, crop?: ScreenArea) {
   if (file.size > 30 * 1024 * 1024) throw new Error("Choose an image smaller than 30 MB.")
   const image = await createImageBitmap(file)
   try {
-    const scale = Math.min(1, 1600 / Math.max(image.width, image.height))
+    const { x, y, width, height } = crop ?? { x: 0, y: 0, width: image.width, height: image.height }
+    const scale = Math.min(1, 1600 / Math.max(width, height))
     const canvas = document.createElement("canvas")
-    canvas.width = Math.max(1, Math.round(image.width * scale))
-    canvas.height = Math.max(1, Math.round(image.height * scale))
+    canvas.width = Math.max(1, Math.round(width * scale))
+    canvas.height = Math.max(1, Math.round(height * scale))
     const context = canvas.getContext("2d", { alpha: false })
     if (!context) throw new Error("Could not prepare the image.")
     context.fillStyle = "#fff"
     context.fillRect(0, 0, canvas.width, canvas.height)
-    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    context.drawImage(image, x, y, width, height, 0, 0, canvas.width, canvas.height)
     for (const quality of [.9, .68, .46, .28]) {
       const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, "image/jpeg", quality))
       if (blob && blob.size <= 512 * 1024) return blob
@@ -56,7 +69,11 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
   const [mutating, setMutating] = useState(false)
   const [revision, setRevision] = useState(0)
   const [managed, setManaged] = useState<boolean>()
-  const [screenshots, setScreenshots] = useState(false)
+  const [screenshots, setScreenshots] = useState<ScreenshotSource[]>([])
+  const [windowsPicker, setWindowsPicker] = useState(false)
+  const [sourcePicker, setSourcePicker] = useState<{ source: DesktopScreenshotSource; targets: CaptureTarget[] }>()
+  const [capturePreview, setCapturePreview] = useState<ScreenshotPreview>()
+  const captureRequest = useRef<AbortController>(undefined)
   const complete = session.status !== "processing" && !session.finalizationPending
 
   useEffect(() => {
@@ -70,15 +87,31 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
   }, [endpoint])
 
   useEffect(() => {
+    if (hasPortableScreenshots) {
+      const controller = new AbortController()
+      void fetch("/api/portable/screenshots", { cache: "no-store", signal: controller.signal }).then(async response => {
+        if (!response.ok) return
+        const { targets, picker } = await response.json()
+        if (!controller.signal.aborted && Array.isArray(targets)) {
+          setScreenshots(screenshotOptions.map(option => option.source).filter(source => targets.includes(source)))
+          setWindowsPicker(picker === "workspace")
+        }
+      }).catch(() => {})
+      return () => controller.abort()
+    }
     if (!native) return
     let active = true
     void native.request("annotationRoutingPolicy").then(result => { if (active) setManaged(result.managed) })
       .catch(() => { if (active) setError("Could not check whether OpenCode is available.") })
     void native.request("annotation", { action: "status" }).then(result => {
-      if (active) setScreenshots(!result.managed && result.enabled !== false)
+      if (active) setScreenshots(!result.managed && result.enabled !== false ? ["area", "window", "display"] : [])
     }).catch(() => {})
     return () => { active = false }
   }, [native])
+
+  useEffect(() => () => captureRequest.current?.abort(), [])
+  const capturePreviewUrl = capturePreview?.url
+  useEffect(() => () => { if (capturePreviewUrl) URL.revokeObjectURL(capturePreviewUrl) }, [capturePreviewUrl])
 
   const sheet = session.annotation?.contactSheetUrl
   const frames = session.annotation?.frames ?? []
@@ -99,8 +132,8 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
     ...assets.map((asset, index) => ({ ...asset, label: `Image ${index + 1}`, removable: true })),
   ]
 
-  async function attach(body: ArrayBuffer) {
-    const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "image/jpeg" }, body })
+  async function attach(body: ArrayBuffer, signal?: AbortSignal) {
+    const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "image/jpeg" }, body, signal })
     if (!response.ok) {
       const failure = await response.json().catch(() => ({}))
       throw new Error(failure.detail || "Could not save the image.")
@@ -126,20 +159,87 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
     }
   }
 
-  async function capture(source: DesktopScreenshotSource) {
-    if (!native || mutating) return
+  async function capture(source: ScreenshotSource) {
+    if ((!native && !hasPortableScreenshots) || mutating) return
     setMutating(true)
     setError("")
     setStatus("")
     try {
-      const { jpeg } = await native.request("sessionScreenshot", { source })
-      if (!jpeg) return
-      const bytes = Uint8Array.from(atob(jpeg), character => character.charCodeAt(0))
-      await attach(bytes.buffer)
+      if (windowsPicker && source !== "picker") {
+        const controller = captureRequest.current = new AbortController()
+        const targets = await portableScreenTargets(source === "area" ? "display" : source, controller.signal)
+        if (!controller.signal.aborted) setSourcePicker({ source, targets })
+        return
+      }
+      if (native && source !== "picker") {
+        const { jpeg } = await native.request("sessionScreenshot", { source })
+        if (!jpeg) return
+        const bytes = Uint8Array.from(atob(jpeg), character => character.charCodeAt(0))
+        await attach(bytes.buffer)
+      } else if (hasPortableScreenshots) {
+        const response = await fetch(`/api/portable/screenshots?source=${source}`, { method: "POST" })
+        if (response.status === 204) return
+        if (!response.ok) {
+          const failure = await response.json().catch(() => ({}))
+          throw new Error(failure.detail || "Could not take a screenshot.")
+        }
+        const image = await response.blob()
+        const normalized = await jpeg(new File([image], "screenshot", { type: image.type }))
+        await attach(await normalized.arrayBuffer())
+      }
       setExpanded(true)
       setStatus(t("Screenshot added."))
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Could not add the screenshot.")
+    } finally { setMutating(false) }
+  }
+
+  async function captureFromWindows(source: DesktopScreenshotSource, target: CaptureTarget) {
+    const controller = captureRequest.current = new AbortController()
+    setMutating(true)
+    setError("")
+    try {
+      const query = new URLSearchParams({ source: source === "area" ? "display" : source, target: target.id })
+      const response = await fetch(`/api/portable/screenshots?${query}`, { method: "POST", signal: controller.signal })
+      if (!response.ok) {
+        const failure = await response.json().catch(() => ({}))
+        throw new Error(typeof failure.detail === "string" ? failure.detail : "Could not take a screenshot.")
+      }
+      const bytes = await response.blob()
+      const file = new File([bytes], "screenshot.jpg", { type: bytes.type })
+      if (source === "area") {
+        const bitmap = await createImageBitmap(file)
+        const { width, height } = bitmap
+        bitmap.close()
+        if (controller.signal.aborted) return
+        setCapturePreview({ target, file, url: URL.createObjectURL(file), width, height })
+      } else {
+        const normalized = await jpeg(file)
+        await attach(await normalized.arrayBuffer(), controller.signal)
+        setExpanded(true)
+        setStatus(t("Screenshot added."))
+      }
+      setSourcePicker(undefined)
+    } catch (failure) {
+      if (!controller.signal.aborted)
+        setError(failure instanceof Error ? failure.message : "Could not add the screenshot.")
+    } finally { setMutating(false) }
+  }
+
+  async function attachScreenshotArea(crop: ScreenArea) {
+    if (!capturePreview || mutating) return
+    const controller = captureRequest.current = new AbortController()
+    setMutating(true)
+    setError("")
+    try {
+      const normalized = await jpeg(capturePreview.file, crop)
+      await attach(await normalized.arrayBuffer(), controller.signal)
+      setCapturePreview(undefined)
+      setExpanded(true)
+      setStatus(t("Screenshot added."))
+    } catch (failure) {
+      if (!controller.signal.aborted)
+        setError(failure instanceof Error ? failure.message : "Could not add the screenshot.")
     } finally { setMutating(false) }
   }
 
@@ -172,7 +272,7 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
             event.target.value = ""
             void add(files)
           }} />
-          {screenshots ? <DropdownMenu.Root open={imageMenuOpen} onOpenChange={setImageMenuOpen}>
+          {screenshots.length > 0 ? <DropdownMenu.Root open={imageMenuOpen} onOpenChange={setImageMenuOpen}>
             <DropdownMenu.Trigger asChild>
               <Button variant="outline" size="icon-sm" aria-label={t("Add images")} title={t("Add images")}
                 disabled={loading || mutating} onClick={event => {
@@ -184,9 +284,8 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
               <DropdownMenu.Content align="end" className="session-image-menu" sideOffset={5}>
                 <DropdownMenu.Item onSelect={() => input.current?.click()}><ImagePlus aria-hidden="true" />{t("Choose image files…")}</DropdownMenu.Item>
                 <DropdownMenu.Separator />
-                <DropdownMenu.Item onSelect={() => void capture("area")}><Crop aria-hidden="true" />{t("Capture area…")}</DropdownMenu.Item>
-                <DropdownMenu.Item onSelect={() => void capture("window")}><AppWindow aria-hidden="true" />{t("Capture window…")}</DropdownMenu.Item>
-                <DropdownMenu.Item onSelect={() => void capture("display")}><ScreenShare aria-hidden="true" />{t("Capture display…")}</DropdownMenu.Item>
+                {screenshotOptions.filter(({ source }) => screenshots.includes(source)).map(({ source, icon: Icon, label }) =>
+                  <DropdownMenu.Item key={source} onSelect={() => void capture(source)}><Icon aria-hidden="true" />{t(label)}</DropdownMenu.Item>)}
               </DropdownMenu.Content>
             </DropdownMenu.Portal>
           </DropdownMenu.Root> : <Button variant="outline" size="icon-sm" aria-label={t("Add images")} title={t("Add images")}
@@ -213,9 +312,33 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
     </div>
     {status && <p className="session-image-message" role="status">{status}</p>}
     {managed && <p className="session-image-message" role="status">{t("OpenCode processing is managed by your organization.")}</p>}
-    {error && <p className="session-image-message" role="alert">{error}</p>}
+    {error && !sourcePicker && !capturePreview && <p className="session-image-message" role="alert">{error}</p>}
     {children}
     {native && session.annotation && <AnnotationDeliveryLog native={native} id={session.id} revision={revision} remoteEnabled={managed === false} />}
+    <Dialog.Root open={!!sourcePicker} onOpenChange={open => { if (!open && !mutating) setSourcePicker(undefined) }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="note-language-scrim" />
+        <Dialog.Content className="note-language-confirm" onInteractOutside={event => event.preventDefault()}
+          onEscapeKeyDown={event => { if (mutating) event.preventDefault() }}>
+          <Dialog.Title>{sourcePicker?.source === "window" ? t("Choose a window to capture") : t("Choose a display to capture")}</Dialog.Title>
+          <Dialog.Description>{sourcePicker?.source === "window" ? t("Choose the window to add to this session.")
+            : t("You have three seconds to switch windows after choosing a display.")}</Dialog.Description>
+          <div className="portable-screen-targets">
+            {sourcePicker?.targets.map(target => <Button key={target.id} size="sm" variant="ghost" title={target.label} disabled={mutating}
+              onClick={() => { if (sourcePicker) void captureFromWindows(sourcePicker.source, target) }}><span>{target.label}</span></Button>)}
+            {!sourcePicker?.targets.length && <p role="status">{t("No sources are available.")}</p>}
+          </div>
+          {mutating && <p role="status">{t("Taking screenshot…")}</p>}
+          {error && <p role="alert">{error}</p>}
+          <div className="note-language-actions">
+            <Button variant="ghost" size="sm" disabled={mutating} onClick={() => setSourcePicker(undefined)}>{t("Cancel")}</Button>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+    {capturePreview && <ScreenAreaDialog key={capturePreview.url} size={capturePreview} imageUrl={capturePreview.url} action="capture"
+      pending={mutating} error={error} onCancel={() => { setCapturePreview(undefined); setError("") }}
+      onRefresh={() => void captureFromWindows("area", capturePreview.target)} onConfirm={area => void attachScreenshotArea(area)} />}
     <Dialog.Root open={!!viewer} onOpenChange={open => { if (!open) setViewer(undefined) }}>
       <Dialog.Portal>
         <Dialog.Overlay className="note-language-scrim" />

@@ -5,7 +5,12 @@ import os
 import select
 import shutil
 import subprocess
+from tempfile import TemporaryDirectory
+from time import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
+from uuid import uuid4
 
 
 @unittest.skipUnless(shutil.which("Xvfb"), "requires an isolated X11 server")
@@ -32,6 +37,7 @@ class X11PasteTests(unittest.IsolatedAsyncioTestCase):
             os.close(read_fd)
             if write_fd is not None:
                 os.close(write_fd)
+        self.address = address
         self.connections = [display.Display(address) for _ in range(3)]
         for connection in self.connections:
             self.addCleanup(connection.close)
@@ -109,3 +115,79 @@ class X11PasteTests(unittest.IsolatedAsyncioTestCase):
         self.reader.connection.sync()
         self.assertIn("Focus changed", await self.paster.paste("a second take", self.target_focus, lambda: True))
         self.assertEqual(await self.current(), latest)
+
+    async def test_paste_last_shortcut_reuses_retained_text_and_honors_focus(self):
+        from portable_dictation_history import PortableDictationHistory
+        from x11_dictation import X11Dictation
+
+        workspace = TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        history = PortableDictationHistory(workspace.name)
+        history.initialize()
+        identifier = str(uuid4())
+        phrase = "Dictated text"
+        saved, epoch = history.record({"id": identifier, "text": phrase, "time": time(), "app": "Editor",
+                                       "seconds": 1, "inferenceMs": 250, "totalMs": 400})
+        self.assertTrue(saved)
+        dictation = X11Dictation(SimpleNamespace(draining=False), None, history)
+        self.addAsyncCleanup(dictation.close)
+        with patch.dict(os.environ, DISPLAY=self.address):
+            dictation.enable()
+        dictation.text, dictation.last_id, dictation.last_clear_epoch = phrase, identifier, epoch
+        self.assertEqual(dictation.snapshot()["recoveryShortcut"], "Ctrl+Alt+V")
+
+        connection = self.reader.connection
+        keys = [connection.keysym_to_keycode(self.XK.string_to_keysym(name))
+                for name in ("Control_L", "Alt_L", "v")]
+
+        def send(event, sequence):
+            for key in sequence:
+                connection.xtest_fake_input(event, key)
+            connection.sync()
+
+        async def press():
+            send(self.X.KeyPress, keys)
+            async with asyncio.timeout(2):
+                while dictation.phase != "pasting":
+                    await asyncio.sleep(.01)
+
+        text = self.reader.atoms["UTF8_STRING"]
+        original = {text: (text, 8, b"Clipboard before dictation")}
+        await self.set_clipboard(original)
+        await press()
+        self.assertEqual(await self.current(), original)
+        delivered = asyncio.create_task(self.receive())
+        self.addAsyncCleanup(self.stop_task, delivered)
+        send(self.X.KeyRelease, reversed(keys))
+        self.assertEqual((await delivered)[text][2], phrase.encode())
+        await dictation.action
+        self.assertEqual(dictation.feedback, "Paste shortcut sent.")
+        self.assertEqual(await self.current(), original)
+
+        await press()
+        self.root.set_input_focus(self.X.RevertToNone, self.X.CurrentTime)
+        connection.sync()
+        self.target.set_input_focus(self.X.RevertToParent, self.X.CurrentTime)
+        connection.sync()
+        send(self.X.KeyRelease, reversed(keys))
+        await dictation.action
+        self.assertIn("Focus changed", dictation.feedback)
+        self.assertEqual(await self.current(), original)
+
+        history.remove()
+        send(self.X.KeyPress, keys)
+        send(self.X.KeyRelease, reversed(keys))
+        async with asyncio.timeout(2):
+            while "no last dictation" not in dictation.feedback:
+                await asyncio.sleep(.01)
+        self.assertEqual(await self.current(), original)
+
+        await dictation.disable()
+        alt = next(1 << index for index, group in enumerate(connection.get_modifier_mapping()) if keys[1] in group)
+        self.root.grab_key(keys[2], self.X.ControlMask | alt, False, self.X.GrabModeAsync, self.X.GrabModeAsync)
+        connection.sync()
+        with patch.dict(os.environ, DISPLAY=self.address):
+            dictation.enable()
+        self.assertTrue(dictation.enabled)
+        self.assertIsNone(dictation.snapshot()["recoveryShortcut"])
+        self.assertIn("Ctrl+Alt+V is unavailable", dictation.feedback)
