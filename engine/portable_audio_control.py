@@ -71,8 +71,9 @@ class DictationAudio:
             if self.ended.is_set() or (while_valid is not None and not while_valid()):
                 return
             flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_BREAKAWAY_FROM_JOB) if os.name == "nt" else 0
+            extra = (str(os.getpid()),) if os.name == "nt" else ()
             self.process = await asyncio.create_subprocess_exec(
-                *self.helper, settings.behavior, str(settings.percent), creationflags=flags,
+                *self.helper, settings.behavior, str(settings.percent), *extra, creationflags=flags,
                 start_new_session=os.name != "nt",
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             )

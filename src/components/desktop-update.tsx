@@ -35,13 +35,13 @@ function updateControl(controls: DesktopUpdateControls, busy: boolean, t: Return
     : visibleProgress ? t(visibleProgress) : switchLabel ?? t(phase === "download" ? "Download Update" : "Look for new versions")
   const result = managed ? "Updates managed by your organization"
     : restarting ? ""
-    : restartBlocked ? "Finish your current work to restart Jard."
+    : restartBlocked ? "Finish your current work to restart Jaro."
     : error || update.restartError || (unavailable ? "Updates are disabled for this installation."
     : checking ? (ready ? checking : "")
     : phase === "error" ? (manual ? message || "Could not check for updates." : "")
-    : phase === "current" ? (manual ? message || "Jard is up to date." : "")
+    : phase === "current" ? (manual ? message || "Jaro is up to date." : "")
     : message || "")
-  const available = version && staged ? t("Jard {version} is ready to install.", { version }) : undefined
+  const available = version && staged ? t("Jaro {version} is ready to install.", { version }) : undefined
   return {
     label, result: result ? t(result) : "", notes: staged ? notes?.trim() : "", available, currentVersion, unavailable, managed, ready,
     compact: !ready && !switchLabel && phase !== "download",
@@ -87,7 +87,7 @@ export function DesktopUpdateSettings({ controls, busy }: Props) {
   const { channels } = update
   return <SettingGroup id="desktop-updates-title" title={t("Updates")}>
     <SettingRow icon={RotateCw} title={t("App updates")} label={false} anchor="desktop-app-updates"
-      find="Look for new versions or restart Jard to install an update"
+      find="Look for new versions or restart Jaro to install an update"
       detail={[action.currentVersion && t("Installed version {version}", { version: action.currentVersion }), action.available].filter(Boolean).join(" · ")}>
       {!action.managed && <Button size="sm" variant={action.ready ? "secondary" : "outline"} disabled={action.disabled} onClick={action.apply}>{action.label}</Button>}
     </SettingRow>

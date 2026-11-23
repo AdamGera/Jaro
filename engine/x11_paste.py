@@ -118,12 +118,13 @@ class X11Paste:
             for target in dict.fromkeys(offered):
                 if target in metadata or target == X.NONE:
                     continue
-                result = await self.convert(reader, target, remaining)
+                try:
+                    result = await self.convert(reader, target, remaining)
+                except ClipboardUnavailable:
+                    continue
                 remaining -= len(result[2]) * (result[1] // 8)
                 data[target] = result
-            if not data:
-                raise ClipboardUnavailable
-            return data
+            return data if data else None
         finally:
             reader.destroy()
             self.connection.flush()
@@ -287,7 +288,7 @@ class X11Paste:
         except (ClipboardUnavailable, error.XError):
             return "Automatic paste was unavailable. Use Copy last to paste the dictation."
         finally:
-            if pasted:
+            if pasted and original is not None:
                 with self.server_grab():
                     if self.owner() == self.window:
                         self.set_data(original, timestamp)

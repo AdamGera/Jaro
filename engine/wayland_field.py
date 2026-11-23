@@ -118,7 +118,7 @@ class WaylandField:
                     return None
                 # The role name is the protocol name, independent of the app's locale.
                 role, = await call(bus, name, path, ACCESSIBLE, "GetRoleName")
-                if role not in ("text", "text box", "entry", "paragraph", "terminal", "document text"):
+                if role == "password text":
                     return None
                 selection, = await call(bus, name, path, TEXT, "GetNSelections")
                 if selection:

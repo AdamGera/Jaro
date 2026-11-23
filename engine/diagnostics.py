@@ -51,6 +51,20 @@ def write_event(kind, phase, *, inference_ms=None):
     _append_event(kind, phase, fields)
 
 
+def write_dictation_timing(values):
+    names = ("captureFinalizeMs", "submissionWaitMs", "speechRequestMs", "inferenceMs",
+             "bridgeRoundTripMs", "outputWaitMs", "clipboardSnapshotMs", "deliveryMs", "totalMs")
+    if not isinstance(values, dict):
+        return
+    fields = {}
+    for name in names:
+        value = values.get(name)
+        if type(value) is int and 0 <= value <= 86_400_000:
+            fields[name] = value
+    if fields:
+        _append_event("dictation", "timing", fields)
+
+
 def write_transform_event(phase, **fields):
     _append_event("transformation", phase, fields)
 

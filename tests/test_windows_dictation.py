@@ -198,3 +198,11 @@ class WindowsDictationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.dictation.gesture_accepted)
         self.assertIsNone(self.dictation.focus)
         self.assertEqual(listener.stdin.write.call_count, 2)
+
+    async def test_uwp_window_without_hwnd_focus_keeps_destination_and_delivers(self):
+        self.dictation.paste_attempt = AsyncMock(return_value=0)
+        await self.dictation.handle_event("start 12 0 56 WindowsTerminal.exe")
+        self.assertEqual(self.dictation.focus, ("12", "0", "56"))
+        self.assertEqual(self.dictation.application, "WindowsTerminal")
+        self.assertEqual(await self.dictation.prepare_delivery()("Hello terminal."), "Paste shortcut sent.")
+        self.dictation.paste_attempt.assert_awaited_once()

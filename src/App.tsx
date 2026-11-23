@@ -856,6 +856,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   }
 
   const updateBusy = phase !== "idle" || dictating || choosingFile || screenBusy || !!detectedRecording
+    || modelSetup?.phase === "downloading" || modelSetup?.phase === "starting"
   const meetingControls: PortableMeetingControls | undefined = hasPortableAudio && !native ? {
     phase: meetingTake ? phase : "idle", elapsed, canStart, feedback: meetingFeedback,
     start: () => void startRecording(true), stop: () => void stopRecording(),

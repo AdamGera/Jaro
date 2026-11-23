@@ -237,33 +237,40 @@ class RumbleModel:
             "inputs_embeds": embeddings.masked_scatter(mask, audio.pooler_output.to(embeddings)),
         }
 
+    def _transcription_inputs(self, audio, prompt=None):
+        inputs = self.processor.apply_transcription_request(audio=audio, prompt=prompt)
+        return inputs.to(device=self.model.device, dtype=self.model.dtype)
+
     def _decode(
         self, audio, max_new_tokens: int = 512, prompt: str | None = None,
         cache_implementation: str | None = None, *, screen_nonspeech: bool = False,
         speech_prefix_samples: int | None = None,
     ) -> tuple[str, str | None]:
         with self.torch.inference_mode():
-            inputs = self.processor.apply_transcription_request(audio=audio, prompt=prompt)
-            inputs = inputs.to(device=self.model.device, dtype=self.model.dtype)
-            if screen_nonspeech and self.aligner:
+            screen = screen_nonspeech and self.aligner is not None
+            screen_prefix = screen and speech_prefix_samples is not None
+            # A confidently blank prefix makes the full take unnecessary.
+            inputs = None if screen_prefix else self._transcription_inputs(audio, prompt)
+            if screen:
                 try:
-                    if speech_prefix_samples is None:
-                        prepared = self._screened_inputs(inputs)
-                    else:
+                    if screen_prefix:
                         # The encoder sees its entire input. Give the screen a separate
                         # prefix so later speech cannot influence its acoustic features.
-                        prefix = self.processor.apply_transcription_request(audio=audio[:speech_prefix_samples])
-                        prefix = prefix.to(device=self.model.device, dtype=self.model.dtype)
+                        prefix = self._transcription_inputs(audio[:speech_prefix_samples])
                         signal = self._audio_features(prefix)
-                        prepared = None if self.aligner.confidently_blank(signal.last_hidden_state) else inputs
+                        if self.aligner.confidently_blank(signal.last_hidden_state):
+                            return "", None
+                    else:
+                        prepared = self._screened_inputs(inputs)
+                        if prepared is None:
+                            return "", None
+                        inputs = prepared
                 except (RuntimeError, ValueError, IndexError, KeyError):
                     if not self.reported_screen_failure:
                         self.reported_screen_failure = True
                         logging.getLogger("uvicorn.error").warning("The dictation speech screen could not check audio. Continuing transcription.")
-                else:
-                    if prepared is None:
-                        return "", None
-                    inputs = prepared
+            if inputs is None:
+                inputs = self._transcription_inputs(audio, prompt)
             output = self.model.generate(
                 **inputs, max_new_tokens=max_new_tokens, cache_implementation=cache_implementation,
             )

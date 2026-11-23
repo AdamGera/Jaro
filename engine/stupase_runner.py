@@ -67,6 +67,8 @@ def serve(root):
     torch.set_num_threads(min(6, os.cpu_count() or 1))
     # CPU also supports the reference model's complex STFT and overlap-add operations.
     model = StuPASE(*(root / name for name, _, _ in CHECKPOINTS)).eval()
+    output.write(HEADER.pack(0))
+    output.flush()
     while header := sys.stdin.buffer.read(HEADER.size):
         size, = HEADER.unpack(header)
         if size > MAX_PCM_BYTES or size % 4 or size == 0:
@@ -76,16 +78,23 @@ def serve(root):
             break
         samples = np.frombuffer(pcm, dtype="<f4")
         count = len(samples)
+        source_peak = float(np.max(np.abs(samples)))
+        if not np.isfinite(samples).all() or source_peak < 1e-8:
+            output.write(HEADER.pack(size) + pcm)
+            output.flush()
+            continue
         padded = max(count, 1600)
         padded += (80 - padded) % 320
         source = torch.from_numpy(np.pad(samples, (0, padded - count))).unsqueeze(0)
         with torch.inference_mode():
             enhanced = model(source)[0, :count].numpy()
         peak = float(np.max(np.abs(enhanced)))
-        if not np.isfinite(enhanced).all() or peak < 1e-8:
+        if not np.isfinite(enhanced).all():
             output.write(HEADER.pack(0))
+        elif peak < 1e-8:
+            output.write(HEADER.pack(size) + pcm)
         else:
-            enhanced *= float(np.max(np.abs(samples))) / peak
+            enhanced *= source_peak / peak
             output.write(HEADER.pack(size) + enhanced.astype("<f4", copy=False).tobytes())
         output.flush()
 

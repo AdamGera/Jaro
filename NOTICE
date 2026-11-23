@@ -7,9 +7,21 @@ GeoNames (https://www.geonames.org/), distributed under CC BY 4.0
 (https://creativecommons.org/licenses/by/4.0/), via geonamescache 3.0.2.
 
 The Dot Scope simulation, dictation and annotation sound assets, and portions
-of the dictation, meeting audio, wired capture, localization, and transformation
-code are by Christopher Langton. See licenses/Christopher-Langton-MIT.txt for
-the full copyright and MIT license notices.
+of the dictation, meeting audio, wired capture, localization, call detection,
+overlay, updater, and transformation code are by Christopher Langton. See
+licenses/Christopher-Langton-MIT.txt for the full copyright and MIT license
+notices.
+
+Optional speech noise cleanup uses StuPASE (Cisco Systems, Apache License 2.0)
+with SenseVoice (ASLP-lab, MIT), WavLM (Microsoft, MIT), and WavTokenizer
+(jishengpeng, MIT) components. See licenses/stupase/NOTICE.md and
+licenses/stupase/ for the full notices and license texts.
+
+Windows screen-recording builds bundle FFmpeg (LGPL-2.1), FriBidi (LGPL-2.1),
+FreeType (FTL — portions of this software are copyright The FreeType Project,
+www.freetype.org), HarfBuzz (MIT), libass (ISC), and Liberation Sans (SIL OFL
+1.1), plus the Native SDK and WebView2 Loader runtimes. See licenses/ for full
+license texts and reproduction sources.
 
 The agent icons identify the respective send destinations. The Codex icons
 come from the OpenAI macOS app (https://openai.com/codex/). The Claude Code

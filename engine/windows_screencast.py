@@ -16,7 +16,7 @@ from audio_file import MAX_AUDIO_SECONDS, codec_binary
 from desktop_pen import PenProcess
 from portable_capture import CaptureError
 from recording_power import keep_awake_until
-from screen_draft import ScreenDraft, validate_region, writer_lock
+from screen_draft import ScreenDraft, validate_region, windows_h264_encoder, windows_video_args, writer_lock
 from screencast_ink import FRAME_BOUNDARY, RecordingDrawing
 from session_images import jpeg_dimensions
 from windows_capture import WindowsScreenAudio
@@ -126,15 +126,18 @@ async def snapshot(source, target):
     return Snapshot(jpeg, (width, height), (native_width, native_height))
 
 
-def encoder_command(movie, width, height):
+def encoder_command(movie, width, height, encoder=None):
+    selected = encoder or windows_h264_encoder()
+    pix_fmt = "nv12" if selected == "h264_mf" else "yuv420p"
+    video_args = windows_video_args(selected)
     return [
         codec_binary("ffmpeg"), "-loglevel", "error", "-nostdin", "-y",
         "-f", "rawvideo", "-pixel_format", "bgra", "-video_size", f"{width}x{height}",
         "-framerate", str(CAPTURE_FPS), "-i", "pipe:0",
         "-filter_complex_threads", "2", "-filter_complex",
-        "[0:v]split[record][preview];[record]format=nv12[main];"
+        f"[0:v]split[record][preview];[record]format={pix_fmt}[main];"
         "[preview]fps=8,scale=w='min(iw,960)':h='min(ih,540)':force_original_aspect_ratio=decrease,format=yuvj420p[thumb]",
-        "-map", "[main]", "-an", "-c:v", "h264_mf", "-b:v", "6M", "-g", "24",
+        "-map", "[main]", "-an", *video_args, "-g", "24",
         "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-flush_packets", "1", str(movie),
         "-map", "[thumb]", "-an", "-c:v", "mjpeg", "-q:v", "6", "-f", "mpjpeg",
         "-boundary_tag", FRAME_BOUNDARY, "-flush_packets", "1", "pipe:1",
@@ -387,7 +390,7 @@ class WindowsScreenRecording:
             async with asyncio.timeout(10):
                 result, _ = await asyncio.gather(self.encoder.wait(), self.recorder.wait())
             if result or not self.movie_ready():
-                raise CaptureError("Windows could not encode this screen recording.")
+                raise CaptureError("Windows could not encode this screen recording. Install the Windows Media Feature Pack if H.264 encoding is unavailable.")
             self.phase = "recorded"
         finally:
             if self.audio:

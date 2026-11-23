@@ -41,9 +41,10 @@ async def read_monitors():
 
 
 class Source:
-    def __init__(self, name, clock):
+    def __init__(self, name, clock, *, optional=False):
         self.name = name
         self.clock = clock
+        self.optional = optional
         self.packets = deque(maxlen=200)
         self.through = None
         self.received = False
@@ -76,7 +77,8 @@ class Source:
                     stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 )
                 while True:
-                    data = await asyncio.wait_for(process.stdout.readexactly(PACKET_FRAMES * 2), timeout=3)
+                    read = process.stdout.readexactly(PACKET_FRAMES * 2)
+                    data = await (read if self.optional else asyncio.wait_for(read, timeout=3))
                     self.push(data)
                     delay = 0.5
             except (OSError, EOFError, TimeoutError):
@@ -138,7 +140,7 @@ class LinuxMeetingRecording(PortableRecording):
                         monitors = (await default_computer_audio(),)
             for name in monitors:
                 if name not in self.outputs:
-                    self.outputs[name] = Source(name, self.clock)
+                    self.outputs[name] = Source(name, self.clock, optional=True)
             await self.close_sources([self.outputs.pop(name) for name in self.outputs.keys() - set(monitors)])
             await asyncio.sleep(ROUTE_INTERVAL)
 
@@ -152,7 +154,9 @@ class LinuxMeetingRecording(PortableRecording):
     async def capture_blocks(self, block_bytes, frame_bytes):
         watcher = asyncio.create_task(self.watch_routes())
         try:
-            while not (self.mic and self.mic.received and any(source.received for source in self.outputs.values())):
+            # Silent playback monitors do not emit packets until audio plays;
+            # begin as soon as the microphone (or any output) delivers audio.
+            while not ((self.mic and self.mic.received) or any(source.received for source in self.outputs.values())):
                 if self.end_frame is not None:
                     return
                 await asyncio.sleep(0.02)

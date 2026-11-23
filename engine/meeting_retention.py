@@ -204,8 +204,8 @@ def sync_directory(path):
 
 
 def archive_path(root, identifier):
-    return Path(root) / ".meeting-trash" / f"Jard Meeting {identifier}"
+    return Path(root) / ".meeting-trash" / f"Jaro Meeting {identifier}"
 
 
 def audio_trash_path(root, identifier):
-    return Path(root) / ".meeting-trash" / f"Jard Meeting Audio {identifier}"
+    return Path(root) / ".meeting-trash" / f"Jaro Meeting Audio {identifier}"

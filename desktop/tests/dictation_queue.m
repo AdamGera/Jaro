@@ -1921,6 +1921,49 @@ static void finishTake(JardSystemDictation *dictation, NSString *identifier, BOO
     assert(dictation.captureID == nil);
 }
 
+static void testDictationTiming(void) {
+    NSMutableArray<JardDictationReply> *replies = NSMutableArray.array;
+    NSMutableArray<NSDictionary *> *timings = NSMutableArray.array;
+    DictationDeliveryFixture *dictation = [[DictationDeliveryFixture alloc] initWithSend:
+        ^(NSString *command, NSDictionary *payload, JardDictationReply reply) {
+            if ([command isEqual:@"jard.diagnosticTiming"]) {
+                assert(!reply);
+                [timings addObject:[payload copy]];
+            } else {
+                assert([command isEqual:@"jard.dictation"] && [payload[@"action"] isEqual:@"transcribe"]);
+                [replies addObject:[reply copy]];
+            }
+        }];
+    dictation.settings[@"retention"] = @0;
+    dictation.settings[@"placement"] = @"off";
+    dictation.settings[@"output"] = @"paste";
+    dictation.board = NSPasteboard.pasteboardWithUniqueName;
+    dictation.editor = AnnotationTargetFixture.new;
+    dictation.editor.processIdentifier = getpid();
+    dictation.caret = [NSValue valueWithRange:NSMakeRange(0, 0)];
+    dictation.expectedPastes = @[@"First.", @"Second."];
+    [dictation.board setString:@"Original clipboard" forType:NSPasteboardTypeString];
+    [dictation setValue:@(NSProcessInfo.processInfo.systemUptime - .25) forKey:@"captureStopRequestedAt"];
+    finishTake(dictation, @"timing-first", NO);
+    finishTake(dictation, @"timing-second", NO);
+    replies[1](@{@"text": @"Second.", @"inferenceMs": @24, @"speechRequestMs": @80}, nil);
+    assert(timings.count == 0 && dictation.pasteCount == 0);
+    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.05]];
+    replies[0](@{@"text": @"First.", @"inferenceMs": @36, @"speechRequestMs": @90}, nil);
+    waitForDelivery(dictation);
+    assert(dictation.pasteCount == 2 && timings.count == 2);
+    NSDictionary *first = timings[0], *second = timings[1];
+    assert([first[@"captureFinalizeMs"] intValue] >= 250 && second[@"captureFinalizeMs"] == nil);
+    assert([first[@"speechRequestMs"] isEqual:@90] && [first[@"inferenceMs"] isEqual:@36]);
+    assert([second[@"speechRequestMs"] isEqual:@80] && [second[@"inferenceMs"] isEqual:@24]);
+    assert([second[@"outputWaitMs"] intValue] >= 125);
+    assert(first[@"clipboardSnapshotMs"] && second[@"clipboardSnapshotMs"]);
+    assert([first[@"totalMs"] intValue] >= [first[@"captureFinalizeMs"] intValue]);
+    assert([[dictation.board stringForType:NSPasteboardTypeString] isEqual:@"Original clipboard"]);
+    [dictation.board releaseGlobally];
+    puts("Dictation timing separated the model, queued delivery, and clipboard even with History off.");
+}
+
 @interface WindowOnlyDictationFixture : JardSystemDictation
 @property(nonatomic, strong) AnnotationTargetFixture *editor;
 @property(nonatomic, strong) NSPasteboard *board;
@@ -4143,6 +4186,7 @@ int main(void) {
         testClipboardFormats();
         testDictationContinuation();
         testQueuedClipboardRestore();
+        testDictationTiming();
         testSecureRouting();
         NSMutableArray<JardDictationReply> *replies = NSMutableArray.array;
         TestDictation *dictation = [[TestDictation alloc] initWithSend:

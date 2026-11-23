@@ -404,10 +404,16 @@ else:
             assert (await rpc("prepare"))["ready"] and {"navigate":"app"} in seen
             await rpc("diagnosticPhase", phase="inserted", text="Private sample sentence", target="Secret destination")
             await rpc("diagnosticPhase", phase="unknown user-provided phase")
+            await rpc("diagnosticTiming", inferenceMs=12, outputWaitMs=0, totalMs=24,
+                      captureFinalizeMs=True, deliveryMs="Secret destination", other="Private sample sentence")
             events = (root / "logs" / "live.ndjson").read_text().splitlines()
             assert [(row["kind"], row["phase"]) for row in map(json.loads, events)] == [
-                ("desktop", "connected"), ("dictation", "inserted"),
+                ("desktop", "connected"), ("dictation", "inserted"), ("dictation", "timing"),
             ]
+            timing = json.loads(events[-1])
+            assert {key: value for key, value in timing.items() if key not in ("time", "kind", "phase")} == {
+                "inferenceMs": 12, "outputWaitMs": 0, "totalMs": 24,
+            }
             assert all("Private sample sentence" not in row and "Secret destination" not in row for row in events)
             assert (root / "logs" / "live.ndjson").stat().st_mode & 0o777 == 0o600
             assert (root / "logs" / "server.log").stat().st_mode & 0o777 == 0o600
@@ -516,6 +522,7 @@ assert.equal(status.phase, "cancelled")
             assert recorded["dictation"] == take
             dictated = await rpc("dictation", action="transcribe", id=recorded["id"], languages=["en"])
             assert "history books" in dictated["text"].lower()
+            assert dictated["speechRequestMs"] >= dictated["inferenceMs"] > 0
             assert not (await web.get("/api/sessions")).raise_for_status().json()
             assert not list((root/"library"/"staging").glob("*.dictation"))
             cancelled = str(uuid4())
@@ -1301,7 +1308,7 @@ assert.equal(status.phase, "cancelled")
                                   headers={"Origin": base})).raise_for_status().json() == {"days": 0}
             assert (await web.put("/api/meetings/audio-retention?days=7")).raise_for_status().json() == {"days": 7}
             removed = (await web.delete(f"/api/sessions/{key}/audio")).raise_for_status().json()["audioRemovedAt"]
-            trashed_audio = root / "Trash" / f"Jard Meeting Audio {key}"
+            trashed_audio = root / "Trash" / f"Jaro Meeting Audio {key}"
             assert (trashed_audio / "mic.wav").read_bytes() == mic
             assert (trashed_audio / "system.wav").read_bytes() == system_audio
             assert (await web.get(f"/api/sessions/{key}/audio?track=mic")).status_code == 404
@@ -2024,6 +2031,8 @@ assert.equal(status.phase, "cancelled")
             }
             for row in events:
                 fields = transformation_fields[row["phase"]] if row["kind"] == "transformation" else {"inferenceMs"}
+                if row["phase"] == "timing":
+                    fields = {"inferenceMs", "outputWaitMs", "totalMs"}
                 assert set(row) <= envelope | fields, row
                 if row["kind"] == "transformation" and row["phase"] == "console":
                     assert row["message"] == "Fixture transformation finished", row

@@ -37,7 +37,7 @@ from annotation_rollback import undo_annotation
 from annotation_routing import send_session_prompt
 from annotation_routing import (RouteUnavailable, capture_for_routing, correct_annotation, destinations as annotation_destinations,
                                 forget_destination_rule, recent_deliveries, route_scopes, send_annotation, set_destination_rule)
-from diagnostics import write_event
+from diagnostics import write_dictation_timing, write_event
 from managed_preferences import ManagedFeatureError, meetings_managed, opencode_managed, require_annotation, require_meetings, require_opencode
 from output_transform_runtime import CAPABILITIES, is_embedded_config
 from output_transform_policy import DISABLED_MESSAGE, PROGRAM_MESSAGE, TransformPolicy, current_policy
@@ -1971,6 +1971,10 @@ class MacBridge:
             if self.connected and phase in ("starting", "listening", "processing", "inserted", "saved", "cancelled", "empty", "error"):
                 write_event("dictation", phase)
             return None
+        if command == "jard.diagnosticTiming":
+            if self.connected:
+                write_dictation_timing(args)
+            return None
         if not self.connected:
             raise ValueError("Open the local workspace first.")
         if command == "jard.meetingClock":
@@ -2240,12 +2244,15 @@ class MacBridge:
                         params["boost_microphone_input"] = "true"
                     if key in self.dictation_release_frames:
                         params["release_frame"] = self.dictation_release_frames[key]
+                    requested_at = monotonic()
                     result = await self.api("POST", "native/staging/" + key + "/dictate",
                                             params=params)
+                    speech_request_ms = round((monotonic() - requested_at) * 1000)
                     succeeded = True
                     write_event("dictation", "inference_complete", inference_ms=result.get("inferenceMs"))
                     if not result.get("text"):
                         return result
+                    result["speechRequestMs"] = speech_request_ms
                     if profile:
                         result["profile"] = profile.target
                     if profile and (profile.steps or profile.corrections):

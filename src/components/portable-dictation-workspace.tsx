@@ -355,7 +355,7 @@ function PortableTextOutput({ status, disabled, save, saveProfiles }: {
   const { t } = useInterfaceLanguage()
   const heading = useId()
   return <SettingGroup id={heading} title={t("Output")}>
-    <RuleEditor label={t("Word replacements")} help={t("Enter one correction per line, such as jard audio => Jard Audio.")}
+    <RuleEditor label={t("Word replacements")} help={t("Enter one correction per line, such as jaro audio => Jaro Audio.")}
       value={status?.replacements ?? ""} disabled={disabled} maxLength={4000} save={save} />
     {status && <OutputProfileEditor value={status.outputProfiles ?? ""} pending={disabled}
       describe={describeProfiles} previewOutput={previewProfiles} save={saveProfiles} wayland={status.platform === "wayland"} />}
@@ -393,9 +393,9 @@ export function PortableDictationWorkspace({ destination, languages }: {
   const [playingID, setPlayingID] = useState<string>()
   const playback = useRef<{ id: string; player: HTMLAudioElement }>(null)
 
-  const stopAudio = useCallback((id: string) => {
+  const stopAudio = useCallback((id?: string) => {
     const current = playback.current
-    if (current?.id !== id) return
+    if (!current || (id !== undefined && current.id !== id)) return
     playback.current = null
     current.player.onended = current.player.onerror = null
     current.player.pause()
@@ -403,6 +403,12 @@ export function PortableDictationWorkspace({ destination, languages }: {
     current.player.load()
     setPlayingID(undefined)
   }, [])
+
+  useEffect(() => () => stopAudio(), [stopAudio])
+
+  useEffect(() => {
+    if (status?.phase && status.phase !== "idle") stopAudio()
+  }, [status?.phase, stopAudio])
 
   async function toggleAudio(id: string) {
     setFeedback("")

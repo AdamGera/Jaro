@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import suppress
+import logging
 import os
 from pathlib import Path
 import signal
@@ -13,7 +14,9 @@ import numpy as np
 from stupase_runner import HEADER, REVISION, checkpoints_ready
 
 
+logger = logging.getLogger(__name__)
 MIC_GAIN = 10 ** (6 / 20)
+STARTUP_TIMEOUT = 90
 CLEANUP_TIMEOUT = 20
 WORKER_IDLE = 90
 RUNNER = Path(__file__).with_name("stupase_runner.py")
@@ -53,6 +56,7 @@ class StuPASECleanup:
         self.downloading = None
         self.error = False
         self.worker = None
+        self.worker_generation = 0
         self.idle = None
         self.lock = asyncio.Lock()
 
@@ -98,16 +102,22 @@ class StuPASECleanup:
         if not wait and self.lock.locked():
             raise CleanupFailed()
         async with self.lock:
+            self.worker_generation += 1
             if self.idle:
                 self.idle.cancel()
+                self.idle = None
             try:
-                async with asyncio.timeout(CLEANUP_TIMEOUT):
-                    if self.worker is None or self.worker.returncode is not None:
+                if self.worker is None or self.worker.returncode is not None:
+                    async with asyncio.timeout(STARTUP_TIMEOUT):
                         self.worker = await asyncio.create_subprocess_exec(
                             sys.executable, str(RUNNER), "serve", str(self.root),
                             creationflags=CREATION_FLAGS,
-                            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                         )
+                        ready, = HEADER.unpack(await self.worker.stdout.readexactly(HEADER.size))
+                        if ready != 0:
+                            raise CleanupFailed()
+                async with asyncio.timeout(CLEANUP_TIMEOUT):
                     worker = self.worker
                     worker.stdin.write(HEADER.pack(len(pcm)) + pcm)
                     await worker.stdin.drain()
@@ -116,22 +126,25 @@ class StuPASECleanup:
                         raise CleanupFailed()
                     return await worker.stdout.readexactly(size)
             except (OSError, TimeoutError, EOFError, CleanupFailed) as error:
-                await self.stop_worker()
+                await self.stop_worker(log_stderr=True)
                 raise CleanupFailed() from error
             except asyncio.CancelledError:
                 await self.stop_worker()
                 raise
             finally:
                 if self.worker:
+                    generation = self.worker_generation
                     self.idle = asyncio.get_running_loop().call_later(
-                        WORKER_IDLE, lambda: asyncio.create_task(self.retire_worker()),
+                        WORKER_IDLE, lambda: asyncio.create_task(self.retire_worker(generation)),
                     )
 
-    async def retire_worker(self):
+    async def retire_worker(self, generation=None):
         async with self.lock:
+            if generation is not None and generation != self.worker_generation:
+                return
             await self.stop_worker()
 
-    async def stop_worker(self):
+    async def stop_worker(self, *, log_stderr=False):
         if self.idle:
             self.idle.cancel()
             self.idle = None
@@ -140,7 +153,9 @@ class StuPASECleanup:
             if worker.returncode is None:
                 with suppress(ProcessLookupError):
                     worker.kill()
-            await worker.communicate()
+            _, stderr = await worker.communicate()
+            if log_stderr and stderr:
+                logger.warning("StuPASE worker failed: %s", stderr.decode("utf-8", errors="replace").strip()[-500:])
 
     async def close(self):
         if task := self.downloading:

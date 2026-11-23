@@ -70,4 +70,3 @@ class DesktopPen(PenProcess):
             raise ValueError("The desktop stroke belongs outside the current recording.")
         timed = [(x, y, max(previous, timestamp / 1_000_000 - started)) for x, y, timestamp in points]
         self.drawing.add(timed, max(previous, released), max(previous, limit), captured=True)
-

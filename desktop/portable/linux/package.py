@@ -1,4 +1,4 @@
-"""Build the Jaro desktop package for Debian 13 amd64."""
+"""Build the Jaro desktop package for Ubuntu 24.04 LTS / Debian 13 amd64."""
 
 import argparse
 import json
@@ -17,7 +17,12 @@ from package_files import ROOT, install, release_metadata, stage_workspace
 
 APP_ID = "local.jardaudio.desktop"
 PACKAGE_ROOT = "/usr/lib/jaro"
-SYSTEM_PYTHON = Path("/usr/bin/python3.13")
+PYTHON_VERSION = f"{sys.version_info[0]}.{sys.version_info[1]}"
+SYSTEM_PYTHON = Path(f"/usr/bin/python{PYTHON_VERSION}")
+SUPPORTED_TARGETS = {
+    ("ubuntu", "24.04"): (3, 12),
+    ("debian", "13"): (3, 13),
+}
 
 
 def stage_runtime(target, wheelhouse):
@@ -26,7 +31,7 @@ def stage_runtime(target, wheelhouse):
     binary.parent.mkdir(parents=True)
     binary.symlink_to(SYSTEM_PYTHON)
     (venv / "pyvenv.cfg").write_text("home = /usr/bin\ninclude-system-site-packages = false\n")
-    packages = venv / "lib/python3.13/site-packages"
+    packages = venv / f"lib/python{PYTHON_VERSION}/site-packages"
     source = ["--no-index", "--find-links", wheelhouse] if wheelhouse else [
         "--index-url", "https://pypi.org/simple", "--find-links", "https://download.pytorch.org/whl/cpu/torch/",
     ]
@@ -57,10 +62,11 @@ def stage_host(target, host):
 
 def build(host, dist, output, revision, wheelhouse, sdk):
     release = platform.freedesktop_os_release() if sys.platform == "linux" else {}
-    if (sys.platform, platform.machine(), sys.version_info[:2], release.get("ID"), release.get("VERSION_ID")) != (
-        "linux", "x86_64", (3, 13), "debian", "13",
-    ):
-        raise ValueError("Build this package on Debian 13 amd64 using Python 3.13 with pip.")
+    target_os = (release.get("ID"), release.get("VERSION_ID"))
+    expected_python = SUPPORTED_TARGETS.get(target_os)
+    if (sys.platform != "linux" or platform.machine() != "x86_64"
+            or expected_python is None or sys.version_info[:2] != expected_python):
+        raise ValueError("Build this package on Ubuntu 24.04 amd64 (Python 3.12) or Debian 13 amd64 (Python 3.13) with pip.")
     version = json.loads((HERE.parent / "app.json").read_bytes())["version"]
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise ValueError("The portable app version must use major.minor.patch.")
@@ -89,6 +95,8 @@ def build(host, dist, output, revision, wheelhouse, sdk):
         for name in ("LICENSE", "NOTICE"):
             install(ROOT / name, stage / "usr/share/doc/jaro" / name)
         shutil.copytree(ROOT / "licenses", stage / "usr/share/doc/jaro/licenses")
+        shutil.copytree(ROOT / "engine/stupase_model/licenses", stage / "usr/share/doc/jaro/licenses/stupase")
+        install(ROOT / "engine/stupase_model/NOTICE.md", stage / "usr/share/doc/jaro/licenses/stupase/NOTICE.md")
         install(ROOT / "desktop/build-tools/MODEL-NOTICES.txt", stage / "usr/share/doc/jaro/MODEL-NOTICES.txt")
         install(sdk / "LICENSE", stage / "usr/share/doc/jaro/Native-SDK-LICENSE")
         control = stage / "DEBIAN"
@@ -104,10 +112,11 @@ Maintainer: Jard <support@jard.ai>
 Section: sound
 Priority: optional
 Installed-Size: {installed_kib}
-Depends: python3.13, ffmpeg, pulseaudio-utils, libgtk-4-1, libwebkitgtk-6.0-4, libglib2.0-bin,
- gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad,
- libgcc-s1, libstdc++6, libgomp1, libgtk4-layer-shell0, libx11-6, libxext6, ca-certificates, curl, util-linux
-Recommends: xdg-desktop-portal, at-spi2-core, gstreamer1.0-tools, gstreamer1.0-pipewire, xclip, wl-clipboard
+Depends: python{PYTHON_VERSION}, ffmpeg, pulseaudio-utils, libgtk-4-1, libwebkitgtk-6.0-4, libglib2.0-bin,
+ gstreamer1.0-tools, gstreamer1.0-pipewire, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad,
+ libgcc-s1, libstdc++6, libgomp1, libgtk4-layer-shell0, libx11-6, libxext6, ca-certificates, curl, openssl, util-linux,
+ xclip, wl-clipboard
+Recommends: xdg-desktop-portal, at-spi2-core
 Homepage: https://www.jard.ai/
 Description: Local audio recording, transcription, and dictation
  Jaro records audio and transcribes it on this computer with local models.

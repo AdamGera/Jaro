@@ -1,6 +1,8 @@
 """StatusNotifierItem and D-Bus menu for the portable Linux desktop."""
 
 import asyncio
+import os
+from pathlib import Path
 
 from dbus_fast import Message, Variant
 from dbus_fast.aio import MessageBus
@@ -44,7 +46,13 @@ class StatusItem(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def IconName(self) -> "s":
-        return ICON
+        share_icon = Path(__file__).resolve().parents[1] / "share/jaro.png"
+        return "jaro" if share_icon.is_file() else ICON
+
+    @dbus_property(access=PropertyAccess.READ)
+    def IconThemePath(self) -> "s":
+        share = Path(__file__).resolve().parents[1] / "share"
+        return str(share) if (share / "jaro.png").is_file() else ""
 
     @dbus_property(access=PropertyAccess.READ)
     def Menu(self) -> "o":

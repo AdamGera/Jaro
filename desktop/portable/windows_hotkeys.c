@@ -35,12 +35,14 @@ DictationTarget active_target(void) {
 }
 
 bool same_target(DictationTarget left, DictationTarget right) {
-    return left.window && left.focus && left.process
-        && left.window == right.window && left.focus == right.focus && left.process == right.process;
+    return left.window && left.process
+        && left.window == right.window && left.process == right.process
+        && (!left.focus || !right.focus || left.focus == right.focus);
 }
 
 INPUT keyboard_input(WORD key, DWORD flags) {
-    INPUT input = {.type = INPUT_KEYBOARD, .ki = {.wVk = key, .dwFlags = flags, .dwExtraInfo = JARO_DICTATION_INPUT}};
+    WORD scan = key == 0xe8 ? 0 : (WORD)MapVirtualKeyExW(key, MAPVK_VK_TO_VSC, GetKeyboardLayout(0));
+    INPUT input = {.type = INPUT_KEYBOARD, .ki = {.wVk = key, .wScan = scan, .dwFlags = flags, .dwExtraInfo = JARO_DICTATION_INPUT}};
     return input;
 }
 
@@ -365,7 +367,7 @@ int main(int argc, char **argv) {
         || (strcmp(argv[5], "standard") && strcmp(argv[5], "terminal"))) return 2;
     unsigned long long window, focus, process;
     if (!argument_number(argv[2], &window) || !argument_number(argv[3], &focus)
-        || !argument_number(argv[4], &process) || !window || !focus || !process || process > UINT32_MAX) return 2;
+        || !argument_number(argv[4], &process) || !window || !process || process > UINT32_MAX) return 2;
     DictationTarget destination = {(HWND)(uintptr_t)window, (HWND)(uintptr_t)focus, (DWORD)process};
     bool terminal = !strcmp(argv[5], "terminal");
     if (argc == 6) return paste_dictation(destination, terminal, NULL, 0);

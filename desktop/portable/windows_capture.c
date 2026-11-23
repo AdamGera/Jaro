@@ -570,7 +570,7 @@ static HRESULT capture(IMMDeviceEnumerator *enumerator, bool loopback, bool dual
             refresh_meeting_outputs(enumerator, &outputs, probe, &route_scope, &tail, 0, 0);
             Output *ready = outputs;
             while (ready && !ready->input.started) ready = ready->next;
-            if (!ready) result = AUDCLNT_E_DEVICE_INVALIDATED;
+            if (!ready && !mic.started) result = AUDCLNT_E_DEVICE_INVALIDATED;
         }
     }
     if (SUCCEEDED(result) && write_clock && (fwrite(&start, sizeof(start), 1, stdout) != 1 || fflush(stdout)))

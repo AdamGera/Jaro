@@ -172,11 +172,11 @@ class SessionStore:
             ids = {row[0]: json.loads(row[1]).get("audioRemovedAt") for row in db.execute("SELECT id,options FROM sessions")}
             audio_pending = {row[0] for row in db.execute("SELECT id FROM meeting_audio_trash")}
         # Finish filesystem changes interrupted between a rename and a database commit.
-        audio_prefix = "Jard Meeting Audio "
-        for path in (self.root / ".meeting-trash").glob(audio_prefix + "*"):
-            name = path.name.removeprefix(audio_prefix)
-            if name in ids and not ids[name] and name not in audio_pending and not (self.audio / name).exists():
-                path.rename(self.audio / name)
+        for audio_prefix in ("Jaro Meeting Audio ", "Jard Meeting Audio "):
+            for path in (self.root / ".meeting-trash").glob(audio_prefix + "*"):
+                name = path.name.removeprefix(audio_prefix)
+                if name in ids and not ids[name] and name not in audio_pending and not (self.audio / name).exists():
+                    path.rename(self.audio / name)
         for path in self.audio.iterdir():
             name = path.name.removesuffix(".deleting").removesuffix(".removing-audio")
             try:

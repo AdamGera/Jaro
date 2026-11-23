@@ -31,6 +31,30 @@ def audio_track_labels(sources):
     return ["Combined audio", *names] if len(names) == 2 else names
 
 
+def windows_h264_encoder(prefer_software=False):
+    candidates = ("libopenh264", "libx264") if prefer_software else ("h264_mf", "libopenh264", "libx264")
+    try:
+        output = subprocess.check_output(
+            [codec_binary("ffmpeg"), "-hide_banner", "-encoders"],
+            stderr=subprocess.DEVNULL, text=True, timeout=5,
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None if prefer_software else "h264_mf"
+    for name in candidates:
+        if f" {name} " in output:
+            return name
+    return None if prefer_software else "h264_mf"
+
+
+def windows_video_args(encoder):
+    if encoder == "h264_mf":
+        return ["-c:v", "h264_mf", "-b:v", "6M", "-pix_fmt", "nv12"]
+    if encoder == "libx264":
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p"]
+    return ["-c:v", encoder, "-b:v", "6M", "-pix_fmt", "yuv420p"]
+
+
 @dataclass(frozen=True)
 class ScreenDraft:
     folder: Path
@@ -144,7 +168,7 @@ class ScreenDraft:
                         shutil.copyfile(font, font_dir / font.name)
                         overlay += ":fontsdir=ink-fonts"
                         font_family = "Liberation Sans"
-                    encoding = ["-vf", overlay, "-c:v", "h264_mf", "-b:v", "6M", "-pix_fmt", "nv12"]
+                    encoding = ["-vf", overlay, *windows_video_args(windows_h264_encoder())]
                 else:
                     encoding = ["-vf", overlay, "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p"]
                 await make_overlay(self.folder / "ink.ass", self.movie, events, font_family)
@@ -164,21 +188,31 @@ class ScreenDraft:
                 output_audio.extend([f"-metadata:s:a:{index}", f"handler_name={label}",
                                      f"-disposition:a:{index}", "default" if index == 0 else "0"])
             inheritance = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"pass_fds": (lock,)}
-            process = await asyncio.create_subprocess_exec(
-                codec_binary("ffmpeg"), "-v", "error", "-nostdin", "-y", *inputs,
-                "-map", "0:v:0", *encoding, *output_audio, "-movflags", "+faststart", output.name,
-                **inheritance,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                cwd=self.folder,
-            )
-            try:
-                if await process.wait():
-                    raise CaptureError("The screen recording contains no playable video.")
-            finally:
-                if process.returncode is None:
-                    with suppress(ProcessLookupError):
-                        process.kill()
-                    await process.wait()
+            attempts = [encoding]
+            if os.name == "nt" and "h264_mf" in encoding:
+                fallback_encoder = windows_h264_encoder(prefer_software=True)
+                if fallback_encoder:
+                    attempts.append(["-vf", overlay, *windows_video_args(fallback_encoder)])
+            succeeded = False
+            for video_args in attempts:
+                process = await asyncio.create_subprocess_exec(
+                    codec_binary("ffmpeg"), "-v", "error", "-nostdin", "-y", *inputs,
+                    "-map", "0:v:0", *video_args, *output_audio, "-movflags", "+faststart", output.name,
+                    **inheritance,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    cwd=self.folder,
+                )
+                try:
+                    if await process.wait() == 0:
+                        succeeded = True
+                        break
+                finally:
+                    if process.returncode is None:
+                        with suppress(ProcessLookupError):
+                            process.kill()
+                        await process.wait()
+            if not succeeded:
+                raise CaptureError("The screen recording contains no playable video.")
         return output
 
 

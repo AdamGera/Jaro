@@ -1,5 +1,5 @@
-#!/usr/bin/python3.13 -I
-"""Install and restart signed per-user Jaro releases on Debian 13."""
+#!/usr/bin/env python3
+"""Install and restart signed per-user Jaro releases on Linux amd64."""
 
 import argparse
 import base64
@@ -25,9 +25,26 @@ PUBLISHER = "dxMjVxu9nD8oMW/Cx+DNTJ2sYv8JS8z95lJkz63hBMM="
 VERSION = r"(?:0|[1-9][0-9]{0,4})(?:\.(?:0|[1-9][0-9]{0,4})){2}"
 MAX_ARCHIVE = 1024 ** 3
 MAX_MANIFEST = 4096
-SYSTEM_PYTHON = "/usr/bin/python3.13"
 APP_ID = "local.jardaudio.desktop"
 PUBLIC_KEY_PREFIX = bytes.fromhex("302a300506032b6570032100")
+
+
+def system_python(payload=None):
+    if payload is not None:
+        lib = payload / "venv/lib"
+        if lib.is_dir():
+            for entry in sorted(lib.iterdir()):
+                if re.fullmatch(r"python3\.[0-9]+", entry.name):
+                    candidate = Path("/usr/bin") / entry.name
+                    if candidate.is_file():
+                        return str(candidate)
+    current = Path(f"/usr/bin/python{sys.version_info[0]}.{sys.version_info[1]}")
+    if current.is_file():
+        return str(current)
+    for candidate in ("/usr/bin/python3.13", "/usr/bin/python3.12", "/usr/bin/python3"):
+        if Path(candidate).is_file():
+            return candidate
+    return sys.executable
 
 
 def signed_message(version, size, digest):
@@ -50,17 +67,30 @@ def verify_manifest(raw, publisher):
     signature = base64.b64decode(data["signature"], validate=True)
     if len(public) != 32 or len(signature) != 64:
         raise ValueError("Invalid update signature or publisher key.")
-    with tempfile.TemporaryDirectory(prefix="jaro-signature-") as temporary:
-        work = Path(temporary)
-        key, message, sig = (work / name for name in ("key", "message", "signature"))
-        key.write_bytes(PUBLIC_KEY_PREFIX + public)
-        message.write_bytes(signed_message(version, size, digest))
-        sig.write_bytes(signature)
-        result = subprocess.run(["/usr/bin/openssl", "pkeyutl", "-verify", "-pubin", "-keyform", "DER",
-                                 "-inkey", key, "-rawin", "-in", message, "-sigfile", sig],
-                                capture_output=True, timeout=10)
-    if result.returncode:
-        raise ValueError("The update signature does not match the installed publisher key.")
+    payload = signed_message(version, size, digest)
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError:
+        openssl = "/usr/bin/openssl" if Path("/usr/bin/openssl").is_file() else shutil.which("openssl")
+        if not openssl:
+            raise ValueError("Install openssl or python3-cryptography to verify Linux updates.")
+        with tempfile.TemporaryDirectory(prefix="jaro-signature-") as temporary:
+            work = Path(temporary)
+            key, message, sig = (work / name for name in ("key", "message", "signature"))
+            key.write_bytes(PUBLIC_KEY_PREFIX + public)
+            message.write_bytes(payload)
+            sig.write_bytes(signature)
+            result = subprocess.run([openssl, "pkeyutl", "-verify", "-pubin", "-keyform", "DER",
+                                     "-inkey", key, "-rawin", "-in", message, "-sigfile", sig],
+                                    capture_output=True, timeout=10)
+        if result.returncode:
+            raise ValueError("The update signature does not match the installed publisher key.")
+    else:
+        try:
+            Ed25519PublicKey.from_public_bytes(public).verify(signature, payload)
+        except InvalidSignature as error:
+            raise ValueError("The update signature does not match the installed publisher key.") from error
     return data
 
 
@@ -189,7 +219,8 @@ def install_version(root, source, manifest):
                     or not (payload / "venv/pyvenv.cfg").is_file()):
                 raise ValueError("The archive does not contain the specified Jaro release.")
             (payload / "venv/bin").mkdir(exist_ok=True)
-            (payload / "venv/bin/python").symlink_to(SYSTEM_PYTHON)
+            (payload / "venv/bin/python").symlink_to(system_python(payload))
+            validate_payload(payload)
             if target.exists():
                 require_private_directory(target)
                 shutil.rmtree(target)
@@ -197,6 +228,18 @@ def install_version(root, source, manifest):
     point_to(root, target)
     prune_versions(root, target, current)
     return target
+
+
+def validate_payload(payload):
+    python = payload / "venv/bin/python"
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise ValueError("The update Python runtime is unavailable.")
+    result = subprocess.run(
+        [str(python), "-EsB", "-c", "import sys; assert sys.version_info >= (3, 12)"],
+        capture_output=True, timeout=10,
+    )
+    if result.returncode:
+        raise ValueError("The update runtime is incompatible with this system's Python.")
 
 
 def desktop_value(value):
@@ -253,6 +296,11 @@ def bootstrap(root, archive, manifest, publisher):
                          f"Exec={command}\nIcon={icon}\nStartupWMClass={APP_ID}\nCategories=AudioVideo;Audio;\n",
                          encoding="utf-8")
         entry.replace(entries / entry.name)
+    source_icon = root / "current/share/jaro.png"
+    if source_icon.is_file():
+        icon_dir = root.parent / "icons/hicolor/512x512/apps"
+        icon_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_icon, icon_dir / f"{APP_ID}.png")
     print(f"Jaro is installed. Open it from the desktop menu or run {command}.")
 
 
@@ -282,6 +330,8 @@ def uninstall(root):
         read_publisher(root)
         remove_desktop_entry(root.parent / "applications" / name, command)
         remove_desktop_entry(autostart, f"{command} --background", autostart=True)
+        with suppress(OSError):
+            (root.parent / f"icons/hicolor/512x512/apps/{APP_ID}.png").unlink(missing_ok=True)
         with tempfile.TemporaryDirectory(prefix=".jaro-uninstall-", dir=root.parent) as holding:
             root.replace(Path(holding) / root.name)
 
@@ -318,7 +368,7 @@ def apply_update(root, staging):
             installed = install_version(root, staging / ARCHIVE, release)
         process = subprocess.Popen([root / "jaro"], env=environment)
         try:
-            result = process.wait(timeout=3)
+            result = process.wait(timeout=8)
         except subprocess.TimeoutExpired:
             return
         if not result:
@@ -337,7 +387,7 @@ def apply_update(root, staging):
 
 def main():
     if os.getuid() == 0 or sys.platform != "linux" or os.uname().machine != "x86_64":
-        raise ValueError("Use this installer as a regular user on Debian 13 amd64.")
+        raise ValueError("Use this installer as a regular user on Linux x86_64.")
     name = Path(sys.argv[0]).name
     if name in ("jaro", "jardctl"):
         launch(Path(__file__).resolve().parent, name, sys.argv[1:])

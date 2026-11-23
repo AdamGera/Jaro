@@ -24,7 +24,8 @@ if sys.platform == "linux" and find_spec("dbus_fast"):
     from wayland_dictation import WaylandDictation
     from wayland_field import EDITABLE_AND_FOCUSED, Field, WaylandField
     from wayland_paste import (
-        CLIPBOARD, EMPTY_RESTORE_FORMAT, KEYBOARD, PASTE_FALLBACK, REMOTE, WaylandPaste, read_clipboard, write_clipboard,
+        CLIPBOARD, EMPTY_RESTORE_FORMAT, KEYBOARD, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V, PASTE_FALLBACK, REMOTE,
+        WaylandPaste, read_clipboard, write_clipboard,
     )
 
 
@@ -112,7 +113,7 @@ class RemoteFixture(PortalFixture):
                 if self.renewal:
                     grants["restore_token"] = Variant("s", self.renewal)
                 return self.response(message, 0, grants)
-            if message.member == "NotifyKeyboardKeysym":
+            if message.member in ("NotifyKeyboardKeysym", "NotifyKeyboardKeycode"):
                 self.key_events.append(tuple(message.body[-2:]))
                 if self.on_key is not None:
                     self.on_key(*self.key_events[-1])
@@ -263,9 +264,10 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         field = WaylandField()
         field.bus = SimpleNamespace(connected=True)
         field.change_focus((":1.8", "/field"))
-        replies = [[[EDITABLE_AND_FOCUSED]], ["text box"], [0], [Variant("i", 2)], [Variant("i", 3)]]
-        with patch("wayland_field.call", new=AsyncMock(side_effect=replies)):
-            self.assertEqual(await field.snapshot(), Field(field.focus, field.revision, 2, 3))
+        for role in ("text box", "section", "document web"):
+            replies = [[[EDITABLE_AND_FOCUSED]], [role], [0], [Variant("i", 2)], [Variant("i", 3)]]
+            with patch("wayland_field.call", new=AsyncMock(side_effect=replies)):
+                self.assertEqual(await field.snapshot(), Field(field.focus, field.revision, 2, 3))
 
     async def asyncSetUp(self):
         daemon = subprocess.Popen(["dbus-daemon", "--session", "--nofork", "--print-address=1"],
@@ -286,7 +288,7 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
 
     async def key_sent(self):
         async with asyncio.timeout(3):
-            while (ord("v"), 0) not in self.desktop.key_events:
+            while (KEY_V, 0) not in self.desktop.key_events:
                 await asyncio.sleep(.01)
 
     def dictation_workspace(self):
@@ -401,8 +403,8 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         await self.key_sent()
         self.assertEqual(await self.desktop.read_owned("text/plain;charset=utf-8"), text.encode())
         self.assertEqual(await delivery, "Paste shortcut sent.")
-        self.assertEqual(self.desktop.key_events, [(0xffe3, 1), (0xffe1, 1), (ord("v"), 1),
-                                                   (ord("v"), 0), (0xffe1, 0), (0xffe3, 0)])
+        self.assertEqual(self.desktop.key_events, [(KEY_LEFTCTRL, 1), (KEY_LEFTSHIFT, 1), (KEY_V, 1),
+                                                   (KEY_V, 0), (KEY_LEFTSHIFT, 0), (KEY_LEFTCTRL, 0)])
         for mime, data in self.desktop.original.items():
             self.assertEqual(await self.desktop.read_owned(mime), data)
 
@@ -481,33 +483,39 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.paste.formats, ("text/html",))
         self.assertEqual(await self.paste.snapshot(), {"text/html": b"<b>Keep this</b>"})
 
-    async def test_background_restore_skips_the_clipboard_probe(self):
+    async def test_background_restore_probes_empty_clipboard_lazily_on_paste(self):
         self.desktop.notify_initial = False
-        with patch("wayland_paste.clipboard_is_empty", new=AsyncMock()) as probe:
+        self.desktop.selection = {}
+        with patch("wayland_paste.clipboard_is_empty", new=AsyncMock(return_value=True)) as probe:
             await self.paste.approve("existing-grant")
-        probe.assert_not_awaited()
-        self.assertIsNone(self.paste.formats)
+            probe.assert_not_awaited()
+            self.assertIsNone(self.paste.formats)
+            delivery = asyncio.create_task(self.paste.paste("After restart.", False, lambda: True))
+            await self.key_sent()
+            self.assertEqual(await self.desktop.read_owned("text/plain"), b"After restart.")
+            self.assertEqual(await delivery, PASTE_SENT)
+            probe.assert_awaited_once()
 
     async def test_copy_during_modifier_press_prevents_pasting_foreign_text(self):
         await self.paste.approve()
         def replace_on_control(key, pressed):
-            if (key, pressed) == (0xffe3, 1):
+            if (key, pressed) == (KEY_LEFTCTRL, 1):
                 self.desktop.foreign_copy({"text/plain": b"New content"})
 
         self.desktop.on_key = replace_on_control
         self.assertIn("Copy last", await self.paste.paste("Available", False, lambda: True))
-        self.assertEqual(self.desktop.key_events, [(0xffe3, 1), (0xffe3, 0)])
+        self.assertEqual(self.desktop.key_events, [(KEY_LEFTCTRL, 1), (KEY_LEFTCTRL, 0)])
         self.assertEqual(len(self.desktop.owners), 1)
         self.assertEqual(self.desktop.selection["text/plain"], b"New content")
 
     async def test_revocation_during_shortcut_does_not_send_more_keys(self):
         await self.paste.approve()
         def revoke_on_control(key, pressed):
-            if (key, pressed) == (0xffe3, 1):
+            if (key, pressed) == (KEY_LEFTCTRL, 1):
                 self.desktop.send(self.desktop.session, SESSION, "Closed", "a{sv}", [{}])
 
         self.desktop.on_key = revoke_on_control
         self.assertIn("Copy last", await self.paste.paste("Available", False, lambda: True))
         self.assertFalse(self.paste.active)
-        self.assertEqual(self.desktop.key_events, [(0xffe3, 1)])
+        self.assertEqual(self.desktop.key_events, [(KEY_LEFTCTRL, 1)])
         self.assertEqual(self.paste.data, {})

@@ -171,7 +171,7 @@ class WindowsDictation(PortableDictation):
                 fields = event.split(" ", 4)
                 if len(fields) < 4 or not all(part.isascii() and part.isdecimal() for part in fields[1:4]):
                     return
-                focus = tuple(fields[1:4]) if all(part != "0" for part in fields[1:4]) else None
+                focus = tuple(fields[1:4]) if fields[1] != "0" and fields[3] != "0" else None
                 if action == "paste-last":
                     self.recovery_focus = focus
                     self.phase = "pasting"

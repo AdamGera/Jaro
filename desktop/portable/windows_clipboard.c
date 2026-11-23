@@ -45,25 +45,28 @@ static bool duplicate_clipboard(Clipboard *clipboard) {
         UINT format = EnumClipboardFormats(previous);
         if (!format) return GetLastError() == ERROR_SUCCESS;
         previous = format;
-        if (clipboard->length == MAX_FORMATS || format == CF_OWNERDISPLAY || format == CF_METAFILEPICT
-            || (format >= CF_PRIVATEFIRST && format <= CF_GDIOBJLAST)) return false;
+        if (clipboard->length == MAX_FORMATS) return true;
+        if (format == CF_OWNERDISPLAY || format == CF_METAFILEPICT
+            || (format >= CF_PRIVATEFIRST && format <= CF_GDIOBJLAST)) continue;
         HANDLE original = GetClipboardData(format);
-        if (!original) return false;
+        if (!original) continue;
 
-        size_t bytes = GlobalSize(original);
+        size_t bytes = 0;
         if (format == CF_BITMAP) {
             BITMAP bitmap;
             if (GetObjectW(original, sizeof(bitmap), &bitmap) != sizeof(bitmap)
-                || bitmap.bmHeight < 0 || bitmap.bmWidthBytes < 0) return false;
+                || bitmap.bmHeight <= 0 || bitmap.bmWidthBytes <= 0) continue;
             bytes = (size_t)bitmap.bmHeight * (size_t)bitmap.bmWidthBytes;
         } else if (format == CF_ENHMETAFILE) {
             bytes = GetEnhMetaFileBits(original, 0, NULL);
         } else if (format == CF_PALETTE) {
             bytes = GetPaletteEntries(original, 0, 0, NULL) * sizeof(PALETTEENTRY);
+        } else {
+            bytes = GlobalSize(original);
         }
-        if (!bytes || bytes > remaining) return false;
+        if (!bytes || bytes > remaining) continue;
         HANDLE copy = OleDuplicateData(original, (CLIPFORMAT)format, GMEM_MOVEABLE);
-        if (!copy) return false;
+        if (!copy) continue;
         clipboard->entries[clipboard->length++] = (Format){format, copy};
         remaining -= bytes;
     }
@@ -125,6 +128,7 @@ static bool shell_without_editor(DictationTarget target) {
     if (!GetClassNameW(target.window, window_class, sizeof(window_class) / sizeof(window_class[0]))) return true;
     if (_wcsicmp(window_class, L"Progman") && _wcsicmp(window_class, L"WorkerW")
         && _wcsicmp(window_class, L"Shell_TrayWnd") && _wcsicmp(window_class, L"Shell_SecondaryTrayWnd")) return false;
+    if (!target.focus) return true;
     WCHAR focused_class[64];
     if (!GetClassNameW(target.focus, focused_class, sizeof(focused_class) / sizeof(focused_class[0]))) return true;
     return _wcsicmp(focused_class, L"Edit") && _wcsnicmp(focused_class, L"RichEdit", 8);

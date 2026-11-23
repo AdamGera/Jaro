@@ -71,6 +71,10 @@ class MeetingTray:
                 (self.directory / "open").touch()
             return
         if command == "quit":
+            if self.busy():
+                with suppress(OSError):
+                    (self.directory / "open").touch()
+                return
             self.state.request_shutdown()
             return
         if self.job and not self.job.done():
@@ -163,4 +167,3 @@ async def windows_tray(tray):
             with suppress(ProcessLookupError):
                 child.kill()
             await child.wait()
-

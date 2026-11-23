@@ -117,10 +117,15 @@ html[data-native-window] .workspace-actions { height: var(--window-header-height
 .sidebar-footer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px; margin-top: auto; flex-shrink: 0; }
 .sidebar-settings { grid-column: 1 / -1; grid-row: 1; }
 .sidebar-footer:has(.sidebar-update-icon) .sidebar-settings { grid-column: 1; }
-.workspace-settings { width: min(100%, 44rem); margin-inline: auto; padding: max(3.75rem, var(--window-header-height, 0px)) clamp(1.25rem, 5vw, 3.5rem) 3rem; }
+.workspace-settings {
+  --pane-width: 48rem;
+  --pane-gutter: clamp(1.25rem, 3.5vw, 2.5rem);
+  width: min(100%, calc(var(--pane-width) + var(--pane-gutter) * 2));
+  margin-inline: auto;
+  padding: max(3.75rem, var(--window-header-height, 0px)) var(--pane-gutter) 3rem;
+}
 .workspace-settings h1 { margin: 1.1rem 0 1.75rem; font-size: 1.75rem; font-weight: 600; letter-spacing: -.035em; }
 .workspace-settings h1:focus { outline: none; }
-.workspace-settings[data-pane="meetings"] { width: min(100%, 56rem); }
 .workspace-settings[data-pane="meetings"] h1 { margin-bottom: .85rem; }
 .meetings-workspace { display: grid; gap: .9rem; }
 .meeting-workspace-controls { display: flex; flex-wrap: wrap; gap: .55rem; align-items: center; }
@@ -179,12 +184,11 @@ html[data-native-window] .workspace-actions { height: var(--window-header-height
 .workspace-settings-tabs > [role="tablist"] > button { padding-inline: clamp(.45rem, 1.6vw, .9rem); }
 .workspace-settings-tabs [data-settings-page][hidden] { display: none; }
 .workspace-settings-tabs [data-settings-page] > .dictation-settings { margin-top: 0; padding-top: 0; border-top: 0; }
-.workspace-settings[data-pane="dictation"] {
-  width: min(100%, 62rem);
-  padding-inline: clamp(1.25rem, 3vw, 2.5rem);
-}
 .workspace-settings[data-pane="dictation"] h1 { margin-bottom: 1.1rem; }
-.workspace-settings[data-pane="dictation"]:has(.dictation-history-browser) { padding-bottom: 1rem; }
+.workspace-settings[data-pane="dictation"]:has(.dictation-history-browser) {
+  --pane-width: 56rem;
+  padding-bottom: 1rem;
+}
 .settings-back { display: inline-flex; align-items: center; gap: .4rem; color: var(--quiet); font-size: .84rem; }
 .settings-back:hover, .settings-back:focus-visible { color: var(--foreground); }
 .settings-back svg { width: 1rem; height: 1rem; }

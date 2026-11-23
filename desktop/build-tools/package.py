@@ -111,6 +111,8 @@ def copy_engine(resources):
     shutil.copytree(ENGINE / "stupase_model", target / "stupase_model", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copytree(DESKTOP / "transforms" / "starter", target / "transform-starter")
     shutil.copytree(REPO / "licenses", resources / "licenses")
+    shutil.copytree(ENGINE / "stupase_model/licenses", resources / "licenses/stupase")
+    shutil.copy2(ENGINE / "stupase_model/NOTICE.md", resources / "licenses/stupase/NOTICE.md")
     for name in ("LICENSE", "NOTICE"):
         shutil.copy2(REPO / name, resources / "licenses" / name)
     for notice in ("LICENSE", "NOTICE"):

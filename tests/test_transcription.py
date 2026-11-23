@@ -148,19 +148,27 @@ class TranscriptionTests(unittest.TestCase):
         # recording if that prefix is admitted.
         audio = np.arange(12, dtype=np.float32)
         engine.model.generate.reset_mock()
+        requests = engine.processor.apply_transcription_request
+        requests.reset_mock()
         engine.aligner.confidently_blank.return_value = True
         self.assertEqual(engine._decode(audio, screen_nonspeech=True, speech_prefix_samples=6), ("", None))
-        np.testing.assert_array_equal(engine.processor.apply_transcription_request.call_args.kwargs["audio"], audio[:6])
+        requests.assert_called_once()
+        np.testing.assert_array_equal(requests.call_args.kwargs["audio"], audio[:6])
         engine.model.generate.assert_not_called()
+        requests.reset_mock()
         engine.aligner.confidently_blank.return_value = False
         self.assertEqual(engine._decode(audio, screen_nonspeech=True, speech_prefix_samples=6), ("Test.", "English"))
-        np.testing.assert_array_equal(engine.processor.apply_transcription_request.call_args_list[-2].kwargs["audio"], audio)
+        self.assertEqual(requests.call_count, 2)
+        np.testing.assert_array_equal(requests.call_args_list[0].kwargs["audio"], audio[:6])
+        np.testing.assert_array_equal(requests.call_args_list[1].kwargs["audio"], audio)
         self.assertIn("input_features", engine.model.generate.call_args.kwargs)
 
         engine.aligner.confidently_blank.side_effect = RuntimeError("fixture projection failed")
         with self.assertLogs("uvicorn.error", level="WARNING"):
             self.assertEqual(engine._decode(np.zeros(1), screen_nonspeech=True), ("Test.", "English"))
         self.assertIn("input_features", engine.model.generate.call_args.kwargs)
+        self.assertEqual(engine._decode(audio, screen_nonspeech=True, speech_prefix_samples=6), ("Test.", "English"))
+        np.testing.assert_array_equal(requests.call_args.kwargs["audio"], audio)
         engine.aligner = None
         engine.model.get_audio_features.reset_mock()
         self.assertEqual(engine._decode(np.zeros(1), screen_nonspeech=True), ("Test.", "English"))

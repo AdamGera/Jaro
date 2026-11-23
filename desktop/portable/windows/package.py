@@ -93,6 +93,8 @@ def stage(args, target):
     stage_launchers(target / "launchers", args.zig)
     licenses = payload / "licenses"
     shutil.copytree(ROOT / "licenses", licenses)
+    shutil.copytree(ROOT / "engine/stupase_model/licenses", licenses / "stupase")
+    install(ROOT / "engine/stupase_model/NOTICE.md", licenses / "stupase/NOTICE.md")
     for name in ("LICENSE", "NOTICE"):
         install(ROOT / name, licenses / name)
     install(args.sdk / "LICENSE", licenses / "Native-SDK-LICENSE")

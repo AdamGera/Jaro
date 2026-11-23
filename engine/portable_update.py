@@ -114,6 +114,7 @@ async def installer_bytes(client, url):
 
 async def stage_installer(release, directory, filename="installer.exe"):
     partial = directory / "installer.partial"
+    partial.unlink(missing_ok=True)
     digest = hashlib.sha256()
     size = 0
     try:
@@ -137,14 +138,15 @@ def windows_launcher():
 
 
 def signature_command(path):
-    # Read the certificate only after Windows has verified the Authenticode signature.
+    # Pin the verified Authenticode publisher subject (rather than raw leaf cert bytes)
+    # so certificate renewal with the same publisher keeps in-app updates working.
     system = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
     environment = dict(os.environ, JARO_SIGNATURE_TARGET=str(path))
     environment["PSModulePath"] = str(system.parent / "Modules")
     return [system, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
         "$s = Microsoft.PowerShell.Security\\Get-AuthenticodeSignature -LiteralPath $env:JARO_SIGNATURE_TARGET; "
-        "if ($s.Status -ne 'Valid' -or -not $s.SignerCertificate) { exit 1 }; "
-        "[Convert]::ToBase64String($s.SignerCertificate.RawData)"], environment
+        "if ($s.Status -ne 'Valid' -or -not $s.SignerCertificate -or -not $s.SignerCertificate.Subject) { exit 1 }; "
+        "[Console]::Out.Write($s.SignerCertificate.Subject)"], environment
 
 
 def signed_by(path):
@@ -221,7 +223,7 @@ class PortableUpdater:
     def clear_installer(self):
         self.ready = False
         if self.staging:
-            for name in self.staged_files:
+            for name in (*self.staged_files, "installer.partial"):
                 with suppress(OSError):
                     (self.staging / name).unlink(missing_ok=True)
 
@@ -405,20 +407,42 @@ def wait_for_launcher(pid):
         windows.CloseHandle(process)
 
 
+def write_version_pointer(pointer, version):
+    partial = pointer.with_name(pointer.name + ".partial")
+    partial.write_text(version + "\n", encoding="ascii")
+    partial.replace(pointer)
+
+
+def prune_windows_versions(root, *keep):
+    versions = root / "versions"
+    if not versions.is_dir():
+        return
+    keep_names = {name for name in keep if name}
+    for entry in versions.iterdir():
+        if entry.name in keep_names or not re.fullmatch(VERSION, entry.name) or entry.is_symlink():
+            continue
+        if (entry / "portable-release.json").is_file():
+            shutil.rmtree(entry, ignore_errors=True)
+
+
 def apply_windows(directory, pid):
     temporary = Path(tempfile.gettempdir()).resolve()
     if directory.parent.resolve() != temporary or not directory.name.startswith("jaro-update-") or directory.is_symlink():
         return
     launcher = windows_launcher()
+    install_root = launcher.parent.parent
+    pointer = install_root / "current-version"
     installer = directory / "installer.exe"
     environment = dict(os.environ)
     environment.pop("JARO_UPDATE_ERROR", None)
+    installed = None
+    version = None
+    updated = False
     try:
         intent = json.loads((directory / "restart.json").read_text(encoding="ascii"))
         version, digest = intent["version"], intent["digest"]
         if not re.fullmatch(VERSION, version) or not re.fullmatch(r"[a-f0-9]{64}", digest):
             raise ValueError("Invalid update handoff.")
-        pointer = launcher.parent.parent / "current-version"
         installed = pointer.read_text(encoding="ascii").strip()
         if (not re.fullmatch(VERSION, installed) or version_key(version) <= version_key(installed)
                 or updates_disabled("windows")):
@@ -430,15 +454,30 @@ def apply_windows(directory, pid):
         if not signed or signed != signed_by(installer) or not wait_for_launcher(pid):
             raise ValueError("Could not verify the installer or close Jaro.")
         result = subprocess.run([installer, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/SP-", "/NORESTART",
-                                 f"/DIR={launcher.parent.parent}", f"/JAROUPDATE={installed}"], stdin=subprocess.DEVNULL,
+                                 f"/DIR={install_root}", f"/JAROUPDATE={installed}"], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
         if result.returncode or pointer.read_text(encoding="ascii").strip() != version:
             raise ValueError("The installer did not activate the expected version.")
+        updated = True
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         environment["JARO_UPDATE_ERROR"] = "1"
     finally:
         shutil.rmtree(directory, ignore_errors=True)
-    subprocess.Popen([launcher], env=environment)
+    process = subprocess.Popen([launcher], env=environment)
+    if not updated:
+        return
+    try:
+        status = process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        prune_windows_versions(install_root, version, installed)
+        return
+    if status == 0:
+        prune_windows_versions(install_root, version, installed)
+        return
+    with suppress(OSError):
+        write_version_pointer(pointer, installed)
+        prune_windows_versions(install_root, installed)
+    subprocess.Popen([launcher], env={**environment, "JARO_UPDATE_ERROR": "1"})
 
 
 if __name__ == "__main__" and sys.platform == "win32" and len(sys.argv) == 3:

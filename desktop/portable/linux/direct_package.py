@@ -30,7 +30,8 @@ def build(package, output, signing_key, publisher):
             raise ValueError("Supply the packaged Jaro Debian build.")
         version = release["version"]
         python = payload / "venv/bin/python"
-        if python.readlink() != SYSTEM_PYTHON:
+        target_python = python.readlink()
+        if not (target_python.parent == Path("/usr/bin") and target_python.name.startswith("python3.")):
             raise ValueError("The package uses an unexpected Python launcher.")
         for path in (python, payload / "in-use", payload / "bin/launch"):
             path.unlink()

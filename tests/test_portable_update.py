@@ -412,6 +412,7 @@ class PortableUpdateTests(unittest.IsolatedAsyncioTestCase):
                           patch("portable_update.wait_for_launcher", return_value=True) as wait,
                           patch("portable_update.subprocess.run", side_effect=install),
                           patch("portable_update.subprocess.Popen") as launch):
+                        launch.return_value.wait.return_value = 0
                         apply_windows(directory, 100)
                     wait.assert_called_once_with(100)
                     self.assertFalse(directory.exists())
@@ -420,3 +421,76 @@ class PortableUpdateTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual("JARO_UPDATE_ERROR" in fields["env"], bool(exit_status))
                     if exit_status:
                         self.assertEqual(PortableUpdater("0.0.9", "windows", previous_error="1").status()["message"], INSTALL_ERROR)
+
+    def test_windows_update_rolls_back_on_failed_relaunch_and_prunes_old_versions(self):
+        with TemporaryDirectory() as root:
+            launcher = Path(root) / "Programs/Jaro/bin/Jaro.exe"
+            launcher.parent.mkdir(parents=True)
+            install_root = launcher.parent.parent
+            pointer = install_root / "current-version"
+            for name in ("0.0.8", "0.0.9", "0.0.10"):
+                folder = install_root / "versions" / name
+                folder.mkdir(parents=True)
+                (folder / "portable-release.json").write_text("{}", encoding="ascii")
+            contents = b"verified installer"
+            pointer.write_text("0.0.9", encoding="ascii")
+            with TemporaryDirectory(prefix="jaro-update-") as staging:
+                directory = Path(staging)
+                (directory / "installer.exe").write_bytes(contents)
+                (directory / "restart.json").write_text(json.dumps({
+                    "version": "0.0.10", "digest": hashlib.sha256(contents).hexdigest(),
+                }))
+
+                def install(_args, **_):
+                    pointer.write_text("0.0.10", encoding="ascii")
+                    return SimpleNamespace(returncode=0)
+
+                first, second = Mock(), Mock()
+                first.wait.return_value = 1
+                with (patch("portable_update.windows_launcher", return_value=launcher),
+                      patch("portable_update.signed_by", return_value=b"CN=Jaro"),
+                      patch("portable_update.updates_disabled", return_value=False),
+                      patch("portable_update.wait_for_launcher", return_value=True),
+                      patch("portable_update.subprocess.run", side_effect=install),
+                      patch("portable_update.subprocess.Popen", side_effect=[first, second]) as launch):
+                    apply_windows(directory, 100)
+                self.assertEqual(pointer.read_text(encoding="ascii").strip(), "0.0.9")
+                self.assertFalse((install_root / "versions/0.0.10").exists())
+                self.assertTrue((install_root / "versions/0.0.9").is_dir())
+                self.assertEqual(launch.call_count, 2)
+                self.assertEqual(launch.call_args_list[-1].kwargs["env"].get("JARO_UPDATE_ERROR"), "1")
+
+    async def test_orphan_partial_installer_is_cleared_and_cleanup_download_blocks_restart(self):
+        from fastapi import HTTPException
+        from server import require_portable_update_idle
+
+        installer = b"fixture installer"
+        offer = Release("0.0.10", "test.exe", 0, len(installer), hashlib.sha256(installer).hexdigest())
+        with TemporaryDirectory() as directory:
+            stage = Path(directory)
+            (stage / "installer.partial").write_bytes(b"leftover")
+            updater = PortableUpdater("0.0.9", "windows", staging=stage)
+            updater.clear_installer()
+            self.assertFalse((stage / "installer.partial").exists())
+            (stage / "installer.partial").write_bytes(b"leftover")
+
+            async def chunks(*_):
+                yield installer
+
+            with patch("portable_update.installer_bytes", new=chunks):
+                await stage_installer(offer, stage)
+            self.assertEqual((stage / "installer.exe").read_bytes(), installer)
+
+        state = SimpleNamespace(
+            status="ready", draining=False, submitting=set(), jobs=set(), sdk_pending=0, screenshot_pending=False,
+            insights=SimpleNamespace(active_job=False, chat_count=0, model=SimpleNamespace(audio_users=0)),
+            leases=ClientLeases(), portable_recording=None, portable_screencast=None,
+            portable_dictation=SimpleNamespace(busy=False, authorizing=False, paste_authorizing=True),
+            portable_recording_lock=None, model_setup=None, stupase_cleanup=SimpleNamespace(downloading=None),
+        )
+        with self.assertRaises(HTTPException):
+            require_portable_update_idle(state, "c1")
+        state.portable_dictation.paste_authorizing = False
+        state.stupase_cleanup.downloading = object()
+        with self.assertRaises(HTTPException):
+            require_portable_update_idle(state, "c1")

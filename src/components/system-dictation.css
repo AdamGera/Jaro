@@ -256,7 +256,7 @@
 }
 .dictation-workspace-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .dictation-preferences { display: grid; gap: 18px; container-type: inline-size; }
-.dictation-workspace-tabs .dictation-preferences { max-width: 50rem; margin-top: 0; padding-top: 0; border-top: 0; }
+.dictation-workspace-tabs .dictation-preferences { margin-top: 0; padding-top: 0; border-top: 0; }
 .dictation-preference-group, .dictation-advanced > details, .dictation-history-index-card, .dictation-history-detail {
   border: 1px solid var(--line);
   border-radius: 12px;

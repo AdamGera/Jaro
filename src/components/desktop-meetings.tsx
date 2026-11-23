@@ -14,7 +14,7 @@ import { Button } from "./ui/button"
 
 export function PortableMeetingSettings({ controls, calls }: { controls: PortableMeetingControls; calls: PortableCallControls }) {
   const { t } = useInterfaceLanguage()
-  type VoiceInput = { noiseCleanup: boolean; boostMicrophone: boolean }
+  type VoiceInput = { noiseCleanup: boolean; boostMicrophone: boolean; cleanupStatus?: "notInstalled" | "downloading" | "ready" | "error" }
   const [voice, setVoice] = useState<VoiceInput>()
   const [pending, setPending] = useState(false)
   const [error, setError] = useState("")
@@ -22,17 +22,22 @@ export function PortableMeetingSettings({ controls, calls }: { controls: Portabl
 
   useEffect(() => {
     const controller = new AbortController()
-    void fetch(endpoint, { cache: "no-store", signal: controller.signal }).then(async response => {
+    const read = () => void fetch(endpoint, { cache: "no-store", signal: controller.signal }).then(async response => {
       if (!response.ok) throw new Error()
       const current = await response.json()
       if (!controller.signal.aborted) setVoice(current)
     }).catch(() => {
       if (!controller.signal.aborted) setError("Could not read the meeting voice settings.")
     })
-    return () => controller.abort()
-  }, [endpoint])
+    read()
+    const timer = voice?.cleanupStatus === "downloading" ? window.setInterval(read, 1500) : undefined
+    return () => {
+      if (timer !== undefined) window.clearInterval(timer)
+      controller.abort()
+    }
+  }, [endpoint, voice?.cleanupStatus])
 
-  async function change(setting: keyof VoiceInput, enabled: boolean) {
+  async function change(setting: "noiseCleanup" | "boostMicrophone", enabled: boolean) {
     setPending(true)
     setError("")
     try {
@@ -62,7 +67,10 @@ export function PortableMeetingSettings({ controls, calls }: { controls: Portabl
     </SettingGroup>
     <SettingGroup id="meeting-voice-title" title={t("Voice input")}>
       <SettingRow icon={Sparkles} title={t("Noise cleanup (StuPASE)")}
-        detail={t("Cleans microphone audio for the final transcript. Downloads 2.3 GB the first time.")}>
+        detail={voice?.noiseCleanup && voice.cleanupStatus === "downloading" ? t("Downloading 2.3 GB. Meetings can still be recorded.")
+          : voice?.noiseCleanup && voice.cleanupStatus === "error" ? t("Download failed. Turn this setting off and on to retry.")
+          : voice?.noiseCleanup && voice.cleanupStatus === "ready" ? t("Cleans the microphone audio locally for the final transcript of new meetings.")
+          : t("Cleans microphone audio for the final transcript. Downloads 2.3 GB the first time.")}>
         {labels => <input {...labels} type="checkbox" role="switch" checked={voice?.noiseCleanup ?? false} disabled={!voice || pending}
           onChange={event => void change("noiseCleanup", event.target.checked)} />}
       </SettingRow>

@@ -378,6 +378,8 @@ static dispatch_queue_t startCueQueue(void) {
 @property(nonatomic, strong) NSNumber *inferenceMs;
 @property(nonatomic, copy) NSDictionary *processing;
 @property(nonatomic) NSTimeInterval submittedAt;
+@property(nonatomic) NSTimeInterval stopRequestedAt, speechRequestedAt, responseReadyAt, deliveryStartedAt, deliveryFinishedAt;
+@property(nonatomic, strong) NSNumber *speechRequestMs, *clipboardSnapshotMs;
 @property(nonatomic, copy) void (^pasteCompletion)(BOOL);
 @property(nonatomic, strong) JardTranscriptReply *printRequest;
 @property(nonatomic, strong) JardOutputContext *outputContext;
@@ -599,6 +601,7 @@ static BOOL JardMaintainEventTap(JardEventTap *tap, CGEventTapLocation location,
 @property(nonatomic) NSTimeInterval shortcutReleasedAt;
 @property(nonatomic) NSTimeInterval captureIntentAt;
 @property(nonatomic) NSTimeInterval captureOpenedAt;
+@property(nonatomic) NSTimeInterval captureStopRequestedAt;
 @property(nonatomic) BOOL retriedColdCapture, captureStartAnnounced, captureIntentional, captureMicReady, captureFromCommand;
 @property(nonatomic) BOOL keyDown, suppressedKey, suppressedPaste, choosingShortcut, closed;
 @property(nonatomic) CGEventFlags lastModifierFlags;
@@ -2706,6 +2709,7 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
 
 - (void)stopCapture {
     if (!self.captureID || self.transcribing) return;
+    if (!self.captureStopRequestedAt) self.captureStopRequestedAt = NSProcessInfo.processInfo.systemUptime;
     [self pinCaptureOutputContext];
     BOOL wasStopping = self.stopping;
     self.stopping = YES;
@@ -2758,7 +2762,7 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     BOOL deferredStart = self.discardingShortcut && self.deferredShortcutStart;
     self.closingReleaseTail = NO;
     self.discardingShortcut = self.deferredShortcutStart = NO;
-    if (self.activeOutput) [self finishHistoryTiming:self.activeOutput];
+    if (self.activeOutput) [self finishDictationTiming:self.activeOutput];
     self.activeOutput = nil;
     [self finishRecordingEnvironmentWithSound:nil];
     void (^cancelMeetingPaste)(BOOL) = self.activeMeetingPaste;
@@ -2773,6 +2777,7 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     self.captureUsesSharedMicrophone = NO;
     self.captureIntentAt = 0;
     self.captureOpenedAt = 0;
+    self.captureStopRequestedAt = 0;
     if (self.shortcutStartCue == self.captureStartCue) {
         self.shortcutStartCue = nil;
         self.shortcutStartCueAt = 0;
@@ -3021,6 +3026,10 @@ static NSNumber *JardTotalMilliseconds(JardDictationJob *job) {
     return @(llround((NSProcessInfo.processInfo.systemUptime - job.submittedAt) * 1000));
 }
 
+static NSNumber *JardElapsedMilliseconds(NSTimeInterval start, NSTimeInterval end) {
+    return start > 0 && end >= start ? @(llround((end - start) * 1000)) : nil;
+}
+
 static NSDictionary *JardHistoryProcessing(id value) {
     if (![value isKindOfClass:NSDictionary.class]) return nil;
     id latency = value[@"latencyMs"];
@@ -3040,7 +3049,23 @@ static NSDictionary *JardHistoryProcessing(id value) {
     return processing;
 }
 
-- (void)finishHistoryTiming:(JardDictationJob *)job {
+- (void)finishDictationTiming:(JardDictationJob *)job {
+    if (job.speechRequestMs && job.deliveryStartedAt) {
+        // Paste history waits for the receiving app to settle. Time delivery through the
+        // shortcut itself so the fixed settle interval does not look like a slow insertion.
+        NSTimeInterval finished = job.deliveryFinishedAt ?: NSProcessInfo.processInfo.systemUptime;
+        NSMutableDictionary *timing = NSMutableDictionary.dictionary;
+        timing[@"captureFinalizeMs"] = JardElapsedMilliseconds(job.stopRequestedAt, job.submittedAt);
+        timing[@"submissionWaitMs"] = JardElapsedMilliseconds(job.submittedAt, job.speechRequestedAt);
+        timing[@"speechRequestMs"] = job.speechRequestMs;
+        timing[@"inferenceMs"] = job.inferenceMs;
+        timing[@"bridgeRoundTripMs"] = JardElapsedMilliseconds(job.speechRequestedAt, job.responseReadyAt);
+        timing[@"outputWaitMs"] = JardElapsedMilliseconds(job.responseReadyAt, job.deliveryStartedAt);
+        timing[@"clipboardSnapshotMs"] = job.clipboardSnapshotMs;
+        timing[@"deliveryMs"] = JardElapsedMilliseconds(job.deliveryStartedAt, finished);
+        timing[@"totalMs"] = JardElapsedMilliseconds(job.stopRequestedAt ?: job.submittedAt, finished);
+        self.send(@"jard.diagnosticTiming", timing, nil);
+    }
     if (!job.historyID || !job.inferenceMs) return;
     NSUInteger index = [self.history indexOfObjectPassingTest:^BOOL(NSDictionary *entry, NSUInteger i, BOOL *stop) {
         return [entry[@"id"] isEqual:job.historyID];
@@ -3503,8 +3528,10 @@ static NSString *JardDeliveryMessage(NSString *message, NSString *warning) {
     }
     NSPasteboard *board = [self pasteboard];
     NSInteger initialCount = board.changeCount;
+    NSTimeInterval snapshotStarted = NSProcessInfo.processInfo.systemUptime;
     JardClipboardSnapshot *items = self.clipboardPending && self.clipboardCount == initialCount
         ? self.clipboard : snapshotClipboard(board, initialCount);
+    self.activeOutput.clipboardSnapshotMs = JardElapsedMilliseconds(snapshotStarted, NSProcessInfo.processInfo.systemUptime);
     if (!items || board.changeCount != initialCount) {
         BOOL meeting = self.activeMeetingPaste != nil;
         NSString *message = @"Jard preserved your clipboard. Use Paste Last or copy the saved dictation.";
@@ -3533,12 +3560,13 @@ static NSString *JardDeliveryMessage(NSString *message, NSString *warning) {
         (usesCurrentCaret ? [self dictationPasteAppStillActive] : [self targetStillFocusedCheckingSelection:YES]) &&
         board.changeCount == count && [self postPasteShortcut];
     if (sent) {
+        self.activeOutput.deliveryFinishedAt = NSProcessInfo.processInfo.systemUptime;
         [self playCompletionCueAt:NSProcessInfo.processInfo.systemUptime];
         JardDictationJob *output = self.activeOutput;
         self.activeOutput = nil;
         self.pasteSettling = YES;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, pasteSettle), dispatch_get_main_queue(), ^{
-            if (!self.closed && output) [self finishHistoryTiming:output];
+            if (!self.closed && output) [self finishDictationTiming:output];
             self.pasteSettling = NO;
             [self drainOutput];
         });
@@ -3630,6 +3658,7 @@ static NSString *JardDeliveryMessage(NSString *message, NSString *warning) {
             [self update:@"error" message:job.error hud:job.error];
             continue;
         }
+        job.deliveryStartedAt = NSProcessInfo.processInfo.systemUptime;
         NSString *text = [self finalTextForJob:job];
         if (job.microphoneLossReason && !job.practice && !job.secureInterrupted) {
             [self recoverMicrophoneLoss:job text:text];
@@ -3783,6 +3812,7 @@ static NSString *JardCorrectVocabulary(NSString *text, NSDictionary *preferences
     job.stageID = stage;
     job.captureEndedAt = NSDate.date.timeIntervalSince1970;
     job.submittedAt = NSProcessInfo.processInfo.systemUptime;
+    job.stopRequestedAt = self.captureStopRequestedAt;
     job.destination = self.destination;
     job.focus = self.focusedElement ? (AXUIElementRef)CFRetain(self.focusedElement) : NULL;
     job.focusedWindowOnly = self.focusedWindowOnly;
@@ -3854,10 +3884,12 @@ static NSString *JardCorrectVocabulary(NSString *text, NSDictionary *preferences
     }
     NSArray *vocabulary = JardVocabulary(job.rawOutput ? @"" : job.preferences[@"vocabulary"]);
     [self holdHistoryAudioForJob:job];
+    job.speechRequestedAt = NSProcessInfo.processInfo.systemUptime;
     self.send(@"jard.dictation", @{@"action": @"transcribe", @"id": job.stageID, @"cleanupOnFailure": @YES,
         @"languages": job.preferences[@"languages"], @"vocabulary": vocabulary, @"outputProfile": profile,
         @"noiseCleanup": job.preferences[@"noiseCleanup"] ?: @NO, @"boostMicrophone": job.preferences[@"boostMicrophone"] ?: @NO}, ^(id result, NSString *error) {
         if (self.closed || job.cancelled) return;
+        job.responseReadyAt = NSProcessInfo.processInfo.systemUptime;
         job.raw = result[@"text"] ?: @"";
         job.processed = result[@"processed"];
         job.outputProfile = result[@"profile"];
@@ -3866,6 +3898,9 @@ static NSString *JardCorrectVocabulary(NSString *text, NSDictionary *preferences
         NSNumber *inference = result[@"inferenceMs"];
         if ([inference isKindOfClass:NSNumber.class] && isfinite(inference.doubleValue) && inference.doubleValue >= 0)
             job.inferenceMs = inference;
+        NSNumber *requestMs = result[@"speechRequestMs"];
+        if ([requestMs isKindOfClass:NSNumber.class] && isfinite(requestMs.doubleValue) && requestMs.doubleValue >= 0)
+            job.speechRequestMs = requestMs;
         job.error = error;
         if (job.printRequest) {
             [self finishPrintedJob:job];

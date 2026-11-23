@@ -333,6 +333,7 @@ async def lifespan(app: FastAPI):
                 tray = MeetingTray(state, tray_directory, lambda: portable_capture_busy(state), latest_meeting,
                                    lambda key: saved_meeting_clipboard(library, key), finish_call)
                 call_tasks.append(asyncio.create_task(tray.run()))
+        background.append(asyncio.create_task(watch_retention(app)))
         if not portable:
             background.append(asyncio.create_task(watch_idle(app)))
         if updater := getattr(state, "portable_updater", None):
@@ -396,7 +397,7 @@ async def lifespan(app: FastAPI):
             await loading
 
 
-async def watch_idle(app):
+async def watch_retention(app):
     next_expiry = 0
     while True:
         await asyncio.sleep(5)
@@ -409,6 +410,12 @@ async def watch_idle(app):
                 and (state.annotation_expiry is None or state.annotation_expiry.done())):
             state.annotation_expiry_due = now + 3600
             state.annotation_expiry = start_job(state, sweep_annotation_retention(state))
+
+
+async def watch_idle(app):
+    while True:
+        await asyncio.sleep(5)
+        state = app.state
         busy = (state.jobs or state.submitting or state.sdk_pending or getattr(state, "screenshot_pending", False)
                 or state.insights.active_job or state.insights.chat_count
                 or state.insights.model.audio_users or state.insights.wake.is_set())
@@ -552,7 +559,8 @@ async def start_model_setup(request: Request):
 
 def check_client(request):
     if request.headers.get("origin", URL) != URL:
-        raise HTTPException(403, "Open Jaro on this Mac.")
+        place = "this computer" if getattr(request.app.state, "portable_workspace", False) else "this Mac"
+        raise HTTPException(403, f"Open Jaro on {place}.")
 
 
 @app.post("/api/clients/{key}", status_code=204)
@@ -560,7 +568,7 @@ async def renew_client(key: UUID, request: Request):
     check_client(request)
     state = request.app.state
     if state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
     state.leases.renew(str(key))
     return Response(status_code=204)
 
@@ -1148,10 +1156,11 @@ def managed_meeting_export(request: Request, key: UUID):
 @app.put("/api/sessions/{key}/meeting-title")
 async def rename_saved_meeting(request: Request, key: UUID, title: Annotated[str, Body(embed=True, min_length=1, max_length=200)]):
     if request.headers.get("origin") != URL:
-        raise HTTPException(403, "Rename meetings from the Jard workspace on this Mac.")
+        place = "this computer" if getattr(request.app.state, "portable_workspace", False) else "this Mac"
+        raise HTTPException(403, f"Rename meetings from the Jaro workspace on {place}.")
     state = request.app.state
     if state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
 
     async def rename():
         name = await run_in_threadpool(state.library.rename_meeting, str(key), title)
@@ -1181,7 +1190,7 @@ def set_meeting_export_preference(request: Request, preference: MeetingExportPre
     check_native(request)
     state = request.app.state
     if state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
     try:
         with state.library.connection() as db:
             meeting_exports.set_folder(db, state.library.root, preference.folder)
@@ -1195,7 +1204,7 @@ def set_meeting_export_option(request: Request, option: Literal["notes", "descri
     check_native(request)
     state = request.app.state
     if state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
     with state.library.connection() as db:
         if option == "notes":
             meeting_exports.set_separate_notes(db, enabled)
@@ -1272,7 +1281,7 @@ async def remove_meeting_audio(request: Request, key: UUID):
     check_client(request)
     state = request.app.state
     if state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
     try:
         removed = await asyncio.shield(start_job(state, run_in_threadpool(state.library.remove_meeting_audio, str(key))))
     except ValueError as error:
@@ -1377,7 +1386,7 @@ def set_automatic_meeting_notes(request: Request, enabled: Annotated[bool, Body(
     require_meetings()
     state = request.app.state
     if state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
     with state.library.connection() as db:
         db.execute("BEGIN IMMEDIATE")
         meeting_brief.set_automatic(db, enabled)
@@ -1392,7 +1401,7 @@ async def set_meeting_retention(request: Request, days: int):
         raise HTTPException(400, "Choose one of the meeting retention periods.")
     state = request.app.state
     if state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
 
     async def update():
         await run_in_threadpool(state.library.set_meeting_retention_days, days)
@@ -1411,7 +1420,7 @@ async def set_audio_retention(request: Request, days: int):
         raise HTTPException(400, "Choose one of the meeting audio retention periods.")
     state = request.app.state
     if state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
 
     async def update():
         await run_in_threadpool(state.library.set_meeting_audio_days, days or None)
@@ -1668,7 +1677,7 @@ async def accept_audio(state, source, name, mime, languages, recording, diarizat
                        meeting_microphone_warning=None, meeting_voice_input=None):
     library = state.library
     if state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
     try:
         video_only = False
         if annotation and mime == "video/mp4":
@@ -1866,7 +1875,11 @@ def read_meeting_voice_input(state):
 
 @app.get("/api/portable/meeting-voice-input")
 def get_portable_meeting_voice_input(request: Request):
-    return read_meeting_voice_input(portable_capture_state(request))
+    state = portable_capture_state(request)
+    voice = read_meeting_voice_input(state)
+    cleanup = getattr(state, "stupase_cleanup", None)
+    status = cleanup.status() if cleanup is not None else stupase_cleanup(state).status()
+    return {**voice, "cleanupStatus": status}
 
 
 class MeetingVoiceInputChange(BaseModel):
@@ -1879,7 +1892,7 @@ async def change_portable_meeting_voice_input(request: Request, change: MeetingV
     require_meetings()
     state = portable_capture_state(request)
     if state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
 
     def update():
         with state.library.connection() as db:
@@ -1888,9 +1901,10 @@ async def change_portable_meeting_voice_input(request: Request, change: MeetingV
         return read_meeting_voice_input(state)
 
     voice = await run_in_threadpool(update)
+    cleanup = stupase_cleanup(state)
     if change.setting == "noiseCleanup" and change.enabled:
-        stupase_cleanup(state).prepare(retry=True)
-    return voice
+        cleanup.prepare(retry=True)
+    return {**voice, "cleanupStatus": cleanup.status()}
 
 
 @app.get("/api/portable/dictation")
@@ -2801,7 +2815,13 @@ def change_portable_login(request: Request, change: LaunchAtLoginChange):
 def require_portable_update_idle(state, client):
     require_update_idle(state, client, allow_browser=True)
     recording_lock = getattr(state, "portable_recording_lock", None)
-    if (state.portable_recording or state.portable_screencast or getattr(state.portable_dictation, "busy", False)
+    dictation = getattr(state, "portable_dictation", None)
+    cleanup = getattr(state, "stupase_cleanup", None)
+    if (state.portable_recording or state.portable_screencast
+            or getattr(dictation, "busy", False)
+            or getattr(dictation, "authorizing", False)
+            or getattr(dictation, "paste_authorizing", False)
+            or bool(getattr(cleanup, "downloading", None))
             or (recording_lock and recording_lock.locked())
             or (state.model_setup or {}).get("phase") in ("checking", "downloading", "starting")):
         raise HTTPException(409, "Finish the current recording, dictation, or model setup before restarting.")
@@ -2869,7 +2889,7 @@ async def new_stage(request: Request, recording: bool = False, dictation: bool =
     if meeting:
         require_meetings()
     if request.app.state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
     if meeting and (not recording or dictation):
         raise HTTPException(400, "A meeting must use a two-source recording stage.")
     metadata = {"meetingProvider": provider, "retentionApplies": True}
@@ -2967,7 +2987,7 @@ async def submit_staged_audio(state, key, languages, *, recording, diarization, 
     if meetings_managed() and await run_in_threadpool(is_meeting_stage, state.staging / str(key)):
         require_meetings()
     if state.draining:
-        raise HTTPException(409, "Jard is preparing to restart.")
+        raise HTTPException(409, "Jaro is preparing to restart.")
     if key in state.submitting:
         raise HTTPException(409, "Audio is being accepted.")
     state.submitting.add(key)

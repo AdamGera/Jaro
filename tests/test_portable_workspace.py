@@ -1654,3 +1654,86 @@ sys.stdout.buffer.write(frame * 31)
             self.assertEqual((await webview.get("/api/sessions", headers={
                 "Cookie": "jaro-workspace-43722=" + record["workspaceKey"],
             })).status_code, 403)
+
+    async def test_stupase_worker_passes_silent_chunks_and_guards_stale_retire(self):
+        from dictation_input import StuPASECleanup
+        from stupase_runner import HEADER
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            cleanup = StuPASECleanup(root)
+            worker_script = (
+                "import struct, sys\n"
+                "h = struct.Struct('<I')\n"
+                "sys.stdout.buffer.write(h.pack(0)); sys.stdout.buffer.flush()\n"
+                "while hdr := sys.stdin.buffer.read(4):\n"
+                "    n, = h.unpack(hdr)\n"
+                "    data = sys.stdin.buffer.read(n)\n"
+                "    sys.stdout.buffer.write(h.pack(n) + data); sys.stdout.buffer.flush()\n"
+            )
+            fake_runner = root / "fake_runner.py"
+            fake_runner.write_text(worker_script, encoding="utf-8")
+            pcm = np.zeros(160, dtype="<f4").tobytes()
+            with patch("dictation_input.checkpoints_ready", return_value=True), patch("dictation_input.RUNNER", fake_runner):
+                try:
+                    self.assertEqual(await cleanup.clean(pcm), pcm)
+                    first_pid = cleanup.worker.pid
+                    stale_gen = cleanup.worker_generation - 1
+                    await cleanup.retire_worker(stale_gen)
+                    self.assertIsNotNone(cleanup.worker)
+                    self.assertEqual(cleanup.worker.pid, first_pid)
+                finally:
+                    await cleanup.close()
+
+    async def test_linux_meeting_starts_with_silent_playback_monitor(self):
+        from linux_meeting_audio import LinuxMeetingRecording, Source
+
+        with TemporaryDirectory() as directory:
+            recording = LinuxMeetingRecording(uuid4(), Path(directory) / "meeting.wav", "both", seconds=10)
+            recording.epoch = asyncio.get_running_loop().time()
+
+            class FakeSource:
+                def __init__(self, name, *, received=False, optional=False):
+                    self.name = name
+                    self.optional = optional
+                    self.received = received
+                    self.task = asyncio.create_task(asyncio.sleep(10))
+
+                def add(self, target, _start):
+                    if not self.optional:
+                        target[:] = 100
+
+            async def watch_routes():
+                recording.mic = FakeSource("mic", received=True, optional=False)
+                recording.outputs["monitor"] = FakeSource("monitor", received=False, optional=True)
+                await asyncio.sleep(10)
+
+            recording.watch_routes = watch_routes
+            blocks = recording.capture_blocks(640, 4)
+            try:
+                block = await asyncio.wait_for(anext(blocks), 1)
+                self.assertEqual(len(block), 640)
+            finally:
+                recording.end_frame = 0
+                await blocks.aclose()
+
+    def test_tray_quit_focuses_workspace_while_busy_and_windows_encoder_falls_back(self):
+        from portable_tray import MeetingTray
+        from screen_draft import windows_h264_encoder
+
+        with TemporaryDirectory() as directory:
+            tray_dir = Path(directory)
+            shutdown = Mock()
+            state = SimpleNamespace(request_shutdown=shutdown)
+            busy_flag = True
+            tray = MeetingTray(state, tray_dir, lambda: busy_flag, lambda: None, lambda _: "", AsyncMock())
+            tray.submit("quit")
+            shutdown.assert_not_called()
+            self.assertTrue((tray_dir / "open").is_file())
+            busy_flag = False
+            tray.submit("quit")
+            shutdown.assert_called_once()
+
+        with patch("screen_draft.subprocess.check_output", return_value=" V..... libopenh264 Cisco OpenH264\n"):
+            self.assertEqual(windows_h264_encoder(), "libopenh264")
+            self.assertEqual(windows_h264_encoder(prefer_software=True), "libopenh264")

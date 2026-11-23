@@ -49,5 +49,5 @@ fi
   --enable-decoder='aac*,alac,flac,mp3*,opus,vorbis,pcm_*,adpcm_*' \
   --enable-parser=aac,aac_latm,flac,mpegaudio,opus,vorbis \
   --enable-filter=aresample,aformat,amix,anull,apad,atrim,volume --enable-muxer=ipod,mp4,wav,pcm_f32le,pcm_s16le \
-  --enable-encoder=aac,pcm_s16le,pcm_f32le "${screen_flags[@]}"
+  --enable-encoder=aac,pcm_s16le,pcm_f32le ${screen_flags[@]+"${screen_flags[@]}"}
 make -j "$jobs" "${programs[@]}"

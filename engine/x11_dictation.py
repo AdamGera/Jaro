@@ -8,6 +8,7 @@ from starlette.concurrency import run_in_threadpool
 
 from linux_capture import CaptureError
 from linux_dictation import LinuxDictation
+from portable_dictation import PASTE_SENT, join_dictation
 from x11_paste import X11Paste
 
 
@@ -32,6 +33,7 @@ class X11Dictation(LinuxDictation):
         self.paste = None
         self.focus = None
         self.focus_revision = 0
+        self.last_insertion = None
         self.listener = None
 
     @property
@@ -192,6 +194,7 @@ class X11Dictation(LinuxDictation):
 
     def clear_focus(self):
         self.focus_revision += 1
+        self.last_insertion = None
         if self.focus is not None:
             focus = self.focus
             self.focus = None
@@ -204,7 +207,9 @@ class X11Dictation(LinuxDictation):
         if focus != self.focus:
             self.clear_focus()
         if focus not in (X.NONE, X.PointerRoot, self.display.screen().root):
-            focus.change_attributes(event_mask=X.FocusChangeMask, onerror=error.CatchError(error.BadWindow))
+            with suppress(error.BadWindow):
+                mask = focus.get_attributes().your_event_mask | X.FocusChangeMask
+                focus.change_attributes(event_mask=mask, onerror=error.CatchError(error.BadWindow))
             self.focus = focus
             self.application = self.focused_application(focus)
 
@@ -217,6 +222,10 @@ class X11Dictation(LinuxDictation):
                     return (names[-1] or names[0])[:256]
                 window = window.query_tree().parent
         return ""
+
+    async def copy_interrupted_text(self, text):
+        self.last_insertion = None
+        return await super().copy_interrupted_text(text)
 
     async def deliver(self, text):
         focus = self.focus
@@ -231,12 +240,17 @@ class X11Dictation(LinuxDictation):
         return deliver
 
     async def paste_to(self, text, focus, allowed, terminal):
+        previous, self.last_insertion = self.last_insertion, None
+        inserted = join_dictation(previous[1], text) if previous and previous[0] == focus else text
         try:
             if self.paste is None:
                 self.paste = X11Paste(self.display)
-            return await self.paste.paste(text, focus, allowed, terminal)
+            result = await self.paste.paste(inserted, focus, allowed, terminal)
         except (OSError, error.DisplayError, error.ConnectionClosedError, error.XError):
             return "Automatic paste was unavailable. Use Copy last to paste the dictation."
+        if result == PASTE_SENT and allowed():
+            self.last_insertion = (focus, inserted)
+        return result
 
     async def disable(self):
         if self.display is not None:

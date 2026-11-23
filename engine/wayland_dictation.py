@@ -419,7 +419,7 @@ class WaylandDictation(LinuxDictation):
                     self.phase = "idle"
                 return "pasted"
             if action in ("start", "toggle") and self.can_start_recording:
-                if self.state.status != "ready" or self.state.portable_recording:
+                if self.state.status != "ready" or self.state.portable_recording or getattr(self.state, "portable_screencast", None):
                     raise CaptureError("Dictation is unavailable while Jaro starts or records audio.")
                 self.schedule()
                 return "starting"
