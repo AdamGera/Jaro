@@ -45,7 +45,7 @@ export function AnnotationAgentPicker({ native, id, annotation, disabled, allowO
   const label = t("Send to your agent")
 
   return <>
-    <Tooltip.Provider delayDuration={300}>
+    <Tooltip.Provider delayDuration={150} skipDelayDuration={300}>
       <Popover.Root open={expanded} onOpenChange={next => {
         if (next) handingOff.current = false
         setExpanded(next)

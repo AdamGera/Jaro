@@ -8,6 +8,7 @@ import { clock } from "@/speaker-activity"
 import type { SavedSession } from "@/audio"
 import { AnnotationAgentPicker, AnnotationDeliveryLog } from "./annotation-destinations"
 import { Button } from "./ui/button"
+import { ActionTooltip } from "./ui/tooltip"
 import { ScreenAreaDialog } from "./screen-area-dialog"
 
 type ImageAsset = { id: string; url: string }
@@ -273,13 +274,15 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
             void add(files)
           }} />
           {screenshots.length > 0 ? <DropdownMenu.Root open={imageMenuOpen} onOpenChange={setImageMenuOpen}>
-            <DropdownMenu.Trigger asChild>
-              <Button variant="outline" size="icon-sm" aria-label={t("Add images")} title={t("Add images")}
-                disabled={loading || mutating} onClick={event => {
-                  // Accessibility can activate a button with a click that has no pointer or key event.
-                  if (event.detail === 0) setImageMenuOpen(open => !open)
-                }}><ImagePlus aria-hidden="true" /></Button>
-            </DropdownMenu.Trigger>
+            <ActionTooltip label={t("Add images")}>
+              <DropdownMenu.Trigger asChild>
+                <Button variant="outline" size="icon-sm" aria-label={t("Add images")}
+                  disabled={loading || mutating} onClick={event => {
+                    // Accessibility can activate a button with a click that has no pointer or key event.
+                    if (event.detail === 0) setImageMenuOpen(open => !open)
+                  }}><ImagePlus aria-hidden="true" /></Button>
+              </DropdownMenu.Trigger>
+            </ActionTooltip>
             <DropdownMenu.Portal>
               <DropdownMenu.Content align="end" className="session-image-menu" sideOffset={5}>
                 <DropdownMenu.Item onSelect={() => input.current?.click()}><ImagePlus aria-hidden="true" />{t("Choose image files…")}</DropdownMenu.Item>
@@ -288,8 +291,10 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
                   <DropdownMenu.Item key={source} onSelect={() => void capture(source)}><Icon aria-hidden="true" />{t(label)}</DropdownMenu.Item>)}
               </DropdownMenu.Content>
             </DropdownMenu.Portal>
-          </DropdownMenu.Root> : <Button variant="outline" size="icon-sm" aria-label={t("Add images")} title={t("Add images")}
-            disabled={loading || mutating} onClick={() => input.current?.click()}><ImagePlus aria-hidden="true" /></Button>}
+          </DropdownMenu.Root> : <ActionTooltip label={t("Add images")}>
+            <Button variant="outline" size="icon-sm" aria-label={t("Add images")}
+              disabled={loading || mutating} onClick={() => input.current?.click()}><ImagePlus aria-hidden="true" /></Button>
+          </ActionTooltip>}
         </>}
         {native && complete && <AnnotationAgentPicker native={native} id={session.id}
           annotation={!!session.annotation} disabled={mutating} allowOpenCode={managed === false}

@@ -1,8 +1,10 @@
 import { useInterfaceLanguage } from "@/interface-language"
 import { Component, lazy, Suspense, useCallback, useDeferredValue, useMemo, useEffect, useRef, useState, type ReactNode, type RefObject } from "react"
+import { createPortal } from "react-dom"
 import { AudioLines, CalendarDays, ChartNoAxesColumnIncreasing, Check, ChevronUp, Clock3, Copy, Download, FileText, LayoutDashboard, ListTree, Pencil, RotateCw, StickyNote, UsersRound } from "lucide-react"
 import { isSettledMeeting, type MeetingBrief, type MeetingExport, type SavedSession, type Transcript } from "@/audio"
 import { clock } from "@/speaker-activity"
+import { overviewDraftKey, readOverviewDraft } from "@/overview-draft"
 import { useOverview, type EditableOverview } from "@/overview"
 import { AudioPlayer, usePlayback } from "./audio-player"
 import { OverviewLanguage, languageName } from "./overview-language"
@@ -14,6 +16,7 @@ import { desktopBridge } from "@/desktop"
 import { SessionImages } from "./session-images"
 import { Button } from "./ui/button"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./ui/tabs"
+import { ActionTooltip } from "./ui/tooltip"
 
 const SpeakerAnalytics = lazy(() => import("./speaker-analytics").then(module => ({ default: module.SpeakerAnalytics })))
 const TimedTranscript = lazy(() => import("./timed-transcript").then(module => ({ default: module.TimedTranscript })))
@@ -26,6 +29,7 @@ type Props = {
   result: Transcript; session?: SavedSession; source: Blob | string | null
   tab: string; onTab: (tab: string) => void
   jump?: number
+  toolbar?: HTMLElement | null
   working: boolean; recording: boolean; liveMeeting: boolean; followLive: boolean; emptyText: string; progress: ReactNode
   copied: boolean; onCopy: () => void
   dictationEnabled: boolean; onDictationBusy: (busy: boolean) => void
@@ -199,23 +203,36 @@ function useMeetingBrief(id?: string, initial?: MeetingBrief | null) {
   return { brief, summarize, pending: queued || !!(action && !action.error), error: action?.error || brief?.error }
 }
 
-function CopyMeetingText({ text, kind }: { text: string; kind: "overview" | "brief" }) {
+function CopyMeetingText({ text, kind, iconOnly = false, onError }: {
+  text: string; kind: "overview" | "brief"; iconOnly?: boolean; onError?: (message: string) => void
+}) {
   const { t } = useInterfaceLanguage()
   const [outcome, setOutcome] = useState<"copied" | "error">()
+  const label = outcome === "copied" ? t("Copied") : t(kind === "overview" ? "Copy overview" : "Copy quick brief")
+  const errorMessage = t(kind === "overview" ? "Could not copy the overview." : "Could not copy the brief.")
   async function copy() {
     try {
       await navigator.clipboard.writeText(text)
+      onError?.("")
       setOutcome("copied")
     } catch {
       setOutcome("error")
+      onError?.(errorMessage)
     }
+  }
+  if (iconOnly) {
+    return <ActionTooltip label={label}>
+      <Button type="button" size="icon-sm" variant="ghost" aria-label={label} onClick={() => void copy()}>
+        {outcome === "copied" ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+      </Button>
+    </ActionTooltip>
   }
   return <>
     <Button type="button" size="sm" variant="ghost" onClick={() => void copy()}>
       {outcome === "copied" ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
-      <span aria-live="polite">{outcome === "copied" ? t("Copied") : t(kind === "overview" ? "Copy overview" : "Copy quick brief")}</span>
+      <span aria-live="polite">{label}</span>
     </Button>
-    {outcome === "error" && <span role="alert">{t(kind === "overview" ? "Could not copy the overview." : "Could not copy the brief.")}</span>}
+    {outcome === "error" && <span role="alert">{errorMessage}</span>}
   </>
 }
 
@@ -253,8 +270,10 @@ function MeetingTitle({ id, title, onRenamed }: { id: string; title: string; onR
 
   if (draft === undefined) return <div className="meeting-title-row">
     <h1 dir="auto">{title}</h1>
-    <Button ref={trigger} size="icon-sm" variant="ghost" aria-label="Rename meeting" title="Rename meeting"
-      onClick={() => setDraft(title)}><Pencil /></Button>
+    <ActionTooltip label={t("Rename meeting")}>
+      <Button ref={trigger} size="icon-sm" variant="ghost" aria-label={t("Rename meeting")}
+        onClick={() => setDraft(title)}><Pencil /></Button>
+    </ActionTooltip>
   </div>
   return <form className="meeting-title-form" onSubmit={event => { event.preventDefault(); void save(draft.trim()) }}
     onKeyDown={event => { if (event.key === "Escape" && !saving) { event.preventDefault(); close() } }}>
@@ -323,7 +342,7 @@ function ManagedMeetingExport({ id, initial, title }: { id: string; initial: Mee
   </>
 }
 
-export function ResultsPanel({ result, session, source, tab, onTab, jump, working, recording, liveMeeting, followLive, emptyText, progress, copied, onCopy, dictationEnabled, onDictationBusy, onMeetingRenamed }: Props) {
+export function ResultsPanel({ result, session, source, tab, onTab, jump, toolbar, working, recording, liveMeeting, followLive, emptyText, progress, copied, onCopy, dictationEnabled, onDictationBusy, onMeetingRenamed }: Props) {
   const { t } = useInterfaceLanguage()
   const complete = session?.status === "complete"
   const reviewable = complete || !!session?.annotation || isSettledMeeting(session)
@@ -337,6 +356,14 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
     .replace(/⟦(\d+(?:\.\d+)?)⟧/g, (_, seconds) => `(${clock(Number(seconds))})`)
   const editRevision = writing?.editRevision
   const [editing, setEditing] = useState<EditableOverview | null>(null)
+  const [overviewCopyError, setOverviewCopyError] = useState<{ key: string; message: string } | null>(null)
+  const sessionId = session?.id
+  const overviewLanguage = version?.language
+  const copyErrorKey = `${sessionId ?? ""}:${tab}:${overviewText ?? ""}`
+  const visibleOverviewCopyError = overviewCopyError?.key === copyErrorKey ? overviewCopyError.message : ""
+  const hasOverviewDraft = useMemo(() => !editing && sessionId && overviewLanguage &&
+    !!readOverviewDraft(overviewDraftKey(sessionId, overviewLanguage)), [editing, sessionId, overviewLanguage])
+  const editLabel = t(hasOverviewDraft ? "Resume overview draft" : "Edit overview")
   const [citation, setCitation] = useState<{ seconds: number } | null>(null)
   const [dock, setDock] = useState<"audio" | "chat" | "expanded" | null>(null)
   const [track, setTrack] = useState<"mix" | "mic" | "system">("mix")
@@ -463,7 +490,39 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
 
   const meetingTitle = session.meetingTitle || session.meetingCalendar?.title || meetingBrief.brief?.title ||
     session.provisionalTitle || draft?.title || version?.title || session.name
+  const canRegenerate = !meetingsManaged && !!writingTab && !!version && !!writing && version.language === writing.target
+  const regenerateLabel = t(writingTab === "overview" ? "Regenerate overview" : "Regenerate timeline")
+  const canCopyOverview = tab === "overview" && !!session.meeting && !!overviewText && !editing
+  const canEditOverview = tab === "overview" && !!version && !!editRevision && !editing
+  const canUseTranscriptTools = tab === "transcript" && !!result.text && !recording && !working
+  const toolbarActions = <>
+    {canUseTranscriptTools && <>
+      <TranscriptFind open={findOpen} onOpen={toggleFind} query={query} onQuery={changeQuery}
+        count={matches.length} index={currentMatch} step={stepMatch} />
+      <ActionTooltip label={copied ? t("Copied") : t("Copy transcript")}>
+        <Button size="icon-sm" variant="ghost" onClick={onCopy} aria-label={copied ? t("Copied") : t("Copy transcript")}>
+          {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+        </Button>
+      </ActionTooltip>
+    </>}
+    {canRegenerate && writingTab && <ActionTooltip label={regenerateLabel}>
+      <Button size="icon-sm" variant="ghost"
+        aria-label={`Regenerate ${writingTab}`}
+        disabled={!!editing || writing.status === "queued" || overview.requesting}
+        onClick={() => overview.regenerate(writingTab)}><RotateCw aria-hidden="true" /></Button>
+    </ActionTooltip>}
+    {canCopyOverview && overviewText && <CopyMeetingText key={overviewText} text={overviewText} kind="overview" iconOnly
+      onError={message => setOverviewCopyError(message ? { key: copyErrorKey, message } : null)} />}
+    {canEditOverview && version && editRevision && <ActionTooltip label={editLabel}>
+      <Button ref={editTrigger} size="icon-sm" variant="ghost"
+        data-draft={hasOverviewDraft || undefined}
+        aria-label={editLabel}
+        disabled={writing?.status === "queued" || overview.requesting}
+        onClick={() => setEditing({ ...version, editRevision })}><Pencil aria-hidden="true" /></Button>
+    </ActionTooltip>}
+  </>
   return <div className="session-sheet">
+    {toolbar && createPortal(toolbarActions, toolbar)}
     <header className="session-heading">
       {complete && session.meeting ? <MeetingTitle id={session.id} title={meetingTitle} onRenamed={onMeetingRenamed} /> :
         <h1 dir="auto">{meetingTitle}</h1>}
@@ -476,24 +535,14 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
         {session.meetingExport && <ManagedMeetingExport key={session.id} id={session.id} initial={session.meetingExport} title={meetingTitle} />}
         {!meetingsManaged && complete && writing?.status !== "empty" && <OverviewLanguage detected={writing?.autoLanguage ?? ""}
           value={writing?.preference ?? "auto"} disabled={!!editing} onSelect={overview.select} />}
-        {!meetingsManaged && writingTab && version && writing && version.language === writing.target && <Button size="sm" variant="ghost" className="regenerate-note"
-          aria-label={`Regenerate ${writingTab}`} title={`Regenerate ${writingTab}`}
-          disabled={!!editing || writing.status === "queued" || overview.requesting}
-          onClick={() => overview.regenerate(writingTab)}><RotateCw aria-hidden="true" /><span>Regenerate</span></Button>}
-        {tab === "overview" && session.meeting && overviewText && !editing &&
-          <CopyMeetingText key={overviewText} text={overviewText} kind="overview" />}
-        {tab === "overview" && version && editRevision && !editing &&
-          <Button ref={editTrigger} size="sm" variant="ghost" className="regenerate-note"
-            aria-label="Edit overview" title="Edit overview"
-            disabled={writing?.status === "queued" || overview.requesting}
-            onClick={() => setEditing({ ...version, editRevision })}><Pencil aria-hidden="true" /><span>{t("Edit")}</span></Button>}
       </div>
+      {visibleOverviewCopyError && <p className="annotation-interruption" role="alert">{visibleOverviewCopyError}</p>}
       {session.annotation && result.interruption && <p className="annotation-interruption" role="alert">{result.interruption}</p>}
       {session.meetingMicrophoneWarning === "digitalSilence" && <p className="annotation-interruption">
         {t("The microphone stopped sending sound during this meeting. Mac audio continued recording.")}
       </p>}
     </header>
-    <Tabs className="transcript-panel" data-finding={findOpen && tab === "transcript"} value={tab} onValueChange={changeTab}>
+    <Tabs className="transcript-panel" value={tab} onValueChange={changeTab}>
       <div className="panel-heading" data-scrolled={scrolled}>
         <TabsList ref={tabList} aria-label="Recording results">
           {(complete || session.annotation) && <TabsTrigger value="overview"><LayoutDashboard aria-hidden="true" className="size-3.5" />{t("Overview")}</TabsTrigger>}
@@ -504,13 +553,6 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
             <ChartNoAxesColumnIncreasing aria-hidden="true" className="size-3.5" />{t("Speaker analytics")}
           </TabsTrigger>}
         </TabsList>
-        {tab === "transcript" && result.text && !recording && !working &&
-          <div className="transcript-tools">
-          <TranscriptFind open={findOpen} onOpen={toggleFind} query={query} onQuery={changeQuery}
-            count={matches.length} index={currentMatch} step={stepMatch} />
-          <Button variant="ghost" className="copy-button" onClick={onCopy} aria-label={copied ? t("Copied") : t("Copy transcript")}>
-            {copied ? <Check /> : <Copy />}<span>{copied ? t("Copied") : t("Copy")}</span>
-          </Button></div>}
       </div>
       <TabsContent value="overview" forceMount={editing ? true : undefined} hidden={tab !== "overview"}
         className="note-body" onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
@@ -530,7 +572,7 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
         </details>}
         {noteStatus}
         {editing ? <Suspense fallback={null}>
-          <OverviewEditor version={editing} onSave={overview.saveEdit} onClose={() => {
+          <OverviewEditor sessionId={session.id} version={editing} onSave={overview.saveEdit} onClose={() => {
             setEditing(null)
             requestAnimationFrame(() => editTrigger.current?.focus({ preventScroll: true }))
           }} />
@@ -600,11 +642,13 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, workin
           </label>}
           <AudioPlayer player={player} />
         </div>
-        <Button ref={audioTrigger} className="audio-launcher" variant="outline" aria-expanded={dock === "audio"}
-          data-playing={player.advancing} aria-controls="session-audio-player" title={dock === "audio" ? "Close audio player" : "Open audio player"}
-          aria-label={dock === "audio" ? "Close audio player" : "Open audio player"} onClick={() => setDock(dock === "audio" ? null : "audio")}>
-          <span ref={waveRef} className="playback-wave" aria-hidden="true"><i /><i /><i /><i /><i /></span><ChevronUp aria-hidden="true" />
-        </Button>
+        <ActionTooltip label={dock === "audio" ? t("Close audio player") : t("Open audio player")} side="top">
+          <Button ref={audioTrigger} className="audio-launcher" variant="outline" aria-expanded={dock === "audio"}
+            data-playing={player.advancing} aria-controls="session-audio-player"
+            aria-label={dock === "audio" ? "Close audio player" : "Open audio player"} onClick={() => setDock(dock === "audio" ? null : "audio")}>
+            <span ref={waveRef} className="playback-wave" aria-hidden="true"><i /><i /><i /><i /><i /></span><ChevronUp aria-hidden="true" />
+          </Button>
+        </ActionTooltip>
       </>}
       {complete && result.text && <Suspense fallback={<button className="chat-launcher" disabled>Opening conversation…</button>}>
         <SessionChat id={session.id} open={dock === "chat" || dock === "expanded"} expanded={dock === "expanded"}

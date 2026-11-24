@@ -4,6 +4,7 @@ import { AlertDialog } from "radix-ui"
 import { Power } from "lucide-react"
 import { desktopBridge } from "@/desktop"
 import { Button } from "./ui/button"
+import { ActionTooltip } from "./ui/tooltip"
 
 export function QuitButton({ recording, recoverable = false, onQuit }: {
   recording: boolean; recoverable?: boolean; onQuit: () => void
@@ -42,9 +43,11 @@ export function QuitButton({ recording, recoverable = false, onQuit }: {
   }
 
   return <AlertDialog.Root onOpenChange={() => setError("")}>
-    <AlertDialog.Trigger asChild>
-      <Button size="icon-sm" variant="ghost" title="Quit Jaro Everywhere" aria-label="Quit Jaro Everywhere"><Power /></Button>
-    </AlertDialog.Trigger>
+    <ActionTooltip label={t("Quit Jaro Everywhere")}>
+      <AlertDialog.Trigger asChild>
+        <Button size="icon-sm" variant="ghost" aria-label="Quit Jaro Everywhere"><Power /></Button>
+      </AlertDialog.Trigger>
+    </ActionTooltip>
     <AlertDialog.Portal>
       <AlertDialog.Overlay className="note-language-scrim" />
       <AlertDialog.Content className="note-language-confirm" onEscapeKeyDown={event => { if (busy) event.preventDefault() }}>

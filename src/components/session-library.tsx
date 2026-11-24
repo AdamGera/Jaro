@@ -365,7 +365,7 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
   </nav>
 
   const visibleSettings = settingsPages.filter(({ id }) => settings?.[id])
-  return <Tooltip.Provider delayDuration={360} skipDelayDuration={100}><div ref={workspaceFrame} className="workspace-frame"
+  return <Tooltip.Provider delayDuration={150} skipDelayDuration={300}><div ref={workspaceFrame} className="workspace-frame"
     data-sidebar={expanded && !compact} onPointerMove={event => {
       if (event.pointerType !== "touch") scrollPointer.current = [event.clientX, event.clientY]
     }} onPointerLeave={() => { scrollPointer.current = null }}>

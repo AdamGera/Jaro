@@ -7,6 +7,7 @@ import { desktopBridge } from "@/desktop"
 import { copySavedMeetingTranscript } from "@/desktop-meeting"
 import { isSettledMeeting, type SavedSession, type Transcript } from "@/audio"
 import { Button } from "@/components/ui/button"
+import { ActionTooltip } from "@/components/ui/tooltip"
 
 export type DownloadItem = {
   id: string
@@ -146,24 +147,34 @@ export function Downloads({ item, compact = false, onAudioRemoved }: {
       {!compact && <><span className="download-source" aria-hidden="true">{item.recording ? <Mic /> : <FileAudio />}</span>
       <span className="download-name" title={item.audioName || item.name} dir="auto">{item.audioName || item.name}</span></>}
       <div className="download-actions">
-        {bridge && item.audioUrl ? <Button variant="ghost" size="icon-sm" aria-label={`${mediaLabel} for ${item.name}`}
-          title={mediaLabel} onClick={() => void revealMedia()}><MediaIcon /></Button> : item.audioUrl ? <Button asChild variant="ghost" size="icon-sm">
-          <a href={item.audioUrl} download={item.audioName || item.name} aria-label={`${mediaLabel} for ${item.name}`} title={mediaLabel}><MediaIcon /></a>
-        </Button> : item.audio && <Button variant="ghost" size="icon-sm" aria-label={`Download audio for ${item.name}`}
-          title="Download audio" onClick={() => downloadAudio(item.audio!, item.name)}><FileAudio /></Button>}
-        {item.transcript && <Button variant="ghost" size="icon-sm" aria-label={`Download JSON transcript for ${item.name}`}
-          title="Download transcript as JSON" onClick={() => bridge ? void exportSaved("json") : downloadTranscript(item)}><FileJson /></Button>}
+        {bridge && item.audioUrl ? <ActionTooltip label={mediaLabel}>
+          <Button variant="ghost" size="icon-sm" aria-label={`${mediaLabel} for ${item.name}`}
+            onClick={() => void revealMedia()}><MediaIcon /></Button>
+        </ActionTooltip> : item.audioUrl ? <ActionTooltip label={mediaLabel}>
+          <Button asChild variant="ghost" size="icon-sm">
+            <a href={item.audioUrl} download={item.audioName || item.name} aria-label={`${mediaLabel} for ${item.name}`}><MediaIcon /></a>
+          </Button>
+        </ActionTooltip> : item.audio && <ActionTooltip label={t("Download audio")}>
+          <Button variant="ghost" size="icon-sm" aria-label={`Download audio for ${item.name}`}
+            onClick={() => downloadAudio(item.audio!, item.name)}><FileAudio /></Button>
+        </ActionTooltip>}
+        {item.transcript && <ActionTooltip label={t("Download transcript as JSON")}>
+          <Button variant="ghost" size="icon-sm" aria-label={`Download JSON transcript for ${item.name}`}
+            onClick={() => bridge ? void exportSaved("json") : downloadTranscript(item)}><FileJson /></Button>
+        </ActionTooltip>}
         {item.saved?.meeting && <DropdownMenu.Root open={meetingExportsOpen} onOpenChange={open => {
           setMeetingExportsOpen(open)
           if (open && transcriptCopy === "copied") setTranscriptCopy(undefined)
         }}>
-          <DropdownMenu.Trigger asChild><Button variant="ghost" size="icon-sm" title="Meeting exports" aria-label="Meeting exports"
-            onClick={event => {
-              // macOS accessibility can activate the button through a click alone.
-              if (event.detail === 0) setMeetingExportsOpen(open => !open)
-            }}>
-            {transcriptCopy === "copied" ? <Check aria-hidden="true" /> : <Download aria-hidden="true" />}
-          </Button></DropdownMenu.Trigger>
+          <ActionTooltip label={t("Meeting exports")}>
+            <DropdownMenu.Trigger asChild><Button variant="ghost" size="icon-sm" aria-label="Meeting exports"
+              onClick={event => {
+                // macOS accessibility can activate the button through a click alone.
+                if (event.detail === 0) setMeetingExportsOpen(open => !open)
+              }}>
+              {transcriptCopy === "copied" ? <Check aria-hidden="true" /> : <Download aria-hidden="true" />}
+            </Button></DropdownMenu.Trigger>
+          </ActionTooltip>
           <DropdownMenu.Portal><DropdownMenu.Content align="end" className="meeting-export-menu" sideOffset={5}>
             {settledMeeting && <DropdownMenu.Item disabled={transcriptCopy === "pending"}
               onSelect={() => { void copyMeeting() }}>{t("Copy transcript")}</DropdownMenu.Item>}

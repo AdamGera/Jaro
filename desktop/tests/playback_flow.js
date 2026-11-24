@@ -60,8 +60,26 @@
         await until(() => !document.querySelector(".dictation-tour"), "Tour dismissed")
       }
     }
-    if (!one(".session-heading h1")) await click(".library-open")
+    if (!one(".session-heading h1")) {
+      const rows = await fetch("/api/sessions", { cache: "no-store" }).then(response => response.json())
+      if (rows[0]?.status === "processing") {
+        history.pushState(null, "", `?session=${rows[0].id}&tab=transcript`)
+        window.dispatchEvent(new PopStateEvent("popstate"))
+      } else {
+        await click(".library-open")
+      }
+    }
     await until(()=>audio()?.readyState>=1,"Audio metadata")
+    if (!one(".session-heading h1")) {
+      // Transition the open processing session to complete without reloading or switching sessions.
+      await fetch("/__parity/complete",{method:"POST",headers:{"x-parity-token":token}})
+      await until(()=>one(".session-heading h1") && audio()?.readyState>=1,"Audio ready after completion transition")
+      await click(".audio-launcher")
+      await click('.play-button[aria-label="Play"]')
+      await until(()=>!audio().paused && audio().currentTime>.25 && Math.max(...levels().filter(Number.isFinite),0)>.45,"Immediate playback after completion")
+      results.afterCompletion=+audio().currentTime.toFixed(2)
+      await close()
+    }
     await click('[role="tab"][id$="-trigger-timeline"]')
     await seekAndShow('.topic-list button',0,"chapter")
     const painted=()=>[...document.querySelectorAll(".playback-wave i")].map(el=>el.getBoundingClientRect().height)
@@ -82,6 +100,12 @@
     await seekAndShow('.topic-list li:nth-child(2) button',35,"newSeekDuringPlayback")
     await close()
     await click('[role="tab"][id$="-trigger-transcript"]')
+    const toolbar = ".workspace-actions .session-toolbar-slot"
+    await until(() => one(toolbar + ' button[aria-label="Copy transcript"]'), "Copy transcript in the top toolbar")
+    await click(toolbar + ' button[aria-label="Search transcript"]')
+    await until(() => one(toolbar + ' input[aria-label="Search transcript"]'), "Transcript search opens in the top toolbar")
+    await click(toolbar + ' button[aria-label="Close search"]')
+    results.transcriptToolbar = true
     await seekAndShow('.speaker-heading button[aria-label*="0:17"]',17,"turn")
     await close()
     await seekAndShow('.transcript-word[data-word="1"]',17/15,"word")

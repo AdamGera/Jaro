@@ -67,19 +67,25 @@ def seed(root, playback=False):
         store.append(key, dict(text=text,language="English",segments=[dict(speaker=speaker,start=start,end=end,text=text)],
             words=[dict(text=w,speaker=speaker,start=start+i*(end-start)/len(words),end=start+(i+1)*(end-start)/len(words),blockStart=start)
                    for i,w in enumerate(words)], activity=[dict(speaker=speaker,start=start,end=end)]), end)
-    store.finish(key)
-    version = dict(title="Listening Test Review",language="en",
-                   summary="The team reviewed headphone recording and agreed on a small change to make microphone and Mac audio levels easier to check.",
-                   markdown="## Recording controls\n\nBoth voices were audible through headphones. The team wants to keep **both input meters** visible before recording.\n\n## Next steps\n\n- Keep the source selector beside Record.\n- Check timestamps on a longer call.\n- Review the result together on Friday.",
-                   topics=[dict(id=1,start=0,label="Listening test",detail="The team confirmed that both voices were clear through headphones."),
-                           dict(id=2,start=35,label="Recording controls",detail="Keep the source selector and both level meters close to Record."),
-                           dict(id=3,start=76,label="Friday review",detail="Compare the results of the longer call together.")])
-    with store.connection() as db:
-        publish(db,key,"en",version)
-        db.execute("UPDATE sessions SET created=? WHERE id=?", ("2026-11-19T07:00:00+00:00",key))
-        db.execute("""INSERT INTO chat_turns(id,message_id,question,answer,status,source_digest)
-                    SELECT id,?,?,?,?,source_digest FROM notes WHERE id=?""",
-                   ("visual-smoke","What did we decide?","Keep both input meters visible and test the timing on a longer call." + (" ⟦35⟧" if playback else ""),"complete",key))
+
+    def complete():
+        store.finish(key)
+        version = dict(title="Listening Test Review",language="en",
+                       summary="The team reviewed headphone recording and agreed on a small change to make microphone and Mac audio levels easier to check.",
+                       markdown="## Recording controls\n\nBoth voices were audible through headphones. The team wants to keep **both input meters** visible before recording.\n\n## Next steps\n\n- Keep the source selector beside Record.\n- Check timestamps on a longer call.\n- Review the result together on Friday.",
+                       topics=[dict(id=1,start=0,label="Listening test",detail="The team confirmed that both voices were clear through headphones."),
+                               dict(id=2,start=35,label="Recording controls",detail="Keep the source selector and both level meters close to Record."),
+                               dict(id=3,start=76,label="Friday review",detail="Compare the results of the longer call together.")])
+        with store.connection() as db:
+            publish(db,key,"en",version)
+            db.execute("UPDATE sessions SET created=? WHERE id=?", ("2026-11-19T07:00:00+00:00",key))
+            db.execute("""INSERT INTO chat_turns(id,message_id,question,answer,status,source_digest)
+                        SELECT id,?,?,?,?,source_digest FROM notes WHERE id=?""",
+                       ("visual-smoke","What did we decide?","Keep both input meters visible and test the timing on a longer call." + (" ⟦35⟧" if playback else ""),"complete",key))
+
+    if not playback:
+        complete()
+    return complete
 
 
 def contents(dist):
@@ -151,7 +157,8 @@ def main():
         from fastapi.staticfiles import StaticFiles
         import uvicorn
         import server
-        seed(library, playback=args.playback)
+        complete_session=None
+        completed=False
         dist=REPO/"dist"
         app_binary=None
         debug_binary=args.qa_executable.resolve() if args.qa_executable else None
@@ -194,16 +201,27 @@ def main():
         def config(request: Request):
             check(request)
             return mode
+        @server.app.post("/__parity/complete")
+        def complete_fixture(request: Request):
+            nonlocal completed
+            check(request)
+            if not completed:
+                complete_session()
+                completed=True
+            return {"ok":True}
         @server.app.post("/__parity/report")
         async def report(request: Request):
             check(request)
             reports.put(await request.json())
             return {"ok":True}
         async def ready(app):
+            nonlocal complete_session
             # Fixtures exercise real persistence and presentation without a microphone or model downloads.
+            complete_session=seed(library, playback=args.playback)
             app.state.status="ready"
             app.state.diarizer=object()
         server.load_model=ready
+        server.DIST=test_dist
         server.app.mount("/",StaticFiles(directory=test_dist,html=True))
         runner=uvicorn.Server(uvicorn.Config(server.app,access_log=False,log_level="warning",timeout_graceful_shutdown=1))
         thread=threading.Thread(target=runner.run,kwargs={"sockets":[sock]},daemon=True)
@@ -230,6 +248,8 @@ def main():
                             data=reports.get(timeout=.25)
                             assert "error" not in data, data
                             assert data["desktop"] == (label in ("native", "production")),"The shipping JS bridge did not match this host."
+                            if args.playback:
+                                assert "afterCompletion" in data["frames"], "Playback did not exercise session completion."
                             (directory/"dom.json").write_text(json.dumps(data,indent=2))
                             if snapshots:
                                 assert all((directory/(s+".png")).is_file() for s in data["frames"])
@@ -247,10 +267,11 @@ def main():
             size=(1050,760)
             if args.playback:
                 render(ref,"reference","playback",size,False)
-                if debug_binary:
-                    render(debug_binary,"native","playback",size,False)
-                if args.browser_driver:
-                    render(args.browser_driver.resolve(),"browser","playback",size,False)
+                for binary, label in ((debug_binary, "native"), (args.browser_driver, "browser")):
+                    if binary:
+                        complete_session = seed(library, playback=True)
+                        completed = False
+                        render(binary.resolve(),label,"playback",size,False)
                 return
             actual=render(app_binary,"production","system",size,False) if app_binary else None
             if actual:

@@ -1,6 +1,8 @@
 import { ChevronDown, ChevronUp, Search, X } from "lucide-react"
 import { useEffect, useRef } from "react"
+import { useInterfaceLanguage } from "@/interface-language"
 import { Button } from "./ui/button"
+import { ActionTooltip } from "./ui/tooltip"
 
 type Props = {
   open: boolean; onOpen: (open: boolean) => void
@@ -8,7 +10,10 @@ type Props = {
   count: number; index: number; step: (distance: number) => void
 }
 
+const findShortcut = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘ F" : "Ctrl F"
+
 export function TranscriptFind({ open, onOpen, query, onQuery, count, index, step }: Props) {
+  const { t } = useInterfaceLanguage()
   const input = useRef<HTMLInputElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
   useEffect(() => {
@@ -18,13 +23,13 @@ export function TranscriptFind({ open, onOpen, query, onQuery, count, index, ste
     onOpen(false)
     requestAnimationFrame(() => trigger.current?.focus({ preventScroll: true }))
   }
-  return open ? <div className="transcript-find" role="search" aria-label="Find in transcript"
+  return open ? <div className="transcript-find" role="search" aria-label={t("Find in transcript")}
     onKeyDown={event => {
       if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close() }
     }}>
     <Search aria-hidden="true" />
     <input ref={input} type="text" dir="auto" spellCheck={false} autoComplete="off"
-      placeholder="Find in transcript" aria-label="Search transcript" value={query}
+      placeholder={t("Find in transcript")} aria-label={t("Search transcript")} value={query}
       onChange={event => onQuery(event.target.value)}
       onKeyDown={event => {
         if (event.key === "Enter" && !event.nativeEvent.isComposing) {
@@ -34,9 +39,17 @@ export function TranscriptFind({ open, onOpen, query, onQuery, count, index, ste
       }} />
     {query.trim() && <span role="status" aria-label={count ? `Match ${index + 1} of ${count}` : "No matches"}>
       {count ? `${index + 1}/${count}` : "0"}</span>}
-    <Button size="icon-xs" variant="ghost" disabled={count < 2} aria-label="Previous match" title="Previous match" onClick={() => step(-1)}><ChevronUp /></Button>
-    <Button size="icon-xs" variant="ghost" disabled={count < 2} aria-label="Next match" title="Next match" onClick={() => step(1)}><ChevronDown /></Button>
-    <Button size="icon-xs" variant="ghost" aria-label="Close search" title="Close search" onClick={close}><X /></Button>
-  </div> : <Button ref={trigger} size="icon-sm" variant="ghost" className="find-trigger" aria-expanded={false}
-    aria-label="Search transcript" title="Search transcript" onClick={() => onOpen(true)}><Search /></Button>
+    <ActionTooltip label={t("Previous match")}>
+      <Button size="icon-xs" variant="ghost" disabled={count < 2} aria-label={t("Previous match")} onClick={() => step(-1)}><ChevronUp /></Button>
+    </ActionTooltip>
+    <ActionTooltip label={t("Next match")}>
+      <Button size="icon-xs" variant="ghost" disabled={count < 2} aria-label={t("Next match")} onClick={() => step(1)}><ChevronDown /></Button>
+    </ActionTooltip>
+    <ActionTooltip label={t("Close search")}>
+      <Button size="icon-xs" variant="ghost" aria-label={t("Close search")} onClick={close}><X /></Button>
+    </ActionTooltip>
+  </div> : <ActionTooltip label={t("Search transcript")} shortcut={findShortcut}>
+    <Button ref={trigger} size="icon-sm" variant="ghost" className="find-trigger" aria-expanded={false}
+      aria-label={t("Search transcript")} onClick={() => onOpen(true)}><Search /></Button>
+  </ActionTooltip>
 }

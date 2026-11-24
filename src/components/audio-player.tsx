@@ -12,25 +12,43 @@ function seekableTime(seconds: number, duration: number) {
 
 export function usePlayback(source: Blob | string | null, transcriptDuration: number | null, onStart: () => void) {
   const audio = useRef<HTMLAudioElement>(null)
+  const detached = useRef<{ element: HTMLAudioElement; time: number; playing: boolean } | null>(null)
+  const [mount, setMount] = useState(0)
+  const attachAudio = useCallback((node: HTMLAudioElement | null) => {
+    const previous = audio.current
+    if (previous === node) return
+    if (previous && !node) {
+      detached.current = { element: previous, time: previous.ended ? 0 : previous.currentTime, playing: !previous.paused }
+    } else if (node && detached.current?.element === node) {
+      detached.current = null
+    }
+    audio.current = node
+    setMount(count => count + 1)
+  }, [])
   const wave = useRef<HTMLSpanElement>(null)
   const meter = useRef<ReturnType<typeof createPlaybackWaveform> | null>(null)
   const [time, setTime] = useState(0)
-  const [playing, setPlaying] = useState(false)
-  const [advancing, setAdvancing] = useState(false)
-  const [mediaDuration, setMediaDuration] = useState(0)
-  const [ready, setReady] = useState(false)
-  const [error, setError] = useState("")
+  const [playback, setPlayback] = useState<{ mount: number; source: Blob | string; playing: boolean; advancing: boolean } | null>(null)
+  const [loaded, setLoaded] = useState<{ mount: number; source: Blob | string; duration: number } | null>(null)
+  const [failure, setFailure] = useState<{ mount: number; source: Blob | string; message: string } | null>(null)
   const switching = useRef<{ source: string | Blob; time: number; playing: boolean } | null>(null)
+  const isCurrent = (state: { mount: number; source: Blob | string } | null) =>
+    mount > 0 && !!source && state?.mount === mount && state.source === source
+  const ready = isCurrent(loaded)
+  const mediaDuration = ready && loaded ? loaded.duration : 0
+  const playing = isCurrent(playback) && !!playback?.playing
+  const advancing = isCurrent(playback) && !!playback?.advancing
+  const error = isCurrent(failure) && failure ? failure.message : ""
   const duration = mediaDuration || transcriptDuration || 0
 
-  const prepareMeter = useCallback((el: HTMLAudioElement) => {
+  const prepareMeter = useCallback(async (el: HTMLAudioElement) => {
     if (!wave.current || typeof AudioContext === "undefined") return
     try {
       if (meter.current?.element !== el) {
         meter.current?.close()
         meter.current = createPlaybackWaveform(el)
       }
-      void meter.current.connect().catch(() => {})
+      await meter.current.connect()
     } catch { /* Playback still works if audio analysis is unavailable. */ }
   }, [])
   useEffect(() => () => {
@@ -40,8 +58,9 @@ export function usePlayback(source: Blob | string | null, transcriptDuration: nu
 
   useEffect(() => {
     const el = audio.current
-    if (!el || !source) return
-    let url = typeof source === "string" ? source : URL.createObjectURL(source)
+    if (!mount || !el || !source) return
+    const currentSource = source
+    let url = typeof currentSource === "string" ? currentSource : URL.createObjectURL(currentSource)
     function release() {
       if (url.startsWith("blob:")) URL.revokeObjectURL(url)
     }
@@ -64,26 +83,25 @@ export function usePlayback(source: Blob | string | null, transcriptDuration: nu
       started = false
       cancelAnimationFrame(frame)
       sync()
-      setAdvancing(false)
-      setPlaying(false)
+      setPlayback({ mount, source: currentSource, playing: false, advancing: false })
     }
     const prepare = async () => {
       if (preparing) {
-        setError("This audio could not be played.")
+        setFailure({ mount, source: currentSource, message: "This audio could not be played." })
         return
       }
       preparing = true
-      setReady(false)
+      setLoaded(current => current?.mount === mount && current.source === currentSource ? null : current)
       try {
-        const options = new URLSearchParams()
-        if (typeof source === "string") {
-          const address = new URL(source, location.href)
-          options.set("saved", address.pathname.split("/")[3])
+        const params = new URLSearchParams()
+        if (typeof currentSource === "string") {
+          const address = new URL(currentSource, location.href)
+          params.set("saved", address.pathname.split("/")[3])
           const track = address.searchParams.get("track")
-          if (track) options.set("track", track)
+          if (track) params.set("track", track)
         }
-        const response = await fetch(`/api/playback${options.size ? `?${options}` : ""}`, {
-          method: "POST", body: typeof source === "string" ? undefined : source, headers: { "Content-Type": "application/octet-stream" }, signal: abort.signal,
+        const response = await fetch(`/api/playback${params.size ? `?${params}` : ""}`, {
+          method: "POST", body: typeof currentSource === "string" ? undefined : currentSource, headers: { "Content-Type": "application/octet-stream" }, signal: abort.signal,
         })
         if (!response.ok) throw new Error()
         const playable = await response.blob()
@@ -92,63 +110,93 @@ export function usePlayback(source: Blob | string | null, transcriptDuration: nu
         url = URL.createObjectURL(playable)
         el.src = url
       } catch {
-        if (!abort.signal.aborted) setError("This audio could not be played.")
+        if (!abort.signal.aborted) setFailure({ mount, source: currentSource, message: "This audio could not be played." })
       }
     }
     el.addEventListener("loadedmetadata", () => {
       if (!Number.isFinite(el.duration) || el.duration <= 0) { void prepare(); return }
-      setMediaDuration(el.duration)
-      setReady(true)
-      if (switching.current?.source === source) {
+      setLoaded({ mount, source: currentSource, duration: el.duration })
+      if (switching.current?.source === currentSource) {
         const saved = switching.current
         switching.current = null
         if (saved.time > 0) el.currentTime = seekableTime(saved.time, el.duration)
         sync()
         if (saved.playing) void el.play().catch(() => {})
+      } else {
+        sync()
       }
     }, options)
     el.addEventListener("error", prepare, options)
-    el.addEventListener("play", () => setPlaying(true), options)
+    el.addEventListener("play", () => setPlayback(current => ({
+      mount, source: currentSource, playing: true, advancing: current?.mount === mount && current.source === currentSource ? current.advancing : false,
+    })), options)
     for (const event of ["waiting", "seeking"]) el.addEventListener(event, () => {
       cancelAnimationFrame(frame)
-      setAdvancing(false)
+      setPlayback(current => ({
+        mount, source: currentSource, playing: current?.mount === mount && current.source === currentSource ? current.playing : !el.paused, advancing: false,
+      }))
     }, options)
     el.addEventListener("playing", () => {
       if (!started) {
         started = true
         onStart()
-        prepareMeter(el)
+        void prepareMeter(el)
       }
       cancelAnimationFrame(frame)
-      setError("")
-      setAdvancing(true)
+      setFailure(current => current?.mount === mount && current.source === currentSource ? null : current)
+      setPlayback({ mount, source: currentSource, playing: true, advancing: true })
       tick()
     }, options)
     for (const event of ["pause", "ended"]) el.addEventListener(event, pause, options)
-    for (const event of ["seeked", "timeupdate"]) el.addEventListener(event, sync, options)
+    el.addEventListener("seeked", () => {
+      sync()
+      if (!el.paused) {
+        cancelAnimationFrame(frame)
+        setPlayback({ mount, source: currentSource, playing: true, advancing: true })
+        tick()
+      }
+    }, options)
+    el.addEventListener("timeupdate", sync, options)
     el.src = url
     return () => {
+      const saved = detached.current?.element === el ? detached.current : null
+      if (saved) detached.current = null
+      if (audio.current && audio.current !== el && !switching.current && saved && (saved.playing || saved.time > 0)) {
+        switching.current = { source: currentSource, time: saved.time, playing: saved.playing }
+      }
       abort.abort()
       cancelAnimationFrame(frame)
       el.pause()
       el.removeAttribute("src")
       el.load()
       release()
+      if (audio.current !== el && meter.current?.element === el) {
+        meter.current.close()
+        meter.current = null
+      }
     }
-  }, [source, onStart, prepareMeter])
+  }, [mount, source, onStart, prepareMeter])
 
   const play = useCallback(() => {
     const el = audio.current
-    if (!el) return
-    // Resume Web Audio during the same user gesture as media playback.
-    prepareMeter(el)
+    if (!el || !source) return
     const continuing = !el.paused
-    void el.play().then(() => {
-      if (continuing && !el.paused && el === audio.current) onStart()
-    }).catch((reason: Error) => {
-      if (reason.name !== "AbortError") setError("Playback could not start.")
-    })
-  }, [onStart, prepareMeter])
+    const start = () => {
+      if (el !== audio.current) return
+      void el.play().then(() => {
+        if (continuing && !el.paused && el === audio.current) onStart()
+      }).catch((reason: Error) => {
+        if (reason.name !== "AbortError") setFailure({ mount, source, message: "Playback could not start." })
+      })
+    }
+    // Connect Web Audio before starting playback; attaching MediaElementAudioSourceNode
+    // after AVFoundation begins playing without a seek can silence WebKit's analyser output.
+    if (!wave.current || typeof AudioContext === "undefined") {
+      start()
+      return
+    }
+    void prepareMeter(el).then(start)
+  }, [mount, source, onStart, prepareMeter])
 
   const seek = useCallback((seconds: number, startPlaying = false) => {
     const el = audio.current
@@ -170,20 +218,16 @@ export function usePlayback(source: Blob | string | null, transcriptDuration: nu
     if (!el || next === source) return
     switching.current = { source: next, time: switching.current?.time ?? (el.ended ? 0 : el.currentTime),
       playing: switching.current?.playing ?? !el.paused }
-    setReady(false)
-    setPlaying(false)
-    setAdvancing(false)
-    setError("")
   }
 
-  return { audio, wave, time, playing, advancing, duration, ready, error, seek, toggle, prepareSwitch }
+  return { audio, attachAudio, wave, time, playing, advancing, duration, ready, error, seek, toggle, prepareSwitch }
 }
 
 export function AudioPlayer({ player }: { player: ReturnType<typeof usePlayback> }) {
   const { t } = useInterfaceLanguage()
-  const { audio, time, duration, ready, playing, error, seek, toggle } = player
+  const { attachAudio, time, duration, ready, playing, error, seek, toggle } = player
   return <div className="audio-player" role="group" aria-label="Audio player">
-    <audio ref={audio} preload="metadata" />
+    <audio ref={attachAudio} preload="metadata" />
     <div className="transport">
       <Button variant="ghost" size="icon-sm" disabled={!ready} aria-label="Back 10 seconds" title="Back 10 seconds" onClick={() => seek(time - 10)}><RotateCcw /><span className="skip-seconds" aria-hidden="true">10</span></Button>
       <Button className="play-button" size="icon" disabled={!ready} aria-label={playing ? "Pause" : t("Play")} onClick={toggle}>

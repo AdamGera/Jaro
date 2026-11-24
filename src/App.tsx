@@ -30,6 +30,7 @@ import { Downloads, type DownloadItem } from "@/components/downloads"
 import { LanguagePicker, type Language } from "@/components/language-picker"
 import { Button } from "@/components/ui/button"
 import { Progress } from "@/components/ui/progress"
+import { ActionTooltip } from "@/components/ui/tooltip"
 import {
   EMPTY_TRANSCRIPT,
   isSettledMeeting,
@@ -96,6 +97,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   const calls = usePortableCalls(hasPortableAudio && !native)
   const detectedRecording = calls.status?.active
   const workspaceActions = useRef<HTMLElement>(null)
+  const [sessionToolbar, setSessionToolbar] = useState<HTMLDivElement | null>(null)
   useEffect(() => {
     const toolbar = workspaceActions.current
     if (!native || !toolbar) return
@@ -933,10 +935,13 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           <span className="wordmark-text">Jaro</span>
         </div>
         <nav ref={workspaceActions} className="workspace-actions" aria-label="Session actions">
+          <div ref={setSessionToolbar} className="session-toolbar-slot" />
           {viewingSession && <Downloads key={current?.id} item={current} compact onAudioRemoved={sessionMediaRemoved} />}
           {hasPortableScreenRecording && !viewingSession && <PortableScreenRecording disabled={!canRecord} onBusy={setScreenBusy}
             languageCodes={selectedLanguages.map(language => language.code)} onSave={openAcceptedSession} />}
-          <Button size="sm" variant="ghost" disabled={phase !== "idle" || restoring || dictating || screenBusy} onClick={newSession} title={t("New session")} aria-label={t("New session")}><Plus /><span>{t("New session")}</span></Button>
+          <ActionTooltip label={t("New session")}>
+            <Button size="sm" variant="ghost" disabled={phase !== "idle" || restoring || dictating || screenBusy} onClick={newSession} aria-label={t("New session")}><Plus /><span>{t("New session")}</span></Button>
+          </ActionTooltip>
           <QuitButton recording={recording || phase === "starting" || dictating || screenBusy || !!detectedRecording} recoverable={hasPortableAudio} onQuit={onQuit} />
         </nav>
       </header>
@@ -947,7 +952,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         <ResultsPanel key={phase === "idle" && current ? current.id : "capture"}
           session={phase === "idle" ? current?.saved : undefined} result={result} source={phase === "idle" && current ? current.audioUrl ?? current.audio ?? null : null}
           tab={tab} onTab={changeTab} working={working} recording={recording} liveMeeting={(recording || phase === "transcribing") && !!liveMeeting}
-          followLive={recording && !meetingStopPending} jump={jump}
+          followLive={recording && !meetingStopPending} jump={jump} toolbar={sessionToolbar}
           dictationEnabled={status === "ready" && phase === "idle" && !choosingFile}
           onDictationBusy={setDictating}
           onMeetingRenamed={(id, title, meetingExport) => {

@@ -4,8 +4,10 @@ import { Popover } from "radix-ui"
 import { portableScreenTargets, type CaptureTarget, type ScreenArea } from "@/portable-capture"
 import { clock } from "@/speaker-activity"
 import { Button } from "./ui/button"
+import { ActionTooltip } from "./ui/tooltip"
 import { ScreenAreaDialog } from "./screen-area-dialog"
 import { ScreencastDrawing } from "./screencast-drawing"
+import { useInterfaceLanguage } from "@/interface-language"
 
 const endpoint = "/api/portable/screencast"
 export const hasPortableScreenRecording = document.documentElement.hasAttribute("data-jaro-screen-recording")
@@ -50,6 +52,7 @@ export function PortableScreenRecording({ disabled, languageCodes, onBusy, onSav
   onBusy: (busy: boolean) => void
   onSave: (id: string) => Promise<void>
 }) {
+  const { t } = useInterfaceLanguage()
   const [available, setAvailable] = useState<Sources>({ sources: [] })
   const [picker, setPicker] = useState<{ source: Source; targets: CaptureTarget[] }>()
   const [take, setTake] = useState<Take>(idle)
@@ -193,12 +196,14 @@ export function PortableScreenRecording({ disabled, languageCodes, onBusy, onSav
   const canSave = take.phase === "recording" || take.phase === "recorded"
   const preview = take.preview
   return <><Popover.Root open={expanded} onOpenChange={open => { setExpanded(open); if (!open) setPicker(undefined) }}>
-    <Popover.Trigger asChild>
-      <Button size="sm" variant="ghost" aria-label={active ? "Manage screen recording" : "Record screen"}
-        title={active ? "Manage screen recording" : "Record screen"} disabled={!active && (disabled || pending)}>
-        <Video /><span>{active ? "Screen recording" : "Record screen"}</span>
-      </Button>
-    </Popover.Trigger>
+    <ActionTooltip label={t(active ? "Manage screen recording" : "Record screen")}>
+      <Popover.Trigger asChild>
+        <Button size="sm" variant="ghost" aria-label={active ? "Manage screen recording" : "Record screen"}
+          disabled={!active && (disabled || pending)}>
+          <Video /><span>{active ? "Screen recording" : "Record screen"}</span>
+        </Button>
+      </Popover.Trigger>
+    </ActionTooltip>
     <Popover.Portal>
       <Popover.Content align="end" sideOffset={8} className="portable-screen-recording" aria-label="Screen recording">
         {take.phase !== "idle" ? <>
