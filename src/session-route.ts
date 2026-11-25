@@ -1,4 +1,4 @@
-import { desktopBridge } from "./desktop"
+import { isDesktopWorkspace, readWorkspaceDraft, rememberWorkspaceDraft } from "./workspace-drafts"
 import type { SavedSession } from "./audio"
 
 const sessionId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
@@ -13,13 +13,13 @@ const desktopLocation = "jard.lastSession"
 
 // Restore the last document for Finder launches. An explicit URL always wins, and
 // regular browser tabs continue to use their own URL and history independently.
-if (desktopBridge()) {
+if (isDesktopWorkspace()) {
   const url = new URL(window.location.href)
   const changed = url.searchParams.has("jard-launch")
   url.searchParams.delete("jard-launch")
   try {
     if (!url.searchParams.has("session")) {
-      const saved = JSON.parse(localStorage.getItem(desktopLocation) ?? "null") as { id: string; tab: string } | null
+      const saved = readWorkspaceDraft(desktopLocation) as { id: string; tab: string } | null
       if (saved && sessionId.test(saved.id) && tabs.has(saved.tab)) {
         url.searchParams.set("session", saved.id)
         url.searchParams.set("tab", saved.tab)
@@ -45,11 +45,8 @@ export function writeSessionRoute(id: string | null, tab = "overview", replace =
   else { url.searchParams.delete("session"); url.searchParams.delete("tab") }
   if (id && tab === "transcript" && at !== undefined) url.searchParams.set("at", String(at))
   else url.searchParams.delete("at")
-  if (desktopBridge()) {
-    try {
-      if (id) localStorage.setItem(desktopLocation, JSON.stringify({ id, tab }))
-      else localStorage.removeItem(desktopLocation)
-    } catch { /* Session URLs remain usable without preferences. */ }
+  if (isDesktopWorkspace()) {
+    rememberWorkspaceDraft(desktopLocation, id ? { id, tab } : null)
   }
   if (url.href === window.location.href) return
   if (replace) history.replaceState(null, "", url)

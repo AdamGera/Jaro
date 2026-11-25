@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { Activity, Clipboard, Keyboard, Languages, Mic, Play, Sparkles, Terminal, Volume2 } from "lucide-react"
 import { useInterfaceLanguage } from "@/interface-language"
 import { dictationSoundStyles, type DictationHistory, type DictationOutputPreview, type DictationOutputProfiles,
-  type DictationPreferences, type DictationVocabularyEntry } from "@/system-dictation"
+  type DictationPreferences, type ProfileApplication, type DictationVocabularyEntry } from "@/system-dictation"
 import { Button } from "./ui/button"
 import type { Language } from "./language-picker"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs"
@@ -18,8 +18,14 @@ type DictationStatus = {
   shortcutRequested: boolean
   platform: "x11" | "wayland" | "windows"
   shortcut: string
+  defaultShortcut?: string
+  rawShortcut?: string
+  rawShortcutError?: string
+  portalRawShortcut?: string
+  portalRawRequested?: boolean
   recoveryShortcut?: string
   cancelShortcut?: string
+  annotationShortcut?: string
   cancelShortcutConflict?: boolean
   canCancel?: boolean
   canStart?: boolean
@@ -29,10 +35,12 @@ type DictationStatus = {
   configurable: boolean
   keyboardAllowed?: boolean
   pasteAuthorizing?: boolean
+  savedVirtualPaste?: boolean
   commandPrefix?: string
   commandMode?: boolean
   gnomeShortcutAvailable?: boolean
   gnomeShortcuts?: boolean
+  gnomeAnnotation?: boolean
   gnomeShortcutsNeedUpdate?: boolean
   phase: "idle" | "starting" | "recording" | "transcribing" | "delivering" | "pasting"
   message: string
@@ -62,6 +70,7 @@ type DictationStatus = {
 const endpoint = "/api/portable/dictation"
 const desktopCommands = [
   ["toggle", "Toggle dictation"], ["start", "Start dictation"], ["stop", "Finish dictation"],
+  ["toggle --raw", "Toggle dictation without processing"], ["start --raw", "Start dictation without processing"],
   ["cancel", "Cancel dictation"], ["paste-last", "Paste last dictation"],
 ] as const
 const windowsShortcutModes = {
@@ -89,6 +98,14 @@ function loadHistory(query: string, offset: number) {
   return request<DictationHistory>("/history?" + params)
 }
 
+function loadApplications() {
+  return request<ProfileApplication[]>("/output-profiles/applications")
+}
+
+function chooseApplication() {
+  return request<ProfileApplication | null>("/output-profiles/choose-application", { method: "POST" })
+}
+
 function profilesRequest<T>(path: string, body: object) {
   return request<T>("/output-profiles" + path, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -99,8 +116,8 @@ async function describeProfiles(profiles: string) {
   return (await profilesRequest<DictationOutputProfiles>("/describe", { profiles })).profiles
 }
 
-function previewProfiles({ text, profiles, app }: { text: string; profiles: string; app: string }) {
-  return profilesRequest<DictationOutputPreview>("/preview", { text, profiles, app })
+function previewProfiles({ text, profiles, app, site }: { text: string; profiles: string; app: string; site: string }) {
+  return profilesRequest<DictationOutputPreview>("/preview", { text, profiles, app, site })
 }
 
 function usePortableDictation(visible: boolean) {
@@ -129,7 +146,7 @@ function usePortableDictation(visible: boolean) {
     }
   }, [visible])
 
-  async function configure(path: string, body?: object) {
+  async function configure(path: string, body?: object, reportError: (message: string) => void = setFeedback) {
     setPending(true)
     setFeedback("")
     try {
@@ -141,7 +158,7 @@ function usePortableDictation(visible: boolean) {
       setStatus(await request(path, options))
       return true
     } catch (error) {
-      setFeedback(error instanceof Error ? error.message : "Could not change system dictation.")
+      reportError(error instanceof Error ? error.message : "Could not change system dictation.")
       return false
     } finally {
       setPending(false)
@@ -228,7 +245,7 @@ function VoiceInput({ visible, disabled, status, languages, configure, saveVocab
     : missing ? "Jaro uses the system microphone until the selected one is available."
     : "Choose the microphone for system-wide dictation."
   const cleanupDetail = status?.cleanupStatus === "downloading" ? "Downloading 2.3 GB. Dictation is available during setup."
-    : status?.cleanupStatus === "error" ? "Download failed. Turn this setting off and on to retry."
+    : status?.cleanupStatus === "error" ? "Noise cleanup is unavailable. Turn this setting off and on to retry."
     : status?.cleanupStatus === "ready" ? "Cleans up background noise locally before transcription."
     : "Downloads 2.3 GB the first time you turn it on."
 
@@ -261,6 +278,53 @@ function VoiceInput({ visible, disabled, status, languages, configure, saveVocab
   </SettingGroup>
 }
 
+export function PortableShortcut({ shortcut, defaultShortcut, disabled, title = "Dictation shortcut",
+  editLabel = "Edit dictation shortcut", detail, bindingError, save }: {
+  shortcut: string; defaultShortcut: string; disabled: boolean; title?: string; editLabel?: string
+  detail?: string; bindingError?: string
+  save: (shortcut: string, reportError: (message: string) => void) => Promise<boolean>
+}) {
+  const { t } = useInterfaceLanguage()
+  const [draft, setDraft] = useState<string>()
+  const [error, setError] = useState("")
+  const input = useRef<HTMLInputElement>(null)
+  const examples = defaultShortcut === "Left Alt"
+    ? "Enter Left Alt or a chord such as Ctrl+Alt+F9."
+    : "Enter a chord such as Ctrl+Shift+F9 or Ctrl+PageUp."
+  const edit = useRef<HTMLButtonElement>(null)
+  const optional = defaultShortcut === ""
+  const canSave = !disabled && draft !== undefined && (optional || !!draft.trim()) && draft.trim() !== shortcut
+  function close() {
+    setDraft(undefined)
+    setError("")
+    requestAnimationFrame(() => edit.current?.focus())
+  }
+  return <SettingRow icon={Keyboard} title={t(title)} label={false}
+    detail={draft !== undefined ? t(examples) : bindingError ? t(bindingError) : detail}>
+    {draft === undefined ? <Button ref={edit} type="button" size="sm" variant="outline" disabled={disabled} onClick={() => {
+      setDraft(shortcut)
+      requestAnimationFrame(() => { input.current?.focus(); input.current?.select() })
+    }} aria-label={t(editLabel)}>{shortcut ? <kbd>{shortcut}</kbd> : t("Off")}</Button> :
+      <form className="dictation-row-actions portable-shortcut-form" onSubmit={async event => {
+        event.preventDefault()
+        setError("")
+        if (canSave && await save(draft.trim(), setError)) close()
+      }}>
+        <input ref={input} type="text" dir="ltr" aria-label={t("New shortcut")} value={draft} maxLength={64}
+          spellCheck={false} autoComplete="off" disabled={disabled}
+          onChange={event => { setDraft(event.target.value); setError("") }}
+          onKeyDown={event => {
+            if (event.key === "Escape") { event.preventDefault(); close() }
+          }} />
+        <Button type="button" variant="ghost" size="sm" disabled={disabled || draft === defaultShortcut}
+          onClick={() => { setDraft(defaultShortcut); setError("") }}>{t(optional ? "Clear" : "Reset")}</Button>
+        <Button type="button" variant="ghost" size="sm" disabled={disabled} onClick={close}>{t("Cancel")}</Button>
+        <Button type="submit" size="sm" variant="outline" disabled={!canSave}>{t("Save")}</Button>
+        {error && <p className="dictation-error" role="alert">{t(error)}</p>}
+      </form>}
+  </SettingRow>
+}
+
 function ShortcutMode({ platform, mode, disabled, onChange }: {
   platform: DictationStatus["platform"]
   mode: DictationPreferences["mode"]
@@ -278,7 +342,8 @@ function ShortcutMode({ platform, mode, disabled, onChange }: {
 }
 
 function hasShortcutMode(status: DictationStatus | undefined): status is DictationStatus & { shortcutMode: DictationPreferences["mode"] } {
-  return !!status?.shortcutMode && (status.platform !== "wayland" || (!!status.shortcut && !status.commandMode))
+  return !!status?.shortcutMode && (status.platform !== "wayland"
+    || (!!(status.shortcut || status.portalRawShortcut) && !status.commandMode))
 }
 
 function FeedbackSettings({ status, disabled, configure }: {
@@ -348,17 +413,43 @@ function FeedbackSettings({ status, disabled, configure }: {
   </SettingGroup>
 }
 
-function PortableTextOutput({ status, disabled, save, saveProfiles }: {
-  status?: DictationStatus; disabled: boolean; save: (value: string) => Promise<boolean>
+function PortableTextOutput({ status, disabled, configure, saveProfiles }: {
+  status?: DictationStatus; disabled: boolean
+  configure: (path: string, body?: object, reportError?: (message: string) => void) => Promise<boolean>
   saveProfiles: (value: string, base: string) => Promise<void>
 }) {
   const { t } = useInterfaceLanguage()
   const heading = useId()
+  const portalControls = status?.portalRawRequested !== undefined && !status.commandMode ? status : undefined
+  const rawBusy = disabled || portalControls?.authorizing || portalControls?.phase !== "idle"
+  const rawCanRetry = portalControls?.portalRawRequested && !portalControls.portalRawShortcut
+    && (portalControls.enabled || portalControls.configurable || !!portalControls.annotationShortcut)
   return <SettingGroup id={heading} title={t("Output")}>
     <RuleEditor label={t("Word replacements")} help={t("Enter one correction per line, such as jaro audio => Jaro Audio.")}
-      value={status?.replacements ?? ""} disabled={disabled} maxLength={4000} save={save} />
+      value={status?.replacements ?? ""} disabled={disabled} maxLength={4000} save={text => configure("/replacements", { text })} />
+    {status?.rawShortcut !== undefined && <PortableShortcut shortcut={status.rawShortcut} defaultShortcut=""
+      title="Dictate without processing" editLabel="Edit raw dictation shortcut"
+      detail={t(status.enabled ? "Use this shortcut to paste speech as heard, without Output rules."
+        : "Enable the global shortcut to use this binding.")}
+      bindingError={status.rawShortcutError} disabled={disabled || status.phase !== "idle"}
+      save={(shortcut, reportError) => configure("/raw-shortcut", { shortcut }, reportError)} />}
+    {portalControls && <SettingRow icon={Keyboard} title={t("Dictate without processing")} label={false}
+      detail={portalControls.portalRawShortcut || t(portalControls.authorizing ? "Waiting for desktop shortcut approval."
+        : rawCanRetry ? "The desktop did not assign a raw dictation shortcut."
+        : "Use a separate desktop shortcut to paste speech without Output rules.")}>
+      <div className="dictation-row-actions">
+        {rawCanRetry && <Button type="button" size="sm" variant="ghost" disabled={rawBusy}
+          onClick={() => void configure("/raw-shortcut", { enabled: true })}>{t("Retry")}</Button>}
+        {portalControls.portalRawShortcut && portalControls.configurable && <Button type="button" size="sm" variant="ghost"
+          disabled={rawBusy} onClick={() => void configure("/configure")}>{t("Configure shortcuts")}</Button>}
+        <input aria-label={t("Dictate without processing")} type="checkbox" role="switch"
+          disabled={rawBusy} checked={portalControls.portalRawRequested}
+          onChange={event => void configure("/raw-shortcut", { enabled: event.target.checked })} />
+      </div>
+    </SettingRow>}
     {status && <OutputProfileEditor value={status.outputProfiles ?? ""} pending={disabled}
-      describe={describeProfiles} previewOutput={previewProfiles} save={saveProfiles} wayland={status.platform === "wayland"} />}
+      chooseApplication={document.documentElement.hasAttribute("data-jaro-application-picker") ? chooseApplication : undefined}
+      loadApplications={loadApplications} describe={describeProfiles} previewOutput={previewProfiles} save={saveProfiles} websiteRules wayland={status.platform === "wayland"} />}
   </SettingGroup>
 }
 
@@ -370,6 +461,8 @@ export function PortableDictationSettings({ visible, disabled, languages }: {
   const { status, pending, feedback, configure, saveVocabulary, saveProfiles } = usePortableDictation(visible)
   return <div className="dictation-preferences">
     {hasShortcutMode(status) && <SettingGroup id={shortcutHeading} title={t("Shortcuts")}>
+      {status.defaultShortcut && <PortableShortcut shortcut={status.shortcut} defaultShortcut={status.defaultShortcut}
+        disabled={disabled || pending || status.phase !== "idle"} save={(shortcut, reportError) => configure("/shortcut", { shortcut }, reportError)} />}
       <ShortcutMode platform={status.platform} mode={status.shortcutMode}
         disabled={disabled || pending || status.authorizing || status.phase !== "idle"}
         onChange={mode => void configure("/shortcut-mode", { mode })} />
@@ -378,7 +471,7 @@ export function PortableDictationSettings({ visible, disabled, languages }: {
       status={status} languages={languages} configure={configure} saveVocabulary={saveVocabulary} />
     <FeedbackSettings status={status} disabled={disabled || pending} configure={configure} />
     <PortableTextOutput status={status} disabled={disabled || pending || !status}
-      save={text => configure("/replacements", { text })} saveProfiles={saveProfiles} />
+      configure={configure} saveProfiles={saveProfiles} />
     {feedback && <p role="status" className="update-settings-feedback">{t(feedback)}</p>}
   </div>
 }
@@ -479,7 +572,7 @@ export function PortableDictationWorkspace({ destination, languages }: {
     status?.authorizing ? (windows ? "Starting the keyboard shortcut…" : "Approve the shortcut in the desktop dialog.") : status?.message
   const message = status?.phase === "idle" ? feedback || activity : activity || feedback
   const wayland = status?.platform === "wayland"
-  const shortcutConnected = status?.enabled || status?.configurable
+  const shortcutConnected = status?.enabled || status?.configurable || !!status?.annotationShortcut
 
   return <Tabs value={tab} onValueChange={setTab} className="dictation-workspace-tabs">
     <div className="dictation-workspace-header">
@@ -495,7 +588,10 @@ export function PortableDictationWorkspace({ destination, languages }: {
     </div>
     <TabsContent value="general"><div className="dictation-preferences">
     <SettingGroup id="linux-dictation-title" title={t("System dictation")}>
-      {!status?.commandMode && <SettingRow icon={Keyboard} title={status?.shortcut || t("Global shortcut")} label={false}
+      {status?.defaultShortcut && <PortableShortcut shortcut={status.shortcut} defaultShortcut={status.defaultShortcut}
+        disabled={pending || status.phase !== "idle"} save={(shortcut, reportError) => configure("/shortcut", { shortcut }, reportError)} />}
+      {!status?.commandMode && <SettingRow icon={Keyboard} title={status?.defaultShortcut
+        ? t("Global shortcut") : status?.shortcut || t("Global shortcut")} label={false}
         detail={windows ? undefined : t(
           wayland ? status.keyboardAllowed ? "Finish with the shortcut in the field where you want the text." :
           "Use Copy last to paste until you allow automatic paste." :
@@ -522,6 +618,12 @@ export function PortableDictationWorkspace({ destination, languages }: {
         detail={t(wayland ? "Discard the current take before it is pasted." : "Discard a hands-free take.")} label={false}>
         <kbd>{status.cancelShortcut}</kbd>
       </SettingRow>}
+      {status?.annotationShortcut && <SettingRow icon={Keyboard} title={t("Annotate shortcut")}
+        detail={t("Tap to choose a display or save. Hold to draw on supported displays.")} label={false}>
+        <kbd>{status.annotationShortcut}</kbd>
+      </SettingRow>}
+      {status?.gnomeAnnotation && <SettingRow icon={Keyboard} title={t("Annotate shortcut")} label={false} children={null}
+        detail={t("Tap to choose a display or save. Assign the key in GNOME Settings → Keyboard → Custom Shortcuts.")} />}
       {wayland && status.commandPrefix && (!shortcutConnected || status.commandMode) && <SettingRow icon={Terminal}
         title={t("Desktop shortcut commands")} label={false}
         detail={t(status.commandMode ? "Assign these commands in your desktop’s keyboard settings." :
@@ -539,7 +641,7 @@ export function PortableDictationWorkspace({ destination, languages }: {
         <div className="dictation-row-actions">
           {status.gnomeShortcutsNeedUpdate && <Button size="sm" variant="outline"
             disabled={pending || status.authorizing || status.pasteAuthorizing || status.phase !== "idle"}
-            onClick={() => void configure("/add-gnome-shortcuts")}>{t("Add cancel shortcut")}</Button>}
+            onClick={() => void configure("/add-gnome-shortcuts")}>{t("Update GNOME shortcuts")}</Button>}
           <Button size="sm" variant="outline" disabled={pending || status.authorizing || status.pasteAuthorizing || status.phase !== "idle"}
             onClick={() => void configure(status.gnomeShortcuts ? "/remove-gnome-shortcuts" : "/add-gnome-shortcuts")}>
             {t(status.gnomeShortcuts ? "Remove GNOME shortcuts" : "Add GNOME shortcuts")}
@@ -548,10 +650,15 @@ export function PortableDictationWorkspace({ destination, languages }: {
       </SettingRow>}
       {wayland && status.enabled && <SettingRow icon={Clipboard} title={t("Automatic paste")} label={false}
         detail={t("Allow keyboard and clipboard access to paste into the active field. Supported desktops can remember this access.")}>
-        <Button size="sm" variant="outline" disabled={pending || status.phase !== "idle"}
-          onClick={() => void configure(status.keyboardAllowed || status.pasteAuthorizing ? "/disable-paste" : "/allow-paste")}>
-          {t(status.pasteAuthorizing ? "Cancel approval" : status.keyboardAllowed ? "Disable paste" : "Allow paste")}
-        </Button>
+        <div className="dictation-row-actions">
+          {status.savedVirtualPaste && !status.keyboardAllowed && !status.pasteAuthorizing &&
+            <Button size="sm" variant="outline" disabled={pending || status.phase !== "idle"}
+              onClick={() => void configure("/disable-paste")}>{t("Forget saved access")}</Button>}
+          <Button size="sm" variant="outline" disabled={pending || status.phase !== "idle"}
+            onClick={() => void configure(status.keyboardAllowed || status.pasteAuthorizing ? "/disable-paste" : "/allow-paste")}>
+            {t(status.pasteAuthorizing ? "Cancel approval" : status.keyboardAllowed ? "Disable paste" : "Allow paste")}
+          </Button>
+        </div>
       </SettingRow>}
       {wayland && <SettingRow icon={Clipboard} title={t("Manual dictation")} label={false}>
         <Button size="sm" variant="outline" disabled={pending || status.authorizing || status.pasteAuthorizing ||
@@ -604,7 +711,7 @@ export function PortableDictationWorkspace({ destination, languages }: {
     </TabsContent>
     <TabsContent value="output" tabIndex={-1}>
       <PortableTextOutput status={status} disabled={pending || !status}
-        save={text => configure("/replacements", { text })} saveProfiles={saveProfiles} />
+        configure={configure} saveProfiles={saveProfiles} />
       {feedback && <p className="dictation-error" role="alert">{t(feedback)}</p>}
     </TabsContent>
   </Tabs>

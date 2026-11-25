@@ -17,6 +17,7 @@ import annotation_storage
 from annotation_assets import staged_annotation_paths
 from engine_paths import ENGINE_ROOT
 import meeting_brief
+import session_images
 from meeting_rolling import RATE, append_rolling, read_rolling, rolling_path
 from meeting_retention import archive_path, audio_trash_path
 from native_recordings import recording_marker
@@ -149,6 +150,9 @@ class SessionStoreTests(unittest.TestCase):
         waiting, waiting_movie = self.retention_annotation(95, pending_writing=True)
         recent, recent_movie = self.retention_annotation(1)
         reader = SessionStore(self.store.root, read_only=True)
+        jpeg = bytes.fromhex("ffd8 ffc0 000b 08 0002 0003 01 01 1100 ffd9")
+        with self.store.connection() as db:
+            image = session_images.add(db, aged, jpeg)
 
         self.assertEqual(annotation_retention.sweep(self.store, self.send_to_fixture_trash), (1, []))
         self.assertFalse(movie.exists())
@@ -160,6 +164,8 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(saved["transcript"]["text"], "Look at this chart.")
         self.assertEqual(reader.annotation_asset(aged, "contact-sheet")[0].read_bytes(), b"fixture sheet")
         self.assertEqual(reader.annotation_asset(aged, "manifest")[0].read_text(), "{}")
+        with reader.connection() as db:
+            self.assertEqual(session_images.get(db, aged, image["id"]), jpeg)
         self.assertEqual({row["id"] for row in reader.annotations()}, {aged, legacy, active, waiting, recent})
         self.assertTrue(all(path.is_file() for path in (legacy_movie, active_movie, waiting_movie, recent_movie)))
 
@@ -170,7 +176,11 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual({row["id"] for row in reader.annotations()}, {active, waiting, recent})
         archive = self.trash / f"Jaro Annotation {aged}"
         self.assertIn("Look at this chart.", (archive / "Narration.md").read_text())
-        self.assertEqual(json.loads((archive / "Annotation.json").read_text())["id"], aged)
+        manifest = json.loads((archive / "Annotation.json").read_text())
+        self.assertEqual(manifest["id"], aged)
+        stored_image, = manifest["tables"]["session_images"]
+        self.assertEqual(stored_image["id"], image["id"])
+        self.assertEqual((archive / stored_image["file"]).read_bytes(), jpeg)
         self.assertEqual((archive / "Capture" / "contact-sheet.png").read_bytes(), b"fixture sheet")
         self.assertTrue((self.trash / f"Jaro Annotation {legacy}" / "Capture" / legacy_movie.name).is_file())
 
@@ -368,15 +378,25 @@ class SessionStoreTests(unittest.TestCase):
 
     def test_meeting_query_export_and_read_only_agent_after_audio_removal(self):
         key, path = self.create_meeting()
+        jpeg = bytes.fromhex("ffd8 ffc0 000b 08 0002 0003 01 01 1100 ffd9")
         with self.store.connection() as db:
             meeting_brief.enqueue(db, key)
             generation = db.execute("SELECT generation FROM meeting_briefs WHERE id=?", (key,)).fetchone()[0]
             self.assertTrue(meeting_brief.settle(db, key, generation, {"title": "Review", "summary": "The team set a deadline."}))
+            image = session_images.add(db, key, jpeg)
+        from session_agent_context import session_payload
+
+        text, _, _, _ = session_payload(self.store.root, key, "t3")
+        handoff_copy = Path(json.loads(text.splitlines()[-1].removeprefix("- ")))
+        self.assertEqual(handoff_copy.read_bytes(), jpeg)
         self.assertEqual([row["id"] for row in self.store.list("zoom", meetings_only=True)], [key])
         self.assertEqual([row["id"] for row in self.store.list("follow up tuesday", meetings_only=True)], [key])
         self.assertEqual(self.store.list("follow up tuesday"), [])
         removed = self.store.remove_meeting_audio(key, trash=self.send_to_fixture_trash)
         self.assertFalse(path.parent.exists())
+        self.assertFalse(handoff_copy.exists())
+        with self.store.connection() as db:
+            self.assertEqual(session_images.get(db, key, image["id"]), jpeg)
         self.assertEqual(self.store.remove_meeting_audio(key, trash=self.send_to_fixture_trash), removed)
         self.assertEqual({item.name for item in (self.trash / audio_trash_path(self.store.root, key).name).iterdir()},
                          {"source.wav", "mic.wav", "system.wav"})
@@ -628,7 +648,7 @@ class SessionStoreTests(unittest.TestCase):
         self.assertTrue(self.store.get(key)["finalizationPending"])
 
         first = SessionStore(self.store.root)
-        resume = first.claim_meeting_finalization()
+        resume = first.claim_recording_finalization()
         self.assertEqual((resume["id"], resume["next_frame"]), (key, 10 * RATE))
         first.finish(key, SHUTDOWN_INTERRUPTION, closing=True, recovered=True)
         with first.connection() as db:
@@ -637,9 +657,9 @@ class SessionStoreTests(unittest.TestCase):
         for _ in range(2):
             # Simulate termination after the attempt was committed, without the shutdown handler.
             restart = SessionStore(self.store.root)
-            self.assertEqual(restart.claim_meeting_finalization()["id"], key)
+            self.assertEqual(restart.claim_recording_finalization()["id"], key)
         last = SessionStore(self.store.root)
-        self.assertIsNone(last.claim_meeting_finalization())
+        self.assertIsNone(last.claim_recording_finalization())
         saved = last.get(key)
         self.assertFalse(saved["finalizationPending"])
         self.assertEqual(saved["status"], "interrupted")
@@ -760,12 +780,29 @@ class SessionStoreTests(unittest.TestCase):
         self.store.set_meeting_retention_days(0)
         self.assertEqual({row["id"] for row in meetings(reader)}, {old, legacy, pending, active, chatting, future})
 
+    def test_explicit_exemption_protects_previously_misclassified_recordings(self):
+        key, audio = self.create_meeting()
+        with self.store.connection() as db:
+            db.execute("""UPDATE sessions SET created='2000-01-01T00:00:00Z',
+                       options=json_set(options,'$.retentionApplies',0) WHERE id=?""", (key,))
+            db.execute("UPDATE overviews SET status='error' WHERE id=?", (key,))
+            db.execute("UPDATE meeting_briefs SET status='error' WHERE id=?", (key,))
+        self.store.set_meeting_retention_days(7)
+        self.store.set_meeting_audio_days(7)
+        self.assertEqual(self.store.expire_meetings(self.send_to_fixture_trash), [])
+        self.assertEqual(self.store.expire_meeting_audio(self.send_to_fixture_trash), [])
+        self.assertTrue(audio.is_file())
+        self.assertIsNone(self.store.get(key)["meetingRetentionDays"])
+        self.assertIsNone(self.store.list("", meetings_only=True)[0]["meetingRetentionDays"])
+
     def test_trash_snapshot_survives_failure_and_engine_restart(self):
         key, audio = self.create_meeting()
+        jpeg = bytes.fromhex("ffd8 ffc0 000b 08 0002 0003 01 01 1100 ffd9")
         user_export = self.root / "My edited transcript.md"
         user_export.write_text("My edits.", encoding="utf8")
         with self.store.connection() as db:
             db.execute("UPDATE overviews SET status='ready' WHERE id=?", (key,))
+            image = session_images.add(db, key, jpeg)
             meeting_brief.settle(db, key, 1, result={"title": "Schedule review", "summary": "Send the agenda."})
             db.execute("UPDATE sessions SET created='2000-01-01T00:00:00+00:00' WHERE id=?", (key,))
 
@@ -782,13 +819,17 @@ class SessionStoreTests(unittest.TestCase):
         self.assertIn("Send the agenda.", (staged / "Transcript.md").read_text())
         self.assertIn("Follow up Tuesday.", (staged / "Notes.md").read_text())
         self.assertIn("## Summary", (staged / "Transcript.md").read_text())
-        self.assertEqual(json.loads((staged / "Meeting.json").read_text())["id"], key)
+        manifest = json.loads((staged / "Meeting.json").read_text())
+        self.assertEqual(manifest["id"], key)
+        stored_image, = manifest["tables"]["session_images"]
+        self.assertEqual(stored_image["id"], image["id"])
         restarted = SessionStore(self.store.root)
         trash = self.trash
         self.assertEqual(restarted.expire_meetings(lambda source: shutil.move(source, trash / source.name)), [])
         self.assertFalse(staged.exists())
         self.assertFalse(audio.exists())
         self.assertTrue((trash / staged.name / "Audio" / audio.name).exists())
+        self.assertEqual((trash / staged.name / stored_image["file"]).read_bytes(), jpeg)
         self.assertEqual(user_export.read_text(), "My edits.")
 
     def test_snapshot_failure_preserves_originals_and_retries_without_duplicate_archives(self):

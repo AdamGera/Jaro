@@ -22,6 +22,10 @@ CloseApplications=no
 RestartApplications=no
 SetupIconFile=Jaro.ico
 SetupMutex=Jaro.PerUserSetup.630E71AE
+#ifdef SignedEngineDir
+SignedUninstaller=yes
+SignedUninstallerDir="{#SignedEngineDir}"
+#endif
 Compression=lzma2/normal
 SolidCompression=yes
 OutputDir=output
@@ -40,6 +44,7 @@ Name: "{userprograms}\Jaro"; Filename: "{app}\bin\Jaro.exe"; IconFilename: "{app
 [UninstallDelete]
 Type: files; Name: "{app}\current-version"
 Type: files; Name: "{app}\current-version.partial"
+Type: files; Name: "{app}\rejected-update.sha256"
 
 [Code]
 const
@@ -110,10 +115,16 @@ end;
 
 procedure CurStepChanged(Step: TSetupStep);
 var
-  Active, Partial: String;
+  Active, Partial, Payload: String;
+  ExitCode: Integer;
 begin
   if Step <> ssPostInstall then
     Exit;
+  Payload := ExpandConstant('{app}\versions\{#AppVersion}');
+  if not Exec(Payload + '\python\python.exe', '-B -X utf8 "' + Payload +
+      '\desktop\portable\open_workspace.py" --help', Payload, SW_HIDE, ewWaitUntilTerminated, ExitCode) or
+      (ExitCode <> 0) then
+    RaiseException('Setup could not start the new Jaro runtime. The active version was preserved.');
   Active := ExpandConstant('{app}\current-version');
   Partial := Active + '.partial';
   if not SaveStringToFile(Partial, '{#AppVersion}' + #10, False) then
@@ -122,6 +133,9 @@ begin
     DeleteFile(Partial);
     RaiseException('Setup could not activate the new Jaro version.');
   end;
+  if not Exec(ExpandConstant('{app}\bin\Jaro.exe'), '--repair-shortcuts', ExpandConstant('{app}\bin'),
+      SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
+    Log('Setup could not migrate Jaro shortcuts that use an old version path.');
 end;
 
 procedure DeinitializeSetup();

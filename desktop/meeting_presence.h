@@ -11,6 +11,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, copy, nullable) NSString *googleMeetCode;
 @property(nonatomic) BOOL slow;
 @property(nonatomic) BOOL unnamedBrowser;
+@property(nonatomic) BOOL unverifiedPage;
 @property(nonatomic) BOOL inputActive;
 - (BOOL)matchesObservation:(JardCall *)call;
 - (BOOL)matchesOfferObservation:(JardCall *)call;

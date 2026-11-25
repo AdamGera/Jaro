@@ -23,6 +23,7 @@ const screenshotOptions = [
 ] as const
 const hasPortableScreenshots = document.documentElement.hasAttribute("data-jaro-screen-recording")
   || document.documentElement.hasAttribute("data-jaro-linux-audio")
+const portableOpenCode = document.documentElement.getAttribute("data-jaro-opencode-handoff")
 
 async function jpeg(file: File, crop?: ScreenArea) {
   if (file.size > 30 * 1024 * 1024) throw new Error("Choose an image smaller than 30 MB.")
@@ -76,6 +77,7 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
   const [capturePreview, setCapturePreview] = useState<ScreenshotPreview>()
   const captureRequest = useRef<AbortController>(undefined)
   const complete = session.status !== "processing" && !session.finalizationPending
+  const openCodeAllowed = native ? managed === false : portableOpenCode === "available"
 
   useEffect(() => {
     const controller = new AbortController()
@@ -296,8 +298,8 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
               disabled={loading || mutating} onClick={() => input.current?.click()}><ImagePlus aria-hidden="true" /></Button>
           </ActionTooltip>}
         </>}
-        {native && complete && <AnnotationAgentPicker native={native} id={session.id}
-          annotation={!!session.annotation} disabled={mutating} allowOpenCode={managed === false}
+        {(native || portableOpenCode) && complete && <AnnotationAgentPicker native={native} id={session.id}
+          annotation={!!session.annotation} disabled={mutating} allowOpenCode={openCodeAllowed}
           onChanged={(agent, message) => {
             setStatus(message ?? "")
             if (agent === "opencode") setRevision(value => value + 1)
@@ -316,10 +318,10 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
       {expanded && !tiles.length && <p className="session-image-message">{t("No images attached.")}</p>}
     </div>
     {status && <p className="session-image-message" role="status">{status}</p>}
-    {managed && <p className="session-image-message" role="status">{t("OpenCode processing is managed by your organization.")}</p>}
+    {(managed || portableOpenCode === "managed") && <p className="session-image-message" role="status">{t("OpenCode processing is managed by your organization.")}</p>}
     {error && !sourcePicker && !capturePreview && <p className="session-image-message" role="alert">{error}</p>}
     {children}
-    {native && session.annotation && <AnnotationDeliveryLog native={native} id={session.id} revision={revision} remoteEnabled={managed === false} />}
+    {(native || portableOpenCode) && session.annotation && <AnnotationDeliveryLog native={native} id={session.id} revision={revision} remoteEnabled={openCodeAllowed} />}
     <Dialog.Root open={!!sourcePicker} onOpenChange={open => { if (!open && !mutating) setSourcePicker(undefined) }}>
       <Dialog.Portal>
         <Dialog.Overlay className="note-language-scrim" />

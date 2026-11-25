@@ -42,12 +42,16 @@ def local_opencode(directory):
                 self.respond(200, {"pid": os.getpid(), "version": "2.0.0-fixture"})
             elif url.path == "/api/session":
                 query = parse_qs(url.query)
-                if query.get("cursor") == ["page-two"]:
+                if "project_rows" in outcome:
+                    self.respond(200, {"data": outcome["project_rows"]})
+                elif query.get("cursor") == ["page-two"]:
                     self.respond(200, {"data": [project, later]})
                 else:
                     self.respond(200, {"data": [project, {"id": "ses_archived", "time": {"archived": 1}},
                                                  {"id": "ses_child", "parentID": project["id"]},
                                                  {"id": "ses_./unsafe"}], "cursor": {"next": "page-two"}})
+            elif "project_rows" in outcome and url.path.rsplit("/", 1)[-1] in outcome.get("project_details", {}):
+                self.respond(200, {"data": outcome["project_details"][url.path.rsplit("/", 1)[-1]]})
             elif url.path == "/api/session/ses_project":
                 details = {**project, "revert": {"messageID": "msg_prior"}} if outcome.get("staged_revert") else project
                 self.respond(200, {"data": details})

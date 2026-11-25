@@ -9,76 +9,24 @@ from dbus_fast.errors import DBusError
 
 from linux_capture import CaptureError
 from linux_desktop_portal import PATH, DesktopPortal, close_descriptors
+from wayland_clipboard import ClipboardLease, clipboard_capabilities, paste_keycodes, run_tool
 
 
 REMOTE = "org.freedesktop.portal.RemoteDesktop"
 CLIPBOARD = "org.freedesktop.portal.Clipboard"
 KEYBOARD = 1
 PERSIST_UNTIL_REVOKED = 2
-KEY_LEFTCTRL = 29
-KEY_LEFTSHIFT = 42
-KEY_V = 47
+CONTROL_L = 0xffe3
+SHIFT_L = 0xffe1
+LATIN_V = ord("v")
 CLIPBOARD_LIMIT = 32 * 1024 * 1024
 RESTORE_DELAY = .5
-IDLE_CLOSE_DELAY = 15.0
+PASTE_SETTLE = .1
+PASTE_SENT = "Paste shortcut sent."
 PASTE_FALLBACK = "Dictation is ready. Use Copy last to paste it into your app."
 TRANSFER_ERRORS = (DBusError, OSError, TimeoutError, EOFError, CaptureError)
 INITIAL_CLIPBOARD_TIMEOUT = .8
 EMPTY_RESTORE_FORMAT = "application/octet-stream"
-
-
-def is_gnome_desktop():
-    return "gnome" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower().split(":")
-
-
-async def run_wl_tool(args, *, input_data=None, timeout=1.2):
-    process = await asyncio.create_subprocess_exec(
-        *args, env={**os.environ, "LC_ALL": "C"},
-        stdin=asyncio.subprocess.PIPE if input_data is not None else asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        async with asyncio.timeout(timeout):
-            stdout, stderr = await process.communicate(input_data)
-        return process.returncode, stdout, stderr
-    finally:
-        if process.returncode is None:
-            with suppress(ProcessLookupError):
-                process.kill()
-            await process.communicate()
-
-
-async def wl_snapshot():
-    tool = shutil.which("wl-paste")
-    if not tool:
-        return None
-    code, stdout, stderr = await run_wl_tool([tool, "--list-types"], timeout=INITIAL_CLIPBOARD_TIMEOUT)
-    if code != 0:
-        return {} if stderr.strip() == b"Nothing is copied" else None
-    formats = [line for line in stdout.decode("utf-8", errors="ignore").splitlines() if line]
-    preferred = [mime for mime in ("text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "text/html", "image/png")
-                 if mime in formats]
-    data = {}
-    remaining = CLIPBOARD_LIMIT
-    for mime in preferred[:4]:
-        code, value, _ = await run_wl_tool([tool, "--no-newline", "--type", mime], timeout=.6)
-        if code == 0 and len(value) <= remaining:
-            data[mime] = value
-            remaining -= len(value)
-    return data if data or not formats else None
-
-
-async def wl_copy_data(data):
-    tool = shutil.which("wl-copy")
-    if not tool:
-        raise CaptureError("wl-copy is unavailable. Use Copy last to paste.")
-    if not data:
-        await run_wl_tool([tool, "--clear"], timeout=.8)
-        return
-    mime, payload = next(iter(data.items()))
-    code, _, _ = await run_wl_tool([tool, "--type", mime], input_data=payload, timeout=.8)
-    if code != 0:
-        raise CaptureError(PASTE_FALLBACK)
 
 
 async def clipboard_is_empty():
@@ -163,10 +111,8 @@ class WaylandPaste(DesktopPortal):
         self.ready = False
         self.closing = False
         self.restore_token = ""
-        self.use_portal_clipboard = True
-        self.use_wtype = False
-        self.idle_closed = False
-        self.idle_timer = None
+        self.compositor_clipboard = None
+        self.wtype = None
         self.formats = None
         self.selection_revision = 0
         self.owns_selection = False
@@ -174,68 +120,39 @@ class WaylandPaste(DesktopPortal):
         self.changed = asyncio.Event()
         self.transfers = set()
         self.delivery = asyncio.Lock()
+        self.restore_task = None
+        self.original_selection = None
+        self.transcript_revision = None
+        self.clipboard_lease = None
 
     @property
     def active(self):
-        if self.use_wtype:
-            return self.ready
-        if self.idle_closed and self.restore_token:
+        if self.wtype:
             return self.ready
         return self.ready and self.session is not None and self.bus is not None and self.bus.connected
 
-    def cancel_idle_close(self):
-        if self.idle_timer is not None:
-            self.idle_timer.cancel()
-            self.idle_timer = None
-
-    def schedule_idle_close(self):
-        self.cancel_idle_close()
-        # Keep KDE sessions open (KDE re-prompts on reopen); close idle GNOME sessions so the banner clears.
-        if not self.use_wtype and self.restore_token and is_gnome_desktop() and self.session is not None:
-            self.idle_timer = asyncio.get_running_loop().call_later(
-                IDLE_CLOSE_DELAY, lambda: asyncio.create_task(self.close_idle_session())
-            )
-
-    async def close_idle_session(self):
-        self.idle_timer = None
-        if self.delivery.locked() or not self.ready or self.session is None or not self.restore_token:
+    async def approve(self, restore_token="", *, virtual_only=False):
+        self.compositor_clipboard, virtual_keyboard = await clipboard_capabilities()
+        self.wtype = shutil.which("wtype") if virtual_keyboard and not restore_token else None
+        if self.wtype:
+            self.ready = True
             return
-        async with self.delivery:
-            if not self.ready or self.session is None or not self.restore_token:
-                return
-            self.closing = True
-            try:
-                await super().close()
-                self.formats = None
-                self.owns_selection = False
-                self.data = {}
-                self.idle_closed = True
-            finally:
-                self.closing = False
-
-    async def approve(self, restore_token=""):
-        self.cancel_idle_close()
-        self.idle_closed = False
-        self.use_wtype = False
+        if virtual_only:
+            raise CaptureError("Saved automatic paste is unavailable on this desktop. Choose Allow paste to approve it here.")
         try:
             await self.connect()
             devices = await self.property(REMOTE, "AvailableDeviceTypes")
         except DBusError as failure:
-            if shutil.which("wtype") and shutil.which("wl-copy"):
-                self.use_wtype = True
-                self.use_portal_clipboard = False
-                self.ready = True
-                return
-            raise CaptureError("This desktop doesn't offer keyboard access for paste.") from failure
+            raise CaptureError("This desktop doesn't offer keyboard access for paste. Use Copy last to paste.") from failure
         if not devices & KEYBOARD:
-            raise CaptureError("This desktop doesn't offer keyboard access for paste.")
-        portal_clipboard = True
-        try:
-            await self.property(CLIPBOARD, "version")
-        except DBusError:
-            portal_clipboard = False
-        if not portal_clipboard and not shutil.which("wl-copy"):
-            raise CaptureError("This desktop doesn't offer clipboard access for paste. Install wl-clipboard or use Copy last.")
+            raise CaptureError("This desktop doesn't offer keyboard access for paste. Use Copy last to paste.")
+        portal_clipboard = False
+        if self.compositor_clipboard is None:
+            try:
+                await self.property(CLIPBOARD, "version")
+                portal_clipboard = True
+            except DBusError as failure:
+                raise CaptureError("This desktop doesn't offer clipboard access for paste. Use Copy last to paste.") from failure
         version = 0
         with suppress(DBusError):
             version = await self.property(REMOTE, "version")
@@ -254,25 +171,23 @@ class WaylandPaste(DesktopPortal):
         devices, clipboard = approved.get("devices"), approved.get("clipboard_enabled")
         has_keyboard = self.session is not None and devices is not None and devices.signature == "u" and bool(devices.value & KEYBOARD)
         has_portal_clipboard = portal_clipboard and clipboard is not None and clipboard.signature == "b" and clipboard.value
-        if not has_keyboard or (portal_clipboard and not has_portal_clipboard and not shutil.which("wl-copy")):
-            raise CaptureError("Paste needs both keyboard and clipboard permission.")
-        self.use_portal_clipboard = has_portal_clipboard
+        if not has_keyboard or (not has_portal_clipboard and self.compositor_clipboard is None):
+            raise CaptureError("Paste needs both keyboard and clipboard permission. Use Copy last to paste.")
         token = approved.get("restore_token")
         if version >= 2 and token is not None and token.signature == "s" and 0 < len(token.value) <= 1024:
             self.restore_token = token.value
         # Some desktops announce only clipboard changes. Check once during
         # interactive approval, before a take targets an external editor.
         revision = self.selection_revision
-        if (self.use_portal_clipboard and self.formats is None and not restore_token
+        if (has_portal_clipboard and self.formats is None and not restore_token
                 and await clipboard_is_empty() and self.session is not None and self.selection_revision == revision):
             self.formats = ()
+        # Closing the portal also releases any clipboard selection it restored.
+        # Keep the session alive until the user disables paste or exits Jaro.
         self.ready = self.session is not None
-        self.schedule_idle_close()
 
     def revoke(self):
-        self.cancel_idle_close()
         self.ready = False
-        self.idle_closed = False
         self.formats = None
         self.owns_selection = False
         self.data = {}
@@ -385,115 +300,199 @@ class WaylandPaste(DesktopPortal):
                 await self.wait_for_selection(revision)
             except TimeoutError:
                 # Releasing this session's offer cannot clear another owner.
-                if self.active and self.owns_selection:
-                    await self.publish({})
-                return
-            if self.formats != (EMPTY_RESTORE_FORMAT,) or not self.active or not self.owns_selection:
-                return
+                if not self.active or not self.owns_selection:
+                    return
+            else:
+                if self.formats != (EMPTY_RESTORE_FORMAT,) or not self.active or not self.owns_selection:
+                    return
+        revision = self.selection_revision
         await self.publish(original)
+        try:
+            await self.wait_for_selection(revision)
+        except TimeoutError:
+            # A slow restore notification must not be mistaken for the next paste's offer.
+            if self.selection_revision == revision:
+                self.formats = None
+                self.owns_selection = False
 
-    async def key(self, keycode, pressed):
-        await self.call(REMOTE, "NotifyKeyboardKeycode", "oa{sv}iu",
-                        [self.session, {}, keycode, int(pressed)])
+    async def key(self, method, value, pressed):
+        await self.call(REMOTE, method, "oa{sv}iu", [self.session, {}, value, int(pressed)])
+
+    async def kde_layout(self):
+        try:
+            async with asyncio.timeout(.25):
+                group, = await self.call("org.kde.KeyboardLayouts", "getLayout", path="/Layouts",
+                                         destination="org.kde.keyboard")
+            return group if type(group) is int and 0 <= group <= 65535 else None
+        except (DBusError, OSError, TimeoutError, ValueError):
+            return None
+
+    async def portal_chord(self, terminal):
+        codes = await paste_keycodes()
+        kde = "kde" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower().split(":")
+        if codes is not None:
+            control, shift, letter, paste = codes
+            ambiguous = control < 0 or letter < 0 or (terminal and shift < 0)
+            # Plasma's portal can resolve key symbols against a different layout group.
+            if kde and ambiguous and (group := await self.kde_layout()) is not None:
+                active_codes = await paste_keycodes(group)
+                if active_codes is not None and await self.kde_layout() == group:
+                    control, shift, letter, paste = active_codes
+            if control > 0 and letter > 0 and (not terminal or shift > 0):
+                keys = (control, shift, letter) if terminal else (control, letter)
+                return "NotifyKeyboardKeycode", keys
+            if letter == 0 or kde:
+                # A dedicated Paste key uses the clipboard on layouts without Latin V.
+                return "NotifyKeyboardKeycode", (paste,) if paste > 0 else ()
+        elif kde:
+            return "NotifyKeyboardKeycode", ()
+        keys = (CONTROL_L, SHIFT_L, LATIN_V) if terminal else (CONTROL_L, LATIN_V)
+        return "NotifyKeyboardKeysym", keys
 
     async def paste_keys(self, terminal, allowed):
-        if self.use_wtype:
+        if self.wtype:
             if not allowed():
                 return False
-            args = [shutil.which("wtype"), "-M", "ctrl"]
+            args = [self.wtype, "-M", "ctrl"]
             if terminal:
                 args.extend(["-M", "shift"])
             args.extend(["-k", "v"])
             if terminal:
                 args.extend(["-m", "shift"])
             args.extend(["-m", "ctrl"])
-            code, _, _ = await run_wl_tool(args, timeout=1.2)
-            return code == 0
-        keys = (KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V) if terminal else (KEY_LEFTCTRL, KEY_V)
+            return await run_tool(*args) is not None
+        method, keys = await self.portal_chord(terminal)
+        if not keys:
+            return False
         pressed = []
         try:
             for key in keys:
                 if not allowed():
                     return False
                 pressed.append(key)
-                await self.key(key, True)
+                await self.key(method, key, True)
         finally:
             for key in reversed(pressed):
                 with suppress(*TRANSFER_ERRORS):
                     if self.session is not None:
-                        await self.key(key, False)
+                        await self.key(method, key, False)
         return True
 
-    async def paste(self, text, terminal, can_send):
+    async def paste(self, text, terminal, can_send, *, confirm=None):
         async with self.delivery:
-            self.cancel_idle_close()
-            if self.idle_closed and self.restore_token:
-                try:
-                    await self.approve(self.restore_token)
-                except TRANSFER_ERRORS:
-                    self.ready = False
-                    self.idle_closed = False
-                    return PASTE_FALLBACK
-            if not self.active or not can_send():
+            if self.closing or not self.active or not can_send():
                 return PASTE_FALLBACK
             try:
-                if not self.use_portal_clipboard:
-                    return await self.deliver_with_wl_clipboard(text, terminal, can_send)
-                return await self.deliver(text, terminal, can_send)
+                if self.compositor_clipboard is not None:
+                    result = await self.deliver_with_data_control(text, terminal, can_send, confirm)
+                else:
+                    result = await self.deliver(text, terminal, can_send, confirm)
+                if result == PASTE_SENT:
+                    await asyncio.sleep(PASTE_SETTLE)
+                return result
             except CaptureError as failure:
                 return str(failure)
             except TRANSFER_ERRORS:
                 return PASTE_FALLBACK
-            finally:
-                self.schedule_idle_close()
 
-    async def deliver_with_wl_clipboard(self, text, terminal, can_send):
-        original = await wl_snapshot()
-        if not can_send() or not self.active:
-            return PASTE_FALLBACK
-        encoded = text.encode()
-        await wl_copy_data({"text/plain;charset=utf-8": encoded})
+    async def deliver_with_data_control(self, text, terminal, can_send, confirm):
+        self.cancel_restore()
+        sent = False
         try:
-            if not await self.paste_keys(terminal, lambda: can_send() and self.active):
-                return PASTE_FALLBACK
-            await asyncio.sleep(RESTORE_DELAY)
-        finally:
-            if original is not None:
-                with suppress(*TRANSFER_ERRORS):
-                    current = await wl_snapshot()
-                    if current is not None and any(value == encoded for value in current.values()):
-                        await wl_copy_data(original)
-        return "Paste shortcut sent."
+            if self.clipboard_lease is not None and not self.clipboard_lease.owned():
+                await self.close_lease()
+            if self.clipboard_lease is None:
+                self.clipboard_lease = await ClipboardLease.start(self.compositor_clipboard)
+            lease = self.clipboard_lease
 
-    async def deliver(self, text, terminal, can_send):
+            def allowed():
+                return lease.owned() and can_send() and self.active and not self.closing
+
+            if not await lease.offer(text.encode()) or not allowed() or (confirm is not None and not await confirm()):
+                return PASTE_FALLBACK
+            if not await self.paste_keys(terminal, allowed):
+                return PASTE_FALLBACK
+            sent = True
+            self.schedule_restore(self.close_lease)
+            return PASTE_SENT
+        finally:
+            if not sent:
+                await self.close_lease()
+
+    async def close_lease(self):
+        lease, self.clipboard_lease = self.clipboard_lease, None
+        if lease is not None:
+            await lease.close()
+
+    async def deliver(self, text, terminal, can_send, confirm):
         revision = self.selection_revision
-        original = await self.snapshot()
-        if revision != self.selection_revision or not can_send() or not self.active:
+        if self.owns_selection and revision == self.transcript_revision:
+            original = self.original_selection
+        else:
+            original = await self.snapshot()
+        if revision != self.selection_revision or not can_send() or not self.active or self.closing:
             return PASTE_FALLBACK
+        self.cancel_restore()
+        self.original_selection = self.transcript_revision = None
         encoded = text.encode()
         transcript = {"text/plain;charset=utf-8": encoded, "text/plain": encoded, "UTF8_STRING": encoded}
         self.changed.clear()
+        sent = False
         try:
             await self.publish(transcript)
             await self.wait_for_selection(revision)
-            if not self.owns_selection or set(self.formats or ()) != transcript.keys() or not can_send() or not self.active:
+            if not self.owns_selection or set(self.formats or ()) != transcript.keys() or not can_send() or not self.active or self.closing:
                 return PASTE_FALLBACK
             claimed = self.selection_revision
-            if not await self.paste_keys(terminal, lambda: (claimed == self.selection_revision and self.owns_selection
-                                                          and can_send() and self.active)):
+            if confirm is not None and not await confirm():
                 return PASTE_FALLBACK
-            await asyncio.sleep(RESTORE_DELAY)
+            if not await self.paste_keys(terminal, lambda: (claimed == self.selection_revision and self.owns_selection
+                                                          and can_send() and self.active and not self.closing)):
+                return PASTE_FALLBACK
+            self.original_selection = original
+            self.transcript_revision = claimed
+            sent = True
+            self.schedule_restore(self.restore_portal_selection)
+            return PASTE_SENT
         finally:
+            if not sent:
+                await self.restore(original)
+
+    def cancel_restore(self):
+        if self.restore_task is not None:
+            self.restore_task.cancel()
+            self.restore_task = None
+
+    def schedule_restore(self, restore):
+        async def later():
+            await asyncio.sleep(RESTORE_DELAY)
+            async with self.delivery:
+                if self.restore_task is asyncio.current_task():
+                    self.restore_task = None
+                    with suppress(*TRANSFER_ERRORS):
+                        await restore()
+
+        self.restore_task = asyncio.create_task(later())
+
+    async def restore_portal_selection(self):
+        original, self.original_selection = self.original_selection, None
+        revision, self.transcript_revision = self.transcript_revision, None
+        if original is not None and revision == self.selection_revision:
             await self.restore(original)
-        return "Paste shortcut sent."
+
+    async def wait_for_restore(self):
+        async with self.delivery:
+            task = self.restore_task
+        if task is not None:
+            await asyncio.shield(task)
 
     async def close(self):
-        self.cancel_idle_close()
         self.closing = True
+        await self.wait_for_restore()
         self.ready = False
-        self.idle_closed = False
         self.changed.set()
         async with self.delivery:
+            await self.close_lease()
             for task in tuple(self.transfers):
                 task.cancel()
             await asyncio.gather(*tuple(self.transfers), return_exceptions=True)

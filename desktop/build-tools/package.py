@@ -99,12 +99,13 @@ def copy_engine(resources):
         "audio_file.py", "chat_context.py", "diarization.py", "diagnostics.py", "engine_lifecycle.py", "engine_paths.py",
         "insights.py", "local_qwen.py", "meeting_transcript.py", "model_installation.py", "native_recordings.py", "note_stream.py", "overview_exchanges.py", "place_hints.py",
         "personal_notes.py", "rumble_model.py", "annotation_assets.py", "annotation_deliveries.py", "annotation_retention.py", "annotation_routing.py",
-        "annotation_storage.py",
+        "annotation_agents.py", "annotation_automation.py", "annotation_projects.py", "annotation_sites.py", "annotation_storage.py",
         "annotation_rollback.py", "saved_annotations.py", "dictation_output.py", "dictation_settings.py", "output_transform_catalog.py", "output_transform_network.py", "output_transform_policy.py", "output_transform_operations.py", "output_transform_runtime.py", "output_transform_workspace.py", "jardctl.py", "server.py", "session_images.py", "session_notes.py", "session_store.py",
-        "meeting_mcp.py", "meeting_brief.py", "meeting_exports.py", "meeting_retention.py", "meeting_rolling.py", "meeting_search.py", "saved_dictations.py", "saved_meetings.py",
+        "meeting_mcp.py", "meeting_brief.py", "meeting_edits.py", "meeting_exports.py", "meeting_retention.py", "meeting_rolling.py", "meeting_search.py", "saved_dictations.py", "saved_meetings.py",
         "linux_capture.py", "managed_preferences.py", "portable_capture.py", "portable_workspace.py", "sdk_discovery.py", "sdk_embedded.py", "speaker_alignment.py", "transcription_pieces.py", "title_words.py", "writing_api.py", "writing_cache.py",
         "overview_autonyms.json", "overview_languages.json", "place_names.json", "windows_job.py",
         "dictation_input.py", "stupase_runner.py", "portable_dictation_sounds.py", "portable_audio_control.py",
+        "opencode_wsl_worker.py", "session_agent_context.py", "windows_dictation_commands.py", "workspace_drafts.py",
     ):
         shutil.copy2(ENGINE / name, target)
     shutil.copytree(REPO / "dist", target / "dist")
@@ -126,7 +127,7 @@ def copy_engine(resources):
     shutil.copy2(TOOLS / "build-codecs.sh", resources / "licenses")
     shutil.copy2(Path(os.environ["NATIVE_SDK_PATH"]) / "LICENSE", resources / "licenses/Native-SDK-LICENSE")
     (target / "desktop/build-tools").mkdir(parents=True)
-    for name in ("mac_bridge.py", "sdk_capture.py", "annotation_automation.py", "annotation_agents.py"):
+    for name in ("mac_bridge.py", "sdk_capture.py"):
         shutil.copy2(DESKTOP / name, target / "desktop" / name)
     for name in ("helper.py", "model_setup.py", "models.json"):
         shutil.copy2(TOOLS / name, target / "desktop/build-tools")
@@ -234,6 +235,7 @@ def assemble(app, updates, transforms):
         info = plistlib.load(data)
     info.update({
         "JardUpdates": updates,
+        "JardUpdateStartupConfirmation": 2,
         "JardOfflineSettingsProtocol": 1,
         "LSMinimumSystemVersion": "26.0",
         "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
@@ -278,6 +280,29 @@ def assemble(app, updates, transforms):
     for path in (CACHE / "llama-b12521").iterdir():
         if path.name == "llama-server" or path.suffix == ".dylib":
             shutil.copy2(path, llama / path.name, follow_symlinks=False)
+
+
+def check_packaged_startup(app):
+    contents = app / "Contents"
+    engine = contents / "Resources/engine"
+    python = contents / "Resources/PythonRuntime/bin/python3.13"
+    if not (engine / "dist/index.html").is_file():
+        raise SystemExit("The packaged workspace is missing dist/index.html.")
+    with tempfile.TemporaryDirectory(prefix="jaro-package-check-") as scratch:
+        env = {"PATH": "/usr/bin:/bin", "HOME": scratch,
+               "RUMBLE_DATA_DIR": str(Path(scratch) / "library"),
+               "RUMBLE_LOG_DIR": str(Path(scratch) / "logs")}
+        checks = (
+            ("engine", [python, "-EsB", "-c", "import server; from portable_workspace import configure_shared_workspace"]),
+            ("desktop bridge", [python, "-EsB", "-c", "import desktop.mac_bridge"]),
+            ("CLI", [contents / "Helpers/jardctl", "--help"]),
+        )
+        for label, command in checks:
+            try:
+                subprocess.run(command, cwd=engine, env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, timeout=30, check=True)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise SystemExit(f"The packaged {label} could not start. Check the staging bundle's runtime and engine files.") from error
 
 
 def sign(app, identity):
@@ -405,6 +430,8 @@ def main():
             sign_with_publisher(app, opts.publisher_identity.expanduser().resolve(), release=bool(opts.update_key))
         else:
             sign(app, opts.identity)
+        # Run the final executables once their signatures are in place.
+        check_packaged_startup(app)
         if opts.notary_profile:
             notarize(app, opts.notary_profile)
         if opts.update_key:

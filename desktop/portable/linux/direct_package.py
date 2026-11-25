@@ -36,7 +36,7 @@ def build(package, output, signing_key, publisher):
         for path in (python, payload / "in-use", payload / "bin/launch"):
             path.unlink()
         metadata.write_text(json.dumps({"kind": direct.KIND, "version": version, "revision": 0}), encoding="ascii")
-        (payload / "share").mkdir()
+        (payload / "share").mkdir(exist_ok=True)
         shutil.copyfile(extracted / f"usr/share/icons/hicolor/512x512/apps/{APP_ID}.png", payload / "share/jaro.png")
         shutil.copytree(extracted / "usr/share/doc/jaro", payload / "share/doc")
         archive = work / direct.ARCHIVE

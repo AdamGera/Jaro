@@ -21,12 +21,13 @@ if sys.platform == "linux" and find_spec("dbus_fast"):
     from linux_capture import CaptureError
     from linux_desktop_portal import APP_ID, DBUS, DESKTOP, PATH, REGISTRY, REQUEST, SESSION
     from portable_dictation_history import PortableDictationHistory
-    from wayland_dictation import CANCEL, PASTE_LAST, SHORTCUT, SHORTCUTS, GlobalShortcuts, WaylandDictation
+    from wayland_dictation import ANNOTATE, CANCEL, PASTE_LAST, RAW, SHORTCUT, SHORTCUTS, GlobalShortcuts, WaylandDictation
 
 
 PRIMARY_LABEL = "Super+D"
 RECOVERY_LABEL = "Ctrl+Alt+V"
 CANCEL_LABEL = "Ctrl+Alt+Shift+X"
+RAW_LABEL = "Ctrl+Alt+Shift+J"
 
 
 class PortalFixture:
@@ -42,10 +43,17 @@ class PortalFixture:
         self.shortcut_changed = None
         self.paste_label = RECOVERY_LABEL
         self.cancel_label = None
+        self.annotation_label = None
+        self.raw_label = None
+        self.listed_raw = None
+        self.reject_raw = False
+        self.listed_annotation = None
         self.listed_shortcut = PRIMARY_LABEL
         self.listed_paste = RECOVERY_LABEL
         self.list_count = 0
         self.configuration = 0
+        self.configure_failure = None
+        self.primary_label = PRIMARY_LABEL
         self.was_closed = False
         self.request_closed = False
 
@@ -55,9 +63,10 @@ class PortalFixture:
         self.bus.add_message_handler(self.route)
 
     @staticmethod
-    def labels(primary, recovery=None, cancel=None):
+    def labels(primary, recovery=None, cancel=None, annotate=None, raw=None):
         return [[key, {"trigger_description": Variant("s", label)}]
-                for key, label in ((SHORTCUT, primary), (PASTE_LAST, recovery), (CANCEL, cancel)) if label is not None]
+                for key, label in ((SHORTCUT, primary), (PASTE_LAST, recovery), (CANCEL, cancel),
+                                   (ANNOTATE, annotate), (RAW, raw)) if label is not None]
 
     def send(self, path, interface, member, signature="", body=None):
         self.bus.send(Message(path=path, interface=interface, member=member, signature=signature,
@@ -98,13 +107,20 @@ class PortalFixture:
                 self.notify("Activated")
             code = self.bind_failure if self.bind_failure is not None else (
                 None if self.approve is None else int(not self.approve))
+            if self.reject_raw and any(key == RAW for key, _ in self.bound):
+                code = 1
             return self.response(message, code,
-                                 {"shortcuts": Variant("a(sa{sv})", self.labels(PRIMARY_LABEL, self.paste_label, self.cancel_label))})
+                                 {"shortcuts": Variant("a(sa{sv})", self.labels(
+                                     self.primary_label, self.paste_label, self.cancel_label,
+                                     self.annotation_label, self.raw_label))})
         if message.interface == SHORTCUTS and message.member == "ListShortcuts":
             self.list_count += 1
-            return self.response(message, 0, {"shortcuts": Variant("a(sa{sv})", self.labels(self.listed_shortcut, self.listed_paste))})
+            return self.response(message, 0, {"shortcuts": Variant("a(sa{sv})", self.labels(
+                self.listed_shortcut, self.listed_paste, annotate=self.listed_annotation, raw=self.listed_raw))})
         if message.interface == SHORTCUTS and message.member == "ConfigureShortcuts":
             self.configuration += 1
+            if self.configure_failure:
+                return Message.new_error(message, self.configure_failure, "Settings cannot open")
             return Message.new_method_return(message)
         if message.interface == SESSION and message.member == "Close":
             self.was_closed = True
@@ -141,6 +157,114 @@ class WaylandShortcutTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(3):
             while len(self.events) < count:
                 await asyncio.sleep(.01)
+
+    async def test_annotation_only_assignment_restores_and_scopes_tap_and_hold(self):
+        from portable_annotation_shortcut import AnnotationShortcut
+
+        self.desktop.primary_label = self.desktop.listed_shortcut = None
+        self.desktop.paste_label = self.desktop.listed_paste = None
+        self.desktop.annotation_label = self.desktop.listed_annotation = "Ctrl+Alt+Shift+S"
+        state = SimpleNamespace(draining=False, portable_screencast=None)
+        pen = SimpleNamespace(active=False, open=AsyncMock(), close=AsyncMock())
+        take = SimpleNamespace(phase="recording", saving=False, stopped=False, started=1, pen=pen, region=None,
+                               draft=SimpleNamespace(key=str(uuid4())))
+
+        async def started(_):
+            state.portable_screencast = take
+
+        async def finished(_):
+            state.portable_screencast = None
+
+        start, finish = AsyncMock(side_effect=started), AsyncMock(side_effect=finished)
+        hotkey = state.portable_annotation_shortcut = AnnotationShortcut(state, start, finish)
+        with TemporaryDirectory() as folder:
+            history = PortableDictationHistory(folder)
+            history.initialize()
+            dictation = WaylandDictation(state, None, history)
+            self.addAsyncCleanup(dictation.close)
+            dictation.enable(restoring=True)
+            await dictation.approval
+            self.assertEqual(dictation.annotation_shortcut, self.desktop.annotation_label)
+            self.assertFalse(dictation.enabled)
+            self.assertEqual([key for key, _ in self.desktop.bound], [ANNOTATE])
+
+            async def wait_until(condition):
+                async with asyncio.timeout(2):
+                    while not condition():
+                        await asyncio.sleep(.005)
+
+            async def press():
+                self.desktop.notify("Activated", shortcut=ANNOTATE)
+                await wait_until(lambda: hotkey.pressed is not None)
+
+            async def release():
+                self.desktop.notify("Deactivated", shortcut=ANNOTATE)
+                await wait_until(lambda: hotkey.pressed is None and hotkey.action is not None and hotkey.action.done())
+
+            await press()
+            self.desktop.notify("Activated", shortcut=ANNOTATE)  # Physical auto-repeat.
+            await release()
+            start.assert_awaited_once_with(None)
+
+            await press()
+            await wait_until(lambda: pen.open.await_count == 1)
+            await release()
+            pen.close.assert_awaited_once()
+            finish.assert_not_awaited()
+
+            await press()
+            replacement = SimpleNamespace(**vars(take))
+            state.portable_screencast = replacement
+            await release()
+            finish.assert_not_awaited()
+
+            # Revoking a binding while its drawing surface is up must end drawing without saving.
+            await press()
+            await wait_until(lambda: pen.open.await_count == 2)
+            self.desktop.send(PATH, SHORTCUTS, "ShortcutsChanged", "oa(sa{sv})", [self.desktop.session, []])
+            await wait_until(lambda: pen.close.await_count == 2)
+            self.assertEqual(dictation.annotation_shortcut, "")
+            finish.assert_not_awaited()
+            self.desktop.send(PATH, SHORTCUTS, "ShortcutsChanged", "oa(sa{sv})",
+                              [self.desktop.session, self.desktop.labels(None, annotate=self.desktop.annotation_label)])
+            await wait_until(lambda: bool(dictation.annotation_shortcut))
+            await press()
+            await release()
+            finish.assert_awaited_once_with(replacement)
+            self.assertEqual(hotkey.saved, take.draft.key)
+            dismissed = SimpleNamespace(**{**vars(take), "phase": "cancelled"})
+            state.portable_screencast = dismissed
+            await press()
+            await release()
+            start.assert_awaited_with(dismissed)
+            await hotkey.close()
+
+    async def test_gnome_annotate_toggles_only_when_added_and_a_fresh_key_is_pressed(self):
+        with TemporaryDirectory() as folder:
+            history = PortableDictationHistory(folder)
+            history.initialize()
+            annotation = Mock()
+            state = SimpleNamespace(draining=False, portable_annotation_shortcut=annotation)
+            dictation = WaylandDictation(state, None, history)
+            self.addAsyncCleanup(dictation.close)
+            with self.assertRaisesRegex(CaptureError, "Enable desktop shortcut commands"):
+                await dictation.run_command("gnome-annotate")
+            dictation.command_mode = dictation.gnome_enabled = True
+            with patch("linux_dictation.monotonic", return_value=1):
+                with self.assertRaisesRegex(CaptureError, "Update Jaro"):
+                    await dictation.run_command("gnome-annotate")
+            annotation.tap.assert_not_called()
+            dictation.gnome_annotation = True
+            with patch("linux_dictation.monotonic", side_effect=[3, 3.45, 3.49, 5, 7]):
+                self.assertEqual(await dictation.run_command("gnome-annotate"), "queued")
+                await dictation.run_command("gnome-annotate")
+                await dictation.run_command("gnome-annotate")
+                annotation.tap.assert_called_once_with()
+                self.assertEqual(await dictation.run_command("gnome-annotate"), "queued")
+                dictation.gnome_enabled = False
+                with self.assertRaisesRegex(CaptureError, "Add GNOME shortcuts"):
+                    await dictation.run_command("gnome-annotate")
+                self.assertEqual(annotation.tap.call_count, 2)
 
     async def test_new_take_invalidates_earlier_portal_paste_destination(self):
         from wayland_paste import PASTE_FALLBACK
@@ -212,6 +336,280 @@ class WaylandShortcutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.desktop.configuration, 1)
         await self.portal.close()
         self.assertTrue(self.desktop.was_closed)
+
+    async def test_configure_can_retry_temporary_failure_and_keeps_assigned_shortcut(self):
+        with TemporaryDirectory() as folder:
+            history = PortableDictationHistory(folder)
+            history.initialize()
+            dictation = WaylandDictation(SimpleNamespace(draining=False), None, history)
+            self.addAsyncCleanup(dictation.close_portal)
+            dictation.restore_paste = Mock()
+            dictation.enable()
+            await dictation.approval
+            self.assertTrue(dictation.enabled)
+            self.assertTrue(dictation.snapshot()["configurable"])
+
+            self.desktop.configure_failure = DBUS + ".Error.NoReply"
+            with self.assertRaisesRegex(CaptureError, "Could not open"):
+                await dictation.configure_shortcut()
+            self.assertTrue(dictation.snapshot()["configurable"])
+            self.desktop.configure_failure = None
+            await dictation.configure_shortcut()
+
+            self.desktop.configure_failure = DBUS + ".Error.UnknownMethod"
+            with self.assertRaisesRegex(CaptureError, "Open your desktop's settings"):
+                await dictation.configure_shortcut()
+            self.assertFalse(dictation.snapshot()["configurable"])
+            self.assertEqual(dictation.shortcut, PRIMARY_LABEL)
+            self.assertFalse(self.desktop.was_closed)
+            with self.assertRaises(CaptureError):
+                await dictation.configure_shortcut()
+            self.assertEqual(self.desktop.configuration, 3)
+
+    async def test_raw_shortcut_rebind_preserves_approved_bindings(self):
+        with TemporaryDirectory() as folder:
+            history = PortableDictationHistory(folder)
+            history.initialize()
+            dictation = WaylandDictation(SimpleNamespace(draining=False), None, history)
+            self.addAsyncCleanup(dictation.close_portal)
+            dictation.restore_paste = Mock()
+            dictation.enable()
+            await dictation.approval
+            self.assertFalse(dictation.snapshot()["portalRawRequested"])
+            self.assertNotIn(RAW, dict(self.desktop.bound))
+            keyboard = dictation.keyboard = SimpleNamespace(active=True)
+
+            self.desktop.reject_raw = True
+            await dictation.change_raw_shortcut(True)
+            await dictation.approval
+            self.assertTrue(history.portal_raw_shortcut())
+            self.assertEqual(dictation.shortcut, PRIMARY_LABEL)
+            self.assertEqual(dictation.recovery_shortcut, RECOVERY_LABEL)
+            self.assertEqual(dictation.raw_shortcut, "")
+            self.assertIs(dictation.keyboard, keyboard)
+            self.assertNotIn(RAW, dict(self.desktop.bound))
+
+            self.desktop.reject_raw = False
+            self.desktop.raw_label = RAW_LABEL
+            await dictation.change_raw_shortcut(True)
+            await dictation.approval
+            self.assertEqual(dictation.raw_shortcut, RAW_LABEL)
+            self.assertEqual(dict(self.desktop.bound)[RAW]["preferred_trigger"].value, "CTRL+ALT+SHIFT+j")
+            self.assertNotIn("preferred_trigger", dict(self.desktop.bound)[SHORTCUT])
+            self.assertNotIn("preferred_trigger", dict(self.desktop.bound)[PASTE_LAST])
+            self.assertIs(dictation.keyboard, keyboard)
+
+            self.desktop.listed_raw = RAW_LABEL
+            await dictation.close_portal()
+            dictation.enable(restoring=True)
+            await dictation.approval
+            self.assertEqual(dictation.raw_shortcut, RAW_LABEL)
+            self.assertNotIn("preferred_trigger", dict(self.desktop.bound)[RAW])
+            self.desktop.send(PATH, SHORTCUTS, "ShortcutsChanged", "oa(sa{sv})",
+                              [self.desktop.session, self.desktop.labels(PRIMARY_LABEL, RECOVERY_LABEL, raw=PRIMARY_LABEL)])
+            async with asyncio.timeout(2):
+                while dictation.raw_shortcut:
+                    await asyncio.sleep(.01)
+            self.assertEqual(dictation.shortcut, PRIMARY_LABEL)
+            self.assertIn("different desktop shortcut", dictation.feedback)
+
+            await dictation.change_raw_shortcut(False)
+            await dictation.approval
+            self.desktop.notify("Activated", shortcut=RAW)
+            await asyncio.sleep(.02)
+            self.assertEqual(dictation.raw_shortcut, "")
+            self.assertEqual(dictation.shortcut, PRIMARY_LABEL)
+            self.assertNotIn(RAW, dictation.portal.held)
+            self.assertFalse(history.portal_raw_shortcut())
+
+    async def test_gnome_reconfigure_keeps_current_assignments_when_list_is_empty(self):
+        saved = {SHORTCUT, PASTE_LAST}
+        with (TemporaryDirectory() as folder, patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}),
+              patch("gnome_shortcuts.portal_shortcut_ids", return_value=saved) as saved_shortcuts):
+            history = PortableDictationHistory(folder)
+            history.initialize()
+            dictation = WaylandDictation(SimpleNamespace(draining=False), None, history)
+            self.addAsyncCleanup(dictation.close_portal)
+            dictation.restore_paste = Mock()
+            dictation.enable()
+            await dictation.approval
+            self.desktop.listed_shortcut = self.desktop.listed_paste = None
+            self.desktop.reject_raw = True
+            await dictation.change_raw_shortcut(True)
+            await dictation.approval
+            self.assertEqual(dictation.shortcut, PRIMARY_LABEL)
+            self.assertEqual(dictation.recovery_shortcut, RECOVERY_LABEL)
+            self.assertNotIn(RAW, dict(self.desktop.bound))
+
+            self.desktop.raw_label = RAW_LABEL
+            self.desktop.reject_raw = False
+            await dictation.change_raw_shortcut(True)
+            await dictation.approval
+            self.assertEqual(dictation.raw_shortcut, RAW_LABEL)
+            self.assertNotIn("preferred_trigger", dict(self.desktop.bound)[SHORTCUT])
+            saved.add(RAW)
+            await dictation.close_portal()
+            dictation.enable(restoring=True)
+            await dictation.approval
+            self.assertEqual(dictation.shortcut, PRIMARY_LABEL)
+            self.assertEqual(dictation.raw_shortcut, RAW_LABEL)
+            self.assertTrue(all("preferred_trigger" not in options for _, options in self.desktop.bound))
+            saved_shortcuts.assert_called_with(APP_ID)
+
+            await dictation.close_portal()
+            saved.remove(RAW)
+            dictation.enable(restoring=True)
+            await dictation.approval
+            self.assertEqual(dictation.shortcut, PRIMARY_LABEL)
+            self.assertEqual(dictation.raw_shortcut, "")
+            self.assertNotIn(RAW, dict(self.desktop.bound))
+
+            saved_shortcuts.return_value = None
+            await dictation.change_raw_shortcut(False)
+            await dictation.approval
+            self.assertEqual(dictation.shortcut, PRIMARY_LABEL)
+            self.assertEqual(dictation.raw_shortcut, "")
+            self.assertNotIn(RAW, dict(self.desktop.bound))
+
+            await dictation.close_portal()
+            saved.clear()
+            saved_shortcuts.return_value = saved
+            self.desktop.bound = None
+            dictation.enable(restoring=True)
+            await dictation.approval
+            self.assertIsNone(self.desktop.bound)
+            self.assertFalse(dictation.enabled)
+            self.assertIn("no saved dictation", dictation.feedback)
+
+    async def test_raw_portal_gesture_and_desktop_command_keep_capture_flavor(self):
+        from portable_capture import private_wav
+        from portable_dictation import PASTE_SENT
+        from wayland_dictation_commands import dispatch, listen
+
+        def recorder(_key, path, _mode, **_options):
+            async def start():
+                with private_wav(path) as (wav, _):
+                    wav.writeframes(b"\x11\x22" * 1600)
+
+            return SimpleNamespace(path=path, worker=asyncio.Future(), frames=1600, interrupted=False,
+                                   start=start, stop=AsyncMock(), finish_dictation=AsyncMock())
+
+        async def wait_until(condition):
+            async with asyncio.timeout(2):
+                while not condition():
+                    await asyncio.sleep(.005)
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            history = PortableDictationHistory(root)
+            history.initialize()
+            history.save_portal_raw_shortcut(True)
+            history.configure(linux_shortcut_mode="doubleTap")
+            state = SimpleNamespace(draining=False, library=SimpleNamespace(root=root), status="ready",
+                                    portable_recording=None, portable_recording_lock=asyncio.Lock(),
+                                    portable_recorder=recorder)
+            transcribe = AsyncMock(return_value={"text": "original speech", "inferenceMs": 10})
+            dictation = WaylandDictation(state, transcribe, history)
+            self.addAsyncCleanup(dictation.close)
+            keyboard = dictation.keyboard = SimpleNamespace(active=True, paste=AsyncMock(return_value=PASTE_SENT),
+                                                            close=AsyncMock())
+            dictation.replacements = "original => updated"
+            dictation.vocabulary_entries = [{"term": "Unrelated", "soundsLike": []}]
+            self.desktop.raw_label = RAW_LABEL
+            dictation.enable()
+            await dictation.approval
+
+            async def tap(key):
+                self.desktop.notify("Activated", shortcut=key)
+                await wait_until(lambda: key in dictation.portal.held)
+                self.desktop.notify("Deactivated", shortcut=key)
+                await wait_until(lambda: key not in dictation.portal.held)
+
+            await tap(RAW)
+            await tap(SHORTCUT)
+            self.assertEqual(dictation.phase, "idle")
+            await tap(RAW)
+            await wait_until(lambda: dictation.phase == "recording")
+            self.assertTrue(dictation.capture_raw)
+            await tap(SHORTCUT)
+            self.assertEqual(dictation.phase, "recording")
+            await tap(RAW)
+            await wait_until(lambda: dictation.phase == "idle" and not dictation.action_pending())
+            self.assertEqual(transcribe.await_args.kwargs["vocabulary"], ())
+            self.assertEqual(keyboard.paste.await_args.args[0], "original speech")
+            self.assertEqual(history.page()["entries"][0]["kind"], "raw")
+
+            keyboard.active = False
+            self.assertFalse(dictation.command_mode)
+            self.assertEqual(await dictation.run_command("start-raw"), "starting")
+            await dictation.action
+            transcribe.return_value = {"text": "Printed words as heard.", "inferenceMs": 10}
+            self.assertEqual(await dictation.run_command("stop-print"),
+                             {"status": "transcript", "text": "Printed words as heard."})
+            keyboard.paste.assert_awaited_once()
+            self.assertEqual(dictation.snapshot()["text"], "original speech")
+            self.assertEqual(history.page()["entries"][0]["kind"], "printed")
+            keyboard.active = True
+            transcribe.return_value = {"text": "original speech", "inferenceMs": 10}
+
+            await dictation.close_portal()
+            dictation.command_mode = True
+            self.assertEqual(await dictation.run_command("start-raw"), "starting")
+            await dictation.action
+            self.assertTrue(dictation.capture_raw)
+            self.assertEqual(await dictation.run_command("toggle"), "recording")
+            self.assertEqual(await dictation.run_command("stop"), "transcribing")
+            await wait_until(lambda: dictation.phase == "idle" and not dictation.action_pending())
+            self.assertEqual(keyboard.paste.await_args.args[0], "original speech")
+            self.assertEqual([entry["kind"] for entry in history.page()["entries"]], ["raw", "printed", "raw"])
+
+            submitted = asyncio.Event()
+
+            async def wait_for_inference(*_args, **_kwargs):
+                submitted.set()
+                await asyncio.Future()
+
+            transcribe.side_effect = wait_for_inference
+            listener = await listen(root, dictation.run_command)
+            try:
+                self.assertEqual(await dictation.run_command("start"), "starting")
+                await dictation.action
+                printing = asyncio.create_task(asyncio.to_thread(dispatch, root, "stop", printed=True))
+                await asyncio.wait_for(submitted.wait(), 2)
+                listener.close()
+                await dictation.close()
+                with self.assertRaisesRegex(RuntimeError, "Dictation canceled"):
+                    await printing
+                self.assertEqual([entry["kind"] for entry in history.page()["entries"]], ["raw", "printed", "raw"])
+            finally:
+                listener.close()
+                await listener.wait_closed()
+
+    async def test_unsupported_configure_releases_an_unassigned_portal_for_retry(self):
+        with TemporaryDirectory() as folder:
+            history = PortableDictationHistory(folder)
+            history.initialize()
+            dictation = WaylandDictation(SimpleNamespace(draining=False), None, history)
+            self.addAsyncCleanup(dictation.close_portal)
+            self.desktop.primary_label = None
+            self.desktop.configure_failure = DBUS + ".Error.NotSupported"
+            dictation.enable()
+            await dictation.approval
+            self.assertFalse(dictation.enabled)
+            self.assertTrue(dictation.snapshot()["configurable"])
+
+            with self.assertRaisesRegex(CaptureError, "Open your desktop's settings"):
+                await dictation.configure_shortcut()
+            self.assertFalse(dictation.snapshot()["configurable"])
+            self.assertTrue(self.desktop.was_closed)
+            self.assertIsNone(dictation.portal)
+
+            self.desktop.primary_label = PRIMARY_LABEL
+            dictation.restore_paste = Mock()
+            dictation.enable()
+            await dictation.approval
+            self.assertEqual(dictation.shortcut, PRIMARY_LABEL)
+            self.assertTrue(dictation.enabled)
 
     async def test_dismissed_shortcut_has_no_activation(self):
         self.desktop.approve = False
@@ -518,7 +916,7 @@ class WaylandShortcutTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(dictation.close)
         dictation.command_mode = dictation.gnome_enabled = True
         dictation.schedule = Mock()
-        with patch("wayland_dictation.monotonic", side_effect=[1, 1.65, 2.25, 3.3, 3.4]):
+        with patch("linux_dictation.monotonic", side_effect=[1, 1.65, 2.25, 3.3, 3.4]):
             self.assertEqual(await dictation.run_command("gnome-toggle"), "starting")
             dictation.phase = "recording"
             self.assertEqual(await dictation.run_command("gnome-toggle"), "recording")

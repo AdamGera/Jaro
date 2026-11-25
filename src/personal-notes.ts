@@ -1,19 +1,15 @@
 import type { JSONContent } from "@tiptap/react"
+import { readWorkspaceDraft, rememberWorkspaceDraft } from "./workspace-drafts"
 
 export type PersonalNotes = { document: JSONContent; revision: number }
 
 export const EMPTY_NOTES: JSONContent = { type: "doc", content: [{ type: "paragraph" }] }
 
 export function readNoteDraft(key: string): PersonalNotes | null {
-  try {
-    const raw = sessionStorage.getItem(key)
-    return raw ? JSON.parse(raw) : null
-  } catch { return null }
+  const draft = readWorkspaceDraft(key) as PersonalNotes | null
+  return draft?.document?.type === "doc" && Number.isInteger(draft.revision) ? draft : null
 }
 
 export function rememberNoteDraft(key: string, value: PersonalNotes | null) {
-  try {
-    if (value) sessionStorage.setItem(key, JSON.stringify(value))
-    else sessionStorage.removeItem(key)
-  } catch { /* The in-memory draft remains available. */ }
+  return rememberWorkspaceDraft(key, value)
 }

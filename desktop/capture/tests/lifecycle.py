@@ -112,6 +112,37 @@ def exercise_microphone_only(executable, folder):
     print("Mic-only capture preserved the microphone level and saved a single WAV.")
 
 
+def exercise_late_packets(executable, folder, mode):
+    path = folder / f"late-{mode}.wav"
+    tracks = [Path(f"{path}.{source}.wav") for source in ("mic", "system")] if mode == "both" else []
+    for output in (path, *tracks):
+        output.touch()
+    args = [executable, "record", "--mode", mode, "--output", str(path)]
+    if tracks:
+        args.append("--separate-tracks")
+    with subprocess.Popen(args, env={**os.environ, "JARD_TEST_LATE_PACKETS": "1"},
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as child:
+        try:
+            for line in child.stdout:
+                event = json.loads(line)
+                if event["event"] == "levels" and event["seconds"] >= 2.25:
+                    break
+            else:
+                raise AssertionError("Late packets stopped the recording.")
+            remaining, _ = child.communicate("stop\n", timeout=5)
+            finished = json.loads(remaining.splitlines()[-1])
+            assert child.returncode == 0 and finished["reason"] == "Stopped", finished
+            assert finished["lateFrames"] >= 3840, finished
+        finally:
+            if child.poll() is None:
+                child.kill()
+    with wave.open(str(path), "rb") as audio:
+        audio.setpos(2 * 48000)
+        expected = 12288 if tracks else 8192
+        assert abs(struct.unpack("<h", audio.readframes(1))[0] - expected) < 3
+    print(f"{mode}: discarded late packets and kept recording on the original timeline.")
+
+
 def exercise_overlapping_takes(executable, folder):
     meeting, dictation = folder / "meeting.wav", folder / "dictation.wav"
     tracks = [Path(f"{meeting}.{source}.wav") for source in ("mic", "system")]
@@ -226,7 +257,7 @@ def exercise_system_fallback(executable, root, *, scenario="waiting"):
             for line in child.stdout:
                 event = json.loads(line)
                 if event["event"] == "meetingSystemAudio":
-                    statuses.append((event["available"], event.get("backend")))
+                    statuses.append((event["available"], event.get("backend") or ("denied" if event.get("permissionDenied") else None)))
                 elif event["event"] == "fixtureLateTapClosed":
                     late_closed += 1
                 elif event.get("seconds", 0) >= stop_after:
@@ -237,14 +268,20 @@ def exercise_system_fallback(executable, root, *, scenario="waiting"):
         finally:
             if child.poll() is None:
                 child.kill()
-    assert statuses == [(False, None), (True, backend)], statuses
-    assert late_closed == int(scenario != "waiting")
+    expected = [(False, None), (False, "denied")] if scenario == "denied" else [(False, None), (True, backend)]
+    assert statuses == expected, statuses
+    assert late_closed == int(scenario in ("open", "recover"))
     with wave.open(str(microphone), "rb") as mic, wave.open(str(system), "rb") as mac:
         count = mic.getnframes()
         assert count == mac.getnframes()
         mic_signal = struct.unpack(f"<{count}h", mic.readframes(count))
         mac_signal = struct.unpack(f"<{count}h", mac.readframes(count))
         first_mic = mic_signal.index(8192)
+        if scenario == "denied":
+            assert count >= 48_000 and not any(mac_signal)
+            assert mic_signal[first_mic:first_mic+48_000] == (8192,) * 48_000
+            print("Meeting permission denial was reported once, and the microphone track kept recording.")
+            return
         first_mac = mac_signal.index(16384)
         assert first_mac - first_mic >= 16_000
         if scenario == "recover":
@@ -421,12 +458,15 @@ if __name__ == "__main__":
         for task in results:
             print(task.result(timeout=20))
         exercise_microphone_only(sys.argv[1], Path(tmp))
+        exercise_late_packets(sys.argv[1], Path(tmp), "mic")
+        exercise_late_packets(sys.argv[1], Path(tmp), "both")
         exercise_overlapping_takes(sys.argv[1], Path(tmp))
         exercise_source_handoff(sys.argv[1], Path(tmp), system_restart=False)
         exercise_source_handoff(sys.argv[1], Path(tmp), system_restart=True)
         exercise_system_fallback(sys.argv[1], Path(tmp))
         exercise_system_fallback(sys.argv[1], Path(tmp), scenario="open")
         exercise_system_fallback(sys.argv[1], Path(tmp), scenario="recover")
+        exercise_system_fallback(sys.argv[1], Path(tmp), scenario="denied")
         exercise_timed_tails(sys.argv[1], Path(tmp))
         exercise_microphone_interruption(sys.argv[1], Path(tmp))
         exercise_abandoned_cold_open(sys.argv[1], Path(tmp))

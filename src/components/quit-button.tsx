@@ -34,6 +34,7 @@ export function QuitButton({ recording, recoverable = false, onQuit }: {
         }
         throw new Error("Jaro is still running. Allow the browser to open Jaro Launcher, then try again.")
       }
+      if (response.status === 409) throw new Error(t("Finish the current recording or local work before quitting Jaro."))
       if (!response.ok) throw new Error("Jaro could not quit. Try again.")
       onQuit()
     } catch (reason) {
@@ -54,7 +55,7 @@ export function QuitButton({ recording, recoverable = false, onQuit }: {
         <AlertDialog.Title>Quit Jaro Everywhere?</AlertDialog.Title>
         <AlertDialog.Description>
           {recording && (native ? "The Mac app will save your recording first. "
-            : recoverable ? "You can recover your recording when you reopen Jaro. " : "Quitting will discard this browser recording. ")}
+            : recoverable ? t("Finish your recording before quitting. ") : "Quitting will discard this browser recording. ")}
           {recoverable ? "This stops Jaro’s local engine." :
             `This stops the shared engine and active jobs for all clients. To leave other clients working, close this ${native ? t("window") : "tab"}.`}
         </AlertDialog.Description>

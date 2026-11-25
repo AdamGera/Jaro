@@ -1,10 +1,12 @@
+import { TranscriptEditingPreference } from "./meeting-transcript-edit"
 import { useInterfaceLanguage } from "@/interface-language"
 import { useEffect, useState } from "react"
-import { Activity, AudioLines, Bell, BookOpen, CalendarDays, Clock, FileText, Folder, HardDrive, History, Monitor, Pencil, Phone, SlidersHorizontal, Sparkles, Square, Video } from "lucide-react"
+import { Activity, AudioLines, Bell, BookOpen, CalendarDays, Clock, FileText, Folder, HardDrive, History, Monitor, Pencil, SlidersHorizontal, Sparkles, Square, Video } from "lucide-react"
 import { AlertDialog } from "radix-ui"
 import { meetingAudioWarning, meetingTimeFormat, useDesktopMeeting } from "@/desktop-meeting"
-import type { DesktopBridge, DesktopMeetingAction, DesktopMeetingCalendar, MeetingIndicatorCorner, MeetingRecordingPolicy } from "@/desktop"
+import type { DesktopBridge, DesktopMeetingAction, DesktopMeetingCalendar, MeetingIndicatorCorner } from "@/desktop"
 import { useNoiseCleanup } from "@/system-dictation"
+import { MeetingCalls } from "./meeting-calls"
 import { MeetingAudioAccess } from "./meeting-audio-access"
 import type { PortableCallControls } from "@/portable-calls"
 import { PortableCallSettings } from "./portable-call-controls"
@@ -68,7 +70,7 @@ export function PortableMeetingSettings({ controls, calls }: { controls: Portabl
     <SettingGroup id="meeting-voice-title" title={t("Voice input")}>
       <SettingRow icon={Sparkles} title={t("Noise cleanup (StuPASE)")}
         detail={voice?.noiseCleanup && voice.cleanupStatus === "downloading" ? t("Downloading 2.3 GB. Meetings can still be recorded.")
-          : voice?.noiseCleanup && voice.cleanupStatus === "error" ? t("Download failed. Turn this setting off and on to retry.")
+          : voice?.noiseCleanup && voice.cleanupStatus === "error" ? t("Noise cleanup is unavailable. Turn this setting off and on to retry.")
           : voice?.noiseCleanup && voice.cleanupStatus === "ready" ? t("Cleans the microphone audio locally for the final transcript of new meetings.")
           : t("Cleans microphone audio for the final transcript. Downloads 2.3 GB the first time.")}>
         {labels => <input {...labels} type="checkbox" role="switch" checked={voice?.noiseCleanup ?? false} disabled={!voice || pending}
@@ -83,6 +85,7 @@ export function PortableMeetingSettings({ controls, calls }: { controls: Portabl
     </SettingGroup>
     <SettingGroup id="meeting-after-title" title={t("After a meeting")}>
       <MeetingWritingPreference portable />
+      <TranscriptEditingPreference />
       <RetentionPreference kind="meeting" portable />
       <RetentionPreference kind="audio" portable />
     </SettingGroup>
@@ -151,7 +154,7 @@ export function DesktopMeetingControls({ native, busy, languages }: { native: De
     <SettingGroup id="meeting-voice-title" title={t("Voice input")}>
       <SettingRow icon={Sparkles} title={t("Noise cleanup (StuPASE)")}
         detail={cleanup === "downloading" ? t("Downloading 2.3 GB. Meetings can still be recorded.")
-          : cleanup === "error" ? t("Download failed. Turn this setting off and on to retry.")
+          : cleanup === "error" ? t("Noise cleanup is unavailable. Turn this setting off and on to retry.")
           : cleanup === "ready" ? t("Cleans the microphone audio locally for the final transcript of new meetings.")
           : t("Cleans microphone audio for the final transcript. Downloads 2.3 GB the first time.")}>
         {labels => <input {...labels} type="checkbox" role="switch" checked={meeting.noiseCleanup ?? false} disabled={pending}
@@ -165,6 +168,7 @@ export function DesktopMeetingControls({ native, busy, languages }: { native: De
     </SettingGroup>
     <SettingGroup id="meeting-after-title" title={t("After a meeting")}>
       <MeetingWritingPreference />
+      <TranscriptEditingPreference />
       <RetentionPreference kind="meeting" />
       <RetentionPreference kind="audio" />
     </SettingGroup>
@@ -172,31 +176,8 @@ export function DesktopMeetingControls({ native, busy, languages }: { native: De
       <MeetingExportPreference native={native} />
     </SettingGroup>
     {meeting.calendar && <MeetingCalendar calendar={meeting.calendar} act={act} pending={pending} busy={busy || meeting.busy} />}
-    <SettingGroup id="meeting-detection-title" title={t("Detected calls")}>
-      <SettingRow icon={Phone} title="Offer to record detected calls" find="Automatically detect meetings">
-        {labels => (
-          <input {...labels} type="checkbox" role="switch" checked={meeting.detection} disabled={pending}
-            onChange={event => void act({ action: "detection", enabled: event.target.checked })} />
-        )}
-      </SettingRow>
-      <SettingRow icon={Clock} title="Stop automatically when a call ends" detail="Automatically started recordings keep going for 30 seconds after a call ends.">
-        {labels => (
-          <input {...labels} type="checkbox" role="switch" checked={meeting.autoStop ?? false} disabled={pending}
-            onChange={event => void act({ action: "autoStop", enabled: event.target.checked })} />
-        )}
-      </SettingRow>
-      {meeting.providerPolicies.map(({ provider, label, scope, policy, canAlwaysRecord }) => <SettingRow key={provider}
-        icon={Phone} title={t(label)} context={scope} find={scope}>
-        {labels => (
-          <select {...labels} value={policy} disabled={pending}
-            onChange={event => void act({ action: "setPolicy", provider, policy: event.target.value as MeetingRecordingPolicy })}>
-            <option value="ask">{t("Ask")}</option>
-            {!!canAlwaysRecord && <option value="auto">{t("Always record")}</option>}
-            <option value="never">{t("Never offer")}</option>
-          </select>
-        )}
-      </SettingRow>)}
-    </SettingGroup>
+    <MeetingCalls meeting={meeting} pending={pending} act={act} feedback={feedback}
+      stopDetail="Automatically started recordings keep going for 30 seconds after a call ends." />
     <section className="dictation-preference-section dictation-advanced" aria-labelledby="meeting-advanced-title" data-setting-group={t("Advanced")}>
       <h3 id="meeting-advanced-title">{t("Advanced")}</h3>
       <SettingDisclosure icon={SlidersHorizontal} title={t("Indicator and recovery")}>

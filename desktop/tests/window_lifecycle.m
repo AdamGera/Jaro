@@ -3,6 +3,8 @@
 #import <CoreAudio/CoreAudio.h>
 #import <WebKit/WebKit.h>
 #import <objc/runtime.h>
+#import <signal.h>
+#import <unistd.h>
 #import "../jard_interface_language.h"
 #import "../jard_meetings.h"
 #import "../jard_updater.h"
@@ -36,6 +38,7 @@
                stagedUpdate:(BOOL)staged;
 - (void)updateChanged:(NSDictionary *)status;
 - (void)updateMeetingMenu:(NSDictionary *)status;
+- (void)menuNeedsUpdate:(NSMenu *)menu;
 - (BOOL)canStartAnnotation;
 - (void)controlAnnotation:(NSString *)action parameters:(NSDictionary *)parameters reply:(JardDictationReply)reply;
 - (void)controlAnnotationAccess:(NSString *)action reply:(JardDictationReply)reply;
@@ -229,7 +232,7 @@ static void fixtureLaunch(JardHost *host, SEL selector, NSNotification *notifica
     BOOL visibleBeforeLaunch = host.window.visible;
     if ([scenario isEqual:@"normal"] || [scenario isEqual:@"annotation-managed"] || [scenario isEqual:@"managed-updates"] ||
         [scenario isEqual:@"launch-update"] || [scenario isEqual:@"focus-update"] || [scenario isEqual:@"update-restart"] ||
-        [scenario isEqual:@"application-settings"] || [scenario isEqual:@"quit-capture"] ||
+        [scenario isEqual:@"application-settings"] || [scenario isEqual:@"web-recovery"] || [scenario isEqual:@"quit-capture"] ||
         [scenario hasPrefix:@"locale-"] || [scenario hasPrefix:@"dock-cold-"] || [scenario hasPrefix:@"hidden-"] ||
         [scenario isEqual:@"dock-setting"] || [scenario isEqual:@"dock-unavailable"]) {
         normalLaunch(host, selector, notification);
@@ -377,12 +380,33 @@ static void fixtureCopyLatestTranscript(JardMeetings *meeting, SEL selector, Jar
                 [host controlAnnotation:@"start" parameters:@{@"source": @"display"} reply:^(id state, NSString *error) {
                     observed[@"start"] = error ?: @"Unexpected capture";
                 }];
+                [host controlAnnotation:@"toggle" parameters:@{} reply:^(id state, NSString *error) {
+                    observed[@"toggleDisabled"] = error ?: @"Unexpected capture";
+                }];
                 [host controlAnnotation:@"status" parameters:@{} reply:^(id state, NSString *error) {
                     observed[@"status"] = error ?: state[@"enabled"];
                 }];
                 [host.systemDictation request:@{@"action": @"setAnnotationEnabled", @"enabled": @YES} reply:^(id state, NSString *error) {
                     observed[@"on"] = error ?: state[@"annotationEnabled"];
                 }];
+                id annotation = [host valueForKey:@"annotation"];
+                id notify = [annotation valueForKey:@"changed"];
+                [annotation setValue:nil forKey:@"changed"];
+                [annotation setValue:NSUUID.UUID.UUIDString forKey:@"identifier"];
+                [annotation setValue:@"picking" forKey:@"phase"];
+                [host controlAnnotation:@"toggle" parameters:@{} reply:^(id state, NSString *error) {
+                    observed[@"togglePicker"] = error ?: @((BOOL)([state[@"phase"] isEqual:@"picking"] && ![state[@"changed"] boolValue]));
+                }];
+                [annotation setValue:@"recording" forKey:@"phase"];
+                [annotation setValue:@YES forKey:@"narrationFinished"];
+                [host controlAnnotation:@"toggle" parameters:@{} reply:^(id state, NSString *error) {
+                    observed[@"toggleRecording"] = error ?: @((BOOL)([state[@"phase"] isEqual:@"saving"] && [state[@"changed"] boolValue]));
+                }];
+                [annotation setValue:@NO forKey:@"narrationFinished"];
+                [annotation setValue:nil forKey:@"identifier"];
+                [annotation setValue:@"idle" forKey:@"phase"];
+                [annotation setValue:nil forKey:@"message"];
+                [annotation setValue:notify forKey:@"changed"];
                 report(@"reply.json", observed);
                 return;
             } else if ([command isEqual:@"annotation-policy"]) {
@@ -410,6 +434,43 @@ static void fixtureCopyLatestTranscript(JardMeetings *meeting, SEL selector, Jar
                         @"shortcutRegistered": @([host.systemDictation valueForKey:@"annotationEvents"] != nil),
                         @"canStart": @([host canStartAnnotation])});
                 }];
+                return;
+            } else if ([command isEqual:@"vocabulary-menu"]) {
+                NSMenuItem *item = host.meetingMenuItems[@"vocabulary"];
+                BOOL hidden = item.hidden;
+                __block NSString *setFailure;
+                void (^set)(NSString *, id) = ^(NSString *key, id value) {
+                    [host.systemDictation request:@{@"action": @"set", @"key": key, @"value": value}
+                        reply:^(id result, NSString *error) { if (error) setFailure = error; }];
+                };
+                set(@"vocabularyMenu", @YES);
+                [host menuNeedsUpdate:item.menu];
+                NSUInteger emptyCount = item.submenu.numberOfItems;
+                if (setFailure || emptyCount != 2) {
+                    report(@"reply.json", @{@"error": setFailure ?: @"Missing initial actions", @"count": @(emptyCount), @"hidden": @(item.hidden)});
+                    return;
+                }
+                NSMutableArray *terms = NSMutableArray.array;
+                for (NSUInteger index = 1; index <= 32; index++) [terms addObject:[NSString stringWithFormat:@"Name %lu", index]];
+                set(@"vocabulary", [terms componentsJoinedByString:@"\n"]);
+                [host menuNeedsUpdate:item.menu];
+                if (setFailure) { report(@"reply.json", @{@"error": setFailure}); return; }
+                BOOL full = ![item.submenu itemAtIndex:0].enabled;
+                NSMutableArray *recent = NSMutableArray.array;
+                for (NSMenuItem *entry in item.submenu.itemArray) {
+                    if (!entry.separatorItem && !entry.action && !entry.enabled) [recent addObject:entry.title];
+                }
+                [item.submenu performActionForItemAtIndex:item.submenu.numberOfItems - 1];
+                NSString *opened = host.windowNavigation[@"pane"] ?: @"";
+                set(@"vocabulary", @"One");
+                [host menuNeedsUpdate:item.menu];
+                BOOL addEnabled = [item.submenu itemAtIndex:0].enabled && !item.hidden;
+                [item.submenu performActionForItemAtIndex:0];
+                NSString *added = host.windowNavigation[@"pane"] ?: @"";
+                set(@"vocabularyMenu", @NO);
+                report(@"reply.json", @{@"initiallyHidden": @(hidden), @"emptyCount": @(emptyCount),
+                    @"recent": recent, @"full": @(full), @"opened": opened, @"added": added,
+                    @"addEnabled": @(addEnabled), @"hidden": @(item.hidden)});
                 return;
             } else if ([command isEqual:@"paste-menu"]) {
                 NSMenuItem *item = host.meetingMenuItems[@"pasteLast"];
@@ -612,6 +673,44 @@ static void fixtureCopyLatestTranscript(JardMeetings *meeting, SEL selector, Jar
                         @"language": language[@"selected"], @"resolved": language[@"resolved"],
                         @"frenchMenu": @([NSApp.mainMenu itemWithTitle:@"Fichier"] != nil), @"dock": [host dockIconStatus]});
                 }];
+                return;
+            } else if ([command hasPrefix:@"web-recovery-"] && [scenario isEqual:@"web-recovery"]) {
+                WKWebView *web = webView(window.contentView);
+                if ([command isEqual:@"web-recovery-prepare"]) {
+                    [window makeKeyAndOrderFront:nil];
+                    [NSApp activate];
+                    [host setValue:@"fixture-capture" forKey:@"sdkCaptureID"];
+                    [web evaluateJavaScript:@"localStorage.setItem('fixture-last-session', '#fixture-notes'); history.replaceState(null, '', '#fixture-notes')"
+                        completionHandler:^(id result, NSError *error) { report(@"reply.json", @{@"ok": @(!error)}); }];
+                } else if ([command isEqual:@"web-recovery-state"]) {
+                    NSMutableDictionary *state = [@{@"sheet": @(window.attachedSheet != nil),
+                        @"recording": @([[host valueForKey:@"sdkCaptureID"] isEqual:@"fixture-capture"]),
+                        @"helperRunning": @([[host valueForKey:@"bridge"] isRunning]), @"visible": @(window.visible),
+                        @"key": @(window.isKeyWindow), @"active": @(NSApp.active),
+                        @"failed": @([host valueForKey:@"failedWorkspace"] != nil)} mutableCopy];
+                    if ([state[@"failed"] boolValue] || window.attachedSheet) {
+                        report(@"reply.json", state);
+                        return;
+                    }
+                    [web evaluateJavaScript:@"({ loads: window.loadCount ?? 0, route: location.hash })"
+                        completionHandler:^(id result, NSError *error) {
+                            if ([result isKindOfClass:NSDictionary.class]) [state addEntriesFromDictionary:result];
+                            report(@"reply.json", state);
+                        }];
+                } else if ([command isEqual:@"web-recovery-kill"]) {
+                    SEL processIdentifier = NSSelectorFromString(@"_webProcessIdentifier");
+                    pid_t pid = [web respondsToSelector:processIdentifier] ?
+                        ((pid_t (*)(id, SEL))[web methodForSelector:processIdentifier])(web, processIdentifier) : 0;
+                    // Terminate only the renderer explicitly owned by this disposable fixture.
+                    report(@"reply.json", @{@"ok": @(pid > 1 && pid != getpid() && kill(pid, SIGKILL) == 0)});
+                } else if ([command isEqual:@"web-recovery-retry"]) {
+                    NSWindow *sheet = window.attachedSheet;
+                    if (sheet) [window endSheet:sheet returnCode:NSAlertFirstButtonReturn];
+                    report(@"reply.json", @{@"ok": @(sheet != nil)});
+                } else {
+                    [host setValue:nil forKey:@"sdkCaptureID"];
+                    report(@"reply.json", @{@"ok": @YES});
+                }
                 return;
             } else if ([command isEqual:@"settings-events"]) {
                 [webView(window.contentView) evaluateJavaScript:@"window.settingsEvents ?? null"

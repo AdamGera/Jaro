@@ -7,7 +7,7 @@ import struct
 import subprocess
 
 from portable_capture import CaptureError, PortableRecording
-from portable_call_pages import BrowserPage, select_call
+from portable_call_pages import BrowserPage, page_identity, select_call
 
 
 def helper_path():
@@ -19,7 +19,7 @@ def helper_path():
     return None
 
 
-async def capture_inventory(command, *arguments, partial=False):
+async def capture_inventory(command, *arguments, partial=False, timeout=None):
     helper = helper_path()
     if helper is None:
         raise CaptureError("Jaro’s Windows audio recorder is unavailable.")
@@ -30,7 +30,7 @@ async def capture_inventory(command, *arguments, partial=False):
         )
         reply = asyncio.create_task(process.communicate())
         try:
-            ready, _ = await asyncio.wait((reply,), timeout=2 if partial else 3)
+            ready, _ = await asyncio.wait((reply,), timeout=timeout if timeout is not None else 2 if partial else 3)
             if not ready and process.returncode is None:
                 with suppress(ProcessLookupError):
                     process.kill()
@@ -69,7 +69,7 @@ async def playback_users():
     return await audio_stream_apps("playback-users")
 
 
-async def browser_call_pages(sources):
+async def browser_call_pages(sources, _microphones=None):
     # Each executable is resolved to a source before the native helper runs.
     executables = [(source, f"{binary}.exe") for source, binaries in sources.items() for binary in binaries]
     if not executables:
@@ -101,7 +101,10 @@ def parse_browser_calls(output, sources):
         fields["title" if kind == b"T" else "address"] = value
     result = {}
     for source, windows in pages.items():
-        call = select_call(source, (BrowserPage(**fields) for fields in windows.values()), complete)
+        candidates = [BrowserPage(**fields) for fields in windows.values()]
+        # An unread or unrelated window could own the browser's microphone.
+        identified = complete and all(page_identity(page.address) for page in candidates)
+        call = select_call(source, candidates, identified)
         if call:
             result[source] = call
     return result
@@ -120,16 +123,16 @@ def parse_microphones(output):
 class WindowsRecording(PortableRecording):
     helper_mode = None
 
-    async def spawn(self, *options):
+    async def spawn(self, *options, stderr=asyncio.subprocess.DEVNULL):
         helper = helper_path()
         if helper is None:
             raise CaptureError("Jaro’s Windows audio recorder is missing. Rebuild the desktop host.")
-        if self.mode == "mic" and self.microphone:
-            options = (*options, "device", self.microphone)
         mode = "dictation" if self.dictation else self.helper_mode or self.mode
+        if self.microphone and mode in ("mic", "dictation", "both"):
+            options = (*options, "device", self.microphone)
         return await asyncio.create_subprocess_exec(
             helper, mode, str(self.seconds), *options, creationflags=subprocess.CREATE_NO_WINDOW,
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=stderr,
         )
 
     def request_stop(self):
@@ -162,14 +165,34 @@ class WindowsMeetingRecording(WindowsRecording):
 class WindowsScreenAudio(WindowsRecording):
     started_ticks = None
 
+    def __init__(self, *args, **options):
+        super().__init__(*args, **options)
+        self.unavailable = set()
+
     async def spawn(self):
-        return await super().spawn("clock")
+        return await super().spawn("clock", stderr=asyncio.subprocess.PIPE)
+
+    async def read_source_status(self):
+        while line := await self.process.stderr.readline():
+            fields = line.split()
+            if len(fields) != 3 or fields[0] != b"jaro-screen-audio" or fields[1] not in (b"mic", b"system"):
+                continue
+            source = fields[1].decode("ascii")
+            if fields[2] == b"unavailable":
+                self.unavailable.add(source)
+            elif fields[2] == b"ready":
+                self.unavailable.discard(source)
 
     async def collect(self):
+        status = asyncio.create_task(self.read_source_status())
         try:
-            stamp = await self.process.stdout.readexactly(8)
-            self.started_ticks, = struct.unpack("<q", stamp)
-        except asyncio.IncompleteReadError:
-            self.ready.set()
-        else:
-            await super().collect()
+            try:
+                stamp = await self.process.stdout.readexactly(8)
+                self.started_ticks, = struct.unpack("<q", stamp)
+            except asyncio.IncompleteReadError:
+                self.ready.set()
+            else:
+                await super().collect()
+        finally:
+            status.cancel()
+            await asyncio.gather(status, return_exceptions=True)

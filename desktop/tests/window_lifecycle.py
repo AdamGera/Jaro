@@ -20,6 +20,9 @@ SETUP = Path(__file__).resolve().parents[1] / "setup.html"
 INTERFACE_LANGUAGES = SETUP.with_name("interface-languages.json")
 SETTINGS_PAGE = b"""<!doctype html><script>
 window.settingsEvents = [];
+window.loadCount = FIXTURE_LOAD_COUNT;
+const lastRoute = localStorage.getItem('fixture-last-session');
+if (lastRoute && !location.hash) history.replaceState(null, '', lastRoute);
 for (const event of ['jard-interface-language', 'jard-dock-icon']) {
     window.addEventListener('native-sdk:' + event, ({detail}) => {
         window.settingsEvents.push(event === 'jard-interface-language'
@@ -35,7 +38,7 @@ for line in sys.stdin:
     if request["command"] == "jard.prepare":
         outcome = os.environ["JARD_WINDOW_FIXTURE_PREPARE"]
         if outcome == "ready":
-            print(json.dumps({"navigate": "app"}), flush=True)
+            print(json.dumps({"navigate": "app", "workspaceKey": "a" * 64}), flush=True)
             response["result"] = {"ready": True}
         elif outcome == "missing":
             response["result"] = {"ready": False}
@@ -67,11 +70,27 @@ class SettingsPage(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == "/_desktop/connect":
+            self.send_response(302)
+            self.send_header("Location", "/#")
+            self.send_header("Set-Cookie", "fixture_workspace=ready; HttpOnly; Path=/; SameSite=Strict")
+            self.end_headers()
+            return
+        if self.path != "/":
+            self.send_error(404)
+            return
+        if "fixture_workspace=ready" not in self.headers.get("Cookie", "").split("; "):
+            self.send_error(401)
+            return
+        loads = getattr(self.server, "workspace_loads", 0) + 1
+        self.server.workspace_loads = loads
+        page = SETTINGS_PAGE.replace(b"FIXTURE_LOAD_COUNT", str(loads).encode())
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
-        self.send_header("Content-Length", str(len(SETTINGS_PAGE)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(page)))
         self.end_headers()
-        self.wfile.write(SETTINGS_PAGE)
+        self.wfile.write(page)
 
 
 def offline_preferences(target, changes, *, succeeds):
@@ -153,7 +172,7 @@ def run_case(executable, scenario, prepare):
         helper = root / "prepare-helper"
         helper.write_text(HELPER)
         helper.chmod(0o700)
-        if scenario == "application-settings":
+        if scenario in {"application-settings", "web-recovery"}:
             server = resources_to_close.enter_context(ThreadingHTTPServer(("127.0.0.1", 0), SettingsPage))
             Thread(target=server.serve_forever, daemon=True).start()
             resources_to_close.callback(server.shutdown)
@@ -200,7 +219,7 @@ def run_case(executable, scenario, prepare):
                     assert initial == {"visibleBeforeLaunch": False,
                                        "visible": scenario in {"normal", "annotation-managed", "managed-updates", "login-setup", "dock-setting",
                                                                "dock-unavailable", "hidden-unavailable", "locale-preselected",
-                                                               "launch-update", "focus-update", "update-restart", "quit-capture", "application-settings"}}, initial
+                                                               "launch-update", "focus-update", "update-restart", "quit-capture", "application-settings", "web-recovery"}}, initial
                     if prepare == "ready":
                         wait_for(lambda: invoke("status")["ready"], "The hidden workspace did not finish preparing.")
                     elif prepare == "missing":
@@ -211,8 +230,30 @@ def run_case(executable, scenario, prepare):
                         wait_for(lambda: invoke("setup-title")["title"] == "Couldn’t open the workspace", "Engine error did not open.")
                         assert invoke("status")["visible"]
 
-                    if scenario == "normal":
+                    if scenario == "web-recovery":
+                        wait_for(lambda: invoke("web-recovery-state").get("loads") == 1, "Fixture workspace did not load.")
+                        assert invoke("web-recovery-prepare")["ok"]
+                        assert invoke("web-recovery-kill")["ok"]
+                        recovered = wait_for(lambda: (state if (state := invoke("web-recovery-state")).get("loads") == 2 else None),
+                                             "The workspace did not reload after WebKit exited.")
+                        assert recovered["route"] == "#fixture-notes" and recovered["recording"], recovered
+                        assert recovered["helperRunning"] and not recovered["sheet"], recovered
+                        assert invoke("web-recovery-kill")["ok"]
+                        second = wait_for(lambda: (state if (state := invoke("web-recovery-state"))["sheet"] else None),
+                                          "The second WebKit exit did not offer recovery.")
+                        assert second["recording"] and second["helperRunning"] and second.get("loads", 0) == 0, second
+                        assert invoke("web-recovery-retry")["ok"]
+                        retried = wait_for(lambda: (state if (state := invoke("web-recovery-state")).get("loads") == 3 else None),
+                                           "Manual retry did not reload the workspace.")
+                        assert retried["route"] == "#fixture-notes" and retried["recording"] and retried["helperRunning"], retried
+                        invoke("web-recovery-finish")
+                    elif scenario == "normal":
                         assert invoke("input-device-events") == {"events": 1, "registered": True}
+                        vocabulary = invoke("vocabulary-menu")
+                        assert vocabulary == {
+                            "initiallyHidden": True, "emptyCount": 2, "recent": [f"Name {i}" for i in range(32, 27, -1)],
+                            "full": True, "opened": "vocabulary", "added": "add-term", "addEnabled": True, "hidden": True,
+                        }, vocabulary
                         paste_menu = invoke("paste-menu")
                         assert paste_menu == {"title": "Paste Last Dictation", "shortcut": "v",
                             "shown": True, "enabled": False, "dockVisible": True}, paste_menu
@@ -223,6 +264,8 @@ def run_case(executable, scenario, prepare):
                         toggle = invoke("annotation-toggle")
                         assert toggle["off"] is False and toggle["status"] is False and toggle["on"] is True, toggle
                         assert toggle["start"] == "Annotate is turned off in Settings.", toggle
+                        assert toggle["toggleDisabled"] == toggle["start"], toggle
+                        assert toggle["togglePicker"] is True and toggle["toggleRecording"] is True, toggle
                         shared = invoke("annotation-shared-meeting")
                         assert shared == {"pickerBlocked": True, "sharedReady": True}, shared
                         concurrent = invoke("annotation-start-over-shared-microphone")
@@ -404,7 +447,7 @@ if __name__ == "__main__":
                             ("login-model", "missing"), ("login-error", "error"), ("dock-setting", "ready"),
                             ("dock-login", "ready"), ("dock-updates", "ready"),
                             ("launch-update", "ready"), ("focus-update", "ready"), ("update-restart", "ready"), ("quit-capture", "ready"),
-                            ("application-settings", "ready"),
+                            ("application-settings", "ready"), ("web-recovery", "ready"),
                             ("dock-unavailable", "ready"), ("locale-preselected", "missing"),
                             ("dock-cold-ready", "ready"), ("dock-cold-input", "ready"), ("dock-cold-missing", "missing"),
                             ("hidden-ready", "ready"), ("hidden-missing", "missing"), ("hidden-unavailable", "ready")]:

@@ -186,8 +186,12 @@ JardCall *JardMeetingBrowserTitleCall(NSString *title, NSString *application) {
     for (NSString *prefix in @[@"Meet - ", @"Meet – ", @"Meet — "]) {
         if (![page hasPrefix:prefix]) continue;
         NSString *name = [[page substringFromIndex:prefix.length] stringByTrimmingCharactersInSet:whitespace];
-        // Keep only a normalized call code. A named tab supplies provider evidence without a call identifier.
-        if (name.length) return googleMeetCall(application, googleMeetCode(name));
+        if (name.length) {
+            // A page title can name an offer, but any website can set that title.
+            JardCall *call = googleMeetCall(application, googleMeetCode(name));
+            call.unverifiedPage = YES;
+            return call;
+        }
     }
     return nil;
 }
@@ -435,6 +439,7 @@ NSArray<JardCall *> *JardActiveCalls(NSString *outputApplication) {
             if (self.absence[previous]) self.lastSeen[previous] = @(now);
             NSMutableArray<JardCall *> *resolved = calls.mutableCopy;
             resolved[i] = googleMeetCall(self.switchedTo.application, self.switchedTo.googleMeetCode);
+            resolved[i].unverifiedPage = YES;
             return resolved;
         }
         [self clearRememberedSwitch];

@@ -7,6 +7,7 @@ from starlette.concurrency import run_in_threadpool
 
 from portable_dictation import HISTORY_ERRORS, QUEUE_FULL, PortableDictation
 from portable_capture import CaptureError
+from wayland_dictation_commands import PRINT_ACTION, RAW_ACTIONS
 
 
 logger = logging.getLogger(__name__)
@@ -20,11 +21,13 @@ class LinuxDictation(PortableDictation):
         super().__init__(state, transcribe, history)
         self.shortcut_mode = "tap"
         self.pressed_at = None
-        self.last_tap = None
+        self.pressed_raw = False
+        self.last_tap = {}
+        self.shortcut_owner = None
         self.shortcut_take = None
         self.tap_timer = None
         self.discard_task = None
-        self.changing_mode = False
+        self.changing_shortcut = False
         try:
             mode = history.linux_shortcut_mode()
             if mode in SHORTCUT_MODES:
@@ -38,22 +41,66 @@ class LinuxDictation(PortableDictation):
     async def change_mode(self, mode):
         if self.busy or self.action_pending() or self.pressed_at is not None or self.tap_timer is not None:
             raise CaptureError("Finish the current dictation before changing the shortcut mode.")
-        self.changing_mode = True
+        self.changing_shortcut = True
         try:
             await run_in_threadpool(self.history.configure, linux_shortcut_mode=mode)
         except HISTORY_ERRORS as failure:
             raise CaptureError("Could not save the Linux dictation shortcut mode.") from failure
         finally:
-            self.changing_mode = False
+            self.changing_shortcut = False
         self.shortcut_mode = mode
-        self.last_tap = None
+        self.last_tap.clear()
 
     def action_pending(self):
         return ((self.action is not None and not self.action.done())
                 or (self.discard_task is not None and not self.discard_task.done()))
 
-    def toggle_from_shortcut(self, *, released_at=None):
-        self.schedule(released_at=released_at)
+    async def run_command(self, action):
+        if action == PRINT_ACTION:
+            return await self.print_current_take()
+        arrival = monotonic()
+        async with self.control:
+            if self.state.draining:
+                raise CaptureError("Jaro is preparing to restart.")
+            if not self.enabled:
+                if self.platform == "wayland":
+                    raise CaptureError("Enable desktop shortcut commands or the global shortcut in Jaro’s Dictation settings.")
+                raise CaptureError("Enable system dictation in Jaro first.")
+            return await self.perform_command(action, arrival)
+
+    async def perform_command(self, action, _arrival):
+        raw = action in RAW_ACTIONS
+        action = RAW_ACTIONS.get(action, action)
+        running = self.action_pending()
+        if action == "cancel":
+            await self.cancel_dictation()
+            return self.phase
+        if action == "stop" and running and self.phase in ("idle", "starting"):
+            await self.cancel_capture()
+            self.feedback = "Dictation canceled."
+            return "idle"
+        if action == "paste-last":
+            if self.busy or running:
+                raise CaptureError("Finish the current dictation before pasting the last one.")
+            await self.command_paste_last()
+            return "pasted"
+        if action in ("start", "toggle") and self.can_start_recording and not running:
+            state = self.state
+            if state.status != "ready" or state.portable_recording or getattr(state, "portable_screencast", None):
+                raise CaptureError("Dictation is unavailable while Jaro starts or records audio.")
+            self.schedule(raw=raw)
+            return "starting"
+        if action in ("stop", "toggle") and not running and self.phase == "recording":
+            if action == "toggle" and raw != self.capture_raw:
+                return self.phase
+            self.toggle_from_shortcut()
+            return "transcribing"
+        if action in ("start", "toggle") and self.queue_full:
+            raise CaptureError(QUEUE_FULL)
+        return self.phase
+
+    def toggle_from_shortcut(self, *, released_at=None, raw=False):
+        return self.schedule(released_at=released_at, raw=raw)
 
     def start_sound(self, **_options):
         if self.shortcut_mode == "holdDouble" and self.shortcut_take == "held":
@@ -63,18 +110,26 @@ class LinuxDictation(PortableDictation):
         else:
             super().start_sound()
 
-    def shortcut_edge(self, pressed):
-        if self.state.draining or self.canceling or self.changing_mode or (self.discard_task and not self.discard_task.done()):
+    def shortcut_edge(self, pressed, *, raw=False):
+        if self.state.draining or self.canceling or self.changing_shortcut or (self.discard_task and not self.discard_task.done()):
+            return
+        if self.shortcut_owner is not None and self.shortcut_owner != raw:
+            return
+        if self.pressed_at is not None and self.pressed_raw != raw:
             return
         if self.shortcut_mode == "tap":
             if pressed:
-                self.toggle_from_shortcut(released_at=monotonic())
+                starting = self.capture is None
+                if (starting or self.shortcut_owner is not None or not raw) and self.toggle_from_shortcut(
+                    released_at=monotonic(), raw=raw
+                ) and starting:
+                    self.shortcut_owner = raw
         elif pressed:
-            self.press_shortcut(monotonic())
+            self.press_shortcut(monotonic(), raw)
         else:
-            self.release_shortcut(monotonic())
+            self.release_shortcut(monotonic(), raw)
 
-    def press_shortcut(self, now):
+    def press_shortcut(self, now, raw):
         if self.shortcut_take == "locked":
             self.finish_shortcut(released_at=now)
             return
@@ -89,21 +144,23 @@ class LinuxDictation(PortableDictation):
             if self.queue_full:
                 self.feedback = QUEUE_FULL
             return
-        second_tap = self.last_tap is not None and now - self.last_tap <= DOUBLE_TAP_WINDOW
-        self.last_tap = None
-        self.pressed_at = now
+        previous = self.last_tap.pop(raw, None)
+        second_tap = previous is not None and now - previous <= DOUBLE_TAP_WINDOW
+        self.pressed_at, self.pressed_raw = now, raw
         if self.shortcut_mode == "doubleTap" and not second_tap:
             return
         self.shortcut_take = "locked" if second_tap else "held"
-        self.toggle_from_shortcut(released_at=now)
+        if self.toggle_from_shortcut(released_at=now, raw=raw):
+            self.shortcut_owner = raw
 
-    def release_shortcut(self, now):
+    def release_shortcut(self, now, raw):
         pressed_at, self.pressed_at = self.pressed_at, None
         if pressed_at is None or self.shortcut_take == "locked":
             return
         brief = now - pressed_at < TAP_LIMIT
         if self.shortcut_mode == "doubleTap":
-            self.last_tap = now if brief else None
+            if brief:
+                self.last_tap[raw] = now
         elif self.shortcut_take == "held":
             if self.shortcut_mode == "holdDouble" and brief:
                 # Reuse the microphone opening if the second tap arrives in time.
@@ -137,7 +194,8 @@ class LinuxDictation(PortableDictation):
         if self.tap_timer is not None:
             self.tap_timer.cancel()
             self.tap_timer = None
-        self.pressed_at = self.last_tap = self.shortcut_take = None
+        self.pressed_at = self.shortcut_owner = self.shortcut_take = None
+        self.last_tap.clear()
 
     def recover_interruption(self):
         return self.tap_timer is None and (self.shortcut_take != "held" or self.pressed_at is None

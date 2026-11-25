@@ -3,13 +3,15 @@ import asyncio
 from contextlib import suppress
 import json
 import math
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PureWindowsPath
 import re
 import struct
 import subprocess
 import sys
 
 from audio_file import codec_binary
+from annotation_projects import project_path
+from annotation_sites import annotation_site, site_scope
 
 ASSETS = {
     "manifest": ("annotation.json", ".annotation.json", "application/json", 24 * 1024 * 1024),
@@ -28,6 +30,11 @@ def staged_annotation_paths(source):
 
 
 async def annotation_movie_info(path, probe=None):
+    duration, audio_tracks = await annotation_movie_tracks(path, probe)
+    return duration, audio_tracks > 0
+
+
+async def annotation_movie_tracks(path, probe=None, *, container_duration=False):
     options = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
     process = await asyncio.create_subprocess_exec(
         probe or codec_binary("ffprobe"), "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mov",
@@ -48,15 +55,15 @@ async def annotation_movie_info(path, probe=None):
         metadata = json.loads(output)
         streams = metadata["streams"]
         video = next(stream for stream in streams if stream["codec_type"] == "video")
-        duration = video.get("duration")
+        duration = metadata.get("format", {}).get("duration") if container_duration else video.get("duration")
         if not duration or duration == "N/A":
-            duration = metadata.get("format", {}).get("duration")
+            duration = video.get("duration") if container_duration else metadata.get("format", {}).get("duration")
         duration = float(duration)
     except (ValueError, TypeError, KeyError, StopIteration) as error:
         raise ValueError("The annotation video could not be opened.") from error
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("The annotation video has no valid duration.")
-    return duration, any(stream["codec_type"] == "audio" for stream in streams)
+    return duration, sum(stream["codec_type"] == "audio" for stream in streams)
 
 
 def annotation_input(path, kind):
@@ -73,30 +80,43 @@ def point(value):
     return isinstance(value, list) and len(value) == 2 and all(number(axis, 0, 1) for axis in value)
 
 
-
-
+LINUX_TERMINAL_BINARIES = {
+    "xterm": ("xterm", "uxterm"), "uxterm": ("xterm",),
+    "gnome-terminal": ("gnome-terminal-server",), "gnome-terminal-server": ("gnome-terminal-server",),
+    "org.gnome.terminal": ("gnome-terminal-server",), "org.gnome.console": ("kgx",), "kgx": ("kgx",),
+    "kitty": ("kitty",), "net.kovidgoyal.kitty": ("kitty",), "konsole": ("konsole",), "org.kde.konsole": ("konsole",),
+    "alacritty": ("alacritty",), "org.alacritty": ("alacritty",), "ghostty": ("ghostty",), "com.mitchellh.ghostty": ("ghostty",),
+    "wezterm": ("wezterm-gui",), "org.wezfurlong.wezterm": ("wezterm-gui",),
+    "foot": ("foot",), "footclient": ("foot",),
+    "xfce4-terminal": ("xfce4-terminal",), "lxterminal": ("lxterminal",), "tilix": ("tilix",),
+    "terminator": ("terminator",),
+}
+WINDOWS_TERMINALS = frozenset(("windowsterminal", "windowsterminalpreview", "cmd", "powershell", "pwsh", "conhost", "openconsole", "wezterm-gui", "alacritty"))
 TERMINAL_APPS = frozenset((
     "com.apple.terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty", "net.kovidgoyal.kitty",
-    "com.github.wez.wezterm", "org.alacritty", "dev.warp.warp-stable", "dev.warp.warp-preview",
-))
+    "com.github.wez.wezterm", "org.alacritty", "dev.warp.warp-stable", "dev.warp.warp-preview", "linux.shell", "windows.shell",
+)) | {f"linux.{app}" for app in LINUX_TERMINAL_BINARIES} | {f"windows.{app}" for app in WINDOWS_TERMINALS}
 
 
 def terminal_path(value):
-    if not isinstance(value, str) or not value.startswith("/") or value.startswith("//") or len(value) > 4096:
+    if not isinstance(value, str):
         return None
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
-        return None
-    path = PurePosixPath(value)
-    if ".." in path.parts or path in (PurePosixPath("/"), Path.home(), Path.home().resolve()):
+    path = project_path(value, windows=not value.startswith("/"))
+    if path in (Path.home(), Path.home().resolve()):
         return None
     return path
 
 
-def terminal_metadata(value):
+def terminal_scope(path):
+    key = str(path).lower() if isinstance(path, PureWindowsPath) else str(path)
+    return {"kind": "terminal", "key": key, "label": path.name}
+
+
+def terminal_metadata(value, *, windows=False):
     if not isinstance(value, dict):
         return None
     folder, project = terminal_path(value.get("folder")), terminal_path(value.get("project"))
-    if not folder or not project or not folder.is_relative_to(project):
+    if not folder or not project or isinstance(folder, PureWindowsPath) != windows or not folder.is_relative_to(project):
         return None
     result = {"folder": str(folder), "project": str(project)}
     title, session = value.get("title"), value.get("session")
@@ -105,6 +125,7 @@ def terminal_metadata(value):
     if isinstance(session, str) and re.fullmatch(r"ses_[A-Za-z0-9_-]{1,123}", session):
         result["session"] = session
     return result
+
 
 def annotation_origin(value):
     if not isinstance(value, dict):
@@ -116,18 +137,18 @@ def annotation_origin(value):
     name = " ".join(name.split())[:160] if isinstance(name, str) else ""
     origin = {"app": app.lower(), "name": name or app}
     if origin["app"] in TERMINAL_APPS:
-        if terminal := terminal_metadata(value.get("terminal")):
+        if terminal := terminal_metadata(value.get("terminal"), windows=app.lower().startswith("windows.")):
             origin["terminal"] = terminal
         return origin
-    site = value.get("site")
-    if isinstance(site, str) and len(site) <= 255:
-        try:
-            host = site.rstrip(".").encode("idna").decode("ascii").lower()
-        except UnicodeError:
-            host = ""
-        if re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*", host):
-            origin["site"] = host
+    site = annotation_site(value.get("site"))
+    location = site_scope(value.get("siteUrl"), observed=True, strip_www=origin["app"].startswith(("windows.", "linux.")))
+    if location and (not site or site == location.host):
+        origin["site"] = location.host
+        origin["siteUrl"] = location.key()
+    elif site:
+        origin["site"] = site
     return origin
+
 
 def read_staged_annotation(source):
     paths = staged_annotation_paths(source)

@@ -47,10 +47,19 @@ def model_status(*, all_models=False):
         raise RuntimeError("Could not read the pinned Jaro model status.") from error
 
 
-async def install_workspace_models(report):
+async def install_workspace_models(report, *, repair=False):
+    await install_models(report, all_models=True, repair=repair)
+
+
+async def install_models(report, *, all_models=False, repair=False, source=None):
     # Descendants stay in the desktop's owned process group or Windows Job.
+    command = model_command("models", all_models=all_models)
+    if repair:
+        command.append("--repair")
+    if source is not None:
+        command.extend(("--from", str(source.resolve(strict=True))))
     process = await asyncio.create_subprocess_exec(
-        *model_command("models", all_models=True), env=model_environment(),
+        *command, env=model_environment(),
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
@@ -80,9 +89,11 @@ async def install_workspace_models(report):
                 await process.communicate()
 
 
-def install_model(source=None, *, progress=False, all_models=False):
+def install_model(source=None, *, progress=False, all_models=False, repair=False):
     command = model_command("models", all_models=all_models)
     label = "Jaro’s local models" if all_models else "Rumble2 Flash"
+    if repair:
+        command.append("--repair")
     if source is not None:
         command.extend(("--from", str(Path(source).resolve(strict=True))))
     failure = None

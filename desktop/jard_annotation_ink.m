@@ -34,6 +34,7 @@ NSDictionary *JardAnnotationRoutingOrigin(NSDictionary *snapshot, NSDictionary *
     if (sameWindow && (previousApp[@"site"] || previousApp[@"terminal"])) {
         NSMutableDictionary *origin = selectedApp.mutableCopy;
         if (previousApp[@"site"]) origin[@"site"] = previousApp[@"site"];
+        if (previousApp[@"siteUrl"]) origin[@"siteUrl"] = previousApp[@"siteUrl"];
         if (previousApp[@"terminal"]) origin[@"terminal"] = previousApp[@"terminal"];
         return origin;
     }

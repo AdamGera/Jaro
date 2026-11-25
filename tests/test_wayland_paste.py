@@ -18,15 +18,19 @@ from test_wayland_shortcuts import PortalFixture
 if sys.platform == "linux" and find_spec("dbus_fast"):
     from dbus_fast import Message, MessageType, Variant
     from dbus_fast.aio import MessageBus
+    from linux_capture import CaptureError
     from linux_desktop_portal import DBUS, DESKTOP, PATH, SESSION
     from portable_dictation import PASTE_SENT
     from portable_dictation_history import PortableDictationHistory
     from wayland_dictation import WaylandDictation
-    from wayland_field import EDITABLE_AND_FOCUSED, Field, WaylandField
+    from wayland_field import (ACCESSIBLE, ACTIVE, EDITABLE_AND_FOCUSED, PROPERTIES, REGISTRY, REGISTRY_ROOT,
+                               Field, FocusWindow, SwayFocus, WaylandField)
     from wayland_paste import (
-        CLIPBOARD, EMPTY_RESTORE_FORMAT, KEYBOARD, KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V, PASTE_FALLBACK, REMOTE,
+        CLIPBOARD, CONTROL_L, EMPTY_RESTORE_FORMAT, KEYBOARD, LATIN_V, PASTE_FALLBACK, REMOTE, SHIFT_L,
         WaylandPaste, read_clipboard, write_clipboard,
     )
+
+KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V = 29, 42, 47
 
 
 class RemoteFixture(PortalFixture):
@@ -41,12 +45,15 @@ class RemoteFixture(PortalFixture):
         self.select_options = []
         self.renewal = ""
         self.started = 0
-        self.permissions = True
+        self.grant_access = True
+        self.clipboard_access = True
         self.notify_initial = True
         self.gnome_formats = False
         self.key_events = []
+        self.key_methods = []
         self.on_key = None
         self.on_set_selection = None
+        self.empty_restore_delay = 0
         self.readers = {}
         self.serial = 0
         self.written = {}
@@ -109,12 +116,14 @@ class RemoteFixture(PortalFixture):
                 self.started += 1
                 if self.notify_initial:
                     self.owner(list(self.selection), False)
-                grants = {"devices": Variant("u", KEYBOARD), "clipboard_enabled": Variant("b", self.permissions)}
+                grants = {"devices": Variant("u", KEYBOARD if self.grant_access else 0),
+                          "clipboard_enabled": Variant("b", self.grant_access and self.clipboard_access)}
                 if self.renewal:
                     grants["restore_token"] = Variant("s", self.renewal)
                 return self.response(message, 0, grants)
             if message.member in ("NotifyKeyboardKeysym", "NotifyKeyboardKeycode"):
                 self.key_events.append(tuple(message.body[-2:]))
+                self.key_methods.append(message.member)
                 if self.on_key is not None:
                     self.on_key(*self.key_events[-1])
                 return Message.new_method_return(message)
@@ -126,7 +135,10 @@ class RemoteFixture(PortalFixture):
                 options = message.body[1]
                 formats = options["mime_types"].value if "mime_types" in options else []
                 self.owners.append(formats)
-                self.owner(formats, bool(formats))
+                if not formats and self.empty_restore_delay:
+                    asyncio.get_running_loop().call_later(self.empty_restore_delay, self.owner, [], False)
+                else:
+                    self.owner(formats, bool(formats))
                 if self.on_set_selection is not None:
                     self.on_set_selection(formats)
                 return Message.new_method_return(message)
@@ -156,6 +168,58 @@ class RemoteFixture(PortalFixture):
 @unittest.skipUnless(sys.platform == "linux" and find_spec("dbus_fast") and shutil.which("dbus-daemon"),
                      "requires dbus-fast and a private session bus")
 class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sway_primes_focus_from_the_compositors_window_and_only_reads_metadata(self):
+        field = WaylandField()
+        field.bus = SimpleNamespace(connected=True)
+        window = FocusWindow(14, 716, "External editor")
+        root = (REGISTRY, REGISTRY_ROOT)
+        app = (":1.8", REGISTRY_ROOT)
+        wrong_app = (":1.9", REGISTRY_ROOT)
+        active = (app[0], "/window")
+        stale = (app[0], "/old_window")
+        editor = (app[0], "/field")
+        children = {root: [wrong_app, app], app: [stale, active], active: [editor], editor: []}
+        states = {active: ACTIVE, stale: ACTIVE, editor: EDITABLE_AND_FOCUSED}
+
+        async def query(_bus, name, path, interface, member, signature="", body=None):
+            target = (name, path)
+            if interface == DBUS and member == "GetConnectionUnixProcessID":
+                return [window.pid if body == [app[0]] else 901]
+            if interface == ACCESSIBLE and member == "GetChildren":
+                return [children[target]]
+            if interface == ACCESSIBLE and member == "GetState":
+                return [[states[target], 0]]
+            if interface == PROPERTIES and member == "Get" and body == [ACCESSIBLE, "Name"]:
+                return [Variant("s", window.title if target == active else "Inactive window")]
+            self.fail(f"Unexpected accessibility query {interface}.{member}")
+
+        with (patch("wayland_field.call", new=query),
+              patch("wayland_field.sway_window", return_value=window) as current):
+            await field.seed_focus()
+            self.assertEqual(field.focus, (*editor, 1))
+            self.assertTrue(await field.confirm_seeded_focus(field.focus))
+            current.return_value = FocusWindow(15, 716, "External editor")
+            self.assertFalse(await field.confirm_seeded_focus(field.focus))
+            self.assertIsNone(field.focus)
+
+    async def test_sway_discards_a_seed_if_a_focus_event_arrives_during_the_lookup(self):
+        field = WaylandField()
+        field.bus = SimpleNamespace(connected=True)
+        window = FocusWindow(16, 716, "External editor")
+        target = (":1.8", "/initial")
+
+        async def search(*_):
+            field.signal(SimpleNamespace(message_type=MessageType.SIGNAL, sender=":1.8", path="/moved",
+                                         interface="org.a11y.atspi.Event.Object", member="StateChanged",
+                                         body=["focused", 1]))
+            return target
+
+        with (patch("wayland_field.sway_window", return_value=window),
+              patch("wayland_field.focused_editor", side_effect=search)):
+            await field.seed_focus()
+        self.assertEqual(field.focus, (":1.8", "/moved", 1))
+        self.assertIsNone(field.seeded_window)
+
     async def test_continuation_requires_matching_focus_caret_and_edit_revision(self):
         with TemporaryDirectory() as directory:
             history = PortableDictationHistory(directory)
@@ -252,6 +316,36 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await dictation.paste_in_field("No observed target", keyboard, lambda: True, False, None), PASTE_SENT)
             keyboard.paste.assert_awaited_once()
 
+    async def test_sway_pastes_queued_plain_text_and_rejects_a_window_that_lost_focus(self):
+        directory = self.enterContext(TemporaryDirectory())
+        history = PortableDictationHistory(directory)
+        history.initialize()
+        dictation = WaylandDictation(SimpleNamespace(), None, history)
+        dictation.command_mode = True
+        sway = dictation.sway = SwayFocus()
+        sway.change((1, 100))
+
+        async def paste(text, terminal, allowed, *, confirm):
+            return PASTE_SENT if allowed() and await confirm() else PASTE_FALLBACK
+
+        keyboard = dictation.keyboard = SimpleNamespace(paste=AsyncMock(side_effect=paste))
+        dictation.watch_focus()
+        dictation.paste_target = keyboard
+        older = dictation.prepare_delivery()
+        dictation.watch_focus()
+        dictation.paste_target = keyboard
+        newer = dictation.prepare_delivery()
+
+        with patch.object(sway, "refresh", AsyncMock(return_value=True)):
+            self.assertEqual(await older("First words."), PASTE_SENT)
+            self.assertEqual(await newer("Second words."), PASTE_SENT)
+            self.assertIsNone(dictation.last_insertion)
+            self.assertEqual([call.args[0] for call in keyboard.paste.await_args_list], ["First words.", "Second words."])
+            sway.change((2, 200))
+            sway.change((1, 100))
+            self.assertEqual(await newer("An old destination."), PASTE_FALLBACK)
+            self.assertEqual(keyboard.paste.await_count, 2)
+
     async def test_accessibility_snapshot_skips_password_caret_and_text_queries(self):
         field = WaylandField()
         field.bus = SimpleNamespace(connected=True)
@@ -285,6 +379,9 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.desktop.bus.disconnect)
         self.paste = WaylandPaste(lambda: None)
         self.addAsyncCleanup(self.paste.close)
+        probe = patch("wayland_paste.paste_keycodes", return_value=(KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V, 135))
+        self.paste_keycodes = probe.start()
+        self.addCleanup(probe.stop)
 
     async def key_sent(self):
         async with asyncio.timeout(3):
@@ -339,6 +436,7 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         await self.key_sent()
         self.assertEqual(await self.desktop.read_owned("text/plain;charset=utf-8"), second.text.encode())
         self.assertEqual(await paste, "pasted")
+        await second.keyboard.wait_for_restore()
         for mime, content in self.desktop.original.items():
             self.assertEqual(await self.desktop.read_owned(mime), content)
         await second.close()
@@ -350,7 +448,7 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.desktop.select_options[-1]["restore_token"], "fixture-approved-second")
         await third.disable_paste()
         await third.close()
-        self.assertEqual(history.consume_paste_grant(), "")
+        self.assertEqual(history.consume_paste_grant(), ("", False))
 
         fourth = reopen()
         await restore_portable_shortcut(state)
@@ -358,23 +456,86 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(fourth.keyboard_allowed)
         self.assertEqual(self.desktop.started, 3)
 
+    async def test_virtual_keyboard_consent_restores_only_when_supported(self):
+        from server import restore_portable_shortcut
+
+        state, history, reopen = self.dictation_workspace()
+
+        async def restart():
+            dictation = reopen()
+            await restore_portable_shortcut(state)
+            await dictation.keyboard_task
+            return dictation
+
+        with (patch("wayland_paste.clipboard_capabilities", return_value=(Path("/fixture/clipboard"), True)) as probe,
+              patch("wayland_paste.shutil.which", return_value="/fixture/wtype")):
+            first = await restart()
+            self.assertFalse(first.keyboard_allowed)
+            probe.assert_not_awaited()
+
+            first.allow_paste()
+            await first.keyboard_task
+            self.assertTrue(first.keyboard_allowed)
+            self.assertEqual(first.feedback, "Automatic paste is ready.")
+            self.assertEqual(history.consume_paste_grant(), ("", True))
+            await first.close()
+
+            probe.return_value = (None, False)
+            unsupported = await restart()
+            self.assertFalse(unsupported.keyboard_allowed)
+            self.assertTrue(unsupported.snapshot()["savedVirtualPaste"])
+            self.assertIn("Choose Allow paste", unsupported.feedback)
+            self.assertEqual(self.desktop.started, 0)
+            await unsupported.close()
+
+            probe.return_value = (Path("/fixture/clipboard"), True)
+            restored = await restart()
+            self.assertTrue(restored.keyboard_allowed)
+            self.assertEqual(self.desktop.started, 0)
+            await restored.disable_paste()
+            await restored.close()
+
+            disabled = await restart()
+            self.assertFalse(disabled.keyboard_allowed)
+            self.assertFalse(disabled.snapshot()["savedVirtualPaste"])
+            self.assertEqual(history.consume_paste_grant(), ("", False))
+            self.assertEqual(self.desktop.started, 0)
+
+    async def test_explicit_portal_approval_replaces_saved_virtual_keyboard_choice(self):
+        from server import restore_portable_shortcut
+
+        state, history, reopen = self.dictation_workspace()
+        history.save_paste_grant("", True)
+        with patch("wayland_paste.clipboard_capabilities", return_value=(None, False)):
+            dictation = reopen()
+            await restore_portable_shortcut(state)
+            await dictation.keyboard_task
+            self.assertEqual(self.desktop.started, 0)
+
+            self.desktop.renewal = "portal-approval"
+            dictation.allow_paste()
+            await dictation.keyboard_task
+            self.assertTrue(dictation.keyboard_allowed)
+            self.assertFalse(dictation.snapshot()["savedVirtualPaste"])
+            self.assertEqual(history.consume_paste_grant(), ("portal-approval", False))
+
     async def test_denied_or_revoked_grant_is_not_reused(self):
         from server import restore_portable_shortcut
 
         state, history, reopen = self.dictation_workspace()
         history.save_paste_grant("expired")
         self.desktop.renewal = "must-not-save"
-        self.desktop.permissions = False
+        self.desktop.grant_access = False
         dictation = reopen()
         await restore_portable_shortcut(state)
         await dictation.keyboard_task
         self.assertEqual(self.desktop.select_options[-1]["restore_token"], "expired")
         self.assertFalse(dictation.keyboard_allowed)
-        self.assertEqual(history.consume_paste_grant(), "")
+        self.assertEqual(history.consume_paste_grant(), ("", False))
         self.assertEqual(self.desktop.key_events, [])
 
         self.desktop.renewal = "granted"
-        self.desktop.permissions = True
+        self.desktop.grant_access = True
         dictation.allow_paste()
         await dictation.keyboard_task
         self.assertTrue(dictation.keyboard_allowed)
@@ -384,8 +545,68 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
             while dictation.keyboard_allowed:
                 await asyncio.sleep(.01)
         await asyncio.gather(*dictation.paste_grant_tasks)
-        self.assertEqual(history.consume_paste_grant(), "")
+        self.assertEqual(history.consume_paste_grant(), ("", False))
         self.assertIn("Copy last", dictation.feedback)
+
+    async def test_virtual_keyboard_requires_the_compositor_protocol_and_clipboard(self):
+        clipboard_owned = True
+
+        lease = SimpleNamespace(owned=lambda: clipboard_owned, offer=AsyncMock(return_value=True), close=AsyncMock())
+
+        with (patch("wayland_paste.clipboard_capabilities", return_value=(Path("/fixture/clipboard"), True)),
+              patch("wayland_paste.shutil.which", return_value="/fixture/wtype"),
+              patch("wayland_paste.ClipboardLease.start", return_value=lease) as start,
+              patch("wayland_paste.run_tool", return_value=b"") as tools,
+              patch("wayland_paste.RESTORE_DELAY", 0)):
+            await self.paste.approve()
+            self.assertTrue(self.paste.active)
+            self.assertEqual(self.desktop.started, 0)
+            self.assertEqual(await self.paste.paste("Dictated text", True, lambda: True), PASTE_SENT)
+            start.assert_awaited_once_with(Path("/fixture/clipboard"))
+            lease.offer.assert_awaited_once_with(b"Dictated text")
+            tools.assert_awaited_once_with("/fixture/wtype", "-M", "ctrl", "-M", "shift", "-k", "v",
+                                           "-m", "shift", "-m", "ctrl")
+            tools.return_value = None
+            self.assertEqual(await self.paste.paste("Dictated text", False, lambda: True), PASTE_FALLBACK)
+            tools.reset_mock()
+            confirm = AsyncMock(return_value=False)
+            self.assertEqual(await self.paste.paste("Dictated text", False, lambda: True, confirm=confirm), PASTE_FALLBACK)
+            confirm.assert_awaited_once()
+            tools.assert_not_awaited()
+            clipboard_owned = False
+            tools.reset_mock()
+            self.assertEqual(await self.paste.paste("Dictated text", False, lambda: True), PASTE_FALLBACK)
+            tools.assert_not_awaited()
+
+    async def test_portal_keyboard_and_data_control_are_independent_on_plasma(self):
+        lease = SimpleNamespace(owned=lambda: True, offer=AsyncMock(return_value=True), close=AsyncMock())
+
+        self.desktop.clipboard_access = False
+        self.desktop.renewal = "plasma-token"
+        with (patch("wayland_paste.clipboard_capabilities", return_value=(Path("/fixture/clipboard"), False)),
+              patch("wayland_paste.ClipboardLease.start", return_value=lease),
+              patch("wayland_paste.RESTORE_DELAY", 0),
+              patch.dict(os.environ, XDG_CURRENT_DESKTOP="KDE")):
+            await self.paste.approve()
+            self.assertTrue(self.paste.active)
+            self.assertFalse(self.desktop.requested_clipboard)
+            self.assertEqual(self.paste.restore_token, "plasma-token")
+            for terminal in (False, True):
+                self.assertEqual(await self.paste.paste("Dictated text", terminal, lambda: True), PASTE_SENT)
+            self.assertEqual(self.desktop.started, 1)
+            self.assertEqual(self.desktop.key_events, [(KEY_LEFTCTRL, 1), (KEY_V, 1), (KEY_V, 0), (KEY_LEFTCTRL, 0),
+                                                       (KEY_LEFTCTRL, 1), (KEY_LEFTSHIFT, 1), (KEY_V, 1),
+                                                       (KEY_V, 0), (KEY_LEFTSHIFT, 0), (KEY_LEFTCTRL, 0)])
+
+    async def test_missing_clipboard_grant_does_not_replace_the_selection(self):
+        self.desktop.clipboard_access = False
+        with patch("wayland_paste.clipboard_capabilities", return_value=(None, False)):
+            with self.assertRaisesRegex(CaptureError, "Copy last"):
+                await self.paste.approve()
+            self.assertFalse(self.paste.active)
+            self.assertEqual(await self.paste.paste("Dictated text", False, lambda: True), PASTE_FALLBACK)
+            self.assertEqual(self.desktop.key_events, [])
+            self.assertEqual(self.desktop.selection, self.desktop.original)
 
     async def test_older_desktop_can_grant_a_session_without_persistence(self):
         self.desktop.remote_version = 1
@@ -403,8 +624,86 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         await self.key_sent()
         self.assertEqual(await self.desktop.read_owned("text/plain;charset=utf-8"), text.encode())
         self.assertEqual(await delivery, "Paste shortcut sent.")
+        await self.paste.wait_for_restore()
         self.assertEqual(self.desktop.key_events, [(KEY_LEFTCTRL, 1), (KEY_LEFTSHIFT, 1), (KEY_V, 1),
                                                    (KEY_V, 0), (KEY_LEFTSHIFT, 0), (KEY_LEFTCTRL, 0)])
+        for mime, data in self.desktop.original.items():
+            self.assertEqual(await self.desktop.read_owned(mime), data)
+
+    async def test_rapid_portal_pastes_reuse_the_original_clipboard(self):
+        await self.paste.approve()
+        self.assertEqual(await asyncio.wait_for(self.paste.paste("First.", False, lambda: True), .4), PASTE_SENT)
+        self.assertEqual(await self.desktop.read_owned("text/plain"), b"First.")
+        self.assertIsNotNone(self.paste.restore_task)
+        self.assertEqual(await self.paste.paste("Second.", False, lambda: True), PASTE_SENT)
+        self.assertEqual(await self.desktop.read_owned("text/plain"), b"Second.")
+        self.assertEqual(len(self.desktop.owners), 2)
+        await self.paste.wait_for_restore()
+        self.assertEqual(len(self.desktop.owners), 3)
+        for mime, data in self.desktop.original.items():
+            self.assertEqual(await self.desktop.read_owned(mime), data)
+
+    async def test_rapid_portal_paste_adopts_new_external_copy(self):
+        await self.paste.approve()
+        self.assertEqual(await self.paste.paste("First.", False, lambda: True), PASTE_SENT)
+        changed = self.paste.selection_revision
+        self.desktop.foreign_copy({"text/plain": b"Newer", "text/html": b"<b>Newer</b>"})
+        await self.paste.wait_for_selection(changed)
+        self.assertEqual(await self.paste.paste("Second.", False, lambda: True), PASTE_SENT)
+        await self.paste.wait_for_restore()
+        self.assertEqual(await self.desktop.read_owned("text/plain"), b"Newer")
+        self.assertEqual(await self.desktop.read_owned("text/html"), b"<b>Newer</b>")
+
+    async def test_data_control_keeps_one_lease_for_rapid_pastes(self):
+        lease = SimpleNamespace(owned=lambda: True, offer=AsyncMock(return_value=True), close=AsyncMock())
+        with (patch("wayland_paste.clipboard_capabilities", return_value=(Path("/fixture/clipboard"), True)),
+              patch("wayland_paste.shutil.which", return_value="/fixture/wtype"),
+              patch("wayland_paste.ClipboardLease.start", return_value=lease) as start,
+              patch("wayland_paste.run_tool", return_value=b"")):
+            await self.paste.approve()
+            self.assertEqual(await self.paste.paste("First.", False, lambda: True), PASTE_SENT)
+            lease.close.assert_not_awaited()
+            self.assertEqual(await self.paste.paste("Second.", False, lambda: True), PASTE_SENT)
+            self.assertEqual([arg.args[0] for arg in lease.offer.await_args_list], [b"First.", b"Second."])
+            start.assert_awaited_once()
+            lease.close.assert_not_awaited()
+            await self.paste.wait_for_restore()
+            lease.close.assert_awaited_once()
+
+    async def test_portal_uses_the_current_layout_with_symbol_fallback(self):
+        self.paste_keycodes.side_effect = [(29, 42, 52, 135), None]
+        await self.paste.approve()
+        with patch("wayland_paste.RESTORE_DELAY", 0):
+            self.assertEqual(await self.paste.paste("Dvorak.", False, lambda: True), PASTE_SENT)
+            self.assertEqual(await self.paste.paste("Changed layout.", True, lambda: True), PASTE_SENT)
+        self.assertEqual(self.desktop.key_events, [
+            (29, 1), (52, 1), (52, 0), (29, 0),
+            (CONTROL_L, 1), (SHIFT_L, 1), (LATIN_V, 1), (LATIN_V, 0), (SHIFT_L, 0), (CONTROL_L, 0),
+        ])
+        self.assertEqual(self.desktop.key_methods, ["NotifyKeyboardKeycode"] * 4 + ["NotifyKeyboardKeysym"] * 6)
+        self.assertEqual(self.paste_keycodes.await_count, 2)
+
+    async def test_plasma_uses_the_selected_layout_and_does_not_guess_a_physical_v(self):
+        self.paste_keycodes.side_effect = [(29, 42, -1, 135), (29, 42, 52, 135), (29, 42, 0, 135)]
+        await self.paste.approve()
+        with (patch.dict(os.environ, XDG_CURRENT_DESKTOP="KDE"),
+              patch.object(self.paste, "kde_layout", return_value=1) as active_group,
+              patch("wayland_paste.RESTORE_DELAY", 0)):
+            self.assertEqual(await self.paste.paste("Dvorak.", True, lambda: True), PASTE_SENT)
+            self.assertEqual(await self.paste.paste("Russian.", False, lambda: True), PASTE_SENT)
+        self.assertEqual(self.desktop.key_events, [(29, 1), (42, 1), (52, 1), (52, 0), (42, 0), (29, 0),
+                                                   (135, 1), (135, 0)])
+        self.assertEqual(self.desktop.key_methods, ["NotifyKeyboardKeycode"] * 8)
+        self.paste_keycodes.assert_any_await(1)
+        self.assertEqual(active_group.await_count, 2)
+
+    async def test_layout_changes_before_delivery_leave_the_clipboard_preserved(self):
+        self.paste_keycodes.side_effect = [(29, 42, -1, 0), (29, 42, 52, 0)]
+        await self.paste.approve()
+        with (patch.dict(os.environ, XDG_CURRENT_DESKTOP="KDE"),
+              patch.object(self.paste, "kde_layout", side_effect=[0, 1])):
+            self.assertEqual(await self.paste.paste("Use Copy last.", False, lambda: True), PASTE_FALLBACK)
+        self.assertEqual(self.desktop.key_events, [])
         for mime, data in self.desktop.original.items():
             self.assertEqual(await self.desktop.read_owned(mime), data)
 
@@ -414,6 +713,7 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         await self.key_sent()
         self.desktop.foreign_copy({"text/plain": b"New copy"})
         self.assertEqual(await delivery, "Paste shortcut sent.")
+        await self.paste.wait_for_restore()
         self.assertEqual(len(self.desktop.owners), 1)
         self.assertEqual(self.desktop.selection["text/plain"], b"New copy")
 
@@ -424,7 +724,22 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         await self.key_sent()
         self.assertEqual(await self.desktop.read_owned("text/plain"), b"Local dictation.")
         self.assertEqual(await delivery, "Paste shortcut sent.")
+        await self.paste.wait_for_restore()
         self.assertEqual(await self.desktop.read_owned("image/png"), self.desktop.original["image/png"])
+
+    async def test_gnome_portal_keeps_the_restored_clipboard_and_grant_while_idle(self):
+        self.desktop.renewal = "approved-once"
+        with patch.dict(os.environ, XDG_CURRENT_DESKTOP="GNOME"):
+            await self.paste.approve()
+            session = self.paste.session
+            self.assertEqual(await self.paste.paste("First take.", False, lambda: True), PASTE_SENT)
+            # The old adapter closed the portal after 15 seconds, releasing the clipboard.
+            await asyncio.sleep(15.1)
+            self.assertEqual(self.paste.session, session)
+            self.assertEqual(await self.desktop.read_owned("image/png"), self.desktop.original["image/png"])
+            self.assertEqual(await self.paste.paste("Second take.", False, lambda: True), PASTE_SENT)
+            self.assertEqual(self.paste.restore_token, "approved-once")
+            self.assertEqual(self.desktop.started, 1)
 
     async def test_unknown_clipboard_keeps_copy_last_available(self):
         self.desktop.notify_initial = False
@@ -445,14 +760,25 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         await self.key_sent()
         self.assertEqual(await self.desktop.read_owned("text/plain"), b"First dictation.")
         self.assertEqual(await delivery, PASTE_SENT)
+        await self.paste.wait_for_restore()
         self.assertEqual(self.desktop.owners[-1], [])
 
     async def test_gnome_clears_the_cached_transcript_if_the_clipboard_was_empty(self):
         self.desktop.selection = {}
+        self.desktop.empty_restore_delay = .04
         await self.paste.approve()
-        with patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}):
+        with (patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}),
+              patch("wayland_paste.RESTORE_DELAY", 0)):
             self.assertEqual(await self.paste.paste("First dictation.", False, lambda: True), PASTE_SENT)
-        self.assertEqual(self.desktop.owners[-2:], [[EMPTY_RESTORE_FORMAT], []])
+            await self.paste.wait_for_restore()
+            self.assertFalse(self.paste.owns_selection)
+            self.assertEqual(self.paste.formats, ())
+            self.assertEqual(await self.paste.paste("Second dictation.", True, lambda: True), PASTE_SENT)
+            await self.paste.wait_for_restore()
+            self.assertFalse(self.paste.owns_selection)
+            self.assertEqual(self.paste.formats, ())
+        self.assertEqual(self.desktop.owners[1::3], [[EMPTY_RESTORE_FORMAT], [EMPTY_RESTORE_FORMAT]])
+        self.assertEqual(self.desktop.owners[2::3], [[], []])
 
     async def test_gnome_empty_restore_preserves_a_new_clipboard_owner(self):
         self.desktop.selection = {}
@@ -465,6 +791,7 @@ class WaylandPasteTests(unittest.IsolatedAsyncioTestCase):
         self.desktop.on_set_selection = copy_during_restore
         with patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}):
             self.assertEqual(await self.paste.paste("First dictation.", False, lambda: True), PASTE_SENT)
+            await self.paste.wait_for_restore()
         self.assertEqual(len(self.desktop.owners), 2)
         self.assertEqual(await self.paste.snapshot(), {"text/plain": b"New copy"})
 

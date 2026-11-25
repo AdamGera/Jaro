@@ -2,14 +2,25 @@
 import math
 import re
 from datetime import date, datetime, time, timedelta, timezone
+from itertools import chain
 from pathlib import Path
 from uuid import UUID
 
 from meeting_rolling import MIXED_SPEAKERS, RATE, SOURCE_LABELS, read_rolling
 from meeting_search import rank_passages, words
-from native_recordings import list_drafts
+from native_recordings import list_drafts, portable_meeting_drafts
 from personal_notes import document_text
 from session_store import MissingSession
+
+
+def read_portable_live_meeting(root, live, *, turns=True):
+    if not live or not turns:
+        return live
+    key = str(UUID(live["id"]))
+    source = root / "microphone-drafts" / f"{key}.wav"
+    frames = round(live["duration"] * RATE)
+    segments = [segment for _, _, result in read_rolling(source, frames) for segment in result["segments"]]
+    return {**live, "meetingTurns": segments}
 
 
 def parse_offset(value):
@@ -77,10 +88,11 @@ def meeting_span(row):
 
 
 def interrupted_meetings(library):
-    for draft in list_drafts(library.root / "staging"):
+    drafts = chain(list_drafts(library.root / "staging"), portable_meeting_drafts(library.root / "microphone-drafts"))
+    for draft in drafts:
         if not draft["meeting"] or library.exists(draft["id"]):
             continue
-        duration = (draft["bytes"] - 44) // 2 / RATE
+        duration = draft["duration"] if "duration" in draft else (draft["bytes"] - 44) // 2 / RATE
         end = datetime.fromtimestamp(draft["modified"], timezone.utc)
         start = end - timedelta(seconds=duration)
         if isinstance(draft.get("started"), str):
@@ -93,13 +105,14 @@ def interrupted_meetings(library):
         provider = draft["provider"] or "Meeting"
         calendar = draft["calendar"] if isinstance(draft["calendar"], dict) else None
         title = draft.get("provisionalTitle")
-        name = draft.get("meetingTitle") or (calendar or {}).get("title") or title or f"{provider} meeting"
+        name = draft.get("meetingTitle") or (calendar or {}).get("title") or title or (
+            f"{provider} meeting" if provider != "Meeting" else provider)
         yield {"id": draft["id"], "name": name,
                "meetingProvider": provider, "meeting": True, "meetingCalendar": calendar, "created": start.isoformat(),
                **({"meetingMicrophoneWarning": "digitalSilence"} if draft.get("meetingMicrophoneWarning") == "digitalSilence" else {}),
                **({"provisionalTitle": title} if title else {}),
                "meetingStartedAt": start.isoformat(), "meetingEndedAt": end.isoformat(), "duration": duration,
-               "processed": 0, "status": "interrupted"}
+               "processed": 0, "status": "interrupted"}, Path(draft["path"])
 
 
 def meetings(library, query="", limit=20, *, since=None, until=None, live=None, include_in_progress=True):
@@ -109,7 +122,8 @@ def meetings(library, query="", limit=20, *, since=None, until=None, live=None, 
         raise ValueError("The until time must be after the since time.")
     rows = library.list("", meetings_only=True)
     saved = {row["id"] for row in rows}
-    rows.extend(draft for draft in interrupted_meetings(library) if draft["id"] not in saved)
+    rows.extend(draft for draft, _ in interrupted_meetings(library)
+                if draft["id"] not in saved and (not live or draft["id"] != live["id"]))
     if live and not any(row["id"] == live["id"] and row["status"] != "processing" for row in rows):
         rows = [{key: value for key, value in live.items() if key != "meetingTurns"},
                 *(row for row in rows if row["id"] != live["id"])]
@@ -157,12 +171,12 @@ def get_meeting(library, identifier, *, turns=True, live=None, staged=True):
     if session is None:
         if not staged:
             raise MissingSession(key)
-        draft = next((draft for draft in interrupted_meetings(library) if draft["id"] == key), None)
-        if draft is None:
+        found = next(((draft, path) for draft, path in interrupted_meetings(library) if draft["id"] == key), None)
+        if found is None:
             # An importer may have committed and cleared staging while the read was in progress.
             session = library.get(key, include_turns=turns)
         else:
-            source = library.root / "staging" / key
+            draft, source = found
             mixed = False
             segments = []
             if turns:

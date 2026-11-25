@@ -12,6 +12,22 @@ overlay, updater, and transformation code are by Christopher Langton. See
 licenses/Christopher-Langton-MIT.txt for the full copyright and MIT license
 notices.
 
+The iOS and Android keyboard sources also include work by Christopher Langton.
+See mobile/ios/LICENSE and mobile/android/app/src/main/assets/licenses/upstream-mit.txt
+for the MIT terms, and the mobile notices for separate model and data licenses.
+
+Linux desktop builds use Wayland data control protocol definitions by Simon Ser,
+Ivan Molodetskikh, and Neal Gompa, and the foreign toplevel management protocol
+definition by Ilia Bozhinov. Their copyright and license terms ship with the
+definitions in the Wayland directory under the package's licenses.
+
+The Ubuntu package bundles GTK4 Layer Shell 1.0.4 by Sophie Winter.
+Its MIT license ships in the package as gtk4-layer-shell-LICENSE.
+
+The downloaded llama.cpp writing runtime uses the MIT License. See
+licenses/llama.cpp-MIT.txt. The Windows runtime also includes LLVM OpenMP with
+its Apache 2.0 license and LLVM Exceptions in LICENSE-LLVM-OpenMP.
+
 Optional speech noise cleanup uses StuPASE (Cisco Systems, Apache License 2.0)
 with SenseVoice (ASLP-lab, MIT), WavLM (Microsoft, MIT), and WavTokenizer
 (jishengpeng, MIT) components. See licenses/stupase/NOTICE.md and
@@ -19,8 +35,8 @@ licenses/stupase/ for the full notices and license texts.
 
 Windows screen-recording builds bundle FFmpeg (LGPL-2.1), FriBidi (LGPL-2.1),
 FreeType (FTL — portions of this software are copyright The FreeType Project,
-www.freetype.org), HarfBuzz (MIT), libass (ISC), and Liberation Sans (SIL OFL
-1.1), plus the Native SDK and WebView2 Loader runtimes. See licenses/ for full
+www.freetype.org), HarfBuzz (MIT), libass (ISC), OpenH264 (BSD-2-Clause), and
+Liberation Sans (SIL OFL 1.1), plus the Native SDK and WebView2 Loader runtimes. See licenses/ for full
 license texts and reproduction sources.
 
 The agent icons identify the respective send destinations. The Codex icons

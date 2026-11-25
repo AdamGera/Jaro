@@ -1,6 +1,6 @@
 """X11 clipboard delivery for dictation, including restoration of rich data."""
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from time import monotonic
 
 from Xlib import X, XK, Xatom, error
@@ -12,6 +12,8 @@ MAX_CLIPBOARD = 32 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
 READ_TIMEOUT = 1.2
 RESTORE_DELAY = .5
+PASTE_SETTLE = .1
+PASTE_SENT = "Paste shortcut sent."
 
 
 class ClipboardUnavailable(Exception):
@@ -31,6 +33,9 @@ class X11Paste:
         self.data = {}
         self.transfers = {}
         self.timestamp = X.CurrentTime
+        self.delivery = asyncio.Lock()
+        self.restore_task = None
+        self.original = None
 
     def new_window(self):
         return self.connection.screen().root.create_window(
@@ -251,6 +256,13 @@ class X11Paste:
             raise ClipboardUnavailable
 
     async def paste(self, text, focus, still_focused, terminal=False):
+        async with self.delivery:
+            result = await self.deliver(text, focus, still_focused, terminal)
+        if result == PASTE_SENT:
+            await asyncio.sleep(PASTE_SETTLE)
+        return result
+
+    async def deliver(self, text, focus, still_focused, terminal):
         connection = self.connection
         atoms = self.atoms
         if not focus or connection.get_input_focus().focus != focus or not still_focused():
@@ -259,7 +271,9 @@ class X11Paste:
             chord, blocked = self.keys(terminal)
             owner = self.owner()
             async with asyncio.timeout(READ_TIMEOUT):
-                original = await self.snapshot(owner)
+                original = self.original if owner == self.window and self.restore_task else await self.snapshot(owner)
+                if original is None:
+                    raise ClipboardUnavailable
                 timestamp = await self.server_time()
                 while self.held(blocked):
                     await asyncio.sleep(.02)
@@ -268,7 +282,6 @@ class X11Paste:
 
         content = text.encode()
         utf8 = atoms["UTF8_STRING"]
-        pasted = False
         try:
             with self.server_grab():
                 if connection.get_input_focus().focus != focus or not still_focused():
@@ -282,17 +295,38 @@ class X11Paste:
                 if self.owner() != self.window:
                     self.data = {}
                     raise ClipboardUnavailable
-                pasted = True
-                self.send_keys(chord)
-            await asyncio.sleep(RESTORE_DELAY)
+                if self.restore_task:
+                    self.restore_task.cancel()
+                self.original = original
+                try:
+                    self.send_keys(chord)
+                except (ClipboardUnavailable, error.XError):
+                    self.restore_task = None
+                    self.restore(timestamp)
+                    raise
+                self.restore_task = asyncio.create_task(self.restore_after_delay(timestamp))
         except (ClipboardUnavailable, error.XError):
             return "Automatic paste was unavailable. Use Copy last to paste the dictation."
-        finally:
-            if pasted and original is not None:
+        return PASTE_SENT
+
+    def restore(self, timestamp):
+        original, self.original = self.original, None
+        if original is not None and self.owner() == self.window:
+            self.set_data(original, timestamp)
+
+    async def restore_after_delay(self, timestamp):
+        await asyncio.sleep(RESTORE_DELAY)
+        async with self.delivery:
+            if self.restore_task is not asyncio.current_task():
+                return
+            self.restore_task = None
+            with suppress(OSError, error.DisplayError, error.ConnectionClosedError, error.XError):
                 with self.server_grab():
-                    if self.owner() == self.window:
-                        self.set_data(original, timestamp)
-        return "Paste shortcut sent."
+                    self.restore(timestamp)
+
+    async def wait_for_restore(self):
+        if self.restore_task:
+            await asyncio.shield(self.restore_task)
 
     async def hand_off(self):
         """Let the desktop clipboard manager retain restored data on quit."""

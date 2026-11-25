@@ -9,7 +9,7 @@ from tempfile import TemporaryDirectory
 
 import annotation_storage
 from personal_notes import as_context
-from meeting_retention import sync_directory, trash_path, write_archive
+from meeting_retention import add_archive_images, snapshot_images, sync_directory, trash_path, write_archive
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS annotation_retention (
@@ -135,16 +135,19 @@ def transfer(library, key, trash):
             original = identity(movie)
             if kind == "record":
                 saved = snapshot(db, key)
+                images = snapshot_images(db, key)
                 transcript, _ = library._result(db, row)
                 path = directory / f"Jaro Annotation {key}"
-                manifest = json.dumps({"version": 1, "id": key, "tables": saved}, ensure_ascii=False)
-                files = {"Annotation.json": manifest + "\n", "Narration.md": transcript["text"] + "\n",
+                files = {"Narration.md": transcript["text"] + "\n",
                          "Notes.md": as_context(db, key) + "\n"}
+                tables = dict(saved)
+                add_archive_images(files, tables, key, images)
+                files["Annotation.json"] = json.dumps({"version": 1, "id": key, "tables": tables}, ensure_ascii=False) + "\n"
                 write_archive(path, files, movie.parent, media_folder="Capture")
             else:
                 path = directory / f"Jaro Annotation Video {key}{movie.suffix}"
                 if original is not None:
-                    os.link(movie, path, follow_symlinks=False)
+                    annotation_storage.duplicate(movie, path)
                     sync_directory(directory)
                     sync_directory(staging)
 
@@ -164,7 +167,7 @@ def transfer(library, key, trash):
             if identity(movie) != original:
                 return False
             if kind == "record":
-                if snapshot(db, key) != saved:
+                if snapshot(db, key) != saved or snapshot_images(db, key) != images:
                     return False
                 library._delete_session(db, key, current["status"], options)
             else:

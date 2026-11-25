@@ -53,6 +53,7 @@ def write_event(kind, phase, *, inference_ms=None):
 
 def write_dictation_timing(values):
     names = ("captureFinalizeMs", "submissionWaitMs", "speechRequestMs", "inferenceMs",
+             "audioReadMs", "speechQueueMs", "audioPriorityMs", "voiceCleanupMs",
              "bridgeRoundTripMs", "outputWaitMs", "clipboardSnapshotMs", "deliveryMs", "totalMs")
     if not isinstance(values, dict):
         return

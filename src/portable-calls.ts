@@ -1,18 +1,19 @@
 import { useEffect, useRef, useState } from "react"
 
-type Policy = "ask" | "never" | "auto"
+import type { MeetingCallAction, MeetingRecordingPolicy } from "@/desktop"
 type OfferAction = "record" | "dismiss" | "more" | "back" | "always" | "never"
-type Preferences = { enabled: boolean; autoStop: boolean; policies: Record<string, Policy> }
+type Preferences = { enabled: boolean; autoStop: boolean; stopRequestedCalls?: boolean; defaultPolicy?: MeetingRecordingPolicy; policies: Record<string, MeetingRecordingPolicy> }
 export type DetectedCall = {
   id: string; name: string; automatic: boolean; elapsed: number; saving: boolean;
   sampleRate: number; stopSeconds: number | null; roomChanged?: boolean; languages: string[];
 }
 type CallStatus = Preferences & {
-  providers: { id: string; name: string; browser: boolean }[]
+  providers: { id: string; name: string; browser: boolean; website?: boolean; lastSeen?: number | null; canAlwaysRecord?: boolean }[]
   offer: { token: string; name: string; choosing: boolean; canAlways: boolean } | null
   active: DetectedCall | null
   completed: string | null
   message: string
+  settingsWarning?: string
 }
 
 const endpoint = "/api/portable/calls"
@@ -71,8 +72,8 @@ export function usePortableCalls(available: boolean) {
 
   return {
     status, error, pending,
-    update(preferences: Preferences) {
-      return act("/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(preferences) })
+    update(change: MeetingCallAction | { action: "stopRequestedCalls"; enabled: boolean }) {
+      return act("/settings", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(change) })
     },
     answer(token: string, action: OfferAction, languages: string[] = []) {
       const query = new URLSearchParams()

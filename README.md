@@ -6,9 +6,9 @@
 
 # Jaro — By Jard
 
-Jaro is a local audio app for Mac. Dictate into the app you’re already using, record meetings, or transcribe an audio file. Transcription runs on your Mac.
+Jaro is a local audio app for macOS and Linux. Dictate into the app you’re already using, record meetings, or transcribe an audio file. Transcription runs on your computer.
 
-**[Download for Mac](https://github.com/AdamGera/Jaro/releases/latest)** · [GitHub repository](https://github.com/AdamGera/Jaro) · Apple Silicon · macOS 26 or later
+**[Download for Mac](https://github.com/AdamGera/Jaro/releases/latest/download/Jaro-arm64.dmg)** · **[Download for Linux](https://github.com/AdamGera/Jaro/releases/latest)**
 
 ## Meetings
 
@@ -34,6 +34,8 @@ Double-tap **Right Option** for hands-free dictation, then press it again to fin
 
 ## Install
 
+### macOS
+
 Before downloading, open **Apple menu → About This Mac**. Jaro requires an **Apple chip** (such as M1) and **macOS 26 or later**. Finder may show a crossed-out app icon if your Mac doesn’t meet these requirements. [Apple’s guide to identifying your Mac’s chip](https://support.apple.com/en-us/116943)
 
 Open the DMG, drag the app to **Applications**, and open it. First launch downloads about 4 GB of models. After setup, transcription, speaker labeling, and summaries work offline.
@@ -41,6 +43,21 @@ Open the DMG, drag the app to **Applications**, and open it. First launch downlo
 Allow microphone or Mac audio access when you first record from those sources. The app is signed by Jard, and macOS may require first-launch approval.
 
 To use the same session library in your browser, choose **File → Open in Browser**.
+
+### Linux x64
+
+On Debian 13 or Ubuntu 24.04 LTS, download the matching `.deb` from the [latest release](https://github.com/AdamGera/Jaro/releases/latest). Install it with `sudo apt install ./filename.deb`, open Jaro, and choose **Download models**. Debian 13 also has a per-user install with **Restart to Update**. See the [Linux setup guide](desktop/portable/linux/README.md) for the installer, desktop shortcuts, and audio permissions.
+
+## Mobile previews
+
+Jaro’s native mobile keyboards let you dictate into other apps, swipe to type, and manage your vocabulary on your device. Both ports are available to build from source.
+
+| Platform | Requirements | Build and setup |
+| --- | --- | --- |
+| iPhone and iPad | iOS or iPadOS 18+. Some dictation features require iOS or iPadOS 26 and supported hardware. | [iPhone and iPad guide](mobile/ios/README.md) |
+| Android | Android 12+ on ARM64 | [Android guide](mobile/android/README.md) |
+
+Public mobile downloads are pending device testing and release signing. [Mobile release status](mobile/README.md) · [Mobile privacy](mobile/PRIVACY.md)
 
 ## Develop and contribute
 
@@ -50,6 +67,6 @@ The [documentation index](docs/README.md) has the user guides, SDK, and build in
 
 At Jard (Joint AI Research & Dynamics), we believe intelligence should live on the edge, on the devices we use every day. A larger model is worth bringing in when a task needs more capability.
 
-Recent advances in speech recognition and compact language models have made dictation, transcripts, and meeting summaries practical on a Mac. We built Jaro to put that research to work today, with your recordings and notes staying on your device. We expect more to become possible on-device as the research progresses.
+Recent advances in speech recognition and compact language models have made dictation, transcripts, and meeting summaries practical on a personal computer. We built Jaro to put that research to work today, with your recordings and notes staying on your device. We expect more to become possible on-device as the research progresses.
 
-Jaro is free and open source under Apache 2.0. Download it and try it, read the source, contribute an improvement, or fork it and build your own version. [License](LICENSE) · [Model credits](NOTICE) · [Mac build details](desktop/build-tools/README.md) · [About Jard](https://www.jard.ai/)
+Jaro is free and open source under Apache 2.0, with separate licenses for the mobile source and bundled components. Download it and try it, contribute an improvement, or fork it and build your own version. [License](LICENSE) · [Component credits](NOTICE) · [Mac build details](desktop/build-tools/README.md) · [About Jard](https://www.jard.ai/jaro)

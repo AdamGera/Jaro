@@ -1,18 +1,18 @@
 #include "windows_dictation.h"
 #include <ole2.h>
-#include <fcntl.h>
-#include <io.h>
-#include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 
 enum {
     MAX_TRANSCRIPT_BYTES = 128 * 1024,
     MAX_CLIPBOARD_BYTES = 32 * 1024 * 1024,
     MAX_FORMATS = 64,
+    SETTLE_MS = 100,
     RESTORE_MS = 750,
     PASTE_TARGET_LOST = 3,
     PASTE_CLIPBOARD_UNAVAILABLE = 4,
-    PASTE_INPUT_UNAVAILABLE = 5
+    PASTE_INPUT_UNAVAILABLE = 5,
+    PASTE_TARGET_ELEVATED = 7
 };
 
 typedef struct {
@@ -25,6 +25,28 @@ typedef struct {
     size_t length;
 } Clipboard;
 
+typedef struct {
+    HWND owner;
+    Clipboard original;
+    DWORD sequence;
+    ULONGLONG restore_at;
+} PasteClipboard;
+
+// The Python controller encodes this fixed-width header in little-endian order.
+typedef struct {
+    uint64_t window, focus;
+    uint32_t process, terminal, revision, length;
+    char channel[32];
+} PasteRequest;
+_Static_assert(sizeof(PasteRequest) == 64, "Windows paste request layout");
+
+typedef struct {
+    HANDLE request_ready, reply_ready;
+    PasteRequest request;
+    char payload[MAX_TRANSCRIPT_BYTES];
+    BYTE status;
+} PasteWorker;
+
 static void release_data(Format entry) {
     if (entry.format == CF_BITMAP || entry.format == CF_PALETTE) DeleteObject(entry.data);
     else if (entry.format == CF_ENHMETAFILE) DeleteEnhMetaFile(entry.data);
@@ -36,6 +58,7 @@ static void release_clipboard(Clipboard *clipboard) {
         Format entry = clipboard->entries[index];
         if (entry.data) release_data(entry);
     }
+    clipboard->length = 0;
 }
 
 static bool duplicate_clipboard(Clipboard *clipboard) {
@@ -45,17 +68,18 @@ static bool duplicate_clipboard(Clipboard *clipboard) {
         UINT format = EnumClipboardFormats(previous);
         if (!format) return GetLastError() == ERROR_SUCCESS;
         previous = format;
-        if (clipboard->length == MAX_FORMATS) return true;
+        if (clipboard->length == MAX_FORMATS) return false;
         if (format == CF_OWNERDISPLAY || format == CF_METAFILEPICT
-            || (format >= CF_PRIVATEFIRST && format <= CF_GDIOBJLAST)) continue;
+            || format == CF_DSPBITMAP || format == CF_DSPMETAFILEPICT || format == CF_DSPENHMETAFILE
+            || (format >= CF_PRIVATEFIRST && format <= CF_GDIOBJLAST)) return false;
         HANDLE original = GetClipboardData(format);
-        if (!original) continue;
+        if (!original) return false;
 
         size_t bytes = 0;
         if (format == CF_BITMAP) {
             BITMAP bitmap;
             if (GetObjectW(original, sizeof(bitmap), &bitmap) != sizeof(bitmap)
-                || bitmap.bmHeight <= 0 || bitmap.bmWidthBytes <= 0) continue;
+                || bitmap.bmHeight <= 0 || bitmap.bmWidthBytes <= 0) return false;
             bytes = (size_t)bitmap.bmHeight * (size_t)bitmap.bmWidthBytes;
         } else if (format == CF_ENHMETAFILE) {
             bytes = GetEnhMetaFileBits(original, 0, NULL);
@@ -64,9 +88,9 @@ static bool duplicate_clipboard(Clipboard *clipboard) {
         } else {
             bytes = GlobalSize(original);
         }
-        if (!bytes || bytes > remaining) continue;
+        if (!bytes || bytes > remaining) return false;
         HANDLE copy = OleDuplicateData(original, (CLIPFORMAT)format, GMEM_MOVEABLE);
-        if (!copy) continue;
+        if (!copy) return false;
         clipboard->entries[clipboard->length++] = (Format){format, copy};
         remaining -= bytes;
     }
@@ -80,22 +104,28 @@ static bool open_clipboard(HWND owner) {
     return false;
 }
 
-static void restore_clipboard(HWND owner, DWORD sequence, Clipboard *clipboard) {
-    if (GetClipboardSequenceNumber() != sequence || !open_clipboard(owner)) return;
-    if (GetClipboardOwner() == owner && GetClipboardSequenceNumber() == sequence && EmptyClipboard()) {
-        for (size_t index = 0; index < clipboard->length; ++index) {
-            Format *entry = &clipboard->entries[index];
-            if (SetClipboardData(entry->format, entry->data)) entry->data = NULL;
-        }
-    }
-    CloseClipboard();
+static bool owns_clipboard(const PasteClipboard *clipboard) {
+    return clipboard->restore_at && GetClipboardOwner() == clipboard->owner
+        && GetClipboardSequenceNumber() == clipboard->sequence;
 }
 
-static HGLOBAL transcript_data(void) {
-    if (_setmode(_fileno(stdin), _O_BINARY) < 0) return NULL;
-    char utf8[MAX_TRANSCRIPT_BYTES + 1];
-    size_t length = fread(utf8, 1, sizeof(utf8), stdin);
-    if (!length || length == sizeof(utf8) || ferror(stdin) || memchr(utf8, 0, length)) return NULL;
+static void restore_clipboard(PasteClipboard *clipboard) {
+    if (owns_clipboard(clipboard) && open_clipboard(clipboard->owner)) {
+        // Check again while the clipboard is locked. A newer copy always wins.
+        if (owns_clipboard(clipboard) && EmptyClipboard()) {
+            for (size_t index = 0; index < clipboard->original.length; ++index) {
+                Format *entry = &clipboard->original.entries[index];
+                if (SetClipboardData(entry->format, entry->data)) entry->data = NULL;
+            }
+        }
+        CloseClipboard();
+    }
+    clipboard->restore_at = 0;
+    release_clipboard(&clipboard->original);
+}
+
+static HGLOBAL transcript_data(const char *utf8, size_t length) {
+    if (memchr(utf8, 0, length)) return NULL;
     int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, (int)length, NULL, 0);
     if (!count) return NULL;
     HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, ((size_t)count + 1) * sizeof(WCHAR));
@@ -143,12 +173,49 @@ static bool can_send(DictationTarget target) {
     return true;
 }
 
-static bool send_paste(bool terminal) {
+static bool process_integrity(HANDLE process, DWORD *integrity) {
+    HANDLE token;
+    if (!OpenProcessToken(process, TOKEN_QUERY, &token)) return false;
+    union {
+        TOKEN_MANDATORY_LABEL label;
+        BYTE data[sizeof(TOKEN_MANDATORY_LABEL) + SECURITY_MAX_SID_SIZE];
+    } buffer;
+    DWORD size;
+    bool available = GetTokenInformation(token, TokenIntegrityLevel, &buffer, sizeof(buffer), &size);
+    CloseHandle(token);
+    if (!available || !IsValidSid(buffer.label.Label.Sid)) return false;
+    BYTE count = *GetSidSubAuthorityCount(buffer.label.Label.Sid);
+    if (!count) return false;
+    *integrity = *GetSidSubAuthority(buffer.label.Label.Sid, count - 1);
+    return true;
+}
+
+static bool higher_integrity(DWORD process_id, DWORD own_integrity) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+    if (!process) return false;
+    DWORD integrity;
+    bool higher = process_integrity(process, &integrity) && integrity > own_integrity;
+    CloseHandle(process);
+    return higher;
+}
+
+static bool target_is_elevated(DictationTarget target) {
+    DWORD own_integrity;
+    if (!process_integrity(GetCurrentProcess(), &own_integrity)) return false;
+    if (higher_integrity(target.process, own_integrity)) return true;
+    DWORD focus_process = 0;
+    if (target.focus) GetWindowThreadProcessId(target.focus, &focus_process);
+    return focus_process && focus_process != target.process && higher_integrity(focus_process, own_integrity);
+}
+
+static bool send_paste(DictationTarget target, bool terminal) {
+    DWORD thread = GetWindowThreadProcessId(target.window, NULL);
+    HKL layout = GetKeyboardLayout(thread);
     INPUT stroke[6];
     size_t count = 0;
-    stroke[count++] = keyboard_input(VK_LCONTROL, 0);
-    if (terminal) stroke[count++] = keyboard_input(VK_LSHIFT, 0);
-    stroke[count++] = keyboard_input('V', 0);
+    stroke[count++] = keyboard_input(VK_LCONTROL, 0, layout);
+    if (terminal) stroke[count++] = keyboard_input(VK_LSHIFT, 0, layout);
+    stroke[count++] = keyboard_input('V', 0, layout);
     const unsigned int pressed = (unsigned int)count;
     for (size_t index = pressed; index > 0; --index) {
         stroke[count] = stroke[index - 1];
@@ -160,66 +227,149 @@ static bool send_paste(bool terminal) {
     return false;
 }
 
-static void serve_clipboard(UINT duration) {
-    ULONGLONG deadline = GetTickCount64() + duration;
-    for (ULONGLONG now = GetTickCount64(); now < deadline; now = GetTickCount64()) {
-        if (MsgWaitForMultipleObjectsEx(0, NULL, (DWORD)(deadline - now), QS_ALLINPUT,
-                                        MWMO_INPUTAVAILABLE) != WAIT_OBJECT_0) break;
+static void serve_clipboard(DWORD duration) {
+    if (MsgWaitForMultipleObjectsEx(0, NULL, duration, QS_ALLINPUT, MWMO_INPUTAVAILABLE) == WAIT_OBJECT_0) {
         MSG message;
         if (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&message);
     }
 }
 
-int paste_dictation(DictationTarget target, bool terminal, const volatile LONG *activity, DWORD expected) {
-    HGLOBAL text = transcript_data();
-    if (!text) return 2;
-    int result = PASTE_TARGET_LOST;
-    Clipboard saved = {0};
-    HWND owner = NULL;
-    HRESULT ole = OleInitialize(NULL);
-    if (FAILED(ole)) {
-        GlobalFree(text);
-        return PASTE_CLIPBOARD_UNAVAILABLE;
-    }
+static int paste_dictation(PasteClipboard *clipboard, HGLOBAL *text, DictationTarget target, bool terminal,
+                           const volatile LONG *activity, DWORD expected) {
     for (int attempt = 0; attempt < 25 && !can_send(target); ++attempt) {
         if (!same_target(target, active_target())) break;
-        Sleep(12);
+        serve_clipboard(12);
     }
-    if (!can_send(target) || shell_without_editor(target)) goto done;
-    if (activity && (DWORD)*activity != expected) {
-        result = PASTE_CONTINUATION_CHANGED;
-        goto done;
+    if (!can_send(target) || shell_without_editor(target)) return PASTE_TARGET_LOST;
+    if (activity && (DWORD)*activity != expected) return PASTE_CONTINUATION_CHANGED;
+    bool elevated = target_is_elevated(target);
+    if (!can_send(target)) return PASTE_TARGET_LOST;
+    if (elevated) return PASTE_TARGET_ELEVATED;
+    if (!open_clipboard(clipboard->owner)) return PASTE_CLIPBOARD_UNAVAILABLE;
+    bool retain = owns_clipboard(clipboard);
+    if (!retain) {
+        clipboard->restore_at = 0;
+        release_clipboard(&clipboard->original);
     }
-    result = PASTE_CLIPBOARD_UNAVAILABLE;
-    owner = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
-    if (!owner || !open_clipboard(owner)) goto done;
-    bool emptied = duplicate_clipboard(&saved) && can_send(target) && EmptyClipboard();
-    if (emptied && SetClipboardData(CF_UNICODETEXT, text)) {
-        text = NULL;
+    bool emptied = (retain || duplicate_clipboard(&clipboard->original)) && can_send(target) && EmptyClipboard();
+    if (emptied && SetClipboardData(CF_UNICODETEXT, *text)) {
+        *text = NULL;
         disable_clipboard_persistence(L"CanIncludeInClipboardHistory");
         disable_clipboard_persistence(L"CanUploadToCloudClipboard");
     }
     CloseClipboard();
-    if (emptied) {
-        // Closing can add synthesized formats and advance the sequence number.
-        DWORD sequence = GetClipboardSequenceNumber();
-        if (GetClipboardOwner() != owner) {
-            result = PASTE_TARGET_LOST;
-            goto done;
-        }
-        if (!text && GetClipboardSequenceNumber() == sequence && can_send(target)) {
-            if (activity && (DWORD)*activity != expected) result = PASTE_CONTINUATION_CHANGED;
-            else result = send_paste(terminal) ? 0 : PASTE_INPUT_UNAVAILABLE;
-            if (result == 0) serve_clipboard(RESTORE_MS);
-        } else if (!text) {
-            result = PASTE_TARGET_LOST;
-        }
-        restore_clipboard(owner, sequence, &saved);
+    if (!emptied) {
+        if (!retain) release_clipboard(&clipboard->original);
+        return PASTE_CLIPBOARD_UNAVAILABLE;
     }
-done:
+    // Closing can add synthesized formats and advance the sequence number.
+    clipboard->sequence = GetClipboardSequenceNumber();
+    clipboard->restore_at = GetTickCount64() + RESTORE_MS;
+    int result = PASTE_CLIPBOARD_UNAVAILABLE;
+    if (!*text) {
+        if (!owns_clipboard(clipboard) || !can_send(target)) result = PASTE_TARGET_LOST;
+        else if (activity && (DWORD)*activity != expected) result = PASTE_CONTINUATION_CHANGED;
+        else result = send_paste(target, terminal) ? 0 : PASTE_INPUT_UNAVAILABLE;
+    }
+    if (result) {
+        restore_clipboard(clipboard);
+        return result;
+    }
+    ULONGLONG deadline = GetTickCount64() + SETTLE_MS;
+    clipboard->restore_at = deadline + (RESTORE_MS - SETTLE_MS);
+    for (ULONGLONG now = GetTickCount64(); now < deadline; now = GetTickCount64())
+        serve_clipboard((DWORD)(deadline - now));
+    return 0;
+}
+
+static int paste_request(PasteClipboard *clipboard, const PasteRequest *request, const char *payload) {
+    if (!request->window || !request->process || request->terminal > 1) return 2;
+    char token[33] = {0}, name[64];
+    HANDLE mapping = NULL;
+    const volatile LONG *activity = NULL;
+    if (request->channel[0]) {
+        memcpy(token, request->channel, sizeof(request->channel));
+        if (!dictation_activity_name(token, name)) return 2;
+        mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, name);
+        if (mapping) activity = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(LONG));
+        if (!activity) {
+            if (mapping) CloseHandle(mapping);
+            return PASTE_CONTINUATION_CHANGED;
+        }
+    }
+    HGLOBAL text = transcript_data(payload, request->length);
+    DictationTarget target = {(HWND)(uintptr_t)request->window, (HWND)(uintptr_t)request->focus, request->process};
+    int result = text ? paste_dictation(clipboard, &text, target, request->terminal, activity, request->revision) : 2;
     if (text) GlobalFree(text);
-    release_clipboard(&saved);
-    if (owner) DestroyWindow(owner);
-    OleUninitialize();
+    if (activity) UnmapViewOfFile((const void *)activity);
+    if (mapping) CloseHandle(mapping);
     return result;
+}
+
+static bool read_request_bytes(HANDLE pipe, void *destination, DWORD length) {
+    char *data = destination;
+    while (length) {
+        DWORD received;
+        if (!ReadFile(pipe, data, length, &received, NULL) || !received) return false;
+        data += received;
+        length -= received;
+    }
+    return true;
+}
+
+static DWORD WINAPI read_paste_requests(void *context) {
+    PasteWorker *worker = context;
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE), output = GetStdHandle(STD_OUTPUT_HANDLE);
+    while (read_request_bytes(input, &worker->request, sizeof(worker->request))) {
+        DWORD length = worker->request.length;
+        if (!length || length > sizeof(worker->payload)
+            || !read_request_bytes(input, worker->payload, length)) break;
+        SetEvent(worker->request_ready);
+        if (WaitForSingleObject(worker->reply_ready, INFINITE) != WAIT_OBJECT_0) break;
+        DWORD sent;
+        if (!WriteFile(output, &worker->status, sizeof(worker->status), &sent, NULL)
+            || sent != sizeof(worker->status)) break;
+    }
+    return 0;
+}
+
+int serve_dictation_pastes(void) {
+    if (FAILED(OleInitialize(NULL))) return PASTE_CLIPBOARD_UNAVAILABLE;
+    PasteClipboard clipboard = {
+        .owner = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL)
+    };
+    PasteWorker worker = {
+        .request_ready = CreateEventW(NULL, FALSE, FALSE, NULL),
+        .reply_ready = CreateEventW(NULL, FALSE, FALSE, NULL)
+    };
+    HANDLE reader = clipboard.owner && worker.request_ready && worker.reply_ready
+        ? CreateThread(NULL, 0, read_paste_requests, &worker, 0, NULL) : NULL;
+    if (reader) {
+        // Pipe reads can block while idle. Keep the clipboard timer and messages
+        // on its owning thread, with just one request in flight.
+        HANDLE signal[] = {reader, worker.request_ready};
+        for (;;) {
+            ULONGLONG now = GetTickCount64();
+            if (clipboard.restore_at && now >= clipboard.restore_at) restore_clipboard(&clipboard);
+            DWORD wait = clipboard.restore_at ? (DWORD)(clipboard.restore_at - now) : INFINITE;
+            DWORD result = MsgWaitForMultipleObjectsEx(2, signal, wait, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if (result == WAIT_OBJECT_0) break;
+            if (result == WAIT_OBJECT_0 + 1) {
+                worker.status = (BYTE)paste_request(&clipboard, &worker.request, worker.payload);
+                SetEvent(worker.reply_ready);
+            } else if (result == WAIT_OBJECT_0 + 2) {
+                serve_clipboard(0);
+            } else if (result == WAIT_FAILED) {
+                restore_clipboard(&clipboard);
+                ExitProcess(PASTE_CLIPBOARD_UNAVAILABLE);
+            }
+        }
+        CloseHandle(reader);
+    }
+    restore_clipboard(&clipboard);
+    if (worker.reply_ready) CloseHandle(worker.reply_ready);
+    if (worker.request_ready) CloseHandle(worker.request_ready);
+    if (clipboard.owner) DestroyWindow(clipboard.owner);
+    OleUninitialize();
+    return reader ? 0 : PASTE_CLIPBOARD_UNAVAILABLE;
 }

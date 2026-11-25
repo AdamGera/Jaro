@@ -1,13 +1,13 @@
 import assert from "node:assert/strict"
 import { createHash, createHmac } from "node:crypto"
-import { chmod, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
 import { connect, create } from "./index.mjs"
 
-test("only the socket that proved ownership receives audio and credentials", async () => {
+test("only the socket that proved ownership receives audio and credentials", { skip: process.platform === "win32" }, async () => {
   const library = await realpath(await mkdtemp(join(tmpdir(), "jard-sdk-")))
   const file = join(library, ".jard-sdk.json")
   const folder = await stat(library, { bigint: true })
@@ -112,4 +112,39 @@ test("embedded clients own their exact child and close on an in-flight cancellat
     await Promise.all([first.close(), second.close()])
   }
   assert.throws(() => process.kill(second.pid, 0), { code: "ESRCH" })
+})
+
+test("opt-in model preparation reports framed progress and stops on cancellation or failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "jaro-sdk-prepare-"))
+  const pidFile = join(root, "pid")
+  const preparing = String.raw`
+const args = process.argv.slice(1)
+if (args.join(" ") !== ["--prepare-speech-model", "--speech-model-source", args[2], "--repair-speech-model"].join(" ")) {
+  process.exit(2)
+}
+require("node:fs").writeFileSync(args[2], String(process.pid))
+const events = [{type:"progress",phase:"checking"}, ...Array.from({length:70}, (_, completedBytes) =>
+  ({type:"progress",phase:"installing",completedBytes,totalBytes:70})), {type:"progress",phase:"loading"}]
+process.stdout.write(events.map(event => JSON.stringify(event) + "\n").join(""))
+` + embeddedFixture
+  const options = { command: [process.execPath, "-e", preparing, "--"], prepare: { from: pidFile, repair: true } }
+  const seen = []
+  try {
+    const client = await create({ ...options, onProgress: event => seen.push(event) })
+    try {
+      assert.deepEqual(seen[0], { phase: "checking" })
+      assert.deepEqual(seen[1], { phase: "installing", completedBytes: 0, totalBytes: 70 })
+      assert.equal(seen.length, 72)
+      assert.deepEqual(seen.at(-1), { phase: "loading" })
+    } finally { await client.close() }
+
+    const abort = new AbortController()
+    await assert.rejects(create({ ...options, signal: abort.signal, onProgress: () => abort.abort() }), { name: "AbortError" })
+    const pid = Number(await readFile(pidFile, "utf8"))
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" })
+
+    const failure = 'process.stdout.write(\'{"type":"error","code":"model-prepare-failed"}\\n\', () => process.exit(1))'
+    await assert.rejects(create({ command: [process.execPath, "-e", failure, "--"], prepare: true }),
+      { code: "model-prepare-failed" })
+  } finally { await rm(root, { recursive: true, force: true }) }
 })

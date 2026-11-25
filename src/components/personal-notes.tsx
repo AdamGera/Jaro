@@ -32,6 +32,7 @@ export function PersonalNotesEditor({ sessionId, initial, onSaved, onUpdateOverv
   const storageKey = `jard.personalNotes.${sessionId}`
   const [recovered] = useState(() => readNoteDraft(storageKey))
   const [saveState, setSaveState] = useState<"saved" | "pending" | "error" | "conflict">(recovered ? "pending" : "saved")
+  const [draftProtected, setDraftProtected] = useState(true)
   const pending = useRef<JSONContent | null>(recovered?.document ?? null)
   const revision = useRef(recovered?.revision ?? initial?.revision ?? 0)
   const inFlight = useRef<Promise<boolean> | null>(null)
@@ -70,6 +71,7 @@ export function PersonalNotesEditor({ sessionId, initial, onSaved, onUpdateOverv
       }
       if (mounted.current) {
         setSaveState("saved")
+        setDraftProtected(true)
         onSaved?.()
       }
       return true
@@ -95,7 +97,7 @@ export function PersonalNotesEditor({ sessionId, initial, onSaved, onUpdateOverv
     onUpdate: ({ editor }) => {
       const document = editor.getJSON()
       pending.current = document
-      rememberNoteDraft(storageKey, { document, revision: revision.current })
+      setDraftProtected(rememberNoteDraft(storageKey, { document, revision: revision.current }))
       if (conflict.current) return
       setSaveState("pending")
       window.clearTimeout(timer.current)
@@ -162,6 +164,7 @@ export function PersonalNotesEditor({ sessionId, initial, onSaved, onUpdateOverv
       pending.current = null
       rememberNoteDraft(storageKey, null)
       editor.commands.setContent(latest.document, { emitUpdate: false })
+      setDraftProtected(true)
       setSaveState("saved")
       onSaved?.()
     } catch {
@@ -218,6 +221,7 @@ export function PersonalNotesEditor({ sessionId, initial, onSaved, onUpdateOverv
           <Button variant="ghost" size="sm" onClick={dictation.cancel}>Cancel dictation</Button>
         </>}
       </div>
+      {!draftProtected && <span role="alert">{t("Save My Notes before closing or restarting Jaro. This draft could not be stored.")}</span>}
       <span role="status" className={saveState === "saved" ? "sr-only" : undefined}>{{
         saved: "Saved locally", pending: "Saving…", error: "Could not save My notes.",
         conflict: "My notes changed in another window.",

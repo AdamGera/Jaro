@@ -1,5 +1,6 @@
 """Build Jaro’s Windows or Linux shell with the pinned Native SDK."""
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -7,10 +8,44 @@ import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 
 HERE = Path(__file__).resolve().parent
 SDK_VERSION = "0.11.1"
+LAYER_SHELL_VERSION = "1.0.4"
+LAYER_SHELL_SHA256 = "7fe327dc3740e4b6f5edfd855e23f84b1ac1ec6854b731047b95df7feb46498b"
+
+
+def linux_layer_shell_flags(output, work):
+    environment = os.environ.copy()
+    runpath = []
+    if platform.freedesktop_os_release().get("ID") == "ubuntu":
+        # Ubuntu 24.04 ships GTK4, but no GTK4 layer-shell library.
+        archive = work / "layer-shell.tar.gz"
+        url = f"https://deb.debian.org/debian/pool/main/g/gtk4-layer-shell/gtk4-layer-shell_{LAYER_SHELL_VERSION}.orig.tar.gz"
+        subprocess.run(["curl", "--fail", "--location", "--retry", "3", "--output", archive, url], check=True)
+        with archive.open("rb") as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != LAYER_SHELL_SHA256:
+                raise ValueError("GTK4 layer-shell source checksum mismatch.")
+        with tarfile.open(archive) as source_tar:
+            source_tar.extractall(work, filter="data")
+        source = work / f"gtk4-layer-shell-{LAYER_SHELL_VERSION}"
+        build_dir = work / "layer-shell-build"
+        prefix = work / "layer-shell"
+        subprocess.run(["meson", "setup", build_dir, source, "--prefix", prefix, "--libdir", "lib",
+                        "--buildtype", "release", "-Dintrospection=false", "-Dvapi=false"], check=True)
+        subprocess.run(["meson", "install", "-C", build_dir], check=True)
+        library = output / "lib"
+        library.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(prefix / "lib/libgtk4-layer-shell.so.0", library / "libgtk4-layer-shell.so.0")
+        shutil.copyfile(source / "LICENSE", library / "gtk4-layer-shell-LICENSE")
+        pkg_paths = [str(prefix / "lib/pkgconfig"), environment.get("PKG_CONFIG_PATH", "")]
+        environment["PKG_CONFIG_PATH"] = os.pathsep.join(filter(None, pkg_paths))
+        runpath = ["-Wl,-rpath,$ORIGIN/../lib"]
+    flags = subprocess.check_output(["pkg-config", "--cflags", "--libs", "gtk4-layer-shell-0", "gtk4"],
+                                    text=True, env=environment).split()
+    return [*flags, *runpath]
 
 
 def build(target, output):
@@ -53,19 +88,21 @@ def build(target, output):
             subprocess.run([*flags, HERE / "windows_screen.c", HERE / "windows_pen.c", "-ld3d11", "-ldxgi", "-ldwmapi", "-lgdi32",
                             "-luser32", "-lole32", "-o", output / "bin/jaro-screen.exe"], check=True)
             subprocess.run([*flags, HERE / "windows_hotkeys.c", HERE / "windows_clipboard.c",
-                            "-luser32", "-lgdi32", "-lole32", "-o", output / "bin/jaro-dictation.exe"], check=True)
+                            "-luser32", "-lgdi32", "-lole32", "-ladvapi32", "-o", output / "bin/jaro-dictation.exe"], check=True)
             subprocess.run([*flags, HERE / "windows_indicator.c", "-municode", "-Wl,--subsystem,windows",
                             "-luser32", "-lgdi32", "-lshcore", "-o", output / "bin/jaro-indicator.exe"], check=True)
             subprocess.run([*flags, HERE / "windows_call_surface.c", "-municode", "-Wl,--subsystem,windows",
                             "-luser32", "-lgdi32", "-lshcore", "-o", output / "bin/jaro-call-surface.exe"], check=True)
             subprocess.run([*flags, HERE / "windows_tray.c", "-municode", "-Wl,--subsystem,windows", "-luser32",
                             "-lshell32", "-o", output / "bin/jaro-tray.exe"], check=True)
+            subprocess.run([*flags, HERE / "save_dialog.c", "-municode", "-Wl,--subsystem,windows", "-lole32",
+                            "-luuid", "-o", output / "bin/jaro-save-video.exe"], check=True)
             shutil.copyfile(HERE / "windows/Jaro.ico", output / "bin/jaro-tray.ico")
             subprocess.run([*flags, HERE / "windows_audio_control.c", HERE / "windows_media_control.c",
                             "-lole32", "-lapi-ms-win-core-winrt-l1-1-0", "-lapi-ms-win-core-winrt-string-l1-1-0",
                             "-o", output / "bin/jaro-audio-control.exe"], check=True)
         else:
-            flags = subprocess.check_output(["pkg-config", "--cflags", "--libs", "gtk4-layer-shell-0", "gtk4"], text=True).split()
+            flags = linux_layer_shell_flags(output, Path(work))
             subprocess.run([zig, "cc", "-O2", "-Wall", "-Wextra", "-Werror", HERE / "linux/pen.c",
                             *flags, "-lm", "-o", output / "bin/jaro-pen"], check=True)
             x11 = subprocess.check_output(["pkg-config", "--libs", "x11", "xext"], text=True).split()
@@ -74,6 +111,26 @@ def build(target, output):
             # Use the distro linker for the GTK notification helper's ELF layout.
             subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", HERE / "linux/call_surface.c",
                             *flags, *x11, "-o", output / "bin/jaro-call-surface"], check=True)
+            subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", HERE / "save_dialog.c",
+                            *flags, "-o", output / "bin/jaro-save-video"], check=True)
+
+            wayland = subprocess.check_output(["pkg-config", "--cflags", "--libs", "wayland-client", "xkbcommon"],
+                                              text=True).split()
+            helpers = (
+                ("wayland_clipboard.c", "jaro-wayland-clipboard", ("ext-data-control-v1", "wlr-data-control-unstable-v1")),
+                ("focused_window.c", "jaro-focused-window", ("wlr-foreign-toplevel-management-unstable-v1",)),
+            )
+            for implementation, executable, definitions in helpers:
+                sources = []
+                for name in definitions:
+                    protocol = HERE / "linux/protocols" / f"{name}.xml"
+                    header, source = Path(work) / f"{name}.h", Path(work) / f"{name}.c"
+                    subprocess.run(["wayland-scanner", "client-header", protocol, header], check=True)
+                    subprocess.run(["wayland-scanner", "private-code", protocol, source], check=True)
+                    sources.append(source)
+                subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", "-I", work,
+                                HERE / "linux" / implementation, *sources, *wayland,
+                                "-o", output / "bin" / executable], check=True)
 
 
 def main():

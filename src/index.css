@@ -764,6 +764,10 @@ html:has(.workspace-settings)::-webkit-scrollbar,
 .annotation-review figcaption { margin-top: .5rem; color: var(--quiet); font-size: .82rem; }
 .annotation-frame-links, .annotation-review-tools { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
 .annotation-review-tools p { margin-inline-end: .4rem; color: var(--quiet); font-size: .82rem; }
+.annotation-trim { display: grid; gap: .65rem; width: min(100%, 32rem); padding: .8rem; border: 1px solid var(--line); border-radius: .7rem; }
+.annotation-trim label { display: grid; grid-template-columns: 5rem minmax(0, 1fr) 4.5rem; align-items: center; gap: .6rem; font-size: .82rem; }
+.annotation-trim input { width: 100%; }
+.annotation-trim label span { text-align: end; font-variant-numeric: tabular-nums; }
 .annotation-destinations { width: min(34rem, calc(100vw - 2rem)); }
 .annotation-destination-search {
   display: flex; align-items: center; gap: .55rem; margin-block: 1rem .65rem; padding-inline: .7rem;
@@ -1012,6 +1016,10 @@ html:has(.workspace-settings)::-webkit-scrollbar,
 .portable-screen-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }
 .portable-screen-actions label { display: flex; align-items: center; width: 100%; gap: .4rem; font-size: .85rem; }
 .portable-screen-actions label small { color: var(--quiet); margin-inline-start: auto; }
+.portable-screen-microphone {
+  min-width: 0; flex: 1; border: 1px solid var(--line); border-radius: .45rem;
+  background: var(--surface); color: var(--foreground); padding: .25rem .45rem;
+}
 .portable-screen-sources { display: flex; flex-wrap: wrap; gap: .35rem; }
 .portable-screen-sources button[data-slot=button] { padding-inline: .5rem; }
 .portable-screen-picker-title { font-size: .85rem; font-weight: 600; }

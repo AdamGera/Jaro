@@ -28,11 +28,13 @@ static const pid_t windowFixturePID = 8251;
 static pid_t windowFixtureIdentity;
 static AXError windowFixtureFocusStatus;
 static NSMutableArray<NSArray *> *nativePasteEvents;
+static void (^nativePasteEdge)(CGEventType);
 
 void CGEventPost(CGEventTapLocation location, CGEventRef event) {
     if (nativePasteEvents) {
         [nativePasteEvents addObject:@[@(location), @(CGEventGetType(event)),
             @(CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)), @(CGEventGetFlags(event))]];
+        if (nativePasteEdge) nativePasteEdge(CGEventGetType(event));
         return;
     }
     ((typeof(&CGEventPost))dlsym(RTLD_NEXT, "CGEventPost"))(location, event);
@@ -128,10 +130,12 @@ void CGEventTapEnable(CFMachPortRef port, bool enabled) {
 // Test the host’s real queue while leaving the microphone and the clipboard closed.
 @interface JardDictationStartCue : NSObject
 - (void)playURL:(NSURL *)url volume:(float)volume at:(NSTimeInterval)deadline;
+- (void)afterPlayback:(dispatch_block_t)completion;
 - (void)withdraw;
 @end
 
 @interface JardSystemDictation (QueueTest)
++ (NSURL *)audioDirectoryForLibrary:(NSString *)configured defaultLibrary:(NSString *)defaultLibrary bundleID:(NSString *)bundleID;
 @property(nonatomic, strong) NSMutableDictionary *settings;
 @property(nonatomic, strong) NSMutableArray *pendingJobs;
 @property(nonatomic, strong) NSMutableArray *history;
@@ -183,6 +187,7 @@ void CGEventTapEnable(CFMachPortRef port, bool enabled) {
 - (BOOL)canStartCommandCapture;
 - (void)deliver:(NSString *)text mode:(NSString *)mode warning:(NSString *)warning;
 - (BOOL)postPasteShortcut;
+- (void)postCaretPasteChecking:(BOOL (^)(void))canSend completion:(void (^)(BOOL))completion;
 - (void)pasteLast;
 - (void)cancelCapture;
 - (void)discardShortcutTake;
@@ -202,6 +207,7 @@ void CGEventTapEnable(CFMachPortRef port, bool enabled) {
 - (BOOL)filterModifierClaim:(CGEventRef)event type:(CGEventType)type;
 - (BOOL)modifierClaimAvailable;
 - (void)sendModifierClaimAt:(NSTimeInterval)when;
+- (void)act:(JardShortcutAction)action;
 - (void)queueAction:(JardShortcutAction)action at:(NSTimeInterval)time;
 - (void)observePhysicalKeyDown:(CGEventRef)event;
 - (void)observeUnmatchedInput:(CGEventType)type event:(CGEventRef)event;
@@ -342,6 +348,9 @@ static void testSecureRouting(void) {
         });
     }
     return YES;
+}
+- (void)postCaretPasteChecking:(BOOL (^)(void))canSend completion:(void (^)(BOOL))completion {
+    completion(canSend() && [self postPasteShortcut]);
 }
 - (void)postDictationKeyEvent:(CGEventRef)event toProcess:(pid_t)pid {
     assert(pid == self.destination.processIdentifier);
@@ -891,9 +900,11 @@ static AnnotationTargetFixture *outputTarget(NSString *name, pid_t pid) {
 @interface StartCueTokenFixture : JardDictationStartCue
 @property(nonatomic) NSUInteger withdrawals;
 @property(nonatomic) NSTimeInterval deadline;
+@property(nonatomic, copy) dispatch_block_t finishCue;
 @end
 
 @implementation StartCueTokenFixture
+- (void)afterPlayback:(dispatch_block_t)completion { self.finishCue = completion; }
 - (void)withdraw { self.withdrawals++; }
 @end
 
@@ -925,6 +936,10 @@ static AnnotationTargetFixture *outputTarget(NSString *name, pid_t pid) {
     assert(!self.active && percent == 20);
     self.mode = mode;
     self.active = YES;
+}
+- (void)setDictationMode:(NSString *)mode percent:(double)percent {
+    assert(self.active && percent == 20);
+    self.mode = mode;
 }
 - (void)finish:(dispatch_block_t)completion {
     if (!self.active) return;
@@ -1438,6 +1453,66 @@ static void testCommandDictation(void) {
     [dictation control:@"cancel" reply:acknowledge];
     transcriptions[3](@{@"text": @"Never delivered"}, nil);
     assert(returned == 4 && dictation.history.count == 2 && [dictation.lastText isEqual:@"Plain raw words"]);
+
+    __block NSUInteger startReplies = 0;
+    [dictation control:@"dictation-start-print" reply:^(id result, NSString *error) {
+        assert(!error && [result[@"text"] isEqual:@"Returned text"]);
+        startReplies++;
+    }];
+    assert(dictation.captureID && !startReplies);
+    [dictation control:@"dictation-start-print" reply:^(id result, NSString *error) {
+        assert(!result && [error containsString:@"current take"]);
+    }];
+    [dictation control:@"stop" reply:acknowledge];
+    ready();
+    transcriptions[4](@{@"text": @"original text", @"processed": @"Returned text"}, nil);
+    assert(startReplies == 1 && [dictation.history.firstObject[@"kind"] isEqual:@"printed"]);
+
+    JardDictationReply rawReply = ^(id result, NSString *error) {
+        assert(!error && [result[@"text"] isEqual:@"Raw print take"]);
+        startReplies++;
+    };
+    [dictation control:@"dictation-start-raw-print" reply:rawReply];
+    [dictation control:@"dictation-stop-print" reply:rawReply];
+    assert(startReplies == 1);
+    ready();
+    assert([options[5][@"outputProfile"] count] == 0 && [options[5][@"vocabulary"] count] == 0);
+    transcriptions[5](@{@"text": @"Raw print take", @"processed": @"Changed"}, nil);
+    assert(startReplies == 3 && dictation.history.count == 4);
+
+    [dictation control:@"dictation-start-print" reply:^(id result, NSString *error) {
+        assert(!error && [result[@"text"] isEqual:@"Finished by shortcut"]);
+        startReplies++;
+    }];
+    [dictation act:JardFinish];
+    ready();
+    transcriptions[6](@{@"text": @"Finished by shortcut"}, nil);
+    assert(startReplies == 4 && dictation.history.count == 5);
+
+    [dictation control:@"dictation-start-print" reply:^(id result, NSString *error) {
+        assert(!error && [result[@"text"] isEqual:@"Recovered after microphone loss"]);
+        startReplies++;
+    }];
+    assert(([dictation handleCapture:@{@"event": @"dictationReady", @"dictation": dictation.captureID,
+        @"id": NSUUID.UUID.UUIDString, @"seconds": @1, @"interruption": @"microphone", @"interrupted": @YES,
+        @"hasLiveAudio": @YES, @"failedAt": @(NSProcessInfo.processInfo.systemUptime)}]));
+    transcriptions[7](@{@"text": @"Recovered after microphone loss"}, nil);
+    assert(startReplies == 5 && dictation.history.count == 6);
+
+    [dictation control:@"dictation-start-print" reply:^(id result, NSString *error) {
+        assert(!error && [result[@"status"] isEqual:@"no-speech"]);
+        startReplies++;
+    }];
+    assert(([dictation handleCapture:@{@"event": @"error", @"dictation": dictation.captureID, @"noSpeech": @YES,
+        @"openingAbandoned": @YES}]));
+    [dictation control:@"dictation-start-print" reply:^(id result, NSString *error) {
+        assert(!result && [error containsString:@"cancelled"]);
+        startReplies++;
+    }];
+    [dictation control:@"cancel" reply:acknowledge];
+    assert(!dictation.captureID && startReplies == 7 && dictation.history.count == 6);
+    assert([dictation.copiedText isEqual:@"Plain raw words"]);
+    assert([dictation.lastText isEqual:@"Plain raw words"]);
     [defaults removeObjectForKey:@"JardSystemDictationHistory"];
     puts("Command dictation printed only to its caller, skipped raw processing, and preserved Paste Last through reopen, silence, and cancellation.");
 }
@@ -1946,16 +2021,22 @@ static void testDictationTiming(void) {
     [dictation setValue:@(NSProcessInfo.processInfo.systemUptime - .25) forKey:@"captureStopRequestedAt"];
     finishTake(dictation, @"timing-first", NO);
     finishTake(dictation, @"timing-second", NO);
-    replies[1](@{@"text": @"Second.", @"inferenceMs": @24, @"speechRequestMs": @80}, nil);
+    replies[1](@{@"text": @"Second.", @"inferenceMs": @24, @"speechRequestMs": @80,
+                 @"speechTiming": @{@"speechQueueMs": @12, @"audioPriorityMs": @4, @"text": @"Not diagnostic data"}}, nil);
     assert(timings.count == 0 && dictation.pasteCount == 0);
     [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.05]];
-    replies[0](@{@"text": @"First.", @"inferenceMs": @36, @"speechRequestMs": @90}, nil);
+    replies[0](@{@"text": @"First.", @"inferenceMs": @36, @"speechRequestMs": @90,
+                 @"speechTiming": @{@"speechQueueMs": @3, @"voiceCleanupMs": @21, @"audioReadMs": @9}}, nil);
     waitForDelivery(dictation);
     assert(dictation.pasteCount == 2 && timings.count == 2);
     NSDictionary *first = timings[0], *second = timings[1];
     assert([first[@"captureFinalizeMs"] intValue] >= 250 && second[@"captureFinalizeMs"] == nil);
     assert([first[@"speechRequestMs"] isEqual:@90] && [first[@"inferenceMs"] isEqual:@36]);
     assert([second[@"speechRequestMs"] isEqual:@80] && [second[@"inferenceMs"] isEqual:@24]);
+    assert([first[@"speechQueueMs"] isEqual:@3] && [first[@"voiceCleanupMs"] isEqual:@21]);
+    assert([first[@"audioReadMs"] isEqual:@9] && second[@"audioReadMs"] == nil);
+    assert([second[@"speechQueueMs"] isEqual:@12] && [second[@"audioPriorityMs"] isEqual:@4]);
+    assert(second[@"text"] == nil && second[@"voiceCleanupMs"] == nil);
     assert([second[@"outputWaitMs"] intValue] >= 125);
     assert(first[@"clipboardSnapshotMs"] && second[@"clipboardSnapshotMs"]);
     assert([first[@"totalMs"] intValue] >= [first[@"captureFinalizeMs"] intValue]);
@@ -1973,11 +2054,12 @@ static void testDictationTiming(void) {
 @implementation WindowOnlyDictationFixture
 - (NSRunningApplication *)foregroundOutputApplication { return (NSRunningApplication *)(id)self.editor; }
 - (NSPasteboard *)pasteboard { return self.board; }
-- (BOOL)postPasteShortcut {
+- (void)postCaretPasteChecking:(BOOL (^)(void))canSend completion:(void (^)(BOOL))completion {
     assert([[self.board stringForType:NSPasteboardTypeString] isEqual:@"A candidate sentence."]);
-    BOOL sent = [super postPasteShortcut];
-    if (sent) self.pastes++;
-    return sent;
+    [super postCaretPasteChecking:canSend completion:^(BOOL sent) {
+        if (sent) self.pastes++;
+        completion(sent);
+    }];
 }
 @end
 
@@ -1998,7 +2080,7 @@ static void testWindowOnlyDictationTarget(void) {
     dictation.settings[@"retention"] = @0;
     fixtureEventTaps = true;
     NSUInteger total = 0;
-    for (NSUInteger scenario = 0; scenario < 9; scenario++) {
+    for (NSUInteger scenario = 0; scenario < 15; scenario++) {
         dictation.editor = outputTarget(@"Window-only editor", windowFixturePID);
         windowFixtureIdentity = windowFixturePID + 2;
         windowFixtureFocusStatus = scenario == 6 ? kAXErrorCannotComplete : kAXErrorNoValue;
@@ -2014,27 +2096,56 @@ static void testWindowOnlyDictationTarget(void) {
             case 8: dictation.editor = nil; break;
         }
         nativePasteEvents = NSMutableArray.array;
+        if (scenario == 14) nativePasteEdge = ^(CGEventType type) {
+            if (type == kCGEventKeyDown) dispatch_async(dispatch_get_main_queue(), ^{ [dictation shutdown]; });
+        };
         finishTake(dictation, @"window-only", NO);
-        BOOL allowed = scenario != 3 && scenario != 8;
+        BOOL beganChord = scenario != 3 && scenario != 8;
+        BOOL allowed = beganChord && scenario < 9;
+        assert(nativePasteEvents.count == (beganChord ? 1 : 0));
+        if (beganChord) dispatch_async(dispatch_get_main_queue(), ^{
+            // The main queue can handle real activity while Command is down.
+            assert(nativePasteEvents.count == 1);
+            switch (scenario) {
+                case 9: dictation.editor = outputTarget(@"Switched during paste", windowFixturePID + 11); break;
+                case 10:
+                    [dictation.board clearContents];
+                    [dictation.board setString:@"New copy during paste" forType:NSPasteboardTypeString];
+                    break;
+                case 11: fixtureSecureInput = true; break;
+                case 12: [dictation cancelCapture]; break;
+                case 13: [dictation activationChanged:nil]; break;
+            }
+        });
+        waitForDelivery(dictation);
         total += allowed;
-        assert([dictation.phase isEqual:allowed ? @"inserted" : @"saved"] && dictation.pastes == total);
-        assert(nativePasteEvents.count == (allowed ? 4 : 0));
-        if (allowed) {
+        if (scenario < 14) assert([dictation.phase isEqual:allowed ? @"inserted" : scenario == 12 ? @"cancelled" : @"saved"]);
+        assert(dictation.pastes == total);
+        BOOL sentKey = allowed || scenario == 14;
+        assert(nativePasteEvents.count == (sentKey ? 4 : beganChord ? 2 : 0));
+        if (beganChord) {
             assert(([nativePasteEvents.firstObject isEqual:@[@(kCGHIDEventTap), @(kCGEventFlagsChanged), @(kVK_Command), @(kCGEventFlagMaskCommand)]]));
             assert(([nativePasteEvents.lastObject isEqual:@[@(kCGHIDEventTap), @(kCGEventFlagsChanged), @(kVK_Command), @0]]));
+        }
+        if (sentKey) {
             assert([nativePasteEvents[1][1] unsignedIntegerValue] == kCGEventKeyDown);
             assert([nativePasteEvents[2][1] unsignedIntegerValue] == kCGEventKeyUp);
             assert([nativePasteEvents[1][2] isEqual:nativePasteEvents[2][2]]);
         }
+        nativePasteEdge = nil;
         nativePasteEvents = nil;
-        waitForDelivery(dictation);
-        assert([[dictation.board stringForType:NSPasteboardTypeString] isEqual:@"Original clipboard"]);
+        NSString *clipboard = scenario == 10 ? @"New copy during paste" : @"Original clipboard";
+        assert([[dictation.board stringForType:NSPasteboardTypeString] isEqual:clipboard]);
+        if (scenario == 10) {
+            [dictation.board clearContents];
+            [dictation.board setString:@"Original clipboard" forType:NSPasteboardTypeString];
+        }
         fixtureSecureInput = false;
     }
     fixtureEventTaps = false;
     windowFixtureIdentity = 0;
     [dictation.board releaseGlobally];
-    puts("Fresh dictation followed the active caret through AX errors and changes, posted the full HID chord, and blocked secure input or a missing app.");
+    puts("Fresh dictation kept the main queue responsive. Target changes, new copies, secure input, and cancellation suppressed the pending V key. Shutdown released both keys after V was posted.");
 }
 
 static void testHistoryTiming(void) {
@@ -3141,14 +3252,38 @@ static void testStartCueWorker(void) {
     [sounding playURL:url volume:.7 at:deadline];
     assert(dispatch_semaphore_wait(sounding.player.played, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0);
     assert(sounding.player.volume == .7f && sounding.player.playedAt >= deadline - .002);
+    __block BOOL stopped = NO;
+    [sounding afterPlayback:^{
+        assert(NSThread.isMainThread && !sounding.player.isPlaying);
+        stopped = YES;
+    }];
     [sounding withdraw];
     assert(dispatch_semaphore_wait(sounding.player.stopped, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0);
     assert(sounding.player.fadeDuration == .02 && sounding.player.stoppedAt >= sounding.player.fadedAt + .018);
-    puts("Start cue preparation ran off the input thread, cancellation beat a stalled audio open, and a sounding cue faded for 20 ms.");
+    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.03]];
+    assert(stopped);
+
+    StartCueWorkerFixture *finished = StartCueWorkerFixture.new;
+    finished.player = FeedbackPlayerFixture.new;
+    __block BOOL completed = NO;
+    [finished playURL:url volume:.7 at:NSProcessInfo.processInfo.systemUptime];
+    [finished afterPlayback:^{
+        assert(NSThread.isMainThread &&
+            NSProcessInfo.processInfo.systemUptime >= finished.player.playedAt + finished.player.duration);
+        completed = YES;
+    }];
+    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.1]];
+    assert(!completed);
+    NSDate *limit = [NSDate dateWithTimeIntervalSinceNow:1];
+    while (!completed && limit.timeIntervalSinceNow > 0)
+        [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.01]];
+    assert(completed);
+    puts("Cue playback starts off the input thread and reports completion on the main thread after playback or a cancel fade.");
 }
 
 static void testStartCueGestures(void) {
-    for (NSString *scenario in @[@"chord", @"tap", @"warm", @"cold-early", @"cold-late", @"silent", @"gap", @"timer"]) {
+    for (NSString *scenario in @[@"chord", @"tap", @"warm", @"cold-early", @"cold-late", @"cold-cancel",
+                                 @"silent", @"gap", @"timer", @"lower", @"pause"]) {
         __block NSUInteger starts = 0;
         CaptureEnvironmentFixture *environment = CaptureEnvironmentFixture.new;
         FeedbackControllerFixture *dictation = [[FeedbackControllerFixture alloc] initWithSend:
@@ -3161,6 +3296,8 @@ static void testStartCueGestures(void) {
             }];
         BOOL keep = ![scenario hasPrefix:@"cold"];
         BOOL silent = [scenario isEqual:@"silent"];
+        NSString *mode = [scenario isEqual:@"lower"] || [scenario isEqual:@"pause"] ? scenario : @"mute";
+        BOOL waitsForCue = !silent && ![mode isEqual:@"pause"];
         dictation.provisional = NSMutableArray.array;
         dictation.recordingEnvironment = environment;
         dictation.settings[@"keepMicrophoneReady"] = @(keep);
@@ -3170,7 +3307,8 @@ static void testStartCueGestures(void) {
         dictation.settings[@"shortcutCode"] = @(kVK_F9);
         dictation.settings[@"shortcutFlags"] = @0;
         dictation.settings[@"placement"] = @"off";
-        dictation.settings[@"audioWhileDictating"] = @"mute";
+        dictation.settings[@"audioWhileDictating"] = mode;
+        dictation.settings[@"lowerAudioPercent"] = @20;
         dictation.dictationKeyEnabled = YES;
         [dictation applyShortcutMode];
 
@@ -3203,13 +3341,24 @@ static void testStartCueGestures(void) {
                 assert(!environment.active);
                 [dictation admitCaptureIntentionAt:press + .3];
             }
-            assert(environment.active && [environment.mode isEqual:@"mute"]);
+            assert(environment.active && (waitsForCue ? environment.mode == nil : [environment.mode isEqual:mode]));
             if ([scenario isEqual:@"cold-late"]) {
-                assert(!dictation.startCues);
+                assert(!dictation.provisional.count && !environment.mode);
                 assert([dictation handleCapture:opened]);
             }
-            assert(dictation.startCues == (keep ? 0 : 1));
-            [dictation cancelCapture];
+            assert(dictation.startCues == 0);
+            assert(dictation.provisional.count == (silent ? 0 : 1));
+            dispatch_block_t finished = dictation.provisional.firstObject.finishCue;
+            assert((finished != nil) == waitsForCue);
+            if ([scenario isEqual:@"cold-cancel"]) {
+                [dictation cancelCapture];
+                finished();
+                assert(!environment.mode);
+            } else {
+                if (finished) finished();
+                assert([environment.mode isEqual:mode]);
+                [dictation cancelCapture];
+            }
             assert(!environment.active && environment.ended == 1);
         }
         [dictation shutdown];
@@ -3948,6 +4097,8 @@ static void testHistoryAudio(void) {
     NSString *staging = [root stringByAppendingPathComponent:@"staging"];
     assert([files createDirectoryAtPath:staging withIntermediateDirectories:YES attributes:nil error:nil]);
     NSString *clipRoot = [root stringByAppendingPathComponent:@"dictation-history-audio"];
+    NSString *alias = [root stringByAppendingString:@"-alias"];
+    assert([files createSymbolicLinkAtPath:alias withDestinationPath:root error:nil]);
     AVAudioFormat *format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatInt16
         sampleRate:48000 channels:1 interleaved:YES];
     AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format frameCapacity:48000];
@@ -3963,11 +4114,13 @@ static void testHistoryAudio(void) {
     assert(original.length > 44);
 
     __block NSString *text = @"Retained dictation";
+    __block void (^whilePending)(void) = nil;
     DictationDeliveryFixture *(^open)(void) = ^{
         DictationDeliveryFixture *owner = [[DictationDeliveryFixture alloc] initWithSend:^(NSString *command,
             NSDictionary *payload, JardDictationReply reply) {
             if (![payload[@"action"] isEqual:@"transcribe"]) return;
             [files removeItemAtPath:[staging stringByAppendingPathComponent:payload[@"id"]] error:nil];
+            if (whilePending) whilePending();
             reply(@{@"text": text}, nil);
         }];
         owner.settings[@"sound"] = @NO;
@@ -3988,7 +4141,18 @@ static void testHistoryAudio(void) {
     };
     DictationDeliveryFixture *owner = open();
     assert([owner.settings[@"retention"] isEqual:@7]);
+    whilePending = ^{
+        id job = owner.pendingJobs.firstObject;
+        NSURL *pending = [job valueForKey:@"pendingHistoryAudio"];
+        NSString *aliasFolder = [alias stringByAppendingPathComponent:@"dictation-history-audio"];
+        NSURL *aliasPending = [NSURL fileURLWithPath:[aliasFolder stringByAppendingPathComponent:pending.lastPathComponent]];
+        assert(pending && ![aliasPending isEqual:pending] && [files fileExistsAtPath:aliasPending.path]);
+        [job setValue:aliasPending forKey:@"pendingHistoryAudio"];
+        [owner sweepHistoryAudioAt:NSDate.date.timeIntervalSince1970];
+        assert([files fileExistsAtPath:aliasPending.path]);
+    };
     NSString *first = take(owner, YES);
+    whilePending = nil;
     assert([[NSData dataWithContentsOfFile:clip(first)] isEqual:original]);
     assert([[files attributesOfItemAtPath:clipRoot error:nil] filePosixPermissions] == 0700);
     assert([[files attributesOfItemAtPath:clip(first) error:nil] filePosixPermissions] == 0600);
@@ -4047,12 +4211,81 @@ static void testHistoryAudio(void) {
     [owner request:@{@"action": @"clearHistory"} reply:^(id result, NSString *error) { assert(!error); }];
     assert(!owner.history.count && [[files contentsOfDirectoryAtPath:clipRoot error:nil] count] == 0);
     [owner shutdown];
+    [files removeItemAtPath:alias error:nil];
     [files removeItemAtPath:root error:nil];
     if (priorRoot) setenv("RUMBLE_DATA_DIR", priorRoot.fileSystemRepresentation, 1);
     else unsetenv("RUMBLE_DATA_DIR");
     if (before) [defaults setObject:before forKey:key];
     else [defaults removeObjectForKey:key];
     puts("History played the original WAV, expired clips at launch and while open, and removed audio on delete and clear.");
+}
+
+static id readHistoryStats(JardSystemDictation *owner) {
+    __block id stats;
+    [owner request:@{@"action": @"historyStats"} reply:^(id result, NSString *error) {
+        assert(NSThread.isMainThread && !error);
+        stats = result[@"stats"];
+    }];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:5];
+    while (!stats && deadline.timeIntervalSinceNow > 0)
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.01]];
+    assert(stats);
+    return stats;
+}
+
+static void testHistoryAudioOwnership(void) {
+    NSString *root = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    NSFileManager *files = NSFileManager.defaultManager;
+    assert([files createDirectoryAtPath:root withIntermediateDirectories:NO attributes:nil error:nil]);
+    NSString *alias = [root stringByAppendingString:@"-alias"];
+    assert([files createSymbolicLinkAtPath:alias withDestinationPath:root error:nil]);
+    assert(![JardSystemDictation audioDirectoryForLibrary:nil defaultLibrary:root bundleID:nil]);
+    assert(![JardSystemDictation audioDirectoryForLibrary:alias defaultLibrary:root bundleID:@"fixture"]);
+    assert([JardSystemDictation audioDirectoryForLibrary:nil defaultLibrary:root bundleID:@"local.jardaudio.desktop"]);
+    assert([JardSystemDictation audioDirectoryForLibrary:[root stringByAppendingPathComponent:@"isolated"]
+        defaultLibrary:root bundleID:@"fixture"]);
+    assert([files removeItemAtPath:alias error:nil] && [files removeItemAtPath:root error:nil]);
+}
+
+static void testHistoryStats(void) {
+    JardSystemDictation *owner = [[JardSystemDictation alloc] initWithSend:nil];
+    owner.settings[@"retention"] = @7;
+    [owner.history removeAllObjects];
+    owner.settings[@"showHistoryStats"] = @NO;
+    assert(readHistoryStats(owner) == NSNull.null);
+    [owner request:@{@"action": @"set", @"key": @"showHistoryStats", @"value": @YES} reply:^(id result, NSString *error) {
+        assert(!error && [result[@"showHistoryStats"] isEqual:@YES]);
+    }];
+    JardSystemDictation *reloaded = [[JardSystemDictation alloc] initWithSend:nil];
+    assert([reloaded.settings[@"showHistoryStats"] isEqual:@YES]);
+    [reloaded shutdown];
+    NSCalendar *calendar = NSCalendar.currentCalendar;
+    NSDate *today = [calendar startOfDayForDate:NSDate.date];
+    for (NSNumber *age in @[@1, @2, @8]) {
+        NSDate *date = [calendar dateByAddingUnit:NSCalendarUnitDay value:-age.integerValue toDate:today options:0];
+        NSDate *morning = [calendar dateBySettingHour:9 minute:0 second:0 ofDate:date options:0];
+        NSMutableDictionary *row = [@{@"id": age.stringValue, @"time": @(morning.timeIntervalSince1970),
+            @"text": @"one two three four"} mutableCopy];
+        if (age.integerValue != 2) row[@"seconds"] = @2;
+        [owner.history addObject:row];
+    }
+    NSDictionary *stats = readHistoryStats(owner);
+    assert([stats[@"dictations"] isEqual:@2] && [stats[@"words"] isEqual:@8]);
+    assert([stats[@"wordsPerMinute"] isEqual:@120] && [stats[@"savedSeconds"] isEqual:@4]);
+    assert([stats[@"streakDays"] isEqual:@2] && [stats[@"busiestHour"] isEqual:@9]);
+    [owner.history removeObjectAtIndex:0];
+    stats = readHistoryStats(owner);
+    assert([stats[@"dictations"] isEqual:@1] && [stats[@"words"] isEqual:@4]);
+    assert(stats[@"wordsPerMinute"] == NSNull.null && stats[@"savedSeconds"] == NSNull.null);
+    assert([stats[@"streakDays"] isEqual:@0]);
+    [owner.history removeAllObjects];
+    stats = readHistoryStats(owner);
+    assert([stats[@"dictations"] isEqual:@0] && stats[@"busiestHour"] == NSNull.null);
+    [owner request:@{@"action": @"set", @"key": @"showHistoryStats", @"value": @NO} reply:^(id result, NSString *error) {
+        assert(!error && [result[@"showHistoryStats"] isEqual:@NO]);
+    }];
+    [owner shutdown];
+    puts("History stats honor the opt-in, expiry, deletions, local calendar, and untimed legacy entries.");
 }
 
 static void testLargeHistory(void) {
@@ -4138,6 +4371,11 @@ static void testLargeHistory(void) {
 
 int main(void) {
     @autoreleasepool {
+        // Every owner sweeps audio on startup. Give the entire suite its own library.
+        NSString *testLibrary = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+        assert([NSFileManager.defaultManager createDirectoryAtPath:testLibrary withIntermediateDirectories:NO
+            attributes:@{NSFilePosixPermissions: @0700} error:nil]);
+        assert(setenv("RUMBLE_DATA_DIR", testLibrary.fileSystemRepresentation, 1) == 0);
         testHUDSpaces();
         testDamagedPreferences();
         testExternalPreferencesReload();
@@ -4160,6 +4398,8 @@ int main(void) {
         testWindowOnlyDictationTarget();
         testHistoryTiming();
         testHistoryAudio();
+        testHistoryAudioOwnership();
+        testHistoryStats();
         testLargeHistory();
         testCancelShortcuts();
         testAnnotationShortcut();
@@ -4318,6 +4558,7 @@ int main(void) {
         assert(press(dictation, kVK_ANSI_S, kCGEventKeyDown, annotationChord, NO) && annotationEvents == 1);
         assert(!press(dictation, kVK_ANSI_V, kCGEventKeyDown, chord, NO));
         assert(![dictation handleKey:NULL type:kCGEventTapDisabledByTimeout] && lostTap == 1);
+        assert([NSFileManager.defaultManager removeItemAtPath:testLibrary error:nil]);
         puts("Native dictation queue, cancellation, secure-input recovery, meeting paste, and annotation tap routing passed.");
     }
 }

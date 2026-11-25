@@ -10,6 +10,7 @@
 #import "jard_secure_hotkeys.h"
 #import "indicator/JardDictationMeter.h"
 #import "indicator/JardHUDPlacement.h"
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <AVFoundation/AVFoundation.h>
 #import <Carbon/Carbon.h>
@@ -59,6 +60,7 @@ static const CGEventFlags shortcutModifiers = kCGEventFlagMaskAlternate | kCGEve
 static const CGEventFlags defaultAnnotationFlags = kCGEventFlagMaskAlternate | kCGEventFlagMaskShift;
 static const CGEventFlags meetingPasteFlags = kCGEventFlagMaskAlternate | kCGEventFlagMaskControl;
 static const NSUInteger clipboardLimit = 16 * 1024 * 1024;
+static const int64_t caretPasteKeyGap = 15 * NSEC_PER_MSEC;
 static const int64_t pasteSettle = 100 * NSEC_PER_MSEC;
 static const int64_t pasteRestoreDelay = 500 * NSEC_PER_MSEC;
 static const PasteboardFlavorFlags writableClipboardFlags = kPasteboardFlavorSenderOnly | kPasteboardFlavorSenderTranslated |
@@ -260,12 +262,15 @@ static NSScreen *activeScreen(void) {
 
 @interface JardDictationStartCue : NSObject
 - (void)playURL:(NSURL *)url volume:(float)volume at:(NSTimeInterval)deadline;
+- (void)afterPlayback:(dispatch_block_t)completion;
 - (void)withdraw;
 @end
 
 @implementation JardDictationStartCue {
     AVAudioPlayer *_player;
     atomic_bool _withdrawn;
+    BOOL _finished;
+    dispatch_block_t _completion;
 }
 
 - (instancetype)init {
@@ -288,6 +293,20 @@ static dispatch_queue_t startCueQueue(void) {
     return [[AVAudioPlayer alloc] initWithContentsOfURL:url error:NULL];
 }
 
+- (void)finishPlayback {
+    _player = nil;
+    _finished = YES;
+    if (_completion) dispatch_async(dispatch_get_main_queue(), _completion);
+    _completion = nil;
+}
+
+- (void)afterPlayback:(dispatch_block_t)completion {
+    dispatch_async(startCueQueue(), ^{
+        if (self->_finished) dispatch_async(dispatch_get_main_queue(), completion);
+        else self->_completion = completion;
+    });
+}
+
 - (void)playURL:(NSURL *)url volume:(float)volume at:(NSTimeInterval)deadline {
     dispatch_async(startCueQueue(), ^{
         if (atomic_load(&self->_withdrawn)) return;
@@ -297,11 +316,11 @@ static dispatch_queue_t startCueQueue(void) {
         NSTimeInterval wait = MAX(0, deadline - NSProcessInfo.processInfo.systemUptime);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)), startCueQueue(), ^{
             if (atomic_load(&self->_withdrawn) || ![self->_player play]) {
-                self->_player = nil;
+                [self finishPlayback];
                 return;
             }
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((self->_player.duration + .1) * NSEC_PER_SEC)),
-                startCueQueue(), ^{ self->_player = nil; });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((self->_player.duration + .04) * NSEC_PER_SEC)),
+                startCueQueue(), ^{ [self finishPlayback]; });
         });
     });
 }
@@ -310,13 +329,13 @@ static dispatch_queue_t startCueQueue(void) {
     if (atomic_exchange(&_withdrawn, true)) return;
     dispatch_async(startCueQueue(), ^{
         if (![self->_player isPlaying]) {
-            self->_player = nil;
+            [self finishPlayback];
             return;
         }
         [self->_player setVolume:0 fadeDuration:.020];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC), startCueQueue(), ^{
             [self->_player stop];
-            self->_player = nil;
+            [self finishPlayback];
         });
     });
 }
@@ -339,10 +358,21 @@ static dispatch_queue_t startCueQueue(void) {
 
 @interface JardTranscriptReply : NSObject
 @property(nonatomic, copy) JardDictationReply reply;
++ (instancetype)waitFor:(JardDictationReply)reply seconds:(int64_t)seconds;
 - (void)finish:(NSDictionary *)result error:(NSString *)error;
 @end
 
 @implementation JardTranscriptReply
++ (instancetype)waitFor:(JardDictationReply)reply seconds:(int64_t)seconds {
+    JardTranscriptReply *request = [self new];
+    request.reply = reply;
+    __weak JardTranscriptReply *waiting = request;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, seconds * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        [waiting finish:nil error:@"Timed out waiting for the dictation transcript."];
+    });
+    return request;
+}
+
 - (void)finish:(NSDictionary *)result error:(NSString *)error {
     JardDictationReply reply = self.reply;
     self.reply = nil;
@@ -380,6 +410,7 @@ static dispatch_queue_t startCueQueue(void) {
 @property(nonatomic) NSTimeInterval submittedAt;
 @property(nonatomic) NSTimeInterval stopRequestedAt, speechRequestedAt, responseReadyAt, deliveryStartedAt, deliveryFinishedAt;
 @property(nonatomic, strong) NSNumber *speechRequestMs, *clipboardSnapshotMs;
+@property(nonatomic, copy) NSDictionary *speechTiming;
 @property(nonatomic, copy) void (^pasteCompletion)(BOOL);
 @property(nonatomic, strong) JardTranscriptReply *printRequest;
 @property(nonatomic, strong) JardOutputContext *outputContext;
@@ -617,6 +648,8 @@ static BOOL JardMaintainEventTap(JardEventTap *tap, CGEventTapLocation location,
 @property(nonatomic) NSInteger clipboardCount;
 @property(nonatomic) NSUInteger clipboardGeneration;
 @property(nonatomic) BOOL clipboardPending, pasteSettling, reportedActivity;
+@property(nonatomic, copy) void (^releaseCaretPasteKeys)(void);
+@property(nonatomic) BOOL caretPasteSent;
 @end
 
 static AXUIElementRef copyAppElement(pid_t pid, CFStringRef attribute, AXError *status) CF_RETURNS_RETAINED {
@@ -792,15 +825,28 @@ static NSDictionary *JardDefaultPreferences(void) {
                   @"pasteLabel": @"⌥⇧V", @"cancelCode": @(kVK_Escape), @"cancelFlags": @0, @"cancelLabel": @"Escape",
                   @"annotateCode": @(kVK_ANSI_S), @"annotateFlags": @(defaultAnnotationFlags), @"annotateLabel": @"⌥⇧S",
                   @"annotationEnabled": @YES, @"annotationShowOverlays": @NO,
-                  @"retention": @7, @"previousRetention": @7, @"sound": @YES,
+                  @"retention": @7, @"previousRetention": @7, @"showHistoryStats": @NO, @"sound": @YES,
                   @"placement": @"top", @"output": @"paste", @"fillerWords": @NO,
                   @"spokenFormatting": @NO, @"replacements": @"", @"appRules": @"",
-                  @"languages": @[], @"inputDevice": @"", @"avoidBluetooth": @YES, @"vocabulary": @"", @"vocabularySoundsLike": @{}, @"livePreview": @NO, @"keepMicrophoneReady": @NO, @"noiseCleanup": @NO, @"boostMicrophone": @NO,
+                  @"languages": @[], @"inputDevice": @"", @"avoidBluetooth": @YES, @"vocabulary": @"", @"vocabularySoundsLike": @{}, @"vocabularyMenu": @NO, @"livePreview": @NO, @"keepMicrophoneReady": @NO, @"noiseCleanup": @NO, @"boostMicrophone": @NO,
                   @"outputProfiles": @"", @"outputScript": @"", @"outputScriptApproval": @{}, @"rewriteInstructions": @"",
                   @"soundSet": @"classic", @"soundVolume": @70, @"audioWhileDictating": @"none", @"lowerAudioPercent": @20};
 }
 
 @implementation JardSystemDictation
+
++ (NSURL *)audioDirectoryForLibrary:(NSString *)configured defaultLibrary:(NSString *)defaultLibrary bundleID:(NSString *)bundleID {
+    NSString *library = configured.length ? configured.stringByExpandingTildeInPath : defaultLibrary;
+    // A different preferences domain has a different index. Its cleanup must
+    // never treat the installed app’s audio as orphaned.
+    if (![bundleID isEqual:@"local.jardaudio.desktop"]) {
+        if (!configured.length || [library.stringByResolvingSymlinksInPath isEqual:defaultLibrary.stringByResolvingSymlinksInPath]) return nil;
+        struct stat source, installed;
+        if (stat(library.fileSystemRepresentation, &source) == 0 && stat(defaultLibrary.fileSystemRepresentation, &installed) == 0 &&
+            source.st_dev == installed.st_dev && source.st_ino == installed.st_ino) return nil;
+    }
+    return [[NSURL fileURLWithPath:library isDirectory:YES] URLByAppendingPathComponent:@"dictation-history-audio" isDirectory:YES];
+}
 
 - (instancetype)initWithSend:(JardDictationSend)send {
     if (!(self = [super init])) return nil;
@@ -822,12 +868,11 @@ static NSDictionary *JardDefaultPreferences(void) {
     _deferHistoryExpiry = _preferencesUnreadable || [invalid containsObject:@"retention"] || [invalid containsObject:@"previousRetention"];
     _pendingJobs = NSMutableArray.array;
     _history = [[NSUserDefaults.standardUserDefaults arrayForKey:historyKey] mutableCopy] ?: NSMutableArray.array;
+    NSString *defaultLibrary = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/Rumble"];
     const char *configuredLibrary = getenv("RUMBLE_DATA_DIR");
-    NSString *library = configuredLibrary && *configuredLibrary
-        ? [[NSString stringWithUTF8String:configuredLibrary] stringByExpandingTildeInPath]
-        : [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/Rumble"];
-    if (library.length) _historyAudioDirectory = [[NSURL fileURLWithPath:library isDirectory:YES]
-        URLByAppendingPathComponent:@"dictation-history-audio" isDirectory:YES];
+    _historyAudioDirectory = [JardSystemDictation audioDirectoryForLibrary:
+        configuredLibrary && *configuredLibrary ? [NSString stringWithUTF8String:configuredLibrary] : nil
+        defaultLibrary:defaultLibrary bundleID:NSBundle.mainBundle.bundleIdentifier];
     _shortcutCandidate = _ignoredRelease = _cancelRelease = -1;
     _phase = @"idle";
     _message = @"";
@@ -974,7 +1019,8 @@ static JardOutputHostUse JardOutputProfilesHostUse(NSDictionary *settings) {
     if (self.microphonePreferenceChanged && ![previous[@"inputDevice"] isEqual:saved[@"inputDevice"]]) {
         self.microphonePreferenceChanged(saved[@"inputDevice"]);
     }
-    if (self.preferencesChanged && ![previous[@"annotationShowOverlays"] isEqual:saved[@"annotationShowOverlays"]])
+    if (self.preferencesChanged && (![previous[@"annotationShowOverlays"] isEqual:saved[@"annotationShowOverlays"]] ||
+        ![previous[@"vocabularyMenu"] isEqual:saved[@"vocabularyMenu"]]))
         self.preferencesChanged(self.status);
 }
 
@@ -1002,6 +1048,45 @@ static NSUInteger JardHistoryTextBytes(NSDictionary *entry) {
     NSUInteger rawBytes = [raw isKindOfClass:NSString.class] ? [raw lengthOfBytesUsingEncoding:NSUTF8StringEncoding] : 0;
     NSUInteger finalBytes = [final isKindOfClass:NSString.class] ? [final lengthOfBytesUsingEncoding:NSUTF8StringEncoding] : 0;
     return rawBytes + finalBytes;
+}
+
+static NSUInteger JardHistoryWords(NSString *text) {
+    if (![text isKindOfClass:NSString.class]) return 0;
+    __block NSUInteger count = 0;
+    [text enumerateSubstringsInRange:NSMakeRange(0, text.length) options:NSStringEnumerationByWords | NSStringEnumerationSubstringNotRequired
+        usingBlock:^(NSString *word, NSRange wordRange, NSRange enclosing, BOOL *stop) { count++; }];
+    return count;
+}
+
+static NSDictionary *JardHistoryStats(NSArray<NSDictionary *> *entries, NSDate *now, NSCalendar *calendar) {
+    NSUInteger words = 0, timedWords = 0, hours[24] = {0}, streak = 0;
+    double seconds = 0;
+    NSMutableSet<NSDate *> *days = NSMutableSet.set;
+    for (NSDictionary *entry in entries) {
+        NSUInteger count = JardHistoryWords(entry[@"text"]);
+        words += count;
+        double duration = [entry[@"seconds"] doubleValue];
+        if (isfinite(duration) && duration > 0) {
+            timedWords += count;
+            seconds += duration;
+        }
+        NSDate *date = [NSDate dateWithTimeIntervalSince1970:[entry[@"time"] doubleValue]];
+        NSInteger hour = [calendar component:NSCalendarUnitHour fromDate:date];
+        if (hour >= 0 && hour < 24) hours[hour]++;
+        [days addObject:[calendar startOfDayForDate:date]];
+    }
+    NSDate *day = [calendar startOfDayForDate:now];
+    if (![days containsObject:day]) day = [calendar dateByAddingUnit:NSCalendarUnitDay value:-1 toDate:day options:0];
+    while (day && [days containsObject:day]) {
+        streak++;
+        day = [calendar dateByAddingUnit:NSCalendarUnitDay value:-1 toDate:day options:0];
+    }
+    NSUInteger busiest = 0;
+    for (NSUInteger hour = 1; hour < 24; hour++) if (hours[hour] > hours[busiest]) busiest = hour;
+    return @{@"dictations": @(entries.count), @"words": @(words), @"streakDays": @(streak),
+             @"busiestHour": hours[busiest] ? @(busiest) : NSNull.null,
+             @"wordsPerMinute": seconds > 0 ? @(round(timedWords * 60.0 / seconds)) : NSNull.null,
+             @"savedSeconds": seconds > 0 ? @(MAX(0., timedWords * 60.0 / 40.0 - seconds)) : NSNull.null};
 }
 
 static NSString *JardBoundHistoryText(NSString *text) {
@@ -1072,15 +1157,15 @@ static BOOL JardPrivateHistoryFile(NSURL *url) {
     NSArray *files = [NSFileManager.defaultManager contentsOfDirectoryAtURL:self.historyAudioDirectory
         includingPropertiesForKeys:@[] options:0 error:nil];
     if (!files) next = now + 60;
-    NSMutableSet<NSURL *> *pending = NSMutableSet.set;
+    NSMutableSet<NSString *> *pending = NSMutableSet.set;
     for (JardDictationJob *job in self.pendingJobs)
-        if (job.pendingHistoryAudio) [pending addObject:job.pendingHistoryAudio];
+        if (job.pendingHistoryAudio) [pending addObject:job.pendingHistoryAudio.lastPathComponent];
     BOOL playingAvailable = NO;
     for (NSURL *file in files) {
         NSString *identifier = file.lastPathComponent.stringByDeletingPathExtension;
         BOOL clip = [file.pathExtension isEqual:@"wav"];
         if (!JardHistoryAudioID(identifier) || !(clip || [file.pathExtension isEqual:@"pending"])) continue;
-        if (!clip && [pending containsObject:file]) continue;
+        if (!clip && [pending containsObject:file.lastPathComponent]) continue;
         NSTimeInterval deadline = clip ? deadlines[identifier].doubleValue : 0;
         if (isfinite(deadline) && deadline > now) {
             next = MIN(next, deadline);
@@ -1529,11 +1614,12 @@ static NSString *annotationTerminalDirectory(AXUIElementRef element) {
     if (app.processIdentifier == ownPID || app.terminated || app.activationPolicy != NSApplicationActivationPolicyRegular || !app.bundleIdentifier.length ||
         !accessibilityAllowed()) return nil;
     AXUIElementRef focus = copyFocus(app.processIdentifier);
+    if (focus) AXUIElementSetMessagingTimeout(focus, .10);
     if (!focus || secureField(focus)) { if (focus) CFRelease(focus); return nil; }
     CFTypeRef window = NULL;
     AXUIElementCopyAttributeValue(focus, kAXWindowAttribute, &window);
     BOOL terminal = JardIsAnnotationTerminal(app.bundleIdentifier);
-    NSString *host = terminal ? nil : browserHost(focus, 0);
+    NSURL *annotationPage = terminal ? nil : browserURL(focus, NSProcessInfo.processInfo.systemUptime + .10);
     NSString *directory = terminal ? annotationTerminalDirectory(focus) : nil;
     CFRelease(focus);
     if (!window || CFGetTypeID(window) != AXUIElementGetTypeID()) {
@@ -1557,7 +1643,13 @@ static NSString *annotationTerminalDirectory(AXUIElementRef element) {
     id caption = CFBridgingRelease(title);
     if (!geometry) return nil;
     NSMutableDictionary *identity = [@{@"app": app.bundleIdentifier, @"name": app.localizedName ?: app.bundleIdentifier} mutableCopy];
-    if (host.length) identity[@"site"] = host;
+    if (annotationPage.host.length) {
+        identity[@"site"] = annotationPage.host.lowercaseString;
+        NSURLComponents *location = [NSURLComponents componentsWithURL:annotationPage resolvingAgainstBaseURL:NO];
+        location.query = nil;
+        location.fragment = nil;
+        if (location.string.length) identity[@"siteUrl"] = location.string;
+    }
     NSString *windowTitle = [caption isKindOfClass:NSString.class] ? caption : @"";
     if (terminal) {
         NSDictionary *context = JardAnnotationTerminalContext(app.processIdentifier, windowTitle, directory);
@@ -1946,6 +2038,7 @@ static NSString *annotationTerminalDirectory(AXUIElementRef element) {
     NSDictionary *latest = self.history.firstObject;
     visible[@"historyRevision"] = latest[@"totalMs"]
         ? [NSString stringWithFormat:@"%@:%@", latest[@"id"], latest[@"totalMs"]] : latest[@"id"] ?: @"";
+    if (latest) visible[@"historyRevision"] = [NSString stringWithFormat:@"%@:%lu", visible[@"historyRevision"], (unsigned long)self.history.count];
     if (self.historyAudioRevision) visible[@"historyRevision"] = [NSString stringWithFormat:@"%@:audio:%lu",
         visible[@"historyRevision"], (unsigned long)self.historyAudioRevision];
     visible[@"playingHistoryID"] = self.playingHistoryID;
@@ -2377,11 +2470,34 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     if (self.shortcutStartCue) self.shortcutStartCueAt = time;
 }
 
+- (BOOL)captureWaitsForStartCue {
+    NSDictionary *preferences = self.capturePreferences;
+    NSString *mode = preferences[@"audioWhileDictating"];
+    return ([mode isEqual:@"mute"] || [mode isEqual:@"lower"]) && [preferences[@"sound"] boolValue] &&
+        [preferences[@"soundVolume"] floatValue] > 0;
+}
+
 - (void)announceCaptureStartIfReady {
     if (!self.captureIntentional || !self.captureMicReady || self.captureStartAnnounced ||
         self.cancelled || self.stopping) return;
     self.captureStartAnnounced = YES;
-    [self playSound:@"start"];
+    if (![self captureWaitsForStartCue]) {
+        if (!self.captureStartCue) [self playSound:@"start"];
+        return;
+    }
+    NSDictionary *preferences = self.capturePreferences;
+    if (!self.captureStartCue) self.captureStartCue =
+        [self newShortcutStartCueAt:NSProcessInfo.processInfo.systemUptime preferences:preferences];
+    NSUInteger sequence = self.takeSequence;
+    __weak typeof(self) weakSelf = self;
+    dispatch_block_t suppressOutput = ^{
+        JardSystemDictation *owner = weakSelf;
+        if (!owner || owner.closed || owner.takeSequence != sequence || owner.cancelled || owner.stopping) return;
+        [owner.recordingEnvironment setDictationMode:preferences[@"audioWhileDictating"]
+            percent:[preferences[@"lowerAudioPercent"] doubleValue]];
+    };
+    if (self.captureStartCue) [self.captureStartCue afterPlayback:suppressOutput];
+    else suppressOutput();
 }
 
 - (void)admitCaptureIntentionAt:(NSTimeInterval)now {
@@ -2392,7 +2508,7 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     self.captureIntentional = YES;
     [self prepareCaptureOutputContext];
     if (!self.recordingEnvironment) self.recordingEnvironment = JardRecordingEnvironment.new;
-    [self.recordingEnvironment beginWithMode:self.capturePreferences[@"audioWhileDictating"]
+    [self.recordingEnvironment beginWithMode:[self captureWaitsForStartCue] ? nil : self.capturePreferences[@"audioWhileDictating"]
         percent:[self.capturePreferences[@"lowerAudioPercent"] doubleValue]];
     [self announceCaptureStartIfReady];
 }
@@ -2651,7 +2767,7 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
         [self fail:@"Dictation is unavailable in secure fields."];
         return;
     }
-    self.practice = [preferences[@"onboarding"] isEqual:@"practice"] &&
+    self.practice = !self.printRequest && [preferences[@"onboarding"] isEqual:@"practice"] &&
         self.destination.processIdentifier == NSProcessInfo.processInfo.processIdentifier;
     self.takeInputRevision = queued ? queued.inputRevision : self.inputRevision;
     self.capturePreferences = preferences;
@@ -2660,7 +2776,7 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     self.queuedCaptureStart = queued.pressedAt;
     self.started = self.stopping = self.cancelled = self.secureTakeInterrupted = NO;
     self.retriedColdCapture = self.captureIntentional = self.captureMicReady = NO;
-    self.captureStartAnnounced = self.captureStartCue != nil;
+    self.captureStartAnnounced = NO;
     self.shortcutReleasedAt = queued.releasedAt;
     self.stopping = queued.releasedAt > 0;
     self.captureIntentAt = _shortcut.phase == JardHeld ? _shortcut.pressedAt + JardHoldThreshold : 0;
@@ -2729,7 +2845,7 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     [self abandonTailPress];
     [self withdrawShortcutStartCue];
     [self.captureStartCue withdraw];
-    if (!self.captureID && !self.transcribing) return;
+    if (self.caretPasteSent || (!self.captureID && !self.transcribing)) return;
     if (self.discardingShortcut) {
         self.discardingShortcut = self.deferredShortcutStart = NO;
         return;
@@ -2755,6 +2871,12 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
 }
 
 - (void)resetCapture {
+    if (self.releaseCaretPasteKeys) {
+        self.releaseCaretPasteKeys();
+        self.releaseCaretPasteKeys = nil;
+        [self restoreClipboard];
+    }
+    self.caretPasteSent = NO;
     // The recorder can acknowledge a short take after the next key gesture has started.
     // Clear only the old recorder state in that case.
     BOOL releasingTail = self.closingReleaseTail;
@@ -3055,6 +3177,10 @@ static NSDictionary *JardHistoryProcessing(id value) {
         // shortcut itself so the fixed settle interval does not look like a slow insertion.
         NSTimeInterval finished = job.deliveryFinishedAt ?: NSProcessInfo.processInfo.systemUptime;
         NSMutableDictionary *timing = NSMutableDictionary.dictionary;
+        for (NSString *field in @[@"audioReadMs", @"speechQueueMs", @"audioPriorityMs", @"voiceCleanupMs"]) {
+            id value = job.speechTiming[field];
+            if ([value isKindOfClass:NSNumber.class]) timing[field] = value;
+        }
         timing[@"captureFinalizeMs"] = JardElapsedMilliseconds(job.stopRequestedAt, job.submittedAt);
         timing[@"submissionWaitMs"] = JardElapsedMilliseconds(job.submittedAt, job.speechRequestedAt);
         timing[@"speechRequestMs"] = job.speechRequestMs;
@@ -3188,39 +3314,55 @@ static NSArray<NSPasteboardItem *> *annotationPasteItems(NSString *markdown, NSD
 }
 
 - (BOOL)postPasteShortcut {
-    CGKeyCode key = JardCurrentPasteKeyCode();
     if ([self pasteboard].changeCount != self.clipboardCount) return NO;
-    if ([self freshDictationFollowsCaret]) {
-        // Use a physical-style Command chord so WebKit and other clients see
-        // the modifier edges, even if they do not expose a focused AX field.
-        CGKeyCode codes[] = {kVK_Command, key, key, kVK_Command};
-        CGEventRef events[4] = {NULL};
-        for (NSUInteger index = 0; index < 4; index++) {
-            events[index] = CGEventCreateKeyboardEvent(NULL, codes[index], index < 2);
-            if (!events[index]) {
-                for (NSUInteger previous = 0; previous < index; previous++) CFRelease(events[previous]);
-                return NO;
-            }
-            if (index == 0 || index == 3) CGEventSetType(events[index], kCGEventFlagsChanged);
-            CGEventSetFlags(events[index], index < 3 ? kCGEventFlagMaskCommand : 0);
-            CGEventSetIntegerValueField(events[index], kCGEventSourceUserData, pasteMarker);
-        }
-        pid_t pid = self.destination.processIdentifier;
-        CGEventPost(kCGHIDEventTap, events[0]);
-        usleep(15000);
-        BOOL sent = [self foregroundOutputApplication].processIdentifier == pid && !IsSecureEventInputEnabled() &&
-            [self pasteboard].changeCount == self.clipboardCount;
-        if (sent) {
-            CGEventPost(kCGHIDEventTap, events[1]);
-            usleep(15000);
-            CGEventPost(kCGHIDEventTap, events[2]);
-            usleep(15000);
-        }
-        CGEventPost(kCGHIDEventTap, events[3]);
-        for (NSUInteger index = 0; index < 4; index++) CFRelease(events[index]);
-        return sent;
+    return sendKey(self.destination.processIdentifier, JardCurrentPasteKeyCode(), kCGEventFlagMaskCommand);
+}
+
+- (void)postCaretPasteChecking:(BOOL (^)(void))canSend completion:(void (^)(BOOL))completion {
+    // WebKit and other clients need the physical modifier edges even when
+    // they don't expose a focused accessibility element.
+    CGKeyCode key = JardCurrentPasteKeyCode();
+    CGKeyCode codes[] = {kVK_Command, key, key, kVK_Command};
+    NSMutableArray *events = [NSMutableArray arrayWithCapacity:4];
+    for (NSUInteger index = 0; index < 4; index++) {
+        CGEventRef event = CGEventCreateKeyboardEvent(NULL, codes[index], index < 2);
+        if (!event) { completion(NO); return; }
+        if (index == 0 || index == 3) CGEventSetType(event, kCGEventFlagsChanged);
+        CGEventSetFlags(event, index < 3 ? kCGEventFlagMaskCommand : 0);
+        CGEventSetIntegerValueField(event, kCGEventSourceUserData, pasteMarker);
+        [events addObject:CFBridgingRelease(event)];
     }
-    return sendKey(self.destination.processIdentifier, key, kCGEventFlagMaskCommand);
+    __block BOOL released = NO;
+    __block BOOL keyHeld = NO;
+    void (^release)(void) = ^{
+        released = YES;
+        if (keyHeld) CGEventPost(kCGHIDEventTap, (__bridge CGEventRef)events[2]);
+        CGEventPost(kCGHIDEventTap, (__bridge CGEventRef)events[3]);
+    };
+    self.releaseCaretPasteKeys = release;
+    CGEventPost(kCGHIDEventTap, (__bridge CGEventRef)events[0]);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, caretPasteKeyGap), dispatch_get_main_queue(), ^{
+        if (released) return;
+        if (!canSend()) {
+            release();
+            self.releaseCaretPasteKeys = nil;
+            completion(NO);
+            return;
+        }
+        keyHeld = self.caretPasteSent = YES;
+        CGEventPost(kCGHIDEventTap, (__bridge CGEventRef)events[1]);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, caretPasteKeyGap), dispatch_get_main_queue(), ^{
+            if (released) return;
+            keyHeld = NO;
+            CGEventPost(kCGHIDEventTap, (__bridge CGEventRef)events[2]);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, caretPasteKeyGap), dispatch_get_main_queue(), ^{
+                if (released) return;
+                release();
+                self.releaseCaretPasteKeys = nil;
+                completion(YES);
+            });
+        });
+    });
 }
 
 - (BOOL)postAnnotationPaste { return [self postPasteShortcut]; }
@@ -3556,9 +3698,29 @@ static NSString *JardDeliveryMessage(NSString *message, NSString *warning) {
         else [self fail:@"Could not prepare the clipboard. Use Paste Last to recover the text."];
         return;
     }
-    BOOL sent = !self.cancelled && board.changeCount == count &&
+    BOOL ready = !self.cancelled && board.changeCount == count &&
         (usesCurrentCaret ? [self dictationPasteAppStillActive] : [self targetStillFocusedCheckingSelection:YES]) &&
-        board.changeCount == count && [self postPasteShortcut];
+        board.changeCount == count;
+    if (ready && usesCurrentCaret) {
+        pid_t pid = self.destination.processIdentifier;
+        NSUInteger revision = self.inputRevision;
+        self.transcribing = YES;
+        [self postCaretPasteChecking:^BOOL{
+            return !self.closed && !self.cancelled && !self.updatePaused && ![self sessionUnavailable] &&
+                self.clipboardGeneration == generation && self.inputRevision == revision &&
+                accessibilityAllowed() && !IsSecureEventInputEnabled() &&
+                [self foregroundOutputApplication].processIdentifier == pid && board.changeCount == count;
+        } completion:^(BOOL sent) {
+            [self finishClipboardPaste:sent text:text warning:warning generation:generation usesCurrentCaret:YES];
+        }];
+    } else {
+        [self finishClipboardPaste:ready && [self postPasteShortcut] text:text warning:warning generation:generation
+                  usesCurrentCaret:usesCurrentCaret];
+    }
+}
+
+- (void)finishClipboardPaste:(BOOL)sent text:(NSString *)text warning:(NSString *)warning
+                  generation:(NSUInteger)generation usesCurrentCaret:(BOOL)usesCurrentCaret {
     if (sent) {
         self.activeOutput.deliveryFinishedAt = NSProcessInfo.processInfo.systemUptime;
         [self playCompletionCueAt:NSProcessInfo.processInfo.systemUptime];
@@ -3573,7 +3735,7 @@ static NSString *JardDeliveryMessage(NSString *message, NSString *warning) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, pasteRestoreDelay), dispatch_get_main_queue(), ^{
             if (self.clipboardGeneration == generation) [self restoreClipboard];
         });
-    } else {
+    } else if (self.clipboardGeneration == generation) {
         [self restoreClipboard];
     }
     BOOL cancelled = self.cancelled;
@@ -3901,6 +4063,8 @@ static NSString *JardCorrectVocabulary(NSString *text, NSDictionary *preferences
         NSNumber *requestMs = result[@"speechRequestMs"];
         if ([requestMs isKindOfClass:NSNumber.class] && isfinite(requestMs.doubleValue) && requestMs.doubleValue >= 0)
             job.speechRequestMs = requestMs;
+        id speechTiming = result[@"speechTiming"];
+        if ([speechTiming isKindOfClass:NSDictionary.class]) job.speechTiming = speechTiming;
         job.error = error;
         if (job.printRequest) {
             [self finishPrintedJob:job];
@@ -4981,6 +5145,14 @@ static BOOL JardShortcutBindingsOverlap(JardShortcutBinding binding, JardShortcu
         !self.captureID && !self.transcribing && !self.closed && !self.updatePaused && !self.choosingShortcut;
 }
 
+- (BOOL)vocabularyMenuEnabled {
+    return [self.settings[@"vocabularyMenu"] boolValue];
+}
+
+- (NSArray<NSDictionary *> *)menuVocabularyEntries {
+    return JardVocabularyEntries(self.settings);
+}
+
 - (void)configurePasteLastMenuItem:(NSMenuItem *)item {
     JardShortcutBinding binding = [self shortcutBinding:@"paste"];
     NSString *key = @"";
@@ -5055,8 +5227,8 @@ static NSDictionary *JardPreferenceCatalog(void) {
             @"lowerAudioPercent": @{@"type": @"integer", @"minimum": @0, @"maximum": @100},
             @"languages": @{@"type": @"array", @"maxItems": @25},
         } mutableCopy];
-        for (NSString *key in @[@"enabled", @"sound", @"fillerWords", @"spokenFormatting", @"avoidBluetooth",
-                                @"livePreview", @"keepMicrophoneReady", @"noiseCleanup", @"boostMicrophone"]) {
+        for (NSString *key in @[@"enabled", @"sound", @"showHistoryStats", @"fillerWords", @"spokenFormatting", @"avoidBluetooth",
+                                @"vocabularyMenu", @"livePreview", @"keepMicrophoneReady", @"noiseCleanup", @"boostMicrophone"]) {
             fields[key] = @{@"type": @"boolean"};
         }
         NSDictionary *limits = @{@"inputDevice": @1024, @"rewriteInstructions": @2500, @"outputProfiles": @48000,
@@ -5895,6 +6067,36 @@ static NSString *JardOutputPolicy(id result) {
     }];
 }
 
+static NSDictionary *JardProfileApplication(NSURL *url) {
+    if (![url.pathExtension.lowercaseString isEqual:@"app"]) return nil;
+    NSString *identifier = [NSBundle bundleWithURL:url].bundleIdentifier;
+    if (!identifier.length || [identifier isEqual:NSBundle.mainBundle.bundleIdentifier]) return nil;
+    NSString *name = [NSFileManager.defaultManager displayNameAtPath:url.path];
+    if ([name.lowercaseString hasSuffix:@".app"]) name = name.stringByDeletingPathExtension;
+    return @{@"id":identifier, @"name":name};
+}
+
+static NSArray *JardProfileApplications(void) {
+    NSFileManager *files = NSFileManager.defaultManager;
+    NSMutableDictionary *applications = [NSMutableDictionary dictionary];
+    NSArray *roots = @[@"/Applications", @"/System/Applications", @"/System/Library/CoreServices/Applications",
+                       [NSHomeDirectory() stringByAppendingPathComponent:@"Applications"]];
+    for (NSString *root in roots) {
+        NSDirectoryEnumerator *entries = [files enumeratorAtURL:[NSURL fileURLWithPath:root]
+            includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsPackageDescendants |
+                NSDirectoryEnumerationSkipsHiddenFiles errorHandler:nil];
+        for (NSURL *url in entries) {
+            if (![url.pathExtension.lowercaseString isEqual:@"app"]) continue;
+            [entries skipDescendants];
+            NSDictionary *app = JardProfileApplication(url);
+            if (app) applications[app[@"id"]] = app;
+        }
+    }
+    return [applications.allValues sortedArrayUsingDescriptors:@[
+        [NSSortDescriptor sortDescriptorWithKey:@"name" ascending:YES selector:@selector(localizedCaseInsensitiveCompare:)],
+        [NSSortDescriptor sortDescriptorWithKey:@"id" ascending:YES]]];
+}
+
 - (void)request:(NSDictionary *)parameters reply:(JardDictationReply)reply {
     if (![parameters isKindOfClass:NSDictionary.class]) { reply(nil, @"Invalid dictation settings."); return; }
     NSString *action = parameters[@"action"];
@@ -5924,6 +6126,24 @@ static NSString *JardOutputPolicy(id result) {
         }
     } else if ([action isEqual:@"stopSoundPreview"]) {
         [self stopSoundPreview];
+    } else if ([action isEqual:@"chooseProfileApplication"]) {
+        NSOpenPanel *panel = NSOpenPanel.openPanel;
+        panel.title = @"Choose an application";
+        panel.directoryURL = [NSURL fileURLWithPath:@"/Applications" isDirectory:YES];
+        panel.allowedContentTypes = @[UTTypeApplicationBundle];
+        [panel beginWithCompletionHandler:^(NSModalResponse response) {
+            if (response != NSModalResponseOK) { reply(@{@"application":NSNull.null}, nil); return; }
+            NSDictionary *app = JardProfileApplication(panel.URL);
+            if (app) reply(@{@"application":app}, nil);
+            else reply(nil, @"Choose an application with a bundle identifier.");
+        }];
+        return;
+    } else if ([action isEqual:@"profileApplications"]) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSArray *items = JardProfileApplications();
+            dispatch_async(dispatch_get_main_queue(), ^{ reply(@{@"applications":items}, nil); });
+        });
+        return;
     } else if ([action isEqual:@"chooseOutputScript"]) {
         [self chooseOutputScript:reply];
         return;
@@ -6117,6 +6337,15 @@ static NSString *JardOutputPolicy(id result) {
             self.choosingShortcut = YES;
             if (self.secureInput) [self updateSecureHotkeys:YES];
         }
+    } else if ([action isEqual:@"historyStats"]) {
+        if (![self.settings[@"showHistoryStats"] boolValue]) { reply(@{@"stats": NSNull.null}, nil); return; }
+        [self trimHistory];
+        NSArray *snapshot = [self.history copy];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSDictionary *stats = JardHistoryStats(snapshot, NSDate.date, NSCalendar.currentCalendar);
+            dispatch_async(dispatch_get_main_queue(), ^{ reply(@{@"stats": stats}, nil); });
+        });
+        return;
     } else if ([action isEqual:@"history"]) {
         [self trimHistory];
         NSString *query = [parameters[@"query"] isKindOfClass:NSString.class] ? parameters[@"query"] : @"";
@@ -6125,7 +6354,7 @@ static NSString *JardOutputPolicy(id result) {
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             NSMutableArray *page = NSMutableArray.array;
             NSInteger matches = 0;
-            __block NSUInteger words = 0;
+            NSUInteger words = 0;
             double seconds = 0;
             for (NSDictionary *entry in snapshot) {
                 if (query.length && ![entry[@"text"] localizedCaseInsensitiveContainsString:query] &&
@@ -6138,11 +6367,7 @@ static NSString *JardOutputPolicy(id result) {
                         [page addObject:textOnly];
                     } else [page addObject:entry];
                 }
-                NSString *text = entry[@"text"];
-                [text enumerateSubstringsInRange:NSMakeRange(0, text.length) options:NSStringEnumerationByWords | NSStringEnumerationSubstringNotRequired
-                    usingBlock:^(NSString *word, NSRange wordRange, NSRange enclosing, BOOL *stop) {
-                        words++;
-                    }];
+                words += JardHistoryWords(entry[@"text"]);
                 seconds += [entry[@"seconds"] doubleValue];
             }
             NSDictionary *result = @{@"entries": page, @"total": @(matches), @"words": @(words), @"seconds": @(seconds)};
@@ -6268,10 +6493,13 @@ static NSString *JardOutputPolicy(id result) {
         reply(result, error);
         return;
     }
-    BOOL raw = [action isEqual:@"dictation-start-raw"] || [action isEqual:@"dictation-toggle-raw"];
-    BOOL print = [action isEqual:@"dictation-stop-print"];
-    if (print) action = @"stop";
-    else if (raw) action = [action isEqual:@"dictation-start-raw"] ? @"start" : @"toggle";
+    BOOL rawPrintStart = [action isEqual:@"dictation-start-raw-print"];
+    BOOL printStart = rawPrintStart || [action isEqual:@"dictation-start-print"];
+    BOOL printStop = [action isEqual:@"dictation-stop-print"];
+    BOOL rawToggle = [action isEqual:@"dictation-toggle-raw"];
+    BOOL raw = rawPrintStart || rawToggle || [action isEqual:@"dictation-start-raw"];
+    if (printStop) action = @"stop";
+    else if (printStart || raw) action = rawToggle ? @"toggle" : @"start";
     if ([action isEqual:@"toggle"]) action = self.captureID ? @"stop" : @"start";
     if ([action isEqual:@"start"]) {
         if (![self canStartCommandCapture]) {
@@ -6282,27 +6510,35 @@ static NSString *JardOutputPolicy(id result) {
         self.commandRawTake = raw;
         self.captureFromCommand = YES;
         _shortcut.phase = JardLocked;
+        if (printStart) self.printRequest = [JardTranscriptReply waitFor:reply seconds:31 * 60];
         [self begin];
+        if (printStart) {
+            if (!self.captureID && self.printRequest) [self fail:@"The microphone did not start."];
+            return;
+        }
     } else if ([action isEqual:@"stop"]) {
         if (!self.captureID) { reply(nil, @"There is no active take."); return; }
-        if (print) {
+        if (printStop) {
             if (self.stopping || self.cancelled || self.practice) {
                 reply(nil, @"There is no active dictation available to print.");
                 return;
             }
-            JardTranscriptReply *request = JardTranscriptReply.new;
-            request.reply = reply;
-            self.printRequest = request;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-                [request finish:nil error:@"Timed out waiting for the dictation transcript."];
-            });
+            JardTranscriptReply *stop = [JardTranscriptReply waitFor:reply seconds:60];
+            JardTranscriptReply *start = self.printRequest;
+            if (start) {
+                self.printRequest = JardTranscriptReply.new;
+                self.printRequest.reply = ^(id result, NSString *error) {
+                    [start finish:result error:error];
+                    [stop finish:result error:error];
+                };
+            } else self.printRequest = stop;
         }
         if (!self.closingReleaseTail) {
             _shortcut.phase = JardFinishing;
             self.shortcutReleasedAt = 0;
             [self stopCapture];
         }
-        if (print) return;
+        if (printStop) return;
     } else if ([action isEqual:@"cancel"]) {
         if (self.captureID || self.transcribing) [self cancelCapture];
         else [self cancelPendingOutput];

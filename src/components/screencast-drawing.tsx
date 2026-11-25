@@ -11,7 +11,6 @@ function strokePath(points: InkPoint[]) {
 }
 
 export function ScreencastDrawing({ url, view, seconds, onDone }: { url: string; view: string; seconds: number; onDone: () => void }) {
-  const epoch = useRef(0)
   const last = useRef(0)
   const nextId = useRef(0)
   const active = useRef<{ pointer: number; points: InkPoint[] }>(undefined)
@@ -22,7 +21,6 @@ export function ScreencastDrawing({ url, view, seconds, onDone }: { url: string;
   const [error, setError] = useState("")
   const image = useRef<HTMLImageElement>(null)
 
-  useEffect(() => { epoch.current = performance.now() / 1000 - seconds }, [seconds])
   useEffect(() => {
     // Some WebKit builds update the natural size before reporting load for MJPEG.
     const timer = window.setInterval(() => {
@@ -34,7 +32,8 @@ export function ScreencastDrawing({ url, view, seconds, onDone }: { url: string;
     return () => window.clearInterval(timer)
   }, [])
 
-  function now() { return Math.max(last.current, performance.now() / 1000 - epoch.current) }
+  // The encoder can pause even while the preview and pointer keep moving.
+  function now() { return Math.max(last.current, seconds) }
 
   function point(event: PointerEvent<HTMLDivElement>): InkPoint {
     const bounds = event.currentTarget.getBoundingClientRect()
@@ -87,7 +86,7 @@ export function ScreencastDrawing({ url, view, seconds, onDone }: { url: string;
 
   async function close() {
     setBusy(true)
-    await fetch(url + "/preview", { method: "DELETE" }).catch(() => {})
+    await fetch(`${url}/preview?view=${view}`, { method: "DELETE" }).catch(() => {})
     onDone()
   }
 

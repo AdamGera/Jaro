@@ -1,29 +1,35 @@
-"""Local meeting commands for the portable desktop's notification area."""
+"""Local meeting and update commands for the portable desktop tray."""
 
 import asyncio
 from contextlib import suppress
 import logging
 import os
 from pathlib import Path
+from secrets import token_hex
 import sqlite3
 import subprocess
 
 from fastapi import HTTPException
-from desktop_clipboard import copy_text
+from engine_lifecycle import begin_draining
 from portable_call_pages import Call
 
 logger = logging.getLogger(__name__)
 COMMANDS = {"open", "record", "stop", "copy", "quit"}
+UPDATE_COMMANDS = {"check", "restart", "download"}
 
 
 class MeetingTray:
-    def __init__(self, state, directory, busy, latest, transcript, finish):
+    def __init__(self, state, directory, busy, latest, copy, *, restart=None, meetings=True,
+                 shutdown_busy=None):
         self.state = state
         self.directory = directory
         self.busy = busy
+        self.shutdown_busy = shutdown_busy or busy
         self.latest = latest
-        self.transcript = transcript
-        self.finish = finish
+        self.copy = copy
+        self.restart = restart
+        self.meetings = meetings
+        self.update_job = None
         self.action = None
         self.job = None
         self.transcribing = None
@@ -39,7 +45,9 @@ class MeetingTray:
         except OSError:
             logger.warning("Could not publish the tray availability.")
 
-    def view(self):
+    def meeting_view(self):
+        if not self.meetings:
+            return "hidden", False
         with suppress(OSError, sqlite3.Error):
             self.key = self.latest()
         recording = self.state.portable_recording
@@ -57,32 +65,79 @@ class MeetingTray:
             phase = "recording"
         else:
             phase = "unavailable" if self.state.status != "ready" or self.busy() else "idle"
+        return phase, bool(self.key)
+
+    def view(self):
+        phase, can_copy = self.meeting_view()
         try:
             pid = int((self.directory / "window-pid").read_text())
         except (OSError, ValueError):
             pid = 0
-        return phase, bool(self.key), pid
+        return phase, can_copy, pid, self.update_view()
+
+    def update_view(self):
+        updater = getattr(self.state, "portable_updater", None)
+        if self.restart is None or updater is None:
+            return "none"
+        status = updater.status()
+        phase = status["phase"]
+        if status.get("updatesDisabled"):
+            return "managed"
+        if phase == "applying" or status.get("restartInProgress") or status.get("trayRestart"):
+            return "restarting"
+        if status.get("staged"):
+            return "wait" if self.shutdown_busy() else "restart"
+        if phase in ("checking", "downloading", "staging", "download"):
+            return phase
+        return "check"
+
+    def open_workspace(self):
+        with suppress(OSError):
+            (self.directory / "open").touch()
 
     def submit(self, command):
+        if command in UPDATE_COMMANDS:
+            if (self.update_job is None or self.update_job.done()) and command == self.update_view():
+                self.update_job = asyncio.create_task(self.update(command))
+            return
         if command not in COMMANDS:
             return
         if command == "open":
-            with suppress(OSError):
-                (self.directory / "open").touch()
+            self.open_workspace()
             return
         if command == "quit":
-            if self.busy():
-                with suppress(OSError):
-                    (self.directory / "open").touch()
+            if self.shutdown_busy():
+                self.open_workspace()
                 return
+            begin_draining(self.state)
             self.state.request_shutdown()
             return
         if self.job and not self.job.done():
             return
-        phase, copy, _ = self.view()
+        phase, copy = self.meeting_view()
         if (command, phase) in (("record", "idle"), ("stop", "recording")) or command == "copy" and copy:
             self.action = command
             self.job = asyncio.create_task(self.execute(command))
+
+    async def update(self, command):
+        updater = self.state.portable_updater
+        updater.publish(restartError="")
+        try:
+            if command == "check":
+                updater.publish(openUpdateSettings=token_hex(12))
+                self.open_workspace()
+                await updater.check()
+            elif command == "download":
+                await updater.download()
+            else:
+                await self.restart(updater)
+        except HTTPException as error:
+            updater.publish(restartError=str(error.detail), openUpdateSettings=token_hex(12))
+            self.open_workspace()
+        except (OSError, ValueError):
+            message = "Could not open the Jaro download." if command == "download" else "Could not complete the update request."
+            updater.publish(restartError=message, openUpdateSettings=token_hex(12))
+            self.open_workspace()
 
     async def execute(self, command):
         try:
@@ -92,18 +147,9 @@ class MeetingTray:
                     await watcher.begin(Call("", ""), ())
                     watcher.offer = None
             elif command == "stop":
-                recording = self.state.portable_recording
-                if recording and recording.meeting:
-                    key = recording.key
-                    if watcher.active and watcher.active.id == key:
-                        await watcher.stop(key)
-                    else:
-                        await self.finish(key)
-                        watcher.completed = str(key)
-                    self.transcribing = key
+                self.transcribing = await watcher.stop_requested()
             else:
-                text = await asyncio.to_thread(self.transcript, self.key)
-                await copy_text(text)
+                await self.copy()
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
             self.state.portable_calls.message = ("Could not copy the meeting transcript." if command == "copy"
                                                   else "Could not complete the meeting tray action.")
@@ -125,9 +171,10 @@ class MeetingTray:
             logger.info("The desktop tray is unavailable.")
         finally:
             self.available(False)
-            if self.job:
-                self.job.cancel()
-                await asyncio.gather(self.job, return_exceptions=True)
+            jobs = [job for job in (self.job, self.update_job) if job is not None]
+            for job in jobs:
+                job.cancel()
+            await asyncio.gather(*jobs, return_exceptions=True)
 
 
 async def windows_tray(tray):
@@ -146,8 +193,8 @@ async def windows_tray(tray):
         while child.returncode is None:
             view = tray.view()
             if view != previous:
-                phase, can_copy, pid = view
-                child.stdin.write(f"{phase} {int(can_copy)} {pid}\n".encode("ascii"))
+                phase, can_copy, pid, update = view
+                child.stdin.write(f"{phase} {int(can_copy)} {pid} {update}\n".encode("ascii"))
                 await child.stdin.drain()
                 previous = view
             try:

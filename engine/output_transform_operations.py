@@ -104,11 +104,17 @@ async def _terminate(process, *, timed_out=False):
             await asyncio.sleep(0.05)
     finally:
         _signal_group(process, signal.SIGKILL)
-        if not process.stdin.is_closing():
-            process.stdin.transport.abort()
+        stdin = process.stdin
+        stdin_transport = getattr(stdin, "transport", None)
+        if stdin is not None and not stdin.is_closing() and stdin_transport is not None:
+            stdin_transport.abort()
         # A descendant may have inherited these pipes even after the group is gone.
-        for fd in (1, 2):
-            process._transport.get_pipe_transport(fd).close()
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            for fd in (1, 2):
+                pipe = transport.get_pipe_transport(fd)
+                if pipe is not None:
+                    pipe.close()
         await process.wait()
 
 

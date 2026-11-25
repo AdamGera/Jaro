@@ -20,11 +20,11 @@ class PortableDictationHistoryTests(unittest.TestCase):
         self.root = Path(folder.name)
         self.history = PortableDictationHistory(self.root)
 
-    def record(self, text, *, app="GTK Editor", age=0, audio=None):
+    def record(self, text, *, app="GTK Editor", age=0, audio=None, kind="dictation"):
         key = str(uuid4())
         stored, epoch = self.history.record({
             "id": key, "time": time() - age, "text": text, "app": app,
-            "seconds": 2.5, "inferenceMs": 160, "totalMs": 210,
+            "seconds": 2.5, "inferenceMs": 160, "totalMs": 210, "kind": kind,
         }, audio)
         return key, stored, epoch
 
@@ -77,6 +77,8 @@ class PortableDictationHistoryTests(unittest.TestCase):
         old_schema = old_schema.replace(",\n    language TEXT NOT NULL DEFAULT ''", "")
         old_schema = old_schema.replace(",\n    windowsShortcutMode TEXT NOT NULL DEFAULT 'hold'", "")
         old_schema = old_schema.replace(",\n    linuxShortcutMode TEXT NOT NULL DEFAULT 'tap'", "")
+        for column in ("x11AnnotationShortcut", "windowsAnnotationShortcut", "x11RawShortcut", "windowsRawShortcut"):
+            old_schema = old_schema.replace(f",\n    {column} TEXT NOT NULL DEFAULT ''", "")
         old_schema = old_schema.replace(",\n    pasteRestoreToken TEXT NOT NULL DEFAULT ''", "")
         old_schema = old_schema.replace(",\n    vocabularyEntries TEXT NOT NULL DEFAULT '[]'", "")
         old_schema = old_schema.replace(",\n    replacements TEXT NOT NULL DEFAULT ''", "")
@@ -87,11 +89,15 @@ class PortableDictationHistoryTests(unittest.TestCase):
         old_schema = old_schema.replace(",\n    soundVolume INTEGER NOT NULL DEFAULT 70 CHECK (soundVolume BETWEEN 0 AND 100)", "")
         old_schema = old_schema.replace(",\n    otherAudio TEXT NOT NULL DEFAULT 'none'", "")
         old_schema = old_schema.replace(",\n    otherAudioPercent INTEGER NOT NULL DEFAULT 20 CHECK (otherAudioPercent BETWEEN 0 AND 100)", "")
-        for column in ("shortcutEnabled", "portalShortcutEnabled", "noiseCleanup", "boostMicrophone"):
+        for column in ("shortcutEnabled", "portalShortcutEnabled", "noiseCleanup", "boostMicrophone", "virtualPasteEnabled",
+                       "x11AnnotationEnabled", "windowsAnnotationEnabled", "portalRawShortcut"):
             old_schema = old_schema.replace(f",\n    {column} INTEGER NOT NULL DEFAULT 0 CHECK ({column} IN (0,1))", "")
-        with self.history.connection(write=True, create=True) as existing:
+        old_schema = old_schema.replace(",\n    kind TEXT NOT NULL DEFAULT 'dictation' CHECK (kind IN ('dictation','raw','printed'))", "")
+        key = str(uuid4())
+        with self.history.connection(write=True, create=True) as existing, existing:
             existing.executescript(old_schema)
-        key, _, _ = self.record("Retain this transcription.")
+            existing.execute("INSERT INTO dictations VALUES (?,?,?,?,?,?,?)",
+                             (key, time(), "Retain this transcription.", "GTK Editor", 2.5, 160, 210))
         self.assertEqual(self.history.page(legacy=True)["entries"][0]["id"], key)
         self.history.initialize()
         self.assertFalse(self.history.commands_enabled())
@@ -100,7 +106,11 @@ class PortableDictationHistoryTests(unittest.TestCase):
         self.assertEqual(self.history.linux_shortcut_mode(), "tap")
         self.assertFalse(self.history.shortcut_enabled())
         self.assertFalse(self.history.shortcut_enabled(portal=True))
-        self.assertEqual(self.history.consume_paste_grant(), "")
+        self.assertFalse(self.history.portal_raw_shortcut())
+        self.assertEqual(self.history.annotation_shortcut(), ("", False))
+        self.assertEqual(self.history.desktop_shortcut(raw=True), "")
+        self.assertEqual(self.history.desktop_shortcut(windows=True, raw=True), "")
+        self.assertEqual(self.history.consume_paste_grant(), ("", False))
         self.assertEqual(self.history.output_preferences(), ([], "", ""))
         self.assertEqual(self.history.indicator_position(), "top")
         self.assertEqual(self.history.sound_preferences(), SoundPreferences())
@@ -109,6 +119,11 @@ class PortableDictationHistoryTests(unittest.TestCase):
         self.history.configure(commands=True, language="fr", windows_shortcut_mode="holdDouble", linux_shortcut_mode="doubleTap",
                                indicator_position="bottom")
         self.history.save_shortcut_enabled(True)
+        self.history.save_annotation_shortcut("Alt+Shift+F9", True)
+        self.history.save_annotation_shortcut("Ctrl+Shift+F9", True, windows=True)
+        self.history.save_desktop_shortcut("F9", raw=True)
+        self.history.save_desktop_shortcut("Ctrl+F8", windows=True, raw=True)
+        self.history.save_portal_raw_shortcut(True)
         self.history.save_sound_preferences(SoundPreferences(False, "signature", 34))
         self.history.save_audio_preferences(AudioPreferences("lower", 35))
         self.history.configure(noise_cleanup=True)
@@ -122,8 +137,14 @@ class PortableDictationHistoryTests(unittest.TestCase):
         self.assertEqual(self.history.windows_shortcut_mode(), "holdDouble")
         self.assertEqual(self.history.linux_shortcut_mode(), "doubleTap")
         self.assertTrue(self.history.shortcut_enabled())
+        self.assertEqual(self.history.annotation_shortcut(), ("Alt+Shift+F9", True))
+        self.assertEqual(self.history.annotation_shortcut(windows=True), ("Ctrl+Shift+F9", True))
+        self.assertEqual(self.history.desktop_shortcut(raw=True), "F9")
+        self.assertEqual(self.history.desktop_shortcut(windows=True, raw=True), "Ctrl+F8")
+        self.assertTrue(self.history.portal_raw_shortcut())
         self.assertFalse(self.history.shortcut_enabled(portal=True))
-        self.assertEqual(self.history.page(legacy=True)["entries"][0]["id"], key)
+        entry = self.history.page(legacy=True)["entries"][0]
+        self.assertEqual((entry["id"], entry["kind"]), (key, "dictation"))
 
     def test_budget_trims_oldest_by_utf8_bytes(self):
         self.history.initialize()
@@ -134,6 +155,20 @@ class PortableDictationHistoryTests(unittest.TestCase):
             recent, _, _ = self.record("ééé")
         self.assertEqual([entry["id"] for entry in self.history.page(legacy=True)["entries"]], [recent])
         self.assertFalse((self.history.audio_dir / f"{old}.wav").exists())
+
+    def test_printed_history_migration_preserves_raw_entries_and_audio(self):
+        with self.history.connection(write=True, create=True) as db, db:
+            db.executescript(SCHEMA.replace("'dictation','raw','printed'", "'dictation','raw'"))
+        normal, _, _ = self.record("Regular text.")
+        raw, _, _ = self.record("The words as heard.", audio=self.wav(), kind="raw")
+        self.history.initialize()
+        self.history.initialize()
+        printed, stored, _ = self.record("Only sent to stdout.", kind="printed")
+        self.assertTrue(stored)
+        entries = {entry["id"]: entry for entry in self.history.page(legacy=True, include_audio=True)["entries"]}
+        self.assertEqual({key: entry["kind"] for key, entry in entries.items()},
+                         {normal: "dictation", raw: "raw", printed: "printed"})
+        self.assertIn("audioExpiresAt", entries[raw])
 
     def test_original_audio_expires_at_24_hours_with_transcript_retained(self):
         initial = time()

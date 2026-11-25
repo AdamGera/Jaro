@@ -1,5 +1,5 @@
 import { useInterfaceLanguage } from "@/interface-language"
-import { useEffect, useEffectEvent, useRef, useState, type ChangeEvent } from "react"
+import { useCallback, useEffect, useEffectEvent, useRef, useState, type ChangeEvent } from "react"
 import { AudioLines, ChevronDown, FolderOpen, Mic, Plus, Square, UsersRound } from "lucide-react"
 
 import { captureSources, desktopBridge, RECORDING_MODES, savedRecordingMode, type CaptureSource, type DesktopCaptureEvent, type RecordingDraft, type RecordingMode } from "./desktop"
@@ -13,13 +13,15 @@ import { portableLogin, PortableApplicationSettings } from "@/components/launch-
 import { AgentSetupSettings } from "@/components/agent-setup-settings"
 import { hasPortableDictation, PortableDictationSettings, PortableDictationWorkspace } from "@/components/portable-dictation-workspace"
 import { PortableModelSetup, type ModelSetup } from "@/components/portable-model-setup"
-import { hasPortableScreenRecording, PortableScreenRecording } from "@/components/portable-screen-recording"
+import { hasPortableScreenRecording, hasDesktopAnnotationSettings, PortableScreenRecording, DesktopAnnotationSettings } from "@/components/portable-screen-recording"
 import { portableUpdates, useDesktopUpdate } from "@/desktop-update"
 import { useSystemDictation } from "./system-dictation"
 import { discardPortableRecording, finishPortableRecording, followPortableRecording, hasPortableAudio, portableRecordingPreview, portableRecordingDrafts, openPortableRecording, setPortableRecordingPreview, type PortableRecording, type SourceLevels } from "./portable-capture"
 import { usePortableCalls, type DetectedCall } from "./portable-calls"
+import { DictationVocabulary, type VocabularyRequest } from "@/components/dictation-vocabulary"
 import { SystemDictationSettings, SystemDictationTour, SystemDictationWorkspace } from "@/components/system-dictation"
 import { RecordingAccessDialog, RecordingAccessSettings } from "@/components/recording-permissions"
+import { discardSessionDrafts, readWorkspacePreference, writeWorkspacePreference } from "./workspace-drafts"
 import { readSessionRoute, sessionTab, writeSessionRoute } from "./session-route"
 import { clock, transcriptForClipboard } from "./speaker-activity"
 import { copySavedMeetingTranscript } from "./desktop-meeting"
@@ -81,6 +83,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   const [screenBusy, setScreenBusy] = useState(false)
   const [status, setStatus] = useState<ModelStatus>("loading")
   const [modelSetup, setModelSetup] = useState<ModelSetup>()
+  const [modelStatusRequest, setModelStatusRequest] = useState(0)
   const [phase, setPhase] = useState<Phase>("idle")
   const [languageOptions, setLanguageOptions] = useState<Language[]>([])
   const [selectedLanguages, setSelectedLanguages] = useState<Language[]>([])
@@ -120,9 +123,15 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   const desktopUpdate = useDesktopUpdate(native, client)
   const recordingAccess = useRecordingAccess(native)
   const systemDictation = useSystemDictation(native)
+  const [vocabularyRequest, setVocabularyRequest] = useState<VocabularyRequest>()
+  const openVocabulary = useCallback((addTerm: boolean) => setVocabularyRequest({ addTerm }), [])
   const [permissionGuide, setPermissionGuide] = useState<"inspection" | "record" | null>(null)
   const [refusedSource, setRefusedSource] = useState<CaptureSource | null>(null)
-  const [mode, setMode] = useState<RecordingMode>(() => hasPortableAudio ? "mic" : savedRecordingMode())
+  const [mode, setMode] = useState<RecordingMode>(() => {
+    if (!hasPortableAudio) return savedRecordingMode()
+    const saved = readWorkspacePreference("jard.recordingMode")
+    return saved === "system" || saved === "both" ? saved : "mic"
+  })
   const portableMeeting = hasPortableAudio && mode === "both"
   const [meetingTake, setMeetingTake] = useState(false)
   const [meetingFeedback, setMeetingFeedback] = useState("")
@@ -162,10 +171,22 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   useEffect(() => {
     if (!hasPortableAudio) return
     const controller = new AbortController()
-    void portableRecordingDrafts(controller.signal).then(drafts => {
-      if (!controller.signal.aborted) setRecoveredAudio(drafts)
-    }).catch(() => {})
-    return () => controller.abort()
+    let timer: number
+    async function load() {
+      try {
+        const { drafts, recovering } = await portableRecordingDrafts(controller.signal)
+        if (controller.signal.aborted) return
+        setRecoveredAudio(drafts)
+        if (recovering) timer = window.setTimeout(load, 1800)
+      } catch {
+        // A model status change or new attempt will refresh the recovery list.
+      }
+    }
+    void load()
+    return () => {
+      controller.abort()
+      window.clearTimeout(timer)
+    }
   }, [status])
 
   useEffect(() => {
@@ -194,19 +215,52 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   }, [native, client])
 
   useEffect(() => {
+    const controller = new AbortController()
+    let revision: string | undefined
+    let checking = false
+    async function check() {
+      if (document.hidden || checking) return
+      checking = true
+      try {
+        const response = await fetch("/api/sessions/revision", { cache: "no-store", signal: controller.signal })
+        if (!response.ok) return
+        const { revision: next } = await response.json() as { revision?: string }
+        if (controller.signal.aborted || typeof next !== "string" || next === revision) return
+        revision = next
+        window.dispatchEvent(new Event("jaro-sessions-changed"))
+      } catch { /* Try again while the workspace is visible. */ }
+      finally { checking = false }
+    }
+    void check()
+    const timer = window.setInterval(check, 1500)
+    document.addEventListener("visibilitychange", check)
+    return () => {
+      controller.abort()
+      window.clearInterval(timer)
+      document.removeEventListener("visibilitychange", check)
+    }
+  }, [])
+
+  useEffect(() => {
     const abort = new AbortController()
     let timer: number
+    let confirmed = false
     async function check() {
       try {
         const response = await fetch("/api/status", { cache: "no-store", signal: abort.signal })
         if (!response.ok) throw new Error("Jaro is unavailable.")
         const update: { status: ModelStatus; languages?: Language[]; diarization?: boolean; modelSetup?: ModelSetup } = await response.json()
         if (abort.signal.aborted) return
+        if (native && !confirmed) {
+          confirmed = true
+          void native.request("workspaceReady").catch(() => {})
+        }
         if (update.status === "ready" && update.languages) setLanguageOptions(update.languages)
         setSpeakerLabelsAvailable(update.diarization === true)
         setStatus(update.status)
         setModelSetup(update.modelSetup)
-        if (update.status !== "loading" && !update.modelSetup) return
+        const modelPhase = update.modelSetup?.phase
+        if (update.status !== "loading" && modelPhase !== "checking" && modelPhase !== "downloading" && modelPhase !== "starting") return
       } catch {
         if (abort.signal.aborted) return
         setStatus("error")
@@ -214,15 +268,19 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       timer = window.setTimeout(check, 650)
     }
     void check()
+    return () => {
+      abort.abort()
+      window.clearTimeout(timer)
+    }
+  }, [native, modelStatusRequest])
 
+  useEffect(() => {
     function releaseMic() {
       session.current?.preview?.stop()
       session.current?.microphone.close()
     }
     window.addEventListener("pagehide", releaseMic)
     return () => {
-      abort.abort()
-      window.clearTimeout(timer)
       window.clearTimeout(copyTimer.current)
       window.removeEventListener("pagehide", releaseMic)
       releaseMic()
@@ -231,12 +289,13 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
 
   const recording = phase === "recording"
   const busy = phase === "starting" || phase === "transcribing"
-  const desktopReady = status === "ready" && phase === "idle" && !restoring && !choosingFile && !dictating
+  const desktopIdle = phase === "idle" && !restoring && !choosingFile && !dictating
+  const desktopReady = status === "ready" && desktopIdle
   const canRecord = desktopReady && !detectedRecording
   const canStart = canRecord && !screenBusy
   const preparingModel = status === "loading"
-  const waitingMeeting = current?.saved?.status === "interrupted" && !!current.saved.finalizationPending && !current.saved.meetingsManaged
-  const processingSavedAudio = phase === "idle" && (current?.saved?.status === "processing" || waitingMeeting)
+  const waitingForFinalization = current?.saved?.status === "interrupted" && !!current.saved.finalizationPending && !current.saved.meetingsManaged
+  const processingSavedAudio = phase === "idle" && (current?.saved?.status === "processing" || waitingForFinalization)
   const working = busy || restoring || preparingModel || processingSavedAudio
 
   function showSession(saved: SavedSession, wanted: string, at?: number, preserveLive = false) {
@@ -430,7 +489,10 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       writeSessionRoute(saved.id, showSession(saved, route.tab, route.at), true, route.at)
     } catch (error) {
       if (controller.signal.aborted) return
-      if (error instanceof MissingSessionError) writeSessionRoute(null, "overview", true)
+      if (error instanceof MissingSessionError) {
+        discardSessionDrafts(route.id)
+        writeSessionRoute(null, "overview", true)
+      }
       setFeedback(error instanceof MissingSessionError ? error.message : "Could not open this session. Reload to try again.")
     } finally {
       if (!controller.signal.aborted) setRestoring(false)
@@ -448,6 +510,21 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   }, [phase])
 
   const selectedId = current?.saved?.id
+  useEffect(() => {
+    if (!selectedId) return
+    const controller = new AbortController()
+    async function refreshEditPermission() {
+      try {
+        const response = await fetch(`/api/sessions/${selectedId}`, { signal: controller.signal, cache: "no-store" })
+        if (!response.ok) return
+        const saved: SavedSession = await response.json()
+        if (!controller.signal.aborted) setCurrent(item => item && item.saved && item.saved.id === selectedId
+          ? { ...item, saved: { ...item.saved, transcriptEditRevision: saved.transcriptEditRevision } } : item)
+      } catch { /* Reopening the session retries the permission lookup. */ }
+    }
+    window.addEventListener("jaro-transcript-edit-setting", refreshEditPermission)
+    return () => { controller.abort(); window.removeEventListener("jaro-transcript-edit-setting", refreshEditPermission) }
+  }, [selectedId])
   const selectedAnnotation = !!current?.saved?.annotation
   const selectedCustomStorage = !!current?.saved?.annotationCustomStorage
   useEffect(() => {
@@ -484,6 +561,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       } catch { /* Existing content stays available across a transient disconnect. */ }
     }
     window.addEventListener("focus", checkSelection)
+    window.addEventListener("jaro-sessions-changed", checkSelection)
     window.addEventListener("jard-meeting-retention", checkSelection)
     window.addEventListener("jard-annotation-retention", checkSelection)
     const poll = selectedAnnotation ? window.setInterval(checkSelection, 30_000) : undefined
@@ -491,6 +569,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       controller.abort()
       window.clearInterval(poll)
       window.removeEventListener("focus", checkSelection)
+      window.removeEventListener("jaro-sessions-changed", checkSelection)
       window.removeEventListener("jard-meeting-retention", checkSelection)
       window.removeEventListener("jard-annotation-retention", checkSelection)
     }
@@ -498,7 +577,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
 
   // A refresh can rejoin an offline transcription after its audio has been accepted.
   // While a recording is processing, refresh its readable transcript whenever coverage advances.
-  const processingId = current && (current.saved?.status === "processing" || waitingMeeting) ? current.id : null
+  const processingId = current && (current.saved?.status === "processing" || waitingForFinalization) ? current.id : null
   const processingMeeting = !!current?.saved?.meeting
   useEffect(() => {
     if (!processingId || phase !== "idle") return
@@ -746,7 +825,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     } catch (error) {
       setFeedback(message(error))
       if (active.meeting) setMeetingFeedback(message(error))
-      if (hasPortableAudio) void portableRecordingDrafts().then(setRecoveredAudio).catch(() => {})
+      if (hasPortableAudio) void portableRecordingDrafts().then(({ drafts }) => setRecoveredAudio(drafts)).catch(() => {})
     } finally {
       if (active.meeting) setMeetingTake(false)
       setPhase("idle")
@@ -771,12 +850,17 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     }
   }
 
-  async function handleRecovery(id: string, discard: boolean) {
-    if ((!native && !hasPortableAudio) || !canStart) return
+  function canRecover(draft: RecordingDraft) {
+    return canStart || (draft.screen && draft.videoOnly && desktopIdle && !detectedRecording && !screenBusy)
+  }
+
+  async function handleRecovery(draft: RecordingDraft, discard: boolean) {
+    if ((!native && !hasPortableAudio && !draft.screen) || !canRecover(draft)) return
+    const { id } = draft
     setChoosingFile(true)
     setFeedback("")
     try {
-      if (hasPortableAudio) {
+      if (hasPortableAudio || draft.screen) {
         if (discard) await discardPortableRecording(id)
         else {
           const saved = await finishPortableRecording(id, {
@@ -805,7 +889,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   function changeMode(value: RecordingMode) {
     setPermissionGuide(null)
     setMode(value)
-    try { localStorage.setItem("jard.recordingMode", value) } catch { /* Use this choice for this window. */ }
+    writeWorkspacePreference("jard.recordingMode", value)
   }
 
   async function openFile(event: ChangeEvent<HTMLInputElement>) {
@@ -846,7 +930,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     ? live && !previewPaused ? "Listening for speech…" : "Your transcript will appear when you stop."
     : "Record or open audio."
   const progressLabel = restoring ? "Opening session…" : processingSavedAudio ?
-    (waitingMeeting ? "Waiting to resume meeting transcription…" :
+    (waitingForFinalization ? "Waiting to resume transcription…" :
       result.transcriptSource === "rolling" ? (processingMeeting ? "Finalizing meeting transcript…" : "Finalizing transcript…") : "Transcribing audio…") : preparingModel ? "Loading local models…"
     : phase === "starting" ? "Waiting for microphone…"
       : processed ? "Transcribing audio…" : "Preparing audio…"
@@ -891,17 +975,25 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       {discarding === draft.id ? <>
         <span>Permanently discard this {clock(draft.seconds)} {t("recording?")}</span>
         <Button size="sm" variant="ghost" disabled={choosingFile} onClick={() => setDiscarding(null)}>{t("Cancel")}</Button>
-        <Button size="sm" variant="destructive" disabled={!canStart} onClick={() => void handleRecovery(draft.id, true)}>Discard recording</Button>
+        <Button size="sm" variant="destructive" disabled={!canRecover(draft)} onClick={() => void handleRecovery(draft, true)}>Discard recording</Button>
       </> : <>
         <span>{draft.screen ? "Interrupted screen recording" : draft.meeting ? "Interrupted meeting" : "Interrupted recording"} · {clock(draft.seconds)}</span>
-        <Button size="sm" variant="outline" disabled={!canStart} onClick={() => void handleRecovery(draft.id, false)}>Recover</Button>
-        <Button size="sm" variant="ghost" disabled={!canStart} onClick={() => setDiscarding(draft.id)}>{t("Discard…")}</Button>
+        <Button size="sm" variant="outline" disabled={!canRecover(draft)} onClick={() => void handleRecovery(draft, false)}>Recover</Button>
+        <Button size="sm" variant="ghost" disabled={!canRecover(draft)} onClick={() => setDiscarding(draft.id)}>{t("Discard…")}</Button>
       </>}
     </div>)}
   </section>
   return (
-    <SessionLibrary update={(native || portableUpdates) && <DesktopUpdateControl controls={desktopUpdate} busy={updateBusy} />}
+    <>
+    {!native && portableUpdates && <dialog ref={desktopUpdate.restartDialog} className="workspace-restart-dialog"
+      aria-label={t("Restarting…")} onCancel={event => event.preventDefault()} onKeyDown={event => event.stopPropagation()}>
+      {t("Restarting…")}
+    </dialog>}
+    {native && <DictationVocabulary external request={vocabularyRequest} saved={systemDictation.status?.vocabularyEntries}
+      saveVocabulary={systemDictation.saveVocabulary} />}
+    <SessionLibrary onOpenVocabulary={openVocabulary} update={(native || portableUpdates) && <DesktopUpdateControl controls={desktopUpdate} busy={updateBusy} />}
       openUpdateSettings={desktopUpdate.update?.openUpdateSettings}
+      onUpdateSettingsOpened={desktopUpdate.acknowledgeSettings}
       installedVersion={desktopUpdate.update?.currentVersion}
       native={native}
       meetingOptions={native ? { languages: selectedLanguages.map(language => language.code), elapsed, busy: updateBusy || status !== "ready" } : undefined}
@@ -911,7 +1003,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         canView: desktopReady && !screenBusy, onView: call => void startRecording(true, call),
       } : undefined}
       dictation={native ? ((destination, id) => <SystemDictationWorkspace key={id} destination={destination}
-        controls={systemDictation} native={native} languages={languageOptions} />) :
+        controls={systemDictation} native={native} languages={languageOptions} openVocabulary={openVocabulary} />) :
         hasPortableDictation ? ((destination, id) => <PortableDictationWorkspace key={id} destination={destination}
           languages={languageOptions} />) : undefined}
       settings={native ? {
@@ -921,22 +1013,25 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           <RecordingAccessSettings native={native} access={recordingAccess} refusedSource={refusedSource} />
           <AgentSetupSettings native={native} />
         </div>,
-        dictation: visible => <SystemDictationSettings controls={systemDictation} native={native} languages={languageOptions} visible={visible} />,
+        dictation: visible => <SystemDictationSettings openVocabulary={openVocabulary} controls={systemDictation} native={native} languages={languageOptions} visible={visible} />,
         meetings: <DesktopMeetingControls native={native} languages={selectedLanguages.map(language => language.code)} busy={updateBusy} />,
         annotate: <DesktopAnnotationControls native={native} languages={selectedLanguages.map(language => language.code)}
           controls={systemDictation} busy={updateBusy}
           allowConcurrentCapture={phase === "recording" && !!liveMeeting?.shared && !meetingStopPending && !choosingFile && !dictating} />,
-      } : portableUpdates || portableLogin || hasPortableAudio ? {
+      } : portableUpdates || portableLogin || hasPortableAudio || hasDesktopAnnotationSettings ? {
         general: <div className="dictation-preferences">
           {portableUpdates && <DesktopUpdateSettings controls={desktopUpdate} busy={updateBusy} />}
           {portableLogin && <PortableApplicationSettings />}
+          {modelSetup?.additional && <PortableModelSetup setup={modelSetup} onStarted={() => setModelStatusRequest(value => value + 1)} />}
         </div>,
         dictation: hasPortableDictation ? visible => <PortableDictationSettings visible={visible}
           disabled={updateBusy} languages={languageOptions} /> : undefined,
         meetings: meetingControls ? <PortableMeetingSettings controls={meetingControls} calls={calls} /> : undefined,
+        annotate: hasDesktopAnnotationSettings ? <DesktopAnnotationSettings busy={updateBusy} /> : undefined,
       } : undefined}
       busy={phase !== "idle" || restoring || dictating || screenBusy} currentId={current?.id}
       onHome={newSession} onSelect={openSaved} onDelete={id => {
+        discardSessionDrafts(id)
         if (current?.id !== id && readSessionRoute().id !== id) return
         restoreRequest.current?.abort()
         setRestoring(false)
@@ -957,7 +1052,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         <nav ref={workspaceActions} className="workspace-actions" aria-label="Session actions">
           <div ref={setSessionToolbar} className="session-toolbar-slot" />
           {viewingSession && <Downloads key={current?.id} item={current} compact onAudioRemoved={sessionMediaRemoved} />}
-          {hasPortableScreenRecording && !viewingSession && <PortableScreenRecording disabled={!canRecord} onBusy={setScreenBusy}
+          {hasPortableScreenRecording && <PortableScreenRecording disabled={!canRecord} hiddenWhenIdle={viewingSession} onBusy={setScreenBusy}
             languageCodes={selectedLanguages.map(language => language.code)} onSave={openAcceptedSession} />}
           <ActionTooltip label={t("New session")}>
             <Button size="sm" variant="ghost" disabled={phase !== "idle" || restoring || dictating || screenBusy} onClick={newSession} aria-label={t("New session")}><Plus /><span>{t("New session")}</span></Button>
@@ -967,14 +1062,21 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       </header>
 
       <main className="workspace" data-session={viewingSession}>
-        {modelSetup && modelSetup.phase !== "checking" && !viewingSession ? <PortableModelSetup setup={modelSetup} /> : <>
         {!viewingSession && showScreenRecovery && recoveryPanel}
-        <ResultsPanel key={phase === "idle" && current ? current.id : "capture"}
+        {modelSetup && !modelSetup.additional && modelSetup.phase !== "checking" && !viewingSession ? <>
+          <PortableModelSetup setup={modelSetup} onStarted={() => setModelStatusRequest(value => value + 1)} />
+          {feedback && <p className="feedback" role="alert">{feedback}</p>}
+        </> : <>
+        <ResultsPanel key={phase === "idle" && current ? `${current.id}:${current.saved?.transcriptEditRevision ?? ""}` : "capture"}
           session={phase === "idle" ? current?.saved : undefined} result={result} source={phase === "idle" && current ? current.audioUrl ?? current.audio ?? null : null}
           tab={tab} onTab={changeTab} working={working} recording={recording}
           followLive={recording && live && !previewPaused && !meetingStopPending} jump={jump} toolbar={sessionToolbar}
           dictationEnabled={status === "ready" && phase === "idle" && !choosingFile}
           onDictationBusy={setDictating}
+          onMeetingEdited={saved => {
+            if (readSessionRoute().id === saved.id) showSession(saved, "transcript")
+            window.dispatchEvent(new Event("jard-meeting-brief"))
+          }}
           onMeetingRenamed={(id, title, meetingExport) => {
             setCurrent(item => item?.saved?.id === id ? {
               ...item, name: title, saved: { ...item.saved, name: title, meetingTitle: title, meetingExport },
@@ -1085,5 +1187,6 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       refusedSource={selectedRefusal} starting={phase === "starting"}
       onClose={() => setPermissionGuide(null)} onRetry={() => void startRecording()} />}
     </SessionLibrary>
+    </>
   )
 }

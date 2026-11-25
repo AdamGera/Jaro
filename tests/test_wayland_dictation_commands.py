@@ -29,6 +29,8 @@ class WaylandDictationCommandTests(unittest.IsolatedAsyncioTestCase):
         if action == "paste-last":
             raise CaptureError("Allow automatic paste first.")
         self.actions.append(action)
+        if action == "stop-print":
+            return {"status": "transcript", "text": "Printed résumé. " * 300}
         return "recording"
 
     async def close(self):
@@ -72,7 +74,30 @@ class WaylandDictationCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[1], f"RUMBLE_DATA_DIR={self.root}")
         self.assertEqual(args[-1], "dictation")
 
+    async def test_raw_commands_reach_the_current_library(self):
+        self.assertEqual(await asyncio.to_thread(dispatch, self.root, "start", raw=True), {"status": "recording"})
+        self.assertEqual(await asyncio.to_thread(dispatch, self.root, "toggle", raw=True), {"status": "recording"})
+        with self.assertRaisesRegex(ValueError, "start or toggle"):
+            await asyncio.to_thread(dispatch, self.root, "stop", raw=True)
+        self.assertEqual(self.actions, ["start-raw", "toggle-raw"])
+
     async def test_gnome_commands_are_identifiable_to_the_workspace(self):
         self.assertEqual(await asyncio.to_thread(dispatch, self.root, "toggle", gnome=True), {"status": "recording"})
         self.assertEqual(await asyncio.to_thread(dispatch, self.root, "cancel", gnome=True), {"status": "recording"})
-        self.assertEqual(self.actions, ["gnome-toggle", "gnome-cancel"])
+        self.assertEqual(await asyncio.to_thread(dispatch, self.root, "annotate", gnome=True), {"status": "recording"})
+        with self.assertRaisesRegex(ValueError, "shortcut command"):
+            await asyncio.to_thread(dispatch, self.root, "annotate")
+        self.assertEqual(self.actions, ["gnome-toggle", "gnome-cancel", "gnome-annotate"])
+
+    async def test_print_keeps_the_full_transcript_on_the_library_socket(self):
+        with self.assertRaisesRegex(ValueError, "print with stop"):
+            await asyncio.to_thread(dispatch, self.root, "start", printed=True)
+        with self.assertRaisesRegex(ValueError, "print with stop"):
+            await asyncio.to_thread(dispatch, self.root, "stop", gnome=True, printed=True)
+        with self.assertRaisesRegex(RuntimeError, "Open Jaro for this library"):
+            await asyncio.to_thread(dispatch, self.root / "other", "stop", printed=True)
+        with patch("wayland_dictation_commands.same_user", return_value=False):
+            self.assertEqual(await self.raw(b"stop-print\n"), b"")
+        self.assertEqual(await asyncio.to_thread(dispatch, self.root, "stop", printed=True),
+                         {"status": "transcript", "text": "Printed résumé. " * 300})
+        self.assertEqual(self.actions, ["stop-print"])

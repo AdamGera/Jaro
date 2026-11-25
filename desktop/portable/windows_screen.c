@@ -412,6 +412,13 @@ static bool parse_region(char *const *args, CaptureRegion *region) {
 int draw_desktop(HMONITOR monitor, RECT crop, SIZE capture_size);
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "cursor-display")) {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        POINT point;
+        HMONITOR monitor = GetCursorPos(&point) ? MonitorFromPoint(point, MONITOR_DEFAULTTONULL) : NULL;
+        if (!monitor) return 1;
+        return printf("%llx:0\n", (unsigned long long)(uintptr_t)monitor) < 0 || fflush(stdout) == EOF;
+    }
     if (argc == 3 && !strcmp(argv[1], "targets")) {
         unsigned count = 0;
         if (!strcmp(argv[2], "window")) EnumWindows(list_window, (LPARAM)&count);

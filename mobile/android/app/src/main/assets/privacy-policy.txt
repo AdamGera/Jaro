@@ -1,0 +1,11 @@
+Jaro for Android privacy
+
+Jaro for Android is an on-device keyboard and dictation app by Jard. It processes microphone audio on the phone when you start dictation. Audio is held in memory while processing. Results go to the active field or appear in Jaro so you can copy them.
+
+The keyboard saves your settings and custom vocabulary in private app storage. It can use Android's personal dictionary. When you undo an autocorrection in a field that allows personalization, Jaro can count that undo against a hash of the word pair so it can avoid repeating the correction. Jaro does not save a keystroke log or transcript history. Password fields have no dictation or suggestions.
+
+Basic dictation works offline after installation. If you request the optional larger speech model, Jaro downloads a pinned file from Hugging Face over HTTPS. The provider receives ordinary connection data such as your IP address. The request includes no microphone audio, typed text, transcripts, or vocabulary.
+
+Jaro Preview also checks a fixed Jaro release manifest on GitHub. You can turn automatic checks off on Home. GitHub receives ordinary connection data, and the request includes no microphone audio, typed text, transcripts, or vocabulary. A download opens in your browser and Android handles installation.
+
+Remove the keyboard in Android Settings, or clear Jaro's app storage to delete its private settings and downloaded model. Text you have inserted is managed by the app where you entered it.

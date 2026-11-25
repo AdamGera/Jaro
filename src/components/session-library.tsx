@@ -5,6 +5,7 @@ import { ArrowLeft, ChevronDown, FileAudio2, House, Mic, PanelLeft, Search, Sett
 import type { DesktopBridge, DictationDestination, WindowNavigation } from "@/desktop"
 import { readSession, type SavedSession } from "@/audio"
 import { useSessionList, type SessionSummary } from "@/session-list"
+import { readWorkspacePreference, writeWorkspacePreference } from "@/workspace-drafts"
 import { SessionSearch } from "./session-search"
 import { MeetingsWorkspace, type MeetingWorkspaceOptions, type PortableMeetingControls } from "./meetings-workspace"
 import { PortableCallBar, type PortableCallBarProps } from "./portable-call-controls"
@@ -59,6 +60,7 @@ function scrollWorkspace(event: KeyboardEvent, frame: HTMLElement, pointer: [num
 type Props = {
   busy: boolean
   currentId?: string
+  onOpenVocabulary?: (addTerm: boolean) => void
   onHome: () => void
   onSelect: (session: SavedSession) => void
   onDelete: (id: string) => void
@@ -70,16 +72,15 @@ type Props = {
   dictation?: (destination: DictationDestination, navigationId?: string) => ReactNode
   update?: ReactNode
   openUpdateSettings?: string
+  onUpdateSettingsOpened?: (token: string) => void
   installedVersion?: string
   children: ReactNode
 }
 
-export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, settings, native, meetingOptions, portableMeeting, callBar, dictation, update, openUpdateSettings, installedVersion, children }: Props) {
+export function SessionLibrary({ busy, currentId, onOpenVocabulary, onHome, onSelect, onDelete, settings, native, meetingOptions, portableMeeting, callBar, dictation, update, openUpdateSettings, onUpdateSettingsOpened, installedVersion, children }: Props) {
   const { t } = useInterfaceLanguage()
   const [compact, setCompact] = useState(() => matchMedia(compactWindow).matches)
-  const [pinned, setPinned] = useState(() => {
-    try { return localStorage.getItem("jard.sidebar") !== "collapsed" } catch { return true }
-  })
+  const [pinned, setPinned] = useState(() => readWorkspacePreference("jard.sidebar") !== "collapsed")
   const [overlay, setOverlay] = useState(false)
   const expanded = compact ? overlay : pinned
   const [showSessions, setShowSessions] = useState(true)
@@ -124,7 +125,7 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
   function toggle() {
     if (compact) { setOverlay(!overlay); return }
     setPinned(!pinned)
-    try { localStorage.setItem("jard.sidebar", pinned ? "collapsed" : "expanded") } catch { /* optional preference */ }
+    writeWorkspacePreference("jard.sidebar", pinned ? "collapsed" : "expanded")
   }
   function search() {
     if (busy || deleting) return
@@ -181,16 +182,20 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
     if (!openUpdateSettings || busy || deleting || handledUpdateSettings.current === openUpdateSettings) return
     const frame = requestAnimationFrame(() => {
       handledUpdateSettings.current = openUpdateSettings
+      let opened = false
       try {
-        if (sessionStorage.getItem("jard.updateSettingsRequest") === openUpdateSettings) return
+        opened = sessionStorage.getItem("jard.updateSettingsRequest") === openUpdateSettings
         sessionStorage.setItem("jard.updateSettingsRequest", openUpdateSettings)
       } catch { /* The component still handles the current request once. */ }
-      setSearchOpen(false)
-      setSettingsPage("general")
-      openPane("settings")
+      if (!opened) {
+        setSearchOpen(false)
+        setSettingsPage("general")
+        openPane("settings")
+      }
+      onUpdateSettingsOpened?.(openUpdateSettings)
     })
     return () => cancelAnimationFrame(frame)
-  }, [openUpdateSettings, busy, deleting, openPane])
+  }, [openUpdateSettings, busy, deleting, openPane, onUpdateSettingsOpened])
   useEffect(() => {
     if (!native) return
     let active = true
@@ -209,7 +214,7 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
     }
   }, [native])
   useEffect(() => {
-    if (!windowNavigation || (busy && windowNavigation.pane !== "live-meeting" && windowNavigation.pane !== "meeting-library") || deleting ||
+    if (!windowNavigation || (busy && !["live-meeting", "meeting-library", "vocabulary", "add-term"].includes(windowNavigation.pane)) || deleting ||
         handledNavigation.current === windowNavigation.id) return
     const frame = requestAnimationFrame(() => {
       handledNavigation.current = windowNavigation.id
@@ -219,7 +224,9 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
       } catch { /* The current workspace still handles the request once. */ }
       setSearchOpen(false)
       const { id, pane: destination } = windowNavigation
-      if (destination === "home" || destination === "live-meeting") {
+      if (destination === "vocabulary" || destination === "add-term") {
+        onOpenVocabulary?.(destination === "add-term")
+      } else if (destination === "home" || destination === "live-meeting") {
         openPane()
         if (destination === "live-meeting") requestAnimationFrame(() => {
           document.querySelector<HTMLElement>("[data-live-transcript]")?.focus({ preventScroll: true })
@@ -235,7 +242,7 @@ export function SessionLibrary({ busy, currentId, onHome, onSelect, onDelete, se
       }
     })
     return () => cancelAnimationFrame(frame)
-  }, [windowNavigation, busy, deleting, openPane])
+  }, [windowNavigation, busy, deleting, openPane, onOpenVocabulary])
   useEffect(() => {
     if (!pane) return
     paneTitle.current?.focus({ preventScroll: true })

@@ -47,6 +47,8 @@ export type DictationPreferences = {
   appRules: string
   fillerWords: boolean
   spokenFormatting: boolean
+  vocabularyMenu: boolean
+  showHistoryStats: boolean
   retention: 0 | 1 | 7 | 30
   languages: string[]
   inputDevice: string
@@ -123,6 +125,10 @@ export type DictationHistoryEntry = {
   totalMs?: number
   audioExpiresAt?: number
 }
+export type DictationHistoryStats = {
+  dictations: number; words: number; savedSeconds: number | null
+  wordsPerMinute: number | null; streakDays: number; busiestHour: number | null
+}
 export type DictationHistory = { entries: DictationHistoryEntry[]; total: number; words: number; seconds: number }
 export type DictationOutputProfile = {
   target: string
@@ -132,6 +138,7 @@ export type DictationOutputProfile = {
   deadline: number
   corrections: string
 }
+export type ProfileApplication = { id: string; name: string }
 export type DictationOutputProfiles = { profiles: DictationOutputProfile[] }
 
 export function profileName(target: string) {
@@ -172,7 +179,9 @@ export type DictationAction =
   | { action: "playHistoryAudio" | "stopHistoryAudio"; id: string }
   | { action: "previewOutput"; text: string; profiles: string; app: string; site: string }
   | { action: "tryOutput"; text: string }
+  | { action: "profileApplications" | "chooseProfileApplication" }
   | { action: "describeOutputProfiles"; profiles: string }
+  | { action: "historyStats" }
   | { action: "history"; query: string; offset: number }
 
 export function useSystemDictation(native: DesktopBridge | undefined) {

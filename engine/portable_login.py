@@ -14,6 +14,7 @@ LINUX_LAUNCHER = Path("/usr/bin/jaro")
 LINUX_ROOT = Path("/usr/lib/jaro")
 ENTRY_NAME = "local.jardaudio.desktop.desktop"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+APPROVAL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
 VALUE_NAME = "Jaro"
 
 
@@ -94,7 +95,20 @@ class LinuxLogin:
 
 class WindowsLogin:
     def __init__(self, launcher):
+        self.launcher = launcher
         self.command = f'"{launcher}" --background'
+
+    def owns(self, command):
+        if command.casefold() == self.command.casefold():
+            return True
+        path, separator, arguments = command[1:].partition('"')
+        if not command.startswith('"') or not separator or arguments.casefold() != " --background":
+            return False
+        executable = Path(path)
+        if executable.is_absolute():
+            with suppress(OSError, ValueError):
+                return executable.resolve(strict=True) == self.launcher.resolve(strict=True)
+        return False
 
     def set_state(self, enabled):
         import winreg
@@ -106,22 +120,36 @@ class WindowsLogin:
             if enabled is not True:
                 return {"state": "disabled"}
             key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, access)
-        with key:
+        with key as run:
             try:
-                current = winreg.QueryValueEx(key, VALUE_NAME)
+                current = winreg.QueryValueEx(run, VALUE_NAME)
             except FileNotFoundError:
                 current = None
-            if current is not None and (current[1] != winreg.REG_SZ or current[0].casefold() != self.command.casefold()):
+            if current is not None and (current[1] != winreg.REG_SZ or not self.owns(current[0])):
                 return {"state": "unknown", "message": "A different Jaro startup entry is managed by Windows."}
             if enabled is True and current is None:
                 if len(self.command.encode("utf-16-le")) // 2 > 260:
                     raise OSError("The Jaro launcher path is too long for Windows startup.")
-                winreg.SetValueEx(key, VALUE_NAME, 0, winreg.REG_SZ, self.command)
+                winreg.SetValueEx(run, VALUE_NAME, 0, winreg.REG_SZ, self.command)
             elif enabled is False and current is not None:
                 with suppress(FileNotFoundError):
-                    winreg.DeleteValue(key, VALUE_NAME)
-        active = current is not None if enabled is None else enabled
-        return {"state": "enabled" if active else "disabled"}
+                    winreg.DeleteValue(run, VALUE_NAME)
+        if enabled is False or (enabled is None and current is None):
+            return {"state": "disabled"}
+
+        # Windows can disable an application while leaving its Run value intact.
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APPROVAL_KEY, 0, winreg.KEY_QUERY_VALUE) as approvals:
+                approval, kind = winreg.QueryValueEx(approvals, VALUE_NAME)
+        except FileNotFoundError:
+            return {"state": "enabled"}
+        if kind == winreg.REG_BINARY and len(approval) == 12:
+            flag = int.from_bytes(approval[:4], "little")
+            if flag in (2, 6):
+                return {"state": "enabled"}
+            if flag in (3, 7):
+                return {"state": "approval"}
+        return {"state": "unknown", "message": "Check Jaro in Windows Settings under Apps → Startup."}
 
 
 class PortableLogin:
@@ -133,14 +161,23 @@ class PortableLogin:
         with self.lock:
             return self.registration.set_state(enabled)
 
+    def open_settings(self):
+        with self.lock:
+            status = self.registration.set_state(None)
+            if status["state"] == "approval":
+                os.startfile("ms-settings:startupapps")
+            return status
+
 
 def installed_launcher(root):
     if os.name == "nt":
         from portable_update import windows_launcher
 
-        launcher = windows_launcher()
-        if root.parent == launcher.parent.parent / "versions" and launcher.is_file():
-            return launcher
+        with suppress(OSError):
+            launcher = windows_launcher()
+            versions = launcher.parent.parent / "versions"
+            if launcher.is_file() and root.parent == versions.resolve(strict=True):
+                return launcher
     elif sys.platform == "linux":
         if root == LINUX_ROOT and os.access(LINUX_LAUNCHER, os.X_OK):
             return LINUX_LAUNCHER

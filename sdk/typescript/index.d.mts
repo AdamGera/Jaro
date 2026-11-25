@@ -36,4 +36,10 @@ export type DesktopJardClient = JardClient & {
 }
 export function connect(options?: RequestOptions & { library?: string }): Promise<DesktopJardClient>
 export type EmbeddedJardClient = JardClient & { close(): Promise<void> }
-export function create(options?: RequestOptions & { command?: string[]; library?: string; startupTimeoutMs?: number }): Promise<EmbeddedJardClient>
+export type ModelPreparationProgress = { phase: "checking" | "loading" }
+  | { phase: "installing"; completedBytes: number; totalBytes: number }
+export function create(options?: RequestOptions & {
+  command?: string[]; library?: string; startupTimeoutMs?: number
+  prepare?: boolean | { from?: string; repair?: boolean }
+  onProgress?: (progress: ModelPreparationProgress) => void
+}): Promise<EmbeddedJardClient>

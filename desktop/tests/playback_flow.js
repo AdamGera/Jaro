@@ -80,7 +80,15 @@
       results.afterCompletion=+audio().currentTime.toFixed(2)
       await close()
     }
+    const toolbar = ".workspace-actions .session-toolbar-slot"
+    await click('[role="tab"][id$="-trigger-overview"]')
+    await until(() => one(toolbar + ' button[aria-label="Copy overview"]') &&
+      one(toolbar + ' button[aria-label="Regenerate overview"]') &&
+      one(toolbar + ' button[aria-label="Edit overview"]'), "Overview tools in the top toolbar")
+    results.overviewToolbar = true
     await click('[role="tab"][id$="-trigger-timeline"]')
+    await until(() => one(toolbar + ' button[aria-label="Regenerate timeline"]'), "Timeline tool in the top toolbar")
+    results.timelineToolbar = true
     await seekAndShow('.topic-list button',0,"chapter")
     const painted=()=>[...document.querySelectorAll(".playback-wave i")].map(el=>el.getBoundingClientRect().height)
     const loud=await until(()=>{
@@ -100,7 +108,6 @@
     await seekAndShow('.topic-list li:nth-child(2) button',35,"newSeekDuringPlayback")
     await close()
     await click('[role="tab"][id$="-trigger-transcript"]')
-    const toolbar = ".workspace-actions .session-toolbar-slot"
     await until(() => one(toolbar + ' button[aria-label="Copy transcript"]'), "Copy transcript in the top toolbar")
     await click(toolbar + ' button[aria-label="Search transcript"]')
     await until(() => one(toolbar + ' input[aria-label="Search transcript"]'), "Transcript search opens in the top toolbar")

@@ -1,4 +1,4 @@
-"""Track Pulse microphones and independent playback routes during a meeting."""
+"""Write Linux microphone and playback inputs on one recording clock."""
 
 import asyncio
 from collections import deque
@@ -7,7 +7,7 @@ import json
 
 import numpy as np
 
-from linux_capture import default_computer_audio, default_microphone, pulse_info
+from linux_capture import LinuxRecording, default_computer_audio, default_microphone, pulse_info
 from portable_capture import CaptureError, PortableRecording, SAMPLE_RATE
 
 
@@ -107,7 +107,9 @@ class Source:
             self.packets.popleft()
 
 
-class LinuxMeetingRecording(PortableRecording):
+class LinuxDualRecording(PortableRecording):
+    requires_microphone = True
+
     def __init__(self, key, path, mode, **kwargs):
         super().__init__(key, path, mode, **kwargs)
         self.mic = None
@@ -118,7 +120,13 @@ class LinuxMeetingRecording(PortableRecording):
         return round((asyncio.get_running_loop().time() - self.epoch) * SAMPLE_RATE)
 
     async def spawn(self):
+        microphone = await default_microphone() if self.requires_microphone else None
         self.epoch = asyncio.get_running_loop().time()
+        if microphone:
+            self.mic = Source(microphone, self.clock)
+
+    async def playback_sources(self):
+        return (await default_computer_audio(),)
 
     async def watch_routes(self):
         while self.end_frame is None:
@@ -132,12 +140,9 @@ class LinuxMeetingRecording(PortableRecording):
                         await self.close_sources((self.mic,))
                     self.mic = Source(microphone, self.clock)
             try:
-                monitors = await read_monitors()
+                monitors = await self.playback_sources()
             except (CaptureError, ValueError):
                 monitors = tuple(self.outputs)
-                if not monitors:
-                    with suppress(CaptureError):
-                        monitors = (await default_computer_audio(),)
             for name in monitors:
                 if name not in self.outputs:
                     self.outputs[name] = Source(name, self.clock, optional=True)
@@ -154,9 +159,10 @@ class LinuxMeetingRecording(PortableRecording):
     async def capture_blocks(self, block_bytes, frame_bytes):
         watcher = asyncio.create_task(self.watch_routes())
         try:
-            # Silent playback monitors do not emit packets until audio plays;
-            # begin as soon as the microphone (or any output) delivers audio.
-            while not ((self.mic and self.mic.received) or any(source.received for source in self.outputs.values())):
+            # A monitor can stay silent until playback begins. Ordinary
+            # recordings wait for the mic, and meetings can start with either input.
+            while not ((self.mic and self.mic.received) or
+                       (not self.requires_microphone and any(source.received for source in self.outputs.values()))):
                 if self.end_frame is not None:
                     return
                 await asyncio.sleep(0.02)
@@ -193,3 +199,20 @@ class LinuxMeetingRecording(PortableRecording):
         if self.end_frame is None:
             self.end_frame = self.clock()
         await self.worker
+
+
+class LinuxMeetingRecording(LinuxDualRecording):
+    requires_microphone = False
+
+    async def playback_sources(self):
+        try:
+            return await read_monitors()
+        except (CaptureError, ValueError):
+            if self.outputs:
+                return tuple(self.outputs)
+            return await super().playback_sources()
+
+
+def linux_recording(key, path, mode, **options):
+    recorder = LinuxDualRecording if mode == "both" else LinuxRecording
+    return recorder(key, path, mode, **options)

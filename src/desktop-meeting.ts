@@ -3,6 +3,7 @@ import type { DesktopBridge, DesktopMeeting, DesktopMeetingAction } from "@/desk
 
 export function meetingAudioWarning(meeting?: DesktopMeeting) {
   if (meeting?.phase !== "recording" && meeting?.phase !== "callEnded") return ""
+  if (meeting.systemAudioPermissionDenied) return "Mac audio access was denied."
   if (meeting.microphoneUnavailable && meeting.systemAudioUnavailable) return "Microphone and Mac audio are reconnecting."
   if (meeting.microphoneUnavailable) return "Microphone is reconnecting."
   if (meeting.systemAudioUnavailable && meeting.microphoneSilent) return "Mac audio is reconnecting. The microphone is silent."

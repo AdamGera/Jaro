@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,7 @@ import shutil
 import subprocess
 from uuid import UUID
 
-from annotation_assets import annotation_movie_info, number
+from annotation_assets import annotation_movie_tracks, number
 from audio_file import codec_binary
 from engine_paths import WORKSPACE_ROOT
 from portable_capture import CaptureError, SAMPLE_RATE, draft_frames, draft_tracks
@@ -31,14 +32,19 @@ def audio_track_labels(sources):
     return ["Combined audio", *names] if len(names) == 2 else names
 
 
+@lru_cache(maxsize=8)
+def _ffmpeg_encoders(binary, check_output):
+    return check_output(
+        [binary, "-hide_banner", "-encoders"],
+        stderr=subprocess.DEVNULL, text=True, timeout=5,
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
+    )
+
+
 def windows_h264_encoder(prefer_software=False):
     candidates = ("libopenh264", "libx264") if prefer_software else ("h264_mf", "libopenh264", "libx264")
     try:
-        output = subprocess.check_output(
-            [codec_binary("ffmpeg"), "-hide_banner", "-encoders"],
-            stderr=subprocess.DEVNULL, text=True, timeout=5,
-            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
-        )
+        output = _ffmpeg_encoders(codec_binary("ffmpeg"), subprocess.check_output)
     except (OSError, subprocess.SubprocessError):
         return None if prefer_software else "h264_mf"
     for name in candidates:
@@ -85,18 +91,20 @@ class ScreenDraft:
             os.fsync(file.fileno())
         stage.replace(self.folder / "audio-offset.json")
 
-    def audio_sidecars(self):
-        """Use committed standalone WAV tracks when the platform captures sound separately."""
+    def narration_frames(self):
         path = self.folder / "audio-offset.json"
         if not self.audio_sources or path.is_symlink() or not path.is_file():
+            return 0
+        return draft_frames(self.narration)
+
+    def audio_sidecars(self):
+        """Use committed standalone WAV tracks when the platform captures sound separately."""
+        if not (frames := self.narration_frames()):
             return None, []
-        with path.open("rb") as file:
+        with (self.folder / "audio-offset.json").open("rb") as file:
             offset = json.loads(file.read(128))
         if not number(offset, 0, 30):
             raise ValueError("The narration offset is invalid.")
-        frames = draft_frames(self.narration)
-        if not frames:
-            return None, []
         labels = audio_track_labels(self.audio_sources)
         sidecars = [(self.narration, labels[0])]
         if len(self.audio_sources) == 2:
@@ -106,15 +114,19 @@ class ScreenDraft:
     def create(self):
         self.folder.mkdir(mode=0o700)
         try:
-            with (self.folder / "draft.tmp").open("xb") as file:
-                file.write(json.dumps({"version": 1, "source": self.source, "audio": self.audio_sources}).encode())
-                file.flush()
-                os.fsync(file.fileno())
-            (self.folder / "draft.tmp").replace(self.folder / "draft.json")
+            self.write_metadata()
         except OSError:
             with suppress(OSError):
                 self.discard()
             raise
+
+    def write_metadata(self):
+        pending = self.folder / "draft.tmp"
+        with pending.open("xb") as file:
+            file.write(json.dumps({"version": 1, "source": self.source, "audio": self.audio_sources}).encode())
+            file.flush()
+            os.fsync(file.fileno())
+        pending.replace(self.folder / "draft.json")
 
     @classmethod
     def read(cls, folder):
@@ -173,11 +185,11 @@ class ScreenDraft:
                     encoding = ["-vf", overlay, "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p"]
                 await make_overlay(self.folder / "ink.ass", self.movie, events, font_family)
             offset, sidecars = self.audio_sidecars()
+            duration, embedded_audio_tracks = await annotation_movie_tracks(self.movie)
             inputs = ["-protocol_whitelist", "file,pipe", "-format_whitelist", "mov", "-i", self.movie.name]
             output_audio = ["-map", "0:a?", "-c:a", "copy"]
-            labels = audio_track_labels(self.audio_sources)
+            labels = audio_track_labels(self.audio_sources)[:embedded_audio_tracks]
             if sidecars:
-                duration, _ = await annotation_movie_info(self.movie)
                 output_audio = ["-c:a", "aac", "-b:a", "128k", "-t", str(duration)]
                 labels = [label for _, label in sidecars]
                 samples = round(offset * SAMPLE_RATE)
@@ -213,7 +225,7 @@ class ScreenDraft:
                         await process.wait()
             if not succeeded:
                 raise CaptureError("The screen recording contains no playable video.")
-        return output
+        return output, duration
 
 
 @contextmanager

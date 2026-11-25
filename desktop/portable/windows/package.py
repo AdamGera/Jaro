@@ -20,9 +20,10 @@ from package_files import ROOT, install, release_metadata, stage_workspace
 CPYTHON_SHA256 = "9e35319bffedab8b36ad44d8f377cb4f1733bcec257a0b6d04d94f01486ddb38"
 FFMPEG_SHA256 = "733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1"
 HOST_FILES = ("jaro.exe", "jaro-capture.exe", "jaro-screen.exe", "jaro-dictation.exe", "jaro-indicator.exe",
-              "jaro-audio-control.exe", "jaro-call-surface.exe", "jaro-tray.exe", "WebView2Loader.dll")
+              "jaro-audio-control.exe", "jaro-call-surface.exe", "jaro-tray.exe", "jaro-save-video.exe", "WebView2Loader.dll")
 CODEC_FILES = ("ffmpeg.exe", "ffprobe.exe")
 INK_FONT_ARCHIVE = "liberation-fonts-ttf-2.1.5"
+OPENH264_ARCHIVE = "openh264-2.7.0"
 
 
 def require_sha256(path, expected):
@@ -67,7 +68,8 @@ def stage_launchers(target, zig):
     target.mkdir()
     args = [zig, "cc", "-target", "x86_64-windows-gnu", "-O2", "-Wall", "-Wextra",
             "-Werror", "-municode", HERE / "launch.c", "-lshell32"]
-    subprocess.run([*args, "-Wl,--subsystem,windows", "-lole32", "-luser32", "-o", target / "Jaro.exe"], check=True)
+    subprocess.run([*args, HERE / "shortcut_repair.c", "-Wl,--subsystem,windows", "-lole32", "-luuid", "-luser32",
+                    "-o", target / "Jaro.exe"], check=True)
     subprocess.run([*args, "-DJARO_CONSOLE", "-o", target / "jardctl.exe"], check=True)
     for debug in target.glob("*.pdb"):
         debug.unlink()
@@ -84,6 +86,7 @@ def stage(args, target):
     require_sha256(codec_source, FFMPEG_SHA256)
     payload = target / "payload"
     stage_workspace(payload, args.dist)
+    (payload / "windows-owned-startup-v1").touch()
     release_metadata(payload, "windows", version)
     for folder, names in ((args.host, HOST_FILES), (args.codecs, CODEC_FILES)):
         for name in names:
@@ -113,6 +116,8 @@ def stage(args, target):
         install(source, licenses / "ffmpeg" / archive)
     for path in (ink_sources, tools / "build-windows-ink-deps.sh"):
         install(path, licenses / "ffmpeg" / path.name)
+    with tarfile.open(args.codecs.parent / f"{OPENH264_ARCHIVE}.tar.gz") as openh264:
+        (licenses / "OpenH264-LICENSE").write_bytes(openh264.extractfile(f"{OPENH264_ARCHIVE}/LICENSE").read())
     with tarfile.open(args.codecs.parent / f"{INK_FONT_ARCHIVE}.tar.gz") as fonts:
         for entry, path in (("LiberationSans-Regular.ttf", payload / "bin/ink-fonts/LiberationSans-Regular.ttf"),
                             ("LICENSE", licenses / "Liberation-Sans-LICENSE")):

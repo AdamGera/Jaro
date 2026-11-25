@@ -21,7 +21,7 @@ import httpx
 
 from diagnostics import EVENT_LOG, PROCESS_LOG, tail_log
 from dictation_settings import SETTINGS_LIMIT, validate_changes
-from engine_lifecycle import PORT, URL, desktop_control_path, library_path, running_engine
+from engine_lifecycle import PORT, URL, desktop_control_path, library_path, read_native_token, running_engine
 from engine_paths import ENGINE_ROOT, WORKSPACE_ROOT
 from managed_preferences import ManagedFeatureError
 from model_installation import ModelUnavailable, ensure_model, install_model, model_status
@@ -29,7 +29,7 @@ from native_recordings import normalize_meeting_title
 from meeting_exports import clock_24
 from saved_annotations import annotation_context, annotation_detail
 from saved_dictations import history_page, preferences_path, read_private_history_plist, render_history
-from saved_meetings import get_meeting, meeting_detail, meeting_search_report, meetings as saved_meetings, render_export, timestamp
+from saved_meetings import get_meeting, meeting_detail, meeting_search_report, meetings as saved_meetings, read_portable_live_meeting, render_export, timestamp
 from session_store import MissingSession, SessionStore
 
 CONTROL_LIMIT = 4 * 1024 * 1024
@@ -71,6 +71,31 @@ def desktop_status(root):
         return desktop(root, "desktop-status", timeout=.75)
     except DesktopUnavailable:
         return None
+
+
+def trash_meeting(root, identifier):
+    if sys.platform == "win32":
+        from windows_dictation_commands import dispatch_meeting_trash
+
+        return dispatch_meeting_trash(root, identifier)
+    if sys.platform == "linux":
+        from wayland_dictation_commands import dispatch_meeting_trash
+
+        return dispatch_meeting_trash(root, identifier)
+    if not running_engine():
+        raise RuntimeError("Open Jaro before moving a meeting to Trash.")
+    with httpx.Client(base_url=URL, trust_env=False, timeout=httpx.Timeout(125, connect=3)) as client:
+        response = client.delete(f"/api/native/meetings/{identifier}",
+                                 headers={"Origin": URL, "X-Jard-Token": read_native_token(root)})
+    if response.status_code == 404:
+        raise MissingSession(str(identifier))
+    if response.status_code not in (202, 204):
+        try:
+            detail = response.json().get("detail")
+        except (AttributeError, ValueError):
+            detail = None
+        raise RuntimeError(detail if isinstance(detail, str) else "Jaro could not move the meeting to Trash.")
+    return {"id": str(identifier), "trashPending": response.status_code == 202}
 
 
 def wait_for_desktop(root, *, previous=None, timeout=20):
@@ -237,8 +262,14 @@ def desktop_settings(root, args):
 
 def live_meeting(root, *, turns=True):
     try:
+        if sys.platform in ("win32", "linux"):
+            if sys.platform == "win32":
+                from windows_dictation_commands import dispatch_meeting
+            else:
+                from wayland_dictation_commands import dispatch_meeting
+            return read_portable_live_meeting(root, dispatch_meeting(root, "live").get("meeting"), turns=turns)
         return control(root, (root / ".native-token").read_text().strip(), "meeting-live", timeout=1, turns=turns)
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, KeyError, TypeError, ValueError):
         return None
 
 
@@ -253,12 +284,38 @@ def watch_meetings(token):
                     print(line.removeprefix("data: "), flush=True)
 
 
+def running_portable_transcriber(root):
+    from sdk_discovery import read_sdk_record
+    from sdk_embedded import sdk_service_status
+
+    deadline = time.monotonic() + 120
+    while True:
+        try:
+            record = read_sdk_record(root)
+        except RuntimeError as error:
+            if isinstance(error.__cause__, FileNotFoundError):
+                return None
+            raise
+        status = sdk_service_status(record)
+        if status is None:
+            return None
+        if status == "ready":
+            return record
+        if status != "loading" or time.monotonic() >= deadline:
+            raise RuntimeError("The running Jaro speech model is unavailable.")
+        time.sleep(.25)
+
+
 def transcription_service(root, scope, *, allow_prompt):
     from sdk_discovery import read_sdk_record
     from sdk_embedded import owned_transcriber
 
-    if os.name == "nt":
+    if sys.platform in ("linux", "win32"):
+        if (record := running_portable_transcriber(root)) is not None:
+            return record
         ensure_model(allow_prompt=allow_prompt)
+        if (record := running_portable_transcriber(root)) is not None:
+            return record
         return scope.enter_context(owned_transcriber())
 
     engine = running_engine()
@@ -378,7 +435,7 @@ def read_history(args):
     filters = dict(since=args.since, until=args.until, app=args.app, grep=args.grep, search=args.search,
                    oldest_first=args.oldest_first, query=args.query, offset=args.offset,
                    limit=page_size if args.limit is None else args.limit, raw=args.raw, legacy=legacy)
-    if sys.platform == "linux":
+    if sys.platform in ("linux", "win32"):
         from portable_dictation_history import PortableDictationHistory
 
         result = PortableDictationHistory(library_path()).page(**filters)
@@ -417,6 +474,16 @@ def read_annotations(library, args):
     if args.action == "context":
         return {**annotation_context(detail), "contactSheetPath": detail["contactSheetPath"]}
     return detail
+
+
+def annotation_area(value):
+    try:
+        bounds = [int(part) for part in value.split(",")]
+    except ValueError:
+        bounds = []
+    if len(bounds) != 4:
+        raise argparse.ArgumentTypeError("Use four integer pixel values as X,Y,WIDTH,HEIGHT.")
+    return bounds
 
 
 def main():
@@ -474,6 +541,7 @@ def main():
     speech_status = model_commands.add_parser("status")
     speech_install = model_commands.add_parser("install")
     speech_install.add_argument("--from", dest="source", type=Path, help="Verify and copy from a local folder.")
+    speech_install.add_argument("--repair", action="store_true", help="Verify installed files and replace damaged copies.")
     for command in (speech_status, speech_install):
         command.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
         command.add_argument("--all", dest="all_models", action="store_true", help="Include speaker labels and local writing.")
@@ -484,14 +552,19 @@ def main():
     dictate = actions.add_parser("dictation")
     dictate.add_argument("action", choices=("start", "stop", "toggle", "cancel", "paste-last"))
     dictate.add_argument("--raw", action="store_true", help="Start without applying output processing.")
-    dictate.add_argument("--print", dest="print_transcript", action="store_true", help="Stop and write the transcript to stdout.")
+    dictate.add_argument("--print", dest="print_transcript", action="store_true",
+                         help="Write the transcript to stdout only (stop on all desktops, start on macOS).")
     dictate.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     meetings = actions.add_parser("meetings")
     meeting_actions = meetings.add_subparsers(dest="action", required=True)
     for action in ("status", "stop", "copy-last"):
-        meeting_actions.add_parser(action)
+        meeting_actions.add_parser(action).add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     meeting_record = meeting_actions.add_parser("record")
     meeting_record.add_argument("--title", help="Name the meeting when recording starts.")
+    meeting_record.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    meeting_delete = meeting_actions.add_parser("delete", help="Move a saved meeting and its files to Trash.")
+    meeting_delete.add_argument("id", type=UUID, help="Full meeting UUID from meetings list.")
+    meeting_delete.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     meeting_actions.add_parser("watch", help="Stream finished meeting IDs as JSON lines.")
     listing = meeting_actions.add_parser("list")
     listing.add_argument("--query", default="")
@@ -526,8 +599,16 @@ def main():
     annotation_start.add_argument("--source", choices=("display", "window", "area", "phone"),
                                   help="explicit source (phone requires a USB iPhone or iPad)")
     annotation_start.add_argument("--language", action="append", help="Override the saved dictation language hints.")
+    annotation_start.add_argument("--target", help="Windows display or window ID returned by annotate targets.")
+    annotation_start.add_argument("--area", type=annotation_area, metavar="X,Y,WIDTH,HEIGHT", help="Exact capture area on native Linux X11.")
+    annotation_targets = annotation_actions.add_parser("targets", help="List Windows screen sources or report the desktop picker.")
+    annotation_targets.add_argument("--source", choices=("display", "window"), default="display")
     annotation_status = annotation_actions.add_parser("status", help="Report the active or most recent capture.")
     annotation_stop = annotation_actions.add_parser("stop", help="Stop and save the active capture.")
+    annotation_stop.add_argument("--from-project", action="store_true",
+                                 help="Match OpenCode rules using this terminal's working folder (Linux and Windows).")
+    annotation_toggle = annotation_actions.add_parser("toggle", help="Start a display capture or stop and save the active capture.")
+    annotation_draw = annotation_actions.add_parser("draw", help="Start drawing or finish drawing in an active capture (Linux).")
     annotation_cancel = annotation_actions.add_parser("cancel", help="Discard the unsaved capture.")
     annotation_storage = annotation_actions.add_parser("storage", help="Read or change the folder for new annotations.")
     folder_options = annotation_storage.add_mutually_exclusive_group()
@@ -540,6 +621,7 @@ def main():
     annotation_remember = annotation_actions.add_parser("remember", help="Remember an OpenCode destination for a captured app, site, or terminal project.")
     annotation_remember.add_argument("id", help="Annotation Session UUID, unique prefix, or latest.")
     annotation_remember.add_argument("--scope", choices=("app", "site", "terminal"), required=True)
+    annotation_remember.add_argument("--scope-key", help="Exact capture scope from annotate destinations, such as a website project path.")
     annotation_remember.add_argument("--to", required=True, help="Exact OpenCode session ID.")
     annotation_remember.add_argument("--service", required=True, help="Service identity returned by annotate destinations.")
     annotation_remember.add_argument("--automatic", action="store_true", help="Send future matching captures after a visible countdown.")
@@ -561,8 +643,8 @@ def main():
                                  help="Allow OpenCode to restore changed files when the turn ran a successful file edit.")
     annotation_correct = annotation_actions.add_parser("correct", help="Ask OpenCode to disregard a delivered annotation.")
     annotation_correct.add_argument("delivery_id", help="Receipt ID returned by annotate send or annotate deliveries.")
-    for action in (annotation_list, annotation_show, annotation_prompt, annotation_start, annotation_status,
-                   annotation_stop, annotation_cancel, annotation_destinations, annotation_send, annotation_deliveries,
+    for action in (annotation_list, annotation_show, annotation_prompt, annotation_start, annotation_status, annotation_targets,
+                   annotation_stop, annotation_toggle, annotation_draw, annotation_cancel, annotation_destinations, annotation_send, annotation_deliveries,
                    annotation_undo, annotation_correct, annotation_remember, annotation_forget, annotation_route):
         action.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     actions.add_parser("mcp", help="Serve read-only meeting and annotation tools over stdio.")
@@ -586,16 +668,32 @@ def main():
     clear_history.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     actions.add_parser("setup")
     args = parser.parse_args()
-    if os.name == "nt" and args.command not in ("model", "transcribe"):
-        parser.error("Choose model or transcribe on Windows.")
+    annotation_command = args.command in ("annotate", "capture")
+    if annotation_command and args.action == "start" and args.area is not None:
+        if sys.platform != "linux":
+            annotation_start.error("Exact coordinates require native Linux X11. Use --source area to select the region.")
+        if args.source not in (None, "area") or args.target is not None:
+            annotation_start.error("--area can only be combined with --source area and cannot be combined with --target.")
+        args.source = "area"
+    if annotation_command and args.action == "draw" and sys.platform != "linux":
+        annotate.error("Use the recording controls to draw on this desktop.")
+    portable_annotation_action = annotation_command and args.action in ("start", "status", "stop", "toggle", "cancel", "targets", "draw")
+    annotation_handoff = annotation_command and args.action in ("destinations", "send", "undo", "correct", "remember", "forget", "route")
+    if os.name == "nt" and args.command not in ("model", "transcribe", "history", "dictation", "mcp") and not (
+            (args.command == "meetings" and args.action != "watch") or portable_annotation_action or annotation_handoff
+            or (annotation_command and args.action in ("list", "show", "context", "deliveries"))):
+        parser.error("Choose model, transcribe, history, dictation, meetings, or annotate on Windows.")
     if args.command == "dictation":
         if args.raw and args.action not in ("start", "toggle"):
             dictate.error("--raw requires start or toggle")
-        if args.print_transcript and args.action != "stop":
-            dictate.error("--print requires stop")
+        if args.print_transcript and args.action not in ("start", "stop"):
+            dictate.error("--print requires start or stop")
     try:
+        if args.command == "dictation" and args.print_transcript and args.action == "start" and sys.platform != "darwin":
+            raise RuntimeError("Starting a print-only dictation is available on macOS. Use `dictation stop --print` here.")
         if args.command == "model":
-            result = (install_model(args.source, progress=not args.json and sys.stderr.isatty(), all_models=args.all_models)
+            result = (install_model(args.source, progress=not args.json and sys.stderr.isatty(),
+                                    all_models=args.all_models, repair=args.repair)
                       if args.action == "install" else model_status(all_models=args.all_models))
             if args.json:
                 print(json.dumps(result, ensure_ascii=False))
@@ -625,11 +723,11 @@ def main():
                 value is not None for value in (args.query, args.since, args.until, args.app, args.grep, args.search, args.limit)
             )):
                 raise ValueError("Clear history removes all entries and does not accept read filters.")
-            if sys.platform == "linux":
+            if sys.platform in ("linux", "win32"):
                 from portable_dictation_history import PortableDictationHistory
 
                 removed = PortableDictationHistory(library_path()).remove()
-                result = {"removed": removed, "changed": bool(removed)}
+                result = {"removed": removed, "changed": bool(removed), "pasteLastCleared": True}
             else:
                 result = desktop(library_path(), "history-clear", confirm=True)
             if args.json:
@@ -638,25 +736,49 @@ def main():
                 count = result["removed"]
                 print(f"Cleared {count} dictation{'s' if count != 1 else ''}.")
             else:
-                print("Cleared Paste Last." if result["changed"] else "History is already empty.")
+                print("Cleared Paste Last." if result["changed"] or result.get("pasteLastCleared") else "History is already empty.")
             return
         if args.command == "transforms":
             result = transformation_workspace(args)
             print(json.dumps(result, ensure_ascii=False) if args.json else result)
             return
         root = library_path()
-        if args.command == "dictation" and sys.platform == "linux":
-            from wayland_dictation_commands import dispatch
-
-            if args.print_transcript:
-                raise ValueError("Printing a live dictation is unavailable on Linux. Use Dictation History to copy it.")
-            result = dispatch(root, args.action)
-            if args.json:
+        if args.command == "dictation" and sys.platform in ("win32", "linux"):
+            if sys.platform == "win32":
+                from windows_dictation_commands import dispatch
+            else:
+                from wayland_dictation_commands import dispatch
+            result = dispatch(root, args.action, raw=args.raw, printed=args.print_transcript)
+            if args.print_transcript and result.get("status") == "no-speech":
+                no_speech(args.json)
+            if args.print_transcript and not args.json:
+                print(result["text"])
+            elif args.json:
                 print(json.dumps(result, ensure_ascii=False))
             return
-        if args.command in ("annotate", "capture"):
+        if annotation_command:
             if args.action in ("list", "show", "context"):
                 value = read_annotations(SessionStore(root, read_only=True), args)
+            elif portable_annotation_action and sys.platform in ("linux", "win32"):
+                if sys.platform == "win32":
+                    from windows_dictation_commands import dispatch_annotation
+                else:
+                    from wayland_dictation_commands import dispatch_annotation
+
+                options = {}
+                if args.action in ("start", "targets"):
+                    options["source"] = args.source or "display"
+                if args.action == "start":
+                    options.update(target=args.target or "", languages=args.language)
+                    if args.area is not None:
+                        options["area"] = args.area
+                if args.action == "stop" and args.from_project:
+                    options["terminalFolder"] = str(Path.cwd())
+                value = dispatch_annotation(root, args.action, **options)
+            elif args.action == "stop" and args.from_project:
+                raise ValueError("--from-project is available on Linux and Windows.")
+            elif args.action == "targets" or (args.action == "start" and args.target is not None):
+                raise ValueError("Use Jaro’s macOS capture picker to choose a source.")
             elif args.action == "deliveries":
                 from annotation_routing import recent_deliveries
                 value = recent_deliveries(root, args.id)
@@ -678,6 +800,8 @@ def main():
                 elif args.action == "remember":
                     options = {"id": args.id, "scope": args.scope, "target": args.to,
                                "service": args.service, "automatic": args.automatic}
+                    if args.scope_key is not None:
+                        options["scopeKey"] = args.scope_key
                 elif args.action == "route":
                     options = {"id": args.id, "routeAction": "cancel" if args.cancel else "status"}
                 elif args.action == "forget":
@@ -691,21 +815,31 @@ def main():
                     if args.action == "undo" and args.restore_files:
                         options["restoreFiles"] = True
                 try:
-                    timeout = {"undo": 26, "send": 18, "correct": 18, "destinations": 18, "remember": 18}
-                    value = desktop(root, "annotation-" + args.action,
-                                    timeout=timeout.get(args.action, 12), **options)
-                except DesktopUnavailable:
-                    if args.action != "route":
+                    if sys.platform in ("linux", "win32") and annotation_handoff:
+                        if sys.platform == "win32":
+                            from windows_dictation_commands import dispatch_annotation
+                        else:
+                            from wayland_dictation_commands import dispatch_annotation
+                        if options.get("restoreFiles"):
+                            raise ValueError("Use Undo without --restore-files to withdraw a queued annotation.")
+                        if args.action in ("undo", "correct"):
+                            options = {"id": args.delivery_id}
+                        value = dispatch_annotation(root, args.action, **options)
+                    else:
+                        timeout = {"undo": 26, "send": 18, "correct": 18, "destinations": 18, "remember": 18}
+                        value = desktop(root, "annotation-" + args.action,
+                                        timeout=timeout.get(args.action, 12), **options)
+                except RuntimeError as error:
+                    if args.action != "route" or not (isinstance(error, DesktopUnavailable) or
+                            (sys.platform in ("linux", "win32") and error.__cause__ is not None)):
                         raise
-                    if WORKSPACE_ROOT != ENGINE_ROOT:
-                        sys.path.insert(0, str(WORKSPACE_ROOT))
                     from annotation_deliveries import AnnotationDeliveries
-                    from desktop.annotation_automation import AnnotationAutomation
+                    from annotation_automation import stored_route_status
                     capture = str(UUID(args.id))
                     outbox = AnnotationDeliveries(root)
                     if args.cancel:
                         outbox.set_pending_route(capture, "cancelled", "Automatic send cancelled.")
-                    value = AnnotationAutomation.stored_status(outbox.get_route(capture), capture)
+                    value = stored_route_status(outbox, outbox.get_route(capture), capture)
             if args.action == "context" and not args.json:
                 print(value["markdown"], end="")
             else:
@@ -758,6 +892,23 @@ def main():
             else:
                 print(result.rstrip("\n") if isinstance(result, str) else json.dumps(result, ensure_ascii=False))
             return
+        if args.command == "meetings" and args.action == "delete":
+            result = trash_meeting(root, args.id)
+            if args.json:
+                print(json.dumps(result))
+            else:
+                print("The meeting is archived and waiting to move to Trash." if result["trashPending"]
+                      else "Moved the meeting to Trash.")
+            return
+        if args.command == "meetings" and args.action in ("status", "record", "stop", "copy-last") and sys.platform in ("win32", "linux"):
+            if sys.platform == "win32":
+                from windows_dictation_commands import dispatch_meeting
+            else:
+                from wayland_dictation_commands import dispatch_meeting
+            title = getattr(args, "title", None) or ""
+            result = dispatch_meeting(root, args.action, title=normalize_meeting_title(title) if title.strip() else "")
+            print(json.dumps(result, ensure_ascii=False))
+            return
         if args.command == "transcribe":
             transcribe_file(root, args)
             return
@@ -784,8 +935,14 @@ def main():
             elif args.command == "dictation":
                 # An older desktop must reject these actions instead of treating print
                 # as an ordinary stop that can insert into the focused application.
-                action = "dictation-stop-print" if args.print_transcript else f"dictation-{args.action}-raw" if args.raw else args.action
-                value = control(root, token, action, timeout=70 if args.print_transcript else 12)
+                action = args.action
+                timeout = 12
+                if args.raw or args.print_transcript:
+                    flags = ("-raw" if args.raw else "") + ("-print" if args.print_transcript else "")
+                    action = f"dictation-{action}{flags}"
+                    if args.print_transcript:
+                        timeout = 31 * 60 + 10 if args.action == "start" else 70
+                value = control(root, token, action, timeout=timeout)
                 if args.print_transcript:
                     if value.get("status") == "no-speech":
                         no_speech(args.json)

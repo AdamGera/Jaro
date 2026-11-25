@@ -15,13 +15,14 @@ export function LaunchAtLogin({ native, onboarding = false }: { native: DesktopB
 export const portableLogin = document.documentElement.hasAttribute("data-jaro-portable-login")
 
 async function requestPortableLogin(action: DesktopLoginAction): Promise<DesktopLoginItem> {
-  const response = await fetch("/api/portable/login-item", {
+  const endpoint = "/api/portable/login-item"
+  const response = await fetch(action.action === "openSettings" ? `${endpoint}/open-settings` : endpoint, {
     cache: "no-store",
     ...(action.action === "set" ? {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled: action.enabled }),
-    } : {}),
+    } : action.action === "openSettings" ? { method: "POST" } : {}),
   })
   if (!response.ok) {
     const failure = await response.json().catch(() => ({}))
@@ -33,11 +34,13 @@ async function requestPortableLogin(action: DesktopLoginAction): Promise<Desktop
 export function PortableApplicationSettings() {
   const { t } = useInterfaceLanguage()
   return <SettingGroup id="desktop-application-title" title={t("Application")}>
-    <LoginSwitch request={requestPortableLogin} description={t("Start Jaro in the background when you sign in.")} />
+    <LoginSwitch request={requestPortableLogin} description={t("Start Jaro in the background when you sign in.")} portable />
   </SettingGroup>
 }
 
-function LoginSwitch({ request, onboarding, description }: { request: LoginRequest; onboarding?: boolean; description?: string }) {
+function LoginSwitch({ request, onboarding, description, portable }: {
+  request: LoginRequest; onboarding?: boolean; description?: string; portable?: boolean
+}) {
   const { t } = useInterfaceLanguage()
   const [status, setStatus] = useState<DesktopLoginItem>()
   const [requested, setRequested] = useState<boolean>()
@@ -76,6 +79,7 @@ function LoginSwitch({ request, onboarding, description }: { request: LoginReque
   }, [request])
 
   async function change(action: DesktopLoginAction) {
+    if (changing.current) return
     const version = ++revision.current
     changing.current = true
     setRequested(action.action === "set" ? action.enabled : undefined)
@@ -114,11 +118,11 @@ function LoginSwitch({ request, onboarding, description }: { request: LoginReque
 
   const control = status?.state === "approval"
     ? <Button type="button" size="sm" variant="outline" onClick={() => void change({ action: "openSettings" })}>
-      {t("Open Login Items")}
+      {t(portable ? "Open Startup Settings" : "Open Login Items")}
     </Button>
     : <span className="dictation-login-state" role="status">{t(status ? "Unavailable" : "Checking…")}</span>
   const detail = error ? <span className="dictation-error" role="alert">{t(error)}</span>
-    : status?.state === "approval" ? t("Allow Jaro in System Settings.") : undefined
+    : status?.state === "approval" ? t(portable ? "Turn on Jaro in Windows Startup settings." : "Allow Jaro in System Settings.") : undefined
   if (onboarding) return <div className="dictation-login">
     <span>{title}{detail && <small className="dictation-login-detail">{detail}</small>}</span>{control}
   </div>

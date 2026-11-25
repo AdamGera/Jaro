@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import plistlib
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -22,7 +23,10 @@ def process_ids(executable):
     for line in subprocess.check_output(["/bin/ps", "-axo", "pid=,comm="], text=True).splitlines():
         fields = line.strip().split(maxsplit=1)
         if len(fields) == 2 and fields[1] == str(executable):
-            yield int(fields[0])
+            command = subprocess.run(["/bin/ps", "-p", fields[0], "-o", "args="],
+                                     capture_output=True, text=True)
+            if command.returncode == 0 and " --jaro-relaunch-update " not in command.stdout:
+                yield int(fields[0])
 
 
 def wait_for(probe, message, timeout=30):
@@ -45,7 +49,32 @@ def wait_for_exit(pid, timeout=30):
         assert queue.control(None, 1, timeout), f"Fixture process {pid} did not exit."
 
 
-def run(package, models, menu_host=None, *, clone_models=False):
+WORKSPACE_DRAFTS_SEED = """
+from pathlib import Path
+import sys
+import wave
+
+from session_notes import publish
+from session_store import SessionStore
+
+root = Path(sys.argv[1])
+source = root.parent / "fixture-silence.wav"
+with wave.open(str(source), "wb") as audio:
+    audio.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
+    audio.writeframes(bytes(32000))
+store = SessionStore(root)
+key, _ = store.create(source, "Fixture workspace edit.wav", "audio/wav",
+                      {"recording": False, "diarization": False}, 1)
+store.append(key, {"text": "Saved fixture transcript.", "language": "English", "words": [], "segments": []}, 1)
+store.finish(key)
+with store.connection() as db:
+    publish(db, key, "en", {"language": "en", "title": "Fixture workspace edit",
+        "summary": "Published fixture overview.", "markdown": "Original text ⟦0⟧", "topics": []})
+print(key)
+"""
+
+
+def run(package, models, menu_host=None, *, clone_models=False, drafts_only=False):
     identifier = "local.jardaudio.cli-fixture." + uuid4().hex
     with tempfile.TemporaryDirectory(prefix="jard-lifecycle-") as temporary:
         folder = Path(temporary).resolve()
@@ -60,6 +89,7 @@ def run(package, models, menu_host=None, *, clone_models=False):
             # Exercise the final refresh against an unavailable feed without reaching the production channel.
             info["JardUpdates"]["feed_url"] = "https://127.0.0.1:9/native-update.json"
             info["JardUpdates"].pop("rollout_url", None)
+            info["JardUpdateStartupConfirmation"] = True
             executable.unlink()
             subprocess.run(["/bin/cp", "-p", menu_host, executable], check=True)
         manifest.unlink()
@@ -89,7 +119,7 @@ def run(package, models, menu_host=None, *, clone_models=False):
         def installed_info():
             return plistlib.loads(manifest.read_bytes())
 
-        def stage_update(version):
+        def stage_update(version, *, fail_launch=False):
             installed = installed_info()
             stage.mkdir(mode=0o700)
             candidate = stage / app.name
@@ -97,6 +127,11 @@ def run(package, models, menu_host=None, *, clone_models=False):
             candidate_manifest = candidate / "Contents/Info.plist"
             candidate_manifest.unlink()
             candidate_manifest.write_bytes(plistlib.dumps({**installed, "CFBundleVersion": version}))
+            if fail_launch:
+                candidate_executable = candidate / "Contents/MacOS" / installed["CFBundleExecutable"]
+                candidate_executable.unlink()
+                shutil.copyfile("/usr/bin/false", candidate_executable)
+                candidate_executable.chmod(0o755)
             sign(candidate)
             subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", candidate], check=True)
             subprocess.run(["/usr/bin/defaults", "write", identifier, "JardPendingUpdate", "-dict",
@@ -123,10 +158,13 @@ def run(package, models, menu_host=None, *, clone_models=False):
             receipt.unlink(missing_ok=True)
             (root / ".update-menu-fixture").write_text(action)
             wait_for(receipt.is_file, f"The native fixture did not perform {action}.")
-            assert receipt.read_text() == title
+            assert (result := receipt.read_text()) == title, (action, result)
+
+        def engine_headers():
+            return {"Origin": base, "X-Jard-Token": (root / ".native-token").read_text().strip()}
 
         def change_lease(url, method):
-            with urlopen(Request(url, method=method, headers={"Origin": base}), timeout=2) as response:
+            with urlopen(Request(url, method=method, headers=engine_headers()), timeout=2) as response:
                 assert response.status == 204
 
         if clone_models:
@@ -141,6 +179,44 @@ def run(package, models, menu_host=None, *, clone_models=False):
                        check=True, timeout=40, stdout=subprocess.DEVNULL)
         preference_lock = Path.home() / "Library" / "Preferences" / f".{identifier}.jard-settings.lock"
         try:
+            if drafts_only:
+                resources = app / "Contents/Resources"
+                python = resources / "PythonRuntime/bin/python3.13"
+                key = subprocess.check_output([python, "-c", WORKSPACE_DRAFTS_SEED, root], text=True,
+                                              env={**env, "PYTHONPATH": str(resources / "engine")}, timeout=15).strip()
+                drafts = {"id": key, "overview": "Draft overview after a packaged update.",
+                          "note": "Personal note drafted before restarting."}
+                (root / ".update-menu-drafts.json").write_text(json.dumps(drafts))
+                subprocess.run(["/usr/bin/defaults", "write", identifier, "JardSystemDictation", "-dict",
+                                "enabled", "-bool", "NO", "onboarding", "later", "mode", "tap"], check=True)
+                subprocess.run(["/usr/bin/defaults", "write", identifier, "JardInterfaceLanguage", "-string", "en"], check=True)
+
+                def saved_part(part):
+                    with urlopen(Request(f"{base}/api/sessions/{key}/{part}", headers=engine_headers()), timeout=5) as response:
+                        return json.load(response)
+
+                stage_update("99.0.1")
+                original = cli("start")
+                wait_staged_update()
+                wait_engine()
+                invoke_fixture("workspace-drafts-prepare", "Both workspace drafts created")
+                assert saved_part("personal-notes")["revision"] == 0
+                assert saved_part("overview")["version"]["summary"] == "Published fixture overview."
+                invoke_fixture("settings-restart", "Restart to Update")
+                wait_for_exit(original["pid"])
+                new = wait_for(lambda: next(iter(process_ids(executable)), None), "The workspace control did not relaunch.")
+                wait_engine()
+                current = cli("start")
+                assert not current["changed"] and current["pid"] == new and current["bundle"] == str(app), current
+                assert current["version"] == "99.0.1", current
+                wait_for(lambda: not stage.exists(), "Launch did not remove the previous update backup.")
+                invoke_fixture("workspace-drafts-verify", "Both workspace drafts recovered")
+                assert saved_part("overview")["version"]["summary"] == drafts["overview"]
+                assert saved_part("personal-notes")["document"]["content"][0]["content"][0]["text"] == drafts["note"]
+                assert cli("settings", "get", "dictation.mode") == {"dictation.mode": "tap"}
+                assert cli("quit")["status"] == "stopped"
+                print("Packaged Restart to Update reopened My Notes, recovered both drafts, and saved them to the same library.")
+                return
             subprocess.run(["/usr/bin/defaults", "write", identifier, "JardCLIFixtureSentinel", "-string", "unchanged"], check=True)
             offline = {"dictation.mode": "hold", "dictation.retention": 1, "dictation.languages": ["en"],
                        "dictation.audioWhileDictating": "lower", "dictation.lowerAudioPercent": 35,
@@ -305,9 +381,9 @@ def run(package, models, menu_host=None, *, clone_models=False):
                 wait_staged_update()
                 wait_engine()
                 browser = base + f"/api/clients/{uuid4()}/stream"
-                with urlopen(browser, timeout=5) as stream:
+                with urlopen(Request(browser, headers=engine_headers()), timeout=5) as stream:
                     assert stream.readline() == b": Jaro connected\n"
-                    invoke_fixture("restart-guard", "Close other Jard windows or browser tabs before restarting.")
+                    invoke_fixture("restart-guard", "Close other Jaro windows or browser tabs before restarting.")
                     assert old["pid"] in process_ids(executable) and stage.is_dir()
                 # Drop the connection without a browser DELETE and retry from the app menu.
                 invoke_fixture("restart", "Restart to Update")
@@ -363,6 +439,21 @@ def run(package, models, menu_host=None, *, clone_models=False):
                     wait_for(lambda: not stage.exists(), "Launch did not remove the previous update backup.")
                     assert cli("quit")["status"] == "stopped"
                 print("Both real workspace buttons installed verified updates and reopened the same app and library.", flush=True)
+                previous_version = installed_info()["CFBundleVersion"]
+                stage_update("99.0.6", fail_launch=True)
+                previous = cli("start")
+                wait_staged_update()
+                wait_engine()
+                invoke_fixture("settings-restart", "Restart to Update")
+                wait_for_exit(previous["pid"])
+                invoke_fixture("rollback-notice", "The update could not start. Jaro restored the previous version.")
+                wait_engine()
+                restored = cli("start")
+                assert not restored["changed"] and restored["version"] == previous_version
+                assert restored["pid"] != previous["pid"] and restored["bundle"] == str(app)
+                wait_for(lambda: not stage.exists(), "Rollback did not release the failed stage.")
+                assert cli("quit")["status"] == "stopped"
+                print("A signed update that exited before startup restored the previous AppKit app and showed the recovery notice.", flush=True)
             print("Offline settings stayed isolated, locked writers were rejected, and desktop updates preserved the app path.")
         finally:
             # Terminate only the fixture bundle even when an assertion interrupts it.
@@ -380,7 +471,7 @@ def run(package, models, menu_host=None, *, clone_models=False):
                 with urlopen(base + "/api/status", timeout=2) as response:
                     ours = json.load(response)["libraryId"] == library_id
                 if ours:
-                    with urlopen(Request(base + "/api/quit", data=b"", headers={"Origin": base, "X-Jard-Action": "quit"}), timeout=2):
+                    with urlopen(Request(base + "/api/quit", data=b"", headers={**engine_headers(), "X-Jard-Action": "quit"}), timeout=2):
                         pass
             for _ in range(20):
                 with socket.socket() as listener:
@@ -397,6 +488,9 @@ if __name__ == "__main__":
     parser.add_argument("models", type=Path)
     parser.add_argument("--menu-host", type=Path, help="QA host built with JARD_TEST_SOURCE=desktop/tests/update_menu.m")
     parser.add_argument("--clone-models", action="store_true", help="Seed from APFS clones before the installer verifies the files.")
+    parser.add_argument("--drafts-only", action="store_true", help="Verify writing drafts through the packaged updater.")
     args = parser.parse_args()
+    if args.drafts_only and not args.menu_host:
+        parser.error("--drafts-only requires --menu-host")
     run(args.package.resolve(), args.models.resolve(), args.menu_host.resolve() if args.menu_host else None,
-        clone_models=args.clone_models)
+        clone_models=args.clone_models, drafts_only=args.drafts_only)

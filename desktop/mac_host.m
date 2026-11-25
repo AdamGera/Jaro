@@ -6,6 +6,7 @@
 #import <IOKit/IOKitLib.h>
 #import <IOKit/pwr_mgt/IOPM.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <WebKit/WebKit.h>
 #import <signal.h>
 #import <errno.h>
 #import <unistd.h>
@@ -26,6 +27,7 @@
 static char statusItemVisibilityContext;
 static NSString *const updatesManagedMessage = @"Updates managed by your organization";
 static NSString *const annotationManagedMessage = @"Screen annotation is managed by your organization.";
+static NSString *const updateRollbackMessage = @"The update could not start. Jaro restored the previous version.";
 static const AudioObjectPropertyAddress inputDeviceProperties[] = {
     {kAudioHardwarePropertyDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
     {kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain},
@@ -61,6 +63,8 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 @property(nonatomic, strong) NSFileHandle *input;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *pending;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, JardDictationReply> *nativePending;
+@property(nonatomic) BOOL preparing;
+@property(nonatomic, strong) NSMutableArray<JardDictationReply> *prepareWaiters;
 @property(nonatomic, strong) JardSystemDictation *systemDictation;
 @property(nonatomic, strong) JardLoginItem *loginItem;
 @property(nonatomic, strong) JardUpdater *updater;
@@ -93,6 +97,7 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 @property(nonatomic, copy) NSDictionary *windowNavigation;
 @property(nonatomic, copy) JardDictationReply pendingUpdateRestart;
 @property(nonatomic) BOOL showingApp, closing;
+@property(nonatomic) BOOL updateStartupReady, closingFailedUpdate;
 @property(nonatomic) BOOL menuQuitPending;
 @property(nonatomic) BOOL systemQuitPending, terminationApproved;
 @property(nonatomic, strong) JardTerminationDelegate *terminationDelegate;
@@ -102,6 +107,10 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 @property(nonatomic, copy) NSString *sdkCaptureID;
 @property(nonatomic, copy) NSString *controlExitID;
 @property(nonatomic, weak) NSWindow *window;
+@property(nonatomic, copy) NSString *workspaceLaunchURL;
+@property(nonatomic) NSTimeInterval lastWorkspaceReload;
+@property(nonatomic, weak) WKWebView *failedWorkspace;
+@property(nonatomic) BOOL workspaceRecoveryShowing;
 @property(nonatomic, strong) id dragMonitor;
 @property(nonatomic) CGFloat workspaceToolbarInset;
 @property(nonatomic, strong) NSMapTable<NSMenuItem *, NSString *> *menuLabels;
@@ -264,6 +273,9 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     } else if ([line[@"navigate"] isEqual:@"app"] && !self.showingApp) {
         // The helper proves engine identity and library ownership before sending this signal.
         // Build the destination locally. A helper message never supplies the navigation URL.
+        NSString *key = [line[@"workspaceKey"] isKindOfClass:NSString.class] ? line[@"workspaceKey"] : nil;
+        NSCharacterSet *invalid = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"].invertedSet;
+        if (key.length != 64 || [key rangeOfCharacterFromSet:invalid].location != NSNotFound) return;
         self.showingApp = YES;
         [self.systemDictation workspaceReady];
         [self.meetings workspaceReady];
@@ -272,10 +284,8 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
             [self showStartupWindowIfHidden];
         self.quietStartupPending = NO;
         [self.pending removeAllObjects];
-        // Use a fresh URL for the first request, even when WebKit still has
-        // the previous bundle's workspace HTML cached under the loopback origin.
-        NSString *workspace = [self.origin stringByAppendingFormat:@"/?jard-launch=%@", NSUUID.UUID.UUIDString];
-        native_sdk_appkit_load_webview(self.host, SDK_BYTES(workspace), 1, NULL, 0, NULL, 0, NULL, 0, 0);
+        self.workspaceLaunchURL = [self.origin stringByAppendingFormat:@"/_desktop/connect#%@", key];
+        native_sdk_appkit_load_webview(self.host, SDK_BYTES(self.workspaceLaunchURL), 1, NULL, 0, NULL, 0, NULL, 0, 0);
     } else if ([line[@"event"] isEqual:@"jard-microphone"]) {
         id detail = line[@"detail"];
         if ([detail isKindOfClass:NSDictionary.class]) [self.systemDictation updateWarmInputStatus:detail];
@@ -367,6 +377,8 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
             NSArray *completions = self.nativePending.allValues;
             [self.nativePending removeAllObjects];
             for (JardDictationReply completion in completions) completion(nil, @"The local helper stopped. Try again.");
+            if (self.preparing || self.prepareWaiters.count)
+                [self finishPrepareWithResult:nil error:@"The local helper stopped. Try again."];
             [self.annotationResultPanel dismiss];
             [self.annotationRoutePanel dismiss];
             [self.systemDictation helperDisconnected];
@@ -520,7 +532,7 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         reply(nil, @"There is no live meeting transcript.");
         return;
     }
-    if (![@[@"settings", @"general", @"dictation", @"history", @"output", @"meetings", @"annotate", @"home", @"live-meeting", @"meeting-library"] containsObject:pane ?: NSNull.null]) {
+    if (![@[@"settings", @"general", @"dictation", @"history", @"output", @"meetings", @"annotate", @"home", @"live-meeting", @"meeting-library", @"vocabulary", @"add-term"] containsObject:pane ?: NSNull.null]) {
         reply(nil, @"Unknown Jaro workspace pane.");
         return;
     }
@@ -549,13 +561,65 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
 }
 
 - (void)checkForScheduledUpdate:(BOOL)workspaceFocused {
-    if (!self.closing && !self.updating && [NSUserDefaults.standardUserDefaults boolForKey:@"JardCheckForUpdatesOnLaunch"])
+    if (!self.closing && !self.updating && ![self.updateRestartError isEqual:updateRollbackMessage] &&
+        [NSUserDefaults.standardUserDefaults boolForKey:@"JardCheckForUpdatesOnLaunch"])
         [self.updater checkAutomaticallyOnActivation:workspaceFocused];
 }
 
 - (void)workspaceFocused:(NSNotification *)notification {
     [self checkForScheduledUpdate:YES];
     [self queueInputDeviceEvent];
+    [self offerWorkspaceRecovery];
+}
+
+- (void)reloadWorkspace:(WKWebView *)web {
+    if (!web || web.window != self.window || self.closing || self.updating || self.menuQuitPending) return;
+    self.failedWorkspace = nil;
+    self.lastWorkspaceReload = NSProcessInfo.processInfo.systemUptime;
+    [self.pending removeAllObjects];
+    NSURL *origin = [NSURL URLWithString:self.origin];
+    NSURL *page = web.URL;
+    // Reload the current session route with the existing workspace cookie.
+    // The original bootstrap recovers a crash before the first page committed.
+    if ([page.scheme isEqual:origin.scheme] && [page.host isEqual:origin.host] &&
+        [page.port isEqual:origin.port] && ![page.path isEqual:@"/_desktop/connect"] && [web reloadFromOrigin]) return;
+    native_sdk_appkit_load_webview(self.host, SDK_BYTES(self.workspaceLaunchURL), 1, NULL, 0, NULL, 0, NULL, 0, 0);
+}
+
+- (void)offerWorkspaceRecovery {
+    WKWebView *web = self.failedWorkspace;
+    NSWindow *window = self.window;
+    if (!web || self.workspaceRecoveryShowing || !window.isKeyWindow || window.attachedSheet ||
+        self.closing || self.updating || self.menuQuitPending) return;
+    NSAlert *alert = NSAlert.new;
+    alert.messageText = JardLocalized(@"Jaro’s workspace stopped responding");
+    alert.informativeText = JardLocalized(@"Reload the workspace to continue. Native recordings keep running.");
+    [alert addButtonWithTitle:JardLocalized(@"Reload workspace")];
+    [alert addButtonWithTitle:JardLocalized(@"Later")];
+    self.workspaceRecoveryShowing = YES;
+    __weak typeof(self) owner = self;
+    [alert beginSheetModalForWindow:window completionHandler:^(NSModalResponse response) {
+        owner.workspaceRecoveryShowing = NO;
+        if (response == NSAlertFirstButtonReturn) [owner reloadWorkspace:web];
+    }];
+}
+
+- (void)workspaceContentTerminated:(NSNotification *)notification {
+    WKWebView *web = notification.object;
+    if (![web isKindOfClass:WKWebView.class] || web.window != self.window ||
+        !self.workspaceLaunchURL || self.closing || self.terminationApproved) return;
+    self.failedWorkspace = web;
+    if (self.updating || self.menuQuitPending) return;
+    [self.systemDictation stopSoundPreview];
+    NSLog(@"Jaro's WebKit content process terminated.");
+    if (!self.lastWorkspaceReload || NSProcessInfo.processInfo.systemUptime - self.lastWorkspaceReload >= 30) {
+        // Let WebKit finish retiring the failed process before asking it to load again.
+        __weak typeof(self) owner = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [owner reloadWorkspace:web]; });
+        return;
+    }
+    // Repeated terminations require an explicit retry. Do not focus a hidden window.
+    [self offerWorkspaceRecovery];
 }
 
 - (void)queueInputDeviceEvent {
@@ -648,6 +712,8 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         name:NSWindowDidMiniaturizeNotification object:self.window];
     [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(workspaceFocused:)
         name:NSWindowDidBecomeKeyNotification object:self.window];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(workspaceContentTerminated:)
+        name:@"JaroWorkspaceContentTerminated" object:nil];
     for (NSString *name in @[NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification]) {
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(chromeChanged:) name:name object:self.window];
     }
@@ -763,6 +829,11 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     if (![request isKindOfClass:NSString.class] || request.length > 100 || ![command isKindOfClass:NSString.class]) return;
     if ([command isEqual:@"jard.chrome"] && [origin isEqual:(self.showingApp ? self.origin : @"zero://inline")]) {
         [self respond:@{@"id": request, @"ok": @YES, @"result": [self chrome]}];
+        return;
+    }
+    if (self.showingApp && [origin isEqual:self.origin] && [command isEqual:@"jard.workspaceReady"]) {
+        if (!self.updateStartupReady) [self confirmUpdateStartup];
+        [self respond:@{@"id": request, @"ok": @YES, @"result": NSNull.null}];
         return;
     }
     if ([command isEqual:@"jard.interfaceLanguage"] && [origin isEqual:(self.showingApp ? self.origin : @"zero://inline")]) {
@@ -985,7 +1056,7 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     }
     NSArray *commands = self.showingApp
         ? @[@"jard.devices", @"jard.inputDevices", @"jard.microphoneLevel", @"jard.record", @"jard.stop", @"jard.dictation",
-            @"jard.dictationCleanup", @"jard.live", @"jard.openAudio", @"jard.revealSessionMedia", @"jard.export", @"jard.meetingExports", @"jard.annotationStorage", @"jard.annotationRoutingPolicy", @"jard.annotationDestinations", @"jard.annotationRoute", @"jard.rememberAnnotationDestination", @"jard.forgetAnnotationDestination", @"jard.sendAnnotation", @"jard.annotationAgentDestinations", @"jard.sendAnnotationToAgent", @"jard.sendSessionToAgent", @"jard.annotationDeliveries", @"jard.undoAnnotationDelivery", @"jard.correctAnnotationDelivery", @"jard.recover", @"jard.discard", @"jard.open"]
+            @"jard.dictationCleanup", @"jard.live", @"jard.openAudio", @"jard.revealSessionMedia", @"jard.export", @"jard.meetingExports", @"jard.annotationStorage", @"jard.annotationRoutingPolicy", @"jard.annotationRules", @"jard.annotationDestinations", @"jard.annotationRoute", @"jard.rememberAnnotationDestination", @"jard.forgetAnnotationDestination", @"jard.sendAnnotation", @"jard.annotationAgentDestinations", @"jard.sendAnnotationToAgent", @"jard.sendSessionToAgent", @"jard.annotationDeliveries", @"jard.undoAnnotationDelivery", @"jard.correctAnnotationDelivery", @"jard.recover", @"jard.discard", @"jard.open"]
         : @[@"jard.prepare", @"jard.setup"];
     if (![origin isEqual:(self.showingApp ? self.origin : @"zero://inline")] || ![commands containsObject:command]) {
         [self reject:request reason:@"This command is unavailable in this view."];
@@ -1001,6 +1072,8 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         [self sendToHelper:command payload:payload request:nil completion:^(id result, NSString *error) {
             if (self.showingApp || self.closing) return;
             BOOL ready = [result isKindOfClass:NSDictionary.class] && [result[@"ready"] isEqual:@YES];
+            if (!error && [result isKindOfClass:NSDictionary.class] && [result[@"ready"] isEqual:@NO])
+                [self confirmUpdateStartup];  // The working app is showing its model setup.
             if (!self.hiddenLaunchRequested && (!self.launchHandled || self.quietStartupPending) && (error || !ready)) {
                 self.quietStartupPending = NO;
                 [self showStartupWindowIfHidden];
@@ -1015,9 +1088,21 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         [publicOptions removeObjectsForKeys:@[@"global", @"keep", @"preRoll", @"inputDevice", @"avoidBluetooth",
             @"outputProfile", @"cleanupOnFailure", @"releaseTail", @"noiseCleanup", @"boostMicrophone", @"meeting", @"meetingLabel", @"meetingCalendar", @"meetingTitle",
             @"meetingApplication", @"meetingSystemAudio"]];
+        if ([command isEqual:@"jard.record"] && ![publicOptions[@"mode"] isEqual:@"system"]) {
+            NSDictionary *microphone = [self.systemDictation sdkMicrophoneSettings];
+            publicOptions[@"inputDevice"] = microphone[@"inputDevice"];
+            publicOptions[@"avoidBluetooth"] = microphone[@"avoidBluetooth"];
+        }
         payload = publicOptions;
     }
     [self sendToHelper:command payload:payload request:request completion:nil];
+}
+
+- (void)finishPrepareWithResult:(id)result error:(NSString *)error {
+    self.preparing = NO;
+    NSArray<JardDictationReply> *waiters = [self.prepareWaiters copy];
+    [self.prepareWaiters removeAllObjects];
+    for (JardDictationReply waiter in waiters) waiter(result, error);
 }
 
 - (void)sendToHelper:(NSString *)command payload:(id)payload request:(NSString *)request completion:(JardDictationReply)completion {
@@ -1026,14 +1111,28 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         if (request) [self reject:request reason:reason];
     };
     if (self.closing) { reject(@"Jard is closing."); return; }
-    if (!self.bridge.running && self.showingApp && ![command isEqual:@"jard.prepare"]) {
-        [self sendToHelper:@"jard.prepare" payload:@{} request:nil completion:^(id result, NSString *error) {
-            if (error || ![result[@"ready"] boolValue]) {
+    if ((self.preparing || !self.bridge.running) && self.showingApp && ![command isEqual:@"jard.prepare"] &&
+        ![command isEqual:@"jard.updateQuiesce"]) {
+        if (!self.prepareWaiters) self.prepareWaiters = NSMutableArray.array;
+        if (self.prepareWaiters.count >= 64) {
+            reject(@"The app is busy or the request is too large.");
+            return;
+        }
+        [self.prepareWaiters addObject:^(id result, NSString *error) {
+            if (self.closing) {
+                reject(@"Jard is closing.");
+            } else if (error || ![result isKindOfClass:NSDictionary.class] || ![result[@"ready"] boolValue]) {
                 reject(error ?: @"The local model is unavailable. Reopen Jard and check model setup.");
             } else {
                 [self sendToHelper:command payload:payload request:request completion:completion];
             }
         }];
+        if (!self.preparing) {
+            self.preparing = YES;
+            [self sendToHelper:@"jard.prepare" payload:@{} request:nil completion:^(id result, NSString *error) {
+                [self finishPrepareWithResult:result error:error];
+            }];
+        }
         return;
     }
     NSError *error = nil;
@@ -1044,7 +1143,7 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     NSString *wireID = NSUUID.UUID.UUIDString;
     NSData *json = [NSJSONSerialization dataWithJSONObject:@{@"id": wireID, @"command": command,
                                                         @"payload": payload} options:0 error:&error];
-    if (!json || json.length > 65536 || self.pending.count + self.nativePending.count >= 64) {
+    if (!json || json.length > 262144 || self.pending.count + self.nativePending.count >= 64) {
         reject(@"The app is busy or the request is too large.");
         return;
     }
@@ -1061,7 +1160,7 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
 
 - (void)updateWindowClosePolicy {
     native_sdk_appkit_set_window_close_policy(self.host, 1,
-        (self.updating || self.hiddenLaunchRequested || self.systemDictation.keepsRunning || self.annotation.busy || self.meetings.keepsRunning || self.sdkCaptureID ||
+        (self.updating || self.hiddenLaunchRequested || self.systemDictation.keepsRunning || self.systemDictation.vocabularyMenuEnabled || self.annotation.busy || self.meetings.keepsRunning || self.sdkCaptureID ||
             (self.showingApp && ![self showDockIcon])) ? 1 : 0);
 }
 
@@ -1148,7 +1247,7 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         @[@"open", @"Open Jaro"], @[@"start", @"Record Meeting"], @[@"stop", @"Stop & Save"],
         @[@"keepRecording", @"Keep Recording"], @[@"copyNew", @"Copy New"], @[@"copyAll", @"Copy All"],
         @[@"indicator", @"Show Recording Indicator"], @[@"privacy", @"Open Recording Privacy Settings"],
-        @[@"recoverMeeting", @"Recover Meeting"], @[@"pasteLast", @"Paste Last Dictation"],
+        @[@"recoverMeeting", @"Recover Meeting"], @[@"pasteLast", @"Paste Last Dictation"], @[@"vocabulary", @"Vocabulary"],
         @[@"copyLatest", @"Copy Last Meeting Transcript"],
         @[@"update", @"Check for Updates…"], @[@"quit", @"Quit Jaro"]
     ]) {
@@ -1157,6 +1256,9 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         item.representedObject = entry[0];
         items[entry[0]] = item;
     }
+    NSMenu *vocabulary = [[NSMenu alloc] initWithTitle:@"Vocabulary"];
+    vocabulary.autoenablesItems = NO;
+    [items[@"vocabulary"] setSubmenu:vocabulary];
     self.meetingMenuItems = items;
     self.meetingStatusItem.menu = menu;
     [self rememberMenuLabels:menu];
@@ -1168,6 +1270,29 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
 - (void)menuNeedsUpdate:(NSMenu *)menu {
     if (menu != self.meetingStatusItem.menu) return;
     [self.systemDictation configurePasteLastMenuItem:self.meetingMenuItems[@"pasteLast"]];
+    NSMenuItem *vocabulary = self.meetingMenuItems[@"vocabulary"];
+    if (vocabulary && !vocabulary.hidden) {
+        NSMenu *submenu = vocabulary.submenu;
+        [submenu removeAllItems];
+        NSArray *entries = self.systemDictation.menuVocabularyEntries;
+        NSMenuItem *add = [submenu addItemWithTitle:JardLocalized(@"Add Term…") action:@selector(meetingMenuAction:) keyEquivalent:@""];
+        add.target = self;
+        add.representedObject = @"add-term";
+        add.enabled = entries.count < 32;
+        if (entries.count) {
+            [submenu addItem:NSMenuItem.separatorItem];
+            NSUInteger shown = 0;
+            for (NSDictionary *entry in entries.reverseObjectEnumerator) {
+                NSString *line = [[entry[@"term"] componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "];
+                [submenu addItemWithTitle:line action:NULL keyEquivalent:@""].enabled = NO;
+                if (++shown == 5) break;
+            }
+            [submenu addItem:NSMenuItem.separatorItem];
+        }
+        NSMenuItem *open = [submenu addItemWithTitle:JardLocalized(@"Open Vocabulary…") action:@selector(meetingMenuAction:) keyEquivalent:@""];
+        open.target = self;
+        open.representedObject = @"vocabulary";
+    }
     [self updateMenuTitle:self.updater.status];
 }
 
@@ -1189,7 +1314,8 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     BOOL dictationEnabled = self.showingApp && self.systemDictation.keepsRunning;
     BOOL canCopyLatest = self.showingApp && [status[@"hasSavedMeeting"] boolValue];
     BOOL dockRequested = [self showDockIcon] && !self.hiddenLaunchRequested;
-    if (!meetingControls && !dictationEnabled && !canCopyLatest && dockRequested) {
+    BOOL vocabularyMenu = self.showingApp && self.systemDictation.vocabularyMenuEnabled;
+    if (!meetingControls && !dictationEnabled && !vocabularyMenu && !canCopyLatest && dockRequested) {
         [self setDockIconVisible:YES];
         [self removeMeetingMenu];
         [self updateWindowClosePolicy];
@@ -1198,6 +1324,7 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     if (!self.meetingStatusItem) [self createMeetingMenu];
     NSDictionary<NSString *, NSMenuItem *> *items = self.meetingMenuItems;
     items[@"start"].hidden = !self.showingApp || self.meetings.managed || busy || permission || recovery;
+    items[@"vocabulary"].hidden = !vocabularyMenu;
     items[@"pasteLast"].hidden = !dictationEnabled;
     [self.systemDictation configurePasteLastMenuItem:items[@"pasteLast"]];
     items[@"quit"].hidden = dockRequested;
@@ -1209,7 +1336,8 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     items[@"copyAll"].enabled = items[@"copyNew"].enabled && [status[@"hasText"] boolValue];
     items[@"copyLatest"].hidden = !canCopyLatest || recording;
     items[@"indicator"].state = [status[@"showIndicator"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
-    items[@"privacy"].hidden = !permission;
+    BOOL systemPermissionDenied = recording && [status[@"systemAudioPermissionDenied"] boolValue];
+    items[@"privacy"].hidden = !permission && !systemPermissionDenied;
     items[@"recoverMeeting"].hidden = !recovery || busy;
     items[@"recoverMeeting"].enabled = items[@"start"].enabled;
     long seconds = [status[@"seconds"] longValue];
@@ -1225,7 +1353,8 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     button.image = [NSImage imageWithSystemSymbolName:symbol accessibilityDescription:nil];
     button.image.template = YES;
     NSString *title = [status[@"title"] isKindOfClass:NSString.class] ? status[@"title"] : nil;
-    NSString *warning = microphoneReconnecting && systemReconnecting ? @"Microphone and Mac audio are reconnecting." :
+    NSString *warning = systemPermissionDenied ? JardLocalized(@"Mac audio access was denied.") :
+        microphoneReconnecting && systemReconnecting ? @"Microphone and Mac audio are reconnecting." :
         microphoneReconnecting ? @"Microphone is reconnecting." :
         systemReconnecting && silent ? @"Mac audio is reconnecting. The microphone is silent." :
         systemReconnecting ? @"Mac audio is reconnecting." :
@@ -1259,6 +1388,10 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     }
     if ([action isEqual:@"update"]) {
         [self updateFromMenu:sender];
+        return;
+    }
+    if ([action isEqual:@"vocabulary"] || [action isEqual:@"add-term"]) {
+        [self controlWindowAction:@"window-show" pane:action reply:^(id result, NSString *error) {}];
         return;
     }
     if ([action isEqual:@"pasteLast"]) {
@@ -1505,6 +1638,10 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
 
 - (void)controlAnnotation:(NSString *)action parameters:(NSDictionary *)parameters quartzPointer:(NSValue *)pointer
     reply:(JardDictationReply)reply {
+    if ([action isEqual:@"toggle"]) {
+        if ([self.annotation.status[@"phase"] isEqual:@"recording"]) action = @"stop";
+        else action = self.annotation.busy ? @"status" : @"start";
+    }
     if ([action isEqual:@"setAudio"]) {
         if (self.annotationManaged) { reply(nil, annotationManagedMessage); return; }
         id microphone = parameters[@"microphone"], computerAudio = parameters[@"computerAudio"];
@@ -1593,6 +1730,37 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     [self.systemDictation pauseForUpdate:NO];
     [self updateWindowClosePolicy];
     [self refreshMeetingAvailability];
+    [self offerWorkspaceRecovery];
+}
+
+- (void)confirmUpdateStartup {
+    self.updateStartupReady = YES;
+    if (self.closingFailedUpdate) return;
+    if (self.updater) [self.updater confirmStartup];
+    else JardConfirmUpdateStartup();
+}
+
+- (void)watchUpdateStartup {
+    if (!JardIsUpdateStartupProbe()) return;
+    __weak JardHost *owner = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 45 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        JardHost *app = owner;
+        if (!app || app.updateStartupReady || app.closing || app.updating ||
+            app.menuQuitPending || app.systemQuitPending || [app hasActiveCapture]) return;
+        app.closingFailedUpdate = app.updating = YES;
+        [app.systemDictation pauseForUpdate:YES];
+        [app sendToHelper:@"jard.updateQuiesce" payload:@{} request:nil completion:^(id result, NSString *error) {
+            if (error || ![result[@"ready"] boolValue]) {
+                app.closingFailedUpdate = NO;
+                [app resumeAfterControlExitFailure];
+                if (app.updateStartupReady) [app confirmUpdateStartup];
+                return;
+            }
+            // The supervisor sees the exit without a receipt and restores the backup.
+            app.terminationApproved = YES;
+            [NSApp terminate:nil];
+        }];
+    });
 }
 
 - (void)waitForAnnotationUntil:(NSTimeInterval)deadline completion:(void (^)(BOOL))completion {
@@ -1850,6 +2018,8 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
 }
 
 - (void)terminateAfterCleanup {
+    // A completed Quit is intentional even if model startup is still pending.
+    [self confirmUpdateStartup];
     self.terminationApproved = YES;
     self.menuQuitPending = NO;
     if (self.systemQuitPending) [self replyToSystemQuit:YES];
@@ -1979,6 +2149,8 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     self.closing = YES;
     [self stopObservingInputDevices];
     [self.nativePending removeAllObjects];
+    self.preparing = NO;
+    [self.prepareWaiters removeAllObjects];
     if (self.dragMonitor) { [NSEvent removeMonitor:self.dragMonitor]; self.dragMonitor = nil; }
     [NSNotificationCenter.defaultCenter removeObserver:self];
     if (NSApp.delegate == self.terminationDelegate) NSApp.delegate = self.terminationDelegate.upstream;
@@ -2012,6 +2184,7 @@ static void hostEvent(void *context, const native_sdk_appkit_event_t *event) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         signal(SIGPIPE, SIG_IGN);
+        if (argc > 1 && !strcmp(argv[1], "--jaro-relaunch-update")) return JardRunUpdateRelaunch(argc, argv);
         if (argc == 2 && !strcmp(argv[1], "--settings-apply-offline"))
             return JardApplyOfflineDictationSettings(JardForcedBoolean(CFSTR("DisableAnnotate")));
         int preferencesLease = JardLockDictationPreferences(NO);
@@ -2024,6 +2197,8 @@ int main(int argc, const char *argv[]) {
         NSString *title = [bundle objectForInfoDictionaryKey:@"CFBundleDisplayName"] ?: @"Jaro";
         NSString *identifier = bundle.bundleIdentifier ?: @"local.jardaudio.desktop";
         JardHost *app = [[JardHost alloc] init];
+        if ([NSProcessInfo.processInfo.environment[@"JARD_UPDATE_ROLLED_BACK"] isEqual:@"1"])
+            app.updateRestartError = updateRollbackMessage;
         app.hiddenLaunchRequested = [NSProcessInfo.processInfo.arguments containsObject:@"--hidden"];
         app.pending = NSMutableDictionary.dictionary;
         app.nativePending = NSMutableDictionary.dictionary;
@@ -2211,6 +2386,7 @@ int main(int argc, const char *argv[]) {
         NSString *origins = [@"zero://inline\n" stringByAppendingString:app.origin];
         native_sdk_appkit_set_security_policy(app.host, SDK_BYTES(origins), NULL, 0, 0);
         native_sdk_appkit_set_bridge_callback(app.host, bridgeMessage, (__bridge void *)app);
+        [app watchUpdateStartup];
         native_sdk_appkit_load_webview(app.host, SDK_BYTES(setup), 0, NULL, 0, NULL, 0, NULL, 0, 0);
         native_sdk_appkit_run(app.host, hostEvent, (__bridge void *)app);
         [app shutdown];

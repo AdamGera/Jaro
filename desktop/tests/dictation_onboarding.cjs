@@ -10,6 +10,7 @@ async function run() {
   try {
     const page = await browser.newPage()
     page.setDefaultTimeout(7000)
+    const portableDraftFixture = process.env.JARO_TEST_WORKSPACE_DRAFTS === "portable"
     const errors = []
     page.on("pageerror", error => errors.push(error.message))
     const dist = path.resolve(__dirname, "../../dist")
@@ -31,6 +32,11 @@ async function run() {
     const fixtureImages = new Map()
     let attachmentError = ""
     let showSaved = false
+    let noteSaveUnavailable = false
+    let overviewSaved = { preference: "auto", autoLanguage: "en", target: "en", status: "ready",
+      version: { language: "en", title: "Fixture meeting", summary: "The group reviewed the agenda.",
+        markdown: "- Reviewed next steps ⟦7⟧", topics: [] }, error: null, editRevision: "fixture" }
+    let lastOverviewWrite
     let showAnnotation = false
     let notesChunkMissing = false
     let holdSessionRestore
@@ -111,9 +117,14 @@ async function run() {
         return route.fulfill({ json: meetingBrief })
       }
       if (pathname === `/api/sessions/${meetingId}/overview`) {
-        return route.fulfill({ json: { preference: "auto", autoLanguage: "en", target: "en", status: "ready",
-          version: { language: "en", title: "Fixture meeting", summary: "The group reviewed the agenda.",
-            markdown: "- Reviewed next steps ⟦7⟧", topics: [] }, error: null, editRevision: "fixture" } })
+        if (route.request().method() === "PUT") {
+          const edit = route.request().postDataJSON()
+          if (edit.revision !== overviewSaved.editRevision) return route.fulfill({ status: 409, json: { detail: "The saved overview changed." } })
+          lastOverviewWrite = edit
+          overviewSaved = { ...overviewSaved, editRevision: edit.revision + "-saved",
+            version: { ...overviewSaved.version, summary: edit.summary, markdown: edit.markdown } }
+        }
+        return route.fulfill({ json: overviewSaved })
       }
       if (pathname === `/api/sessions/${meetingId}/managed-export`) return route.fulfill({ json: managedExport })
       if (pathname === `/api/sessions/${meetingId}/meeting-title` && route.request().method() === "PUT") {
@@ -123,6 +134,7 @@ async function run() {
       }
       if (pathname === `/api/sessions/${meetingId}/personal-notes`) {
         if (route.request().method() === "PUT") {
+          if (noteSaveUnavailable) return route.fulfill({ status: 503, json: {} })
           const edit = route.request().postDataJSON()
           if (edit.revision !== personalNotes.revision) return route.fulfill({ status: 409, json: {} })
           personalNotes = { document: edit.document, revision: edit.revision + 1 }
@@ -191,6 +203,11 @@ async function run() {
       if (pathname.startsWith("/api/")) return route.fulfill({
         json: pathname === "/api/status" ? { status: "ready", languages: [], diarization: true } : [],
       })
+      if (pathname === "/" && portableDraftFixture) {
+        const body = readFileSync(path.join(dist, "index.html"), "utf8")
+          .replace("<html ", "<html data-jaro-portable-workspace data-jaro-desktop-client ")
+        return route.fulfill({ body, contentType: "text/html" })
+      }
       return route.fulfill({ path: path.join(dist, pathname === "/" ? "index.html" : pathname) })
     })
     const interfaceCatalog = JSON.parse(readFileSync(path.join(__dirname, "../interface-languages.json"), "utf8"))
@@ -203,7 +220,7 @@ async function run() {
         cancelLabel: "Escape", pasteLabel: "⌥⇧V", rawLabel: "", annotateLabel: "⌥⇧S", annotationListener: true,
         annotationEnabled: true, annotationRecorderAvailable: true,
         shortcutSide: "right", shortcutTarget: "", choosingShortcut: false,
-        outputProfiles: "default | compact", historyRevision: 0, vocabularyEntries: [],
+        outputProfiles: "default | compact", historyRevision: 0, showHistoryStats: false, vocabularyEntries: [],
         sound: true, soundSet: "classic", soundVolume: 70, soundPreview: false, soundPreviewRevision: 0, placement: "top",
       }
       window.fixtureLoginState = "disabled"
@@ -242,8 +259,8 @@ async function run() {
       window.annotationAccessActions = []
       window.annotationFolder = { folder: "/fixture/Jaro/audio", custom: false, available: true }
       window.annotationFolderActions = []
-      window.meetingsFixture = { phase: "idle", busy: 0, detection: false, recoveryAvailable: 0, hasText: 0, providerPolicies: [
-        { provider: "app:zoom", label: "Zoom", policy: "ask", canAlwaysRecord: true },
+      window.meetingsFixture = { phase: "idle", busy: 0, detection: false, recoveryAvailable: 0, hasText: 0, defaultPolicy: "ask", providerPolicies: [
+        { provider: "app:zoom", label: "Zoom", policy: "ask", canAlwaysRecord: true, inheritsPolicy: true, lastSeen: Date.now() / 1000 },
         { provider: "site:meet.google.com", label: "Google Meet", policy: "ask", canAlwaysRecord: true },
         { provider: "site:zoom.us", label: "Zoom", scope: "zoom.us", policy: "never", canAlwaysRecord: true },
         { provider: "browser:com.google.chrome", label: "Google Chrome", policy: "never", canAlwaysRecord: false },
@@ -425,10 +442,15 @@ async function run() {
             }))
           }
           if (input.action === "copyNew") meeting.hasNewText = false
+          if (input.action === "setDefaultPolicy") {
+            meeting.defaultPolicy = input.policy
+            meeting.providerPolicies.filter(row => row.inheritsPolicy).forEach(row => { row.policy = input.policy })
+          }
           if (input.action === "setPolicy") {
             const provider = meeting.providerPolicies.find(row => row.provider === input.provider)
             if (!provider || (input.policy === "auto" && !provider.canAlwaysRecord)) throw new Error("Choose an available recording preference for this provider.")
-            provider.policy = input.policy
+            provider.inheritsPolicy = input.policy === "inherit"
+            provider.policy = provider.inheritsPolicy ? meeting.defaultPolicy : input.policy
           }
           if (input.action === "stop") Object.assign(meeting, { phase: "finished", busy: false, message: "Meeting saved to Sessions." })
           return { ...meeting }
@@ -601,6 +623,9 @@ async function run() {
             window.fixtureStarterSelected = false
             window.scriptApproved = ""
             break
+          case "historyStats":
+            return { stats: state.showHistoryStats ? { dictations: window.historyFixture.length,
+              words: 123, savedSeconds: 80, wordsPerMinute: 100, streakDays: 2, busiestHour: 9 } : null }
           case "history": {
             if (input.query === "other words") await new Promise(resolve => setTimeout(resolve, 400))
             const entries = window.historyFixture.filter(item => item.text.includes(input.query))
@@ -615,6 +640,7 @@ async function run() {
             break
           case "bulkHistory":
             if (input.operation === "delete") {
+              state.historyRevision++
               window.deletedHistory = input.ids
               window.historyFixture = window.historyFixture.filter(item => !input.ids.includes(item.id))
             } else {
@@ -622,7 +648,7 @@ async function run() {
               window.copiedHistory = input.ids
             }
             break
-          case "clearHistory": window.historyFixture = []; break
+          case "clearHistory": window.historyFixture = []; state.historyRevision++; break
           case "microphone": state.microphone = "granted"; break
           case "accessibility": state.accessibilityRequested = true; break
           case "repairAccessibility":
@@ -716,6 +742,63 @@ async function run() {
       const description = node.getAttribute("aria-describedby")
       return description ? document.getElementById(description)?.textContent.trim() : undefined
     })
+    if (process.env.JARO_TEST_WORKSPACE_DRAFTS) {
+      showSaved = true
+      const origin = "http://127.0.0.1:18997"
+      await page.goto(`${origin}/?session=${meetingId}&tab=overview`)
+      if (!portableDraftFixture) await button("Set up later").click()
+      const edit = () => page.getByRole("textbox", { name: "Edit overview" })
+      await button("Edit overview").click()
+      await edit().fill("Uncommitted overview from this window")
+      const overviewKey = `jard.overviewDraft.${meetingId}.en`
+      assert.equal(await page.evaluate(key => !!localStorage.getItem(key), overviewKey), true)
+      await page.getByRole("tab", { name: "Timeline", exact: true }).click()
+      await page.getByRole("tab", { name: "Overview", exact: true }).click()
+      await edit().getByText("Uncommitted overview from this window", { exact: true }).waitFor()
+
+      // A new desktop window has the same origin and local storage, with no session storage.
+      const reopen = async () => {
+        await page.evaluate(() => sessionStorage.clear())
+        await page.goto(origin + "/")
+        if (!portableDraftFixture) await button("Set up later").click()
+      }
+      await reopen()
+      await button("Resume overview draft").click()
+      await edit().getByText("Uncommitted overview from this window", { exact: true }).waitFor()
+      await button("Save changes").click()
+      await page.getByText("Uncommitted overview from this window", { exact: true }).waitFor()
+      assert.equal(lastOverviewWrite.revision, "fixture")
+      assert.equal(await page.evaluate(key => localStorage.getItem(key), overviewKey), null)
+      await button("Edit overview").click()
+      await edit().fill("An older draft")
+      overviewSaved = { ...overviewSaved, editRevision: "fixture-newer",
+        version: { ...overviewSaved.version, summary: "Newer saved overview" } }
+      await reopen()
+      await page.getByText("Newer saved overview", { exact: true }).waitFor()
+      await button("Resume overview draft").click()
+      await page.getByText("The saved overview changed since you started this draft.").waitFor()
+      await edit().getByText("An older draft", { exact: true }).waitFor()
+      assert.equal(await button("Save changes").count(), 0)
+      await button("Discard draft").click()
+      await page.getByText("Newer saved overview", { exact: true }).waitFor()
+      assert.equal(await page.evaluate(key => localStorage.getItem(key), overviewKey), null)
+
+      noteSaveUnavailable = true
+      await page.getByRole("tab", { name: "My Notes" }).click()
+      const notes = page.getByRole("textbox", { name: "My notes" })
+      await notes.fill("A note written while saving was unavailable")
+      await button("Retry save").waitFor()
+      await reopen()
+      await notes.getByText("A note written while saving was unavailable", { exact: true }).waitFor()
+      noteSaveUnavailable = false
+      await button("Retry save").click()
+      const noteKey = `jard.personalNotes.${meetingId}`
+      await page.waitForFunction(key => !localStorage.getItem(key), noteKey)
+      assert.equal(personalNotes.document.content[0].content[0].text, "A note written while saving was unavailable")
+      assert.deepEqual(errors, [])
+      console.log("WebKit restored Overview and My Notes after simulated desktop restart and preserved a newer saved Overview.")
+      return
+    }
     await page.goto("http://127.0.0.1:18997/?jard-launch=fixture")
     assert.equal(new URL(page.url()).searchParams.has("jard-launch"), false)
     await heading("Speak where you write.").waitFor()
@@ -735,12 +818,14 @@ async function run() {
     })
     await loginSwitch.click()
     assert(await loginSwitch.isChecked())
-    await loginSwitch.click()
-    assert(!await loginSwitch.isChecked())
-    await page.waitForFunction(() => window.fixturePendingLoginWrites.length === 2)
+    assert(await loginSwitch.isDisabled())
+    await page.waitForFunction(() => window.fixturePendingLoginWrites.length === 1)
     await page.evaluate(() => window.fixturePendingLoginWrites[0]())
     await page.waitForFunction(() => window.fixtureLoginState === "enabled")
+    await loginSwitch.click()
     assert(!await loginSwitch.isChecked())
+    assert(await loginSwitch.isDisabled())
+    await page.waitForFunction(() => window.fixturePendingLoginWrites.length === 2)
     await page.evaluate(() => {
       window.fixtureHoldLoginWrites = false
       window.fixturePendingLoginWrites[1]()
@@ -1263,21 +1348,39 @@ async function run() {
     await folderControls.getByRole("button", { name: "Choose Folder…" }).waitFor()
     assert.equal(await page.getByRole("switch", { name: /Separate notes file/ }).isChecked(), true)
     assert.equal(await page.getByRole("switch", { name: /Descriptive meeting filenames/ }).isChecked(), true)
-    const zoomPolicy = page.getByRole("combobox", { name: "Zoom", exact: true })
+    const manageCalls = button("Manage calls")
+    await findTrigger.click()
+    await findSettings.fill("Automatically detect meetings")
+    await page.getByRole("option", { name: /Calls/ }).click()
+    await focusedSetting("Calls")
+    await manageCalls.press("Enter")
+    const callsDialog = page.getByRole("dialog", { name: "Calls" })
+    const defaultCallBehavior = callsDialog.getByRole("combobox", { name: "Default call behavior" })
+    const zoomPolicy = callsDialog.getByRole("combobox", { name: "Zoom", exact: true })
     const zoomSitePolicy = page.getByRole("combobox", { name: "Zoom zoom.us", exact: true })
     const chromePolicy = page.getByRole("combobox", { name: "Google Chrome", exact: true })
-    assert.equal(await zoomPolicy.inputValue(), "ask")
+    assert.equal(await defaultCallBehavior.inputValue(), "ask")
+    assert.equal(await zoomPolicy.inputValue(), "inherit")
+    await callsDialog.getByText(/Last seen /).waitFor()
     assert.equal(await zoomSitePolicy.inputValue(), "never")
-    assert.deepEqual(await chromePolicy.locator("option").allTextContents(), ["Ask", "Never offer"])
+    assert.deepEqual(await chromePolicy.locator("option").allTextContents(), ["Use inherited rules", "Ask", "Never offer"])
+    await defaultCallBehavior.selectOption("auto")
+    await zoomPolicy.getByRole("option", { name: "Inherited · Always record" }).waitFor({ state: "attached" })
+    assert.equal(await page.evaluate(() => window.meetingsFixture.detection), false)
+    await zoomPolicy.selectOption("ask")
+    await zoomPolicy.selectOption("inherit")
     await zoomPolicy.selectOption("auto")
     assert.equal(await page.evaluate(() => window.meetingsFixture.providerPolicies[0].policy), "auto")
     assert.equal(await zoomSitePolicy.inputValue(), "never")
     await page.getByRole("combobox", { name: "Google Meet", exact: true }).selectOption("never")
     assert.equal(await page.evaluate(() => window.meetingsFixture.phase), "idle")
-    await page.getByRole("switch", { name: "Offer to record detected calls" }).check()
+    await callsDialog.getByRole("switch", { name: "Detect calls" }).check()
     assert.equal(await page.evaluate(() => window.meetingsFixture.detection), true)
     await page.getByRole("switch", { name: /Stop automatically when a call ends/ }).check()
     assert.equal(await page.evaluate(() => window.meetingsFixture.autoStop), true)
+    await page.keyboard.press("Escape")
+    await callsDialog.waitFor({ state: "hidden" })
+    assert.equal(await manageCalls.evaluate(button => button === document.activeElement), true)
     assert.equal(await page.evaluate(() => window.calendarRequests), 0)
     await button("Connect Calendar").click()
     await button("Open Calendar Settings").click()
@@ -1407,9 +1510,11 @@ async function run() {
     await button("Copy New").click()
     await page.getByText("Copied meeting transcript.").waitFor()
     assert.equal(await button("Copy New").isEnabled(), true)
+    await manageCalls.click()
     await zoomSitePolicy.selectOption("ask")
     assert.equal(await page.evaluate(() => window.meetingsFixture.providerPolicies[2].policy), "ask")
     assert.equal(await zoomPolicy.inputValue(), "auto")
+    await callsDialog.getByRole("button", { name: "Done" }).click()
     await button("Stop & Save").click()
     await page.getByText("Meeting saved to Sessions.").waitFor()
     assert.equal(await button("Copy New").isEnabled(), false)
@@ -1472,6 +1577,8 @@ async function run() {
     await button("Dictation").click()
     await heading("Dictation").waitFor()
     const dictationHeadingX = (await heading("Dictation").boundingBox()).x
+    const dictationTabList = page.getByRole("tablist", { name: "Dictation tabs" })
+    const dictationTabListX = (await dictationTabList.boundingBox()).x
     assert.equal(await page.getByRole("tab", { name: "General" }).getAttribute("aria-selected"), "true")
     await heading("Dictation").focus()
     await page.keyboard.press("Meta+f")
@@ -1886,6 +1993,28 @@ async function run() {
       const bounds = document.activeElement?.getBoundingClientRect()
       return bounds && bounds.top >= 0 && bounds.bottom <= innerHeight
     })
+    const menuRequest = (pane, id) => page.evaluate(detail => {
+      window.dispatchEvent(new CustomEvent("native-sdk:jard-window-navigation", { detail }))
+    }, { pane, id })
+    const menuToggle = page.getByRole("switch", { name: "Vocabulary menu" })
+    assert.equal(await menuToggle.isChecked(), false)
+    await menuToggle.check()
+    await menuRequest("add-term", "menu-add")
+    const menuEditor = page.getByRole("dialog", { name: "Vocabulary" })
+    const menuTerms = menuEditor.getByRole("textbox", { name: "Term", exact: true })
+    await menuTerms.first().waitFor()
+    await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Term")
+    await menuTerms.first().fill("Unsaved draft")
+    await menuEditor.getByRole("textbox", { name: "Sounds like" }).fill("x")
+    await menuRequest("add-term", "menu-add-another")
+    await menuTerms.nth(1).waitFor()
+    assert.equal(await menuTerms.first().inputValue(), "Unsaved draft")
+    await menuRequest("add-term", "menu-add-another")
+    await menuRequest("vocabulary", "menu-open")
+    await page.waitForFunction(() => sessionStorage.getItem("jard.windowNavigation") === "menu-open")
+    assert.equal(await menuTerms.count(), 2)
+    await menuEditor.getByRole("button", { name: "Discard unsaved changes" }).click()
+    await menuToggle.uncheck()
     const editVocabulary = button("Edit vocabulary")
     await editVocabulary.click()
     const vocabulary = page.getByRole("dialog", { name: "Vocabulary" })
@@ -1954,6 +2083,7 @@ async function run() {
     await page.evaluate(() => { window.dictationFixture.preferencesWarning = "" })
     await page.getByRole("tab", { name: "History" }).click()
     assert.equal((await heading("Dictation").boundingBox()).x, dictationHeadingX)
+    assert.equal((await dictationTabList.boundingBox()).x, dictationTabListX)
     assert.equal(await whileDictating.isVisible(), false)
     await page.keyboard.press("Meta+k")
     await findSettings.fill("Dictation HUD")
@@ -1962,6 +2092,12 @@ async function run() {
     assert.equal(await page.getByRole("tab", { name: "General" }).getAttribute("aria-selected"), "true")
     assert.equal(await feedback.evaluate(label => label.closest("details").open), true)
     await page.getByRole("tab", { name: "History" }).click()
+    const statsStrip = page.getByLabel("History stats", { exact: true })
+    assert.equal(await statsStrip.count(), 0)
+    await page.getByRole("tab", { name: "General" }).click()
+    await page.getByRole("switch", { name: "Show History stats" }).check()
+    await page.getByRole("tab", { name: "History" }).click()
+    await statsStrip.getByText("123", { exact: true }).waitFor()
     const list = page.getByRole("list", { name: "Dictations" })
     const detail = page.getByRole("article", { name: "Selected dictation" })
     const firstEntry = list.getByRole("button", { name: /A practice dictation/ })
@@ -2088,6 +2224,7 @@ async function run() {
     await page.getByText("Loading history…").waitFor()
     assert.equal(await button("Copy selected dictation").count(), 0)
     await page.getByText("No dictations found.").waitFor()
+    await statsStrip.getByText("123", { exact: true }).waitFor()
     assert.equal((await historySearch.boundingBox()).width, searchBox.width)
     await historySearch.fill("history books")
     await firstEntry.waitFor()
@@ -2096,9 +2233,8 @@ async function run() {
     assert.deepEqual(await searchTools.boundingBox(), fixedBounds)
     await button("Show sidebar").click()
     await page.setViewportSize({ width: 460, height: 710 })
-    const compactList = await list.boundingBox()
-    const compactDetail = await detail.boundingBox()
-    assert.ok(compactDetail.y > compactList.y + compactList.height)
+    await page.waitForFunction(([list, detail]) => detail.getBoundingClientRect().top > list.getBoundingClientRect().bottom,
+      [await list.elementHandle(), await detail.elementHandle()])
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth))
     await button("Delete selected dictation").click()
     await button("Delete").click()
@@ -2119,6 +2255,7 @@ async function run() {
     assert.equal(await findSettings.count(), 0)
     await button("Delete").click()
     await page.getByText("No saved dictations yet.").waitFor()
+    await statsStrip.waitFor({ state: "detached" })
     await page.evaluate(() => {
       window.historyFixture = Array.from({ length: 16 }, (_, index) => ({
         id: `refilled-${index}`, text: `Refilled dictation ${index + 1}`, app: "Notes", time: Date.now() / 1000,
@@ -2257,7 +2394,7 @@ async function run() {
     await page.getByRole("alert").filter({ hasText: "Could not copy the overview." }).waitFor()
     await page.evaluate(() => { window.clipboardUnavailable = false })
     await button("Copy overview").click()
-    await page.locator(".session-meta").getByRole("button", { name: "Copied" }).waitFor()
+    await page.locator(".workspace-actions").getByRole("button", { name: "Copied" }).waitFor()
     assert.equal(await page.evaluate(() => window.copiedSummary), "The group reviewed the agenda.\n\n- Reviewed next steps (0:07)")
     await briefToggle.click()
     await briefText.waitFor()
@@ -2364,7 +2501,7 @@ async function run() {
     publishMeeting("Draft transcript", 0, "interrupted")
     await page.goto(`http://127.0.0.1:18997/?session=${meetingId}&tab=transcript`)
     await page.getByText("Draft transcript", { exact: true }).waitFor()
-    await page.getByText("Waiting to resume meeting transcription…", { exact: true }).waitFor()
+    await page.getByText("Waiting to resume transcription…", { exact: true }).waitFor()
     publishMeeting("Updated working transcript", 4)
     await page.getByText("Updated working transcript", { exact: true }).waitFor()
     publishMeeting("Final meeting transcript", 10, "complete")
@@ -2394,6 +2531,25 @@ async function run() {
     const saveVideo = annotationPanel.getByRole("button", { name: "Save video…" })
     await saveVideo.click()
     assert.deepEqual(await page.evaluate(() => window.lastExport), { id: annotationId, kind: "audio" })
+    if (fixtureMovie) {
+      const trim = annotationPanel.getByRole("button", { name: "Trim video" })
+      await trim.click()
+      const start = annotationPanel.getByRole("slider", { name: "Clip start" })
+      const end = annotationPanel.getByRole("slider", { name: "Clip end" })
+      await start.press("ArrowRight")
+      await end.press("Home")
+      await end.press("ArrowRight")
+      await end.press("ArrowRight")
+      await annotationPanel.getByRole("button", { name: "Preview clip" }).click()
+      await page.waitForFunction(() => {
+        const player = document.querySelector(".annotation-review video")
+        return player?.paused && Math.abs(player.currentTime - .8) < .03
+      })
+      await annotationPanel.getByRole("button", { name: "Save clip…" }).click()
+      assert.deepEqual(await page.evaluate(() => window.lastExport), { id: annotationId, kind: "annotation-clip", startMs: 100, endMs: 800 })
+      await trim.click()
+      assert.equal(await start.count(), 0)
+    }
     await annotationPanel.getByRole("button", { name: "Jump to 0:00.6", exact: true }).click()
     await page.waitForFunction(() => Math.abs(document.querySelector("video")?.currentTime - .6) < .05)
     const savedVideo = annotated.audioUrl
@@ -2518,7 +2674,7 @@ async function run() {
     await button("Remember destination").click()
     await destinationPicker.getByText("Project notes · Saved for example.test · Automatic", { exact: true }).waitFor()
     assert.deepEqual(await page.evaluate(() => window.rememberedAnnotation), {
-      id: annotationId, scope: "site", service: "fixture-service", target: "ses_two", automatic: true,
+      id: annotationId, scope: "site", scopeKey: "example.test", service: "fixture-service", target: "ses_two", automatic: true,
     })
     assert.equal(await page.evaluate(() => window.sentAnnotation), undefined)
     await button("Forget").click()
@@ -2947,7 +3103,7 @@ async function run() {
     await page.getByText("Meetings are managed by your organization.", { exact: true }).waitFor()
     assert.equal(await page.locator('[data-setting-title="System Audio Recording"]').count(), 0)
     assert.equal(await button("Record Meeting").count(), 0)
-    assert.equal(await page.getByRole("switch", { name: "Offer to record detected calls" }).count(), 0)
+    assert.equal(await button("Manage calls").count(), 0)
     managedMeetings = false
     await page.evaluate(() => localStorage.removeItem("managedMeetingsFixture"))
     await page.reload()

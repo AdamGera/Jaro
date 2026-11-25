@@ -17,6 +17,7 @@ from uuid import uuid4
 from starlette.concurrency import run_in_threadpool
 
 from desktop_clipboard import copy_text
+from profile_applications import profile_aliases
 from dictation_output import (dictation_vocabulary_aliases, merge_vocabulary, parse_portable_profiles, process,
                               profile_for, rewrite_locally)
 from portable_audio_control import AudioPreferences, DictationAudio
@@ -51,6 +52,15 @@ def join_dictation(previous, text):
     return text
 
 
+@dataclass(frozen=True)
+class OutputContext:
+    application: str = ""
+    host: str = ""
+    executable: str = ""
+    site_url: str = ""
+    terminal: dict | None = None
+
+
 @dataclass
 class DictationJob:
     folder: TemporaryDirectory
@@ -68,6 +78,14 @@ class DictationJob:
     stopped: float
     captured_at: float
     done: asyncio.Event
+    raw: bool = False
+    printed: asyncio.Future | None = None
+    browser_host: str = ""
+
+
+def resolve_print(reply, result):
+    if reply is not None and not reply.done():
+        reply.set_result(result)
 
 
 def indicator_helper():
@@ -79,12 +97,12 @@ def output_vocabulary(entries, profile):
     return tuple(merge_vocabulary(profile.vocabulary if profile else (), (entry["term"] for entry in entries)))
 
 
-async def transform_output(state, text, entries, replacements, profile, *, application="", preview=False):
+async def transform_output(state, text, entries, replacements, profile, *, application="", browser_host="", preview=False):
     rewrite = None
     if profile and "rewrite" in profile.steps and not preview:
         async def rewrite(value):
             return await rewrite_locally(state.insights, value, profile.instruction, output_vocabulary(entries, profile),
-                                         profile.deadline, application=application)
+                                         profile.deadline, application=application, browser_host=browser_host)
 
     return await process(text, profile.steps if profile else (), rewrite=rewrite, builtins_only=preview,
                          global_corrections=replacements, corrections=profile.corrections if profile else "",
@@ -109,25 +127,28 @@ class PortableDictation:
         self.jobs = deque()
         self.output_task = None
         self.committing = False
+        self.canceling = False
         self.capture_idle = asyncio.Event()
         self.phase = "idle"
-        self.canceling = False
         self.feedback = ""
         self.text = ""
+        self.last_raw = False
         self.last_id = None
-        self.last_clear_epoch = None
+        self.last_clear_epoch = DEFAULT["clearEpoch"]
         self.microphone = ""
         self.microphone_fallback = False
         self.language = ""
         self.capture_languages = ()
+        self.capture_raw = False
         self.noise_cleanup = False
         self.boost_microphone = False
         self.capture_voice_input = {}
-        self.capture_output = ([], "", None)
+        self.capture_output = ([], "", [], {})
         self.vocabulary_entries = []
         self.replacements = ""
         self.output_profiles = ""
         self.profiles = []
+        self.app_aliases = {}
         self.indicator_position = "top"
         self.indicator_helper = indicator_helper()
         self.indicator_issue = False
@@ -145,7 +166,9 @@ class PortableDictation:
         except HISTORY_ERRORS:
             logger.warning("Could not read the dictation shortcut preference.", exc_info=True)
         try:
-            self.terminal = bool(history.status()[0]["terminal"])
+            preferences, _ = history.status()
+            self.terminal = bool(preferences["terminal"])
+            self.last_clear_epoch = preferences["clearEpoch"]
         except HISTORY_ERRORS:
             self.terminal = False
         try:
@@ -167,6 +190,7 @@ class PortableDictation:
         try:
             self.vocabulary_entries, self.replacements, self.output_profiles = history.output_preferences()
             self.profiles = parse_portable_profiles(self.output_profiles)
+            self.app_aliases = profile_aliases(self.platform, self.profiles)
         except HISTORY_ERRORS:
             logger.warning("Could not read the dictation output preferences.", exc_info=True)
         try:
@@ -205,6 +229,10 @@ class PortableDictation:
             self.capture_idle.set()
         else:
             self.capture_idle.clear()
+        self.update_cancel_shortcut()
+
+    def update_cancel_shortcut(self):
+        pass
 
     @property
     def queue_full(self):
@@ -213,6 +241,7 @@ class PortableDictation:
     @property
     def can_start_recording(self):
         return (self._capture_phase == "idle" and not self.queue_full and not self.committing and not self.canceling
+                and not getattr(getattr(self.state, "portable_sdk_capture", None), "busy", False)
                 and (self.action is None or self.action.done()))
 
     @property
@@ -225,12 +254,13 @@ class PortableDictation:
     def snapshot(self):
         text, key, epoch = self.text, self.last_id, self.last_clear_epoch
         try:
-            settings, saved = self.history.status(key)
-            if not saved or epoch is not None and epoch != settings["clearEpoch"]:
+            settings, saved = self.history.status(key, required=True)
+            if not saved or epoch != settings["clearEpoch"]:
                 text = ""
             history_available = True
         except HISTORY_ERRORS:
             settings, history_available = DEFAULT, False
+            text = ""
         cleanup = getattr(self.state, "stupase_cleanup", None)
         return {"enabled": self.enabled, "platform": self.platform, "shortcut": self.shortcut,
                 "shortcutRequested": self.shortcut_requested,
@@ -266,20 +296,32 @@ class PortableDictation:
     def clear_focus(self):
         pass
 
+    async def output_context(self, read_site, *, annotation=False):
+        return OutputContext(self.application)
+
     async def retain(self, result, job):
         text = result["text"]
         key = str(uuid4())
         entry = {"id": key, "time": job.captured_at, "text": text, "app": job.application,
+                 "kind": "printed" if job.printed is not None else "raw" if job.raw else "dictation",
                  "seconds": job.frames / SAMPLE_RATE, "inferenceMs": result["inferenceMs"],
                  "totalMs": round((monotonic() - job.started) * 1000)}
-        self.text, self.last_id, self.last_clear_epoch = text, None, None
-        try:
-            saved, epoch = await run_in_threadpool(self.history.record, entry, job.path)
-        except HISTORY_ERRORS:
-            logger.warning("Could not retain the dictation.", exc_info=True)
-            return "Could not save dictation history."
-        self.last_id, self.last_clear_epoch = key if saved else None, epoch
-        return ""
+
+        def save():
+            epoch = self.last_clear_epoch
+            try:
+                epoch = self.history.status(required=True)[0]["clearEpoch"]
+                saved, epoch = self.history.record(entry, job.path, clear_epoch=epoch)
+                return saved, epoch, ""
+            except HISTORY_ERRORS:
+                logger.warning("Could not retain the dictation.", exc_info=True)
+                return False, epoch, "Could not save dictation history."
+
+        saved, epoch, warning = await run_in_threadpool(save)
+        if job.printed is None:
+            self.text, self.last_id, self.last_clear_epoch = text, key if saved else None, epoch
+            self.last_raw = job.raw
+        return warning
 
     def recording_ended(self, worker):
         if self.capture is not None and self.capture.worker is worker and self.phase == "recording":
@@ -295,7 +337,7 @@ class PortableDictation:
             return "Microphone interrupted. Use Copy last or Paste Last to recover your dictation."
         return "Microphone interrupted. The dictation was copied."
 
-    def schedule(self, *, released_at=None):
+    def schedule(self, *, released_at=None, raw=False, printed=None):
         if not self.canceling and (self.action is None or self.action.done()):
             if self.capture is None:
                 if not self.can_start_recording:
@@ -304,11 +346,32 @@ class PortableDictation:
                     return False
                 self.watch_focus()
                 self.phase = "starting"
-            self.action = asyncio.create_task(self.toggle(released_at=released_at))
+            self.action = asyncio.create_task(self.toggle(released_at=released_at, raw=raw, printed=printed))
             return True
         return False
 
-    def prepare_delivery(self):
+    async def print_current_take(self):
+        async with self.control:
+            if self.state.draining:
+                raise CaptureError("Jaro is preparing to restart.")
+            if not self.enabled:
+                raise CaptureError("Enable system dictation in Jaro first.")
+            if self._capture_phase == "starting" and self.action is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(self.action), 5)
+                except TimeoutError as failure:
+                    raise CaptureError("Jaro is still opening the microphone.") from failure
+            if self._capture_phase != "recording":
+                raise CaptureError("There is no active dictation.")
+            reply = asyncio.get_running_loop().create_future()
+            if not self.schedule(printed=reply):
+                raise CaptureError("Jaro is already finishing this dictation.")
+        try:
+            return await asyncio.wait_for(reply, 60)
+        except TimeoutError as failure:
+            raise CaptureError("Timed out waiting for the dictation transcript.") from failure
+
+    def prepare_delivery(self, *, raw=False):
         return self.deliver
 
     async def start_microphone(self, filename, microphone, *, meter=False):
@@ -370,18 +433,21 @@ class PortableDictation:
             self.wake_guard = keep_awake_until(capture.worker, "Jaro is taking dictation", delay=delay, while_valid=active)
         self.sounds.play("start", self.capture_sound, delay=delay, while_valid=active, ready=ready)
 
-    async def toggle(self, *, released_at=None):
+    async def toggle(self, *, released_at=None, raw=False, printed=None):
         state = self.state
         final_cue = None
         take = self.capture
         try:
             if self.capture is not None:
-                job = await self.finish_take(released_at)
+                job = await self.finish_take(released_at, printed=printed)
+                if job is None:
+                    resolve_print(printed, {"status": "no-speech"})
                 if job is not None and asyncio.current_task() is not self.action:
                     await job.done.wait()
                 return
             async with state.portable_recording_lock:
-                if state.status != "ready" or state.draining or state.portable_recording or getattr(state, "portable_screencast", None):
+                if (state.status != "ready" or state.draining or state.portable_recording or getattr(state, "portable_screencast", None)
+                        or getattr(getattr(state, "portable_sdk_capture", None), "busy", False)):
                     self.feedback = "Dictation is unavailable while Jaro starts or records audio."
                     return
                 self.phase = "starting"
@@ -394,8 +460,9 @@ class PortableDictation:
                 position = self.indicator_position
                 meter = self.indicator_helper is not None and position != "off"
                 self.capture_languages = (self.language,) if self.language else ()
+                self.capture_raw = raw
                 self.capture_voice_input = {"noise_cleanup": self.noise_cleanup, "boost": self.boost_microphone}
-                self.capture_output = self.vocabulary_entries, self.replacements, profile_for(self.profiles, self.application)
+                self.capture_output = self.vocabulary_entries, self.replacements, self.profiles, self.app_aliases
                 self.microphone_fallback = False
                 try:
                     await self.start_microphone("speech.wav", microphone, meter=meter)
@@ -416,10 +483,15 @@ class PortableDictation:
                         self.indicator_task = asyncio.create_task(self.run_indicator(position))
         except CaptureError as failure:
             self.feedback = str(failure)
+            resolve_print(printed, {"error": self.feedback})
             final_cue = "error"
+        except asyncio.CancelledError:
+            resolve_print(printed, {"error": "Dictation canceled."})
+            raise
         except Exception:
             logger.exception("Portable dictation failed.")
             self.feedback = "Could not finish the dictation."
+            resolve_print(printed, {"error": self.feedback})
             final_cue = "error"
         finally:
             if (self.capture is take or take is None) and (self._capture_phase != "recording" or final_cue):
@@ -428,25 +500,45 @@ class PortableDictation:
                 if final_cue:
                     self.sounds.play(final_cue, self.capture_sound, after=self.audio_control.task)
 
-    async def finish_take(self, released_at):
+    async def finish_take(self, released_at, *, printed=None):
         self.phase = "transcribing"
         started, captured_at = monotonic(), time()
         capture = self.capture
-        if released_at is None:
-            await capture.stop()
-        else:
-            await capture.finish_dictation(released_at)
-        restored = self.audio_control.release()
+        vocabulary, replacements, profiles, aliases = self.capture_output
+        output = OutputContext(self.application)
+        context = None
+        if not self.capture_raw and not capture.interrupted:
+            read_site = any(profile.target.casefold().startswith("site:") or "rewrite" in profile.steps for profile in profiles)
+            context = asyncio.create_task(self.output_context(read_site))
+        try:
+            if released_at is None:
+                await capture.stop()
+            else:
+                await capture.finish_dictation(released_at)
+            restored = self.audio_control.release()
+            if context is not None and not capture.interrupted:
+                with suppress(OSError, ValueError):
+                    output = await context
+                context = None
+        finally:
+            if context is not None:
+                context.cancel()
+                await asyncio.gather(context, return_exceptions=True)
         if capture.interrupted:
             if not self.recover_interruption():
                 return None
         else:
             self.sounds.play("stop", self.capture_sound, after=restored)
+        application, host = output.application, output.host
+        profile = profile_for(profiles, application, bundle=output.executable, host=host,
+                              bundle_name=aliases.get(application.casefold(), ""))
         job = DictationJob(
             self.folder, capture.path, capture.frames, self.capture_languages, self.capture_voice_input,
-            self.capture_output, self.application,
-            self.copy_interrupted_text if capture.interrupted else self.prepare_delivery(), self.capture_sound,
+            (vocabulary, replacements, profile), application,
+            self.copy_interrupted_text if capture.interrupted else self.prepare_delivery(raw=self.capture_raw),
+            self.capture_sound,
             capture.interrupted, self.microphone_fallback, started, monotonic(), captured_at, asyncio.Event(),
+            raw=self.capture_raw, printed=printed, browser_host=host,
         )
         self.folder = None
         try:
@@ -468,29 +560,37 @@ class PortableDictation:
             except Exception:
                 logger.exception("Portable dictation failed.")
                 self.feedback = "Could not finish the dictation."
+                resolve_print(job.printed, {"error": self.feedback})
             finally:
                 self.committing = False
                 self.jobs.popleft()
+                self.update_cancel_shortcut()
                 job.folder.cleanup()
                 try:
                     if not self.jobs and self._capture_phase == "idle" and self.capture is None:
                         self.clear_focus()
                         await self.stop_indicator()
                 finally:
+                    resolve_print(job.printed, {"error": "Dictation canceled."})
                     job.done.set()
 
     async def process_job(self, job):
         vocabulary, replacements, profile = job.output
-        terms = output_vocabulary(vocabulary, profile)
-        result = await self.transcribe(self.state, job.path, job.languages, vocabulary=terms or None, **job.voice)
+        # None asks the decoder to use the library vocabulary. Raw must explicitly use no terms.
+        terms = () if job.raw else (output_vocabulary(vocabulary, profile) or None)
+        result = await self.transcribe(self.state, job.path, job.languages, vocabulary=terms, **job.voice)
         text = result["text"]
         warnings = ()
-        if text and (vocabulary or replacements or profile):
+        if job.raw:
+            text = text.strip()
+            result = {**result, "text": text}
+        elif text and (vocabulary or replacements or profile):
             output = await transform_output(self.state, text, vocabulary, replacements, profile,
-                                            application=job.application)
+                                            application=job.application, browser_host=job.browser_host)
             text, warnings = output.text, output.warnings
             if not text:
                 self.feedback = "Nothing left to paste after applying the output settings."
+                resolve_print(job.printed, {"error": self.feedback})
                 return
             result = {**result, "text": text}
         # Do not send paste shortcuts or play completion cues into a newer capture.
@@ -499,14 +599,20 @@ class PortableDictation:
         final_cue = None
         if text:
             self.committing = True
+            self.update_cancel_shortcut()
             history_error = await self.retain(result, job)
-            self.feedback = await job.delivery(text)
+            if job.printed is not None:
+                self.feedback = "Returned dictation to the command."
+                resolve_print(job.printed, {"status": "transcript", "text": text})
+            else:
+                self.feedback = await job.delivery(text)
             if self.feedback == PASTE_SENT and job.sound.style in DONE_STYLES and monotonic() - job.stopped >= DONE_DELAY:
                 final_cue = "done"
             self.feedback = " ".join(filter(None, (self.feedback, history_error, *warnings)))
         else:
             self.feedback = ("Microphone interrupted before Jaro could recover any speech."
                              if job.interrupted else "No speech detected.")
+            resolve_print(job.printed, {"status": "no-speech"})
             final_cue = "error"
         if job.microphone_fallback:
             self.feedback = f"{self.feedback} Used the system microphone because the selected one was unavailable.".strip()
@@ -526,6 +632,7 @@ class PortableDictation:
             self.clear_focus()
             await self.stop_indicator()
         self.application = ""
+        self.capture_raw = False
         if self.capture is not None:
             capture, self.capture = self.capture, None
             with suppress(OSError):
@@ -539,6 +646,7 @@ class PortableDictation:
     async def cancel_capture(self, *, audible=False, include_pending=False):
         play_cancel = audible and self._capture_phase in ("recording", "transcribing")
         self.canceling = True
+        self.update_cancel_shortcut()
         try:
             if self.action is not None:
                 if self.phase != "delivering":
@@ -556,9 +664,10 @@ class PortableDictation:
                 await self.audio_control.settle()
         finally:
             self.canceling = False
+            self.update_cancel_shortcut()
 
     async def cancel_pending(self):
-        # Keep a paste and its clipboard restoration atomic, even during shutdown.
+        # Let an in-flight paste reach its delivery acknowledgement during shutdown.
         while len(self.jobs) > 1:
             self.drop_job(self.jobs.pop())
         if self.output_task is not None:
@@ -575,6 +684,7 @@ class PortableDictation:
     @staticmethod
     def drop_job(job):
         job.folder.cleanup()
+        resolve_print(job.printed, {"error": "Dictation canceled."})
         job.done.set()
 
     async def cancel_dictation(self):
@@ -584,11 +694,14 @@ class PortableDictation:
             await self.cancel_capture(audible=True)
         elif len(self.jobs) > 1:
             self.drop_job(self.jobs.pop())
+            self.update_cancel_shortcut()
         else:
             self.canceling = True
+            self.update_cancel_shortcut()
             try:
                 await self.cancel_pending()
             finally:
                 self.canceling = False
+                self.update_cancel_shortcut()
         self.feedback = "Dictation canceled."
         return True

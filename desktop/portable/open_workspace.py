@@ -6,15 +6,18 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "engine"))
 
 from sdk_embedded import owned_service, verify_service
 from engine_paths import library_path
+from linux_direct import STARTUP_ENV, STARTUP_RECEIPT, WINDOW_STARTUP_SECONDS, WORKSPACE_CONNECTED
 from desktop_instance import STARTUP_VARIABLES, claim_desktop, replace_private, startup_environment
 
 
@@ -91,8 +94,12 @@ def run_owned_workspace(instance, host, *, installed, background):
         environment["JARO_DICTATION_AUDIO"] = str(host.with_name("jaro-audio-control.exe"))
         environment["JARO_CALL_SURFACE"] = str(host.with_name("jaro-call-surface.exe"))
         environment["JARO_TRAY_HELPER"] = str(host.with_name("jaro-tray.exe"))
+        environment["JARO_SAVE_VIDEO_DIALOG"] = str(host.with_name("jaro-save-video.exe"))
     elif sys.platform == "linux":
+        environment["JARO_SAVE_VIDEO_DIALOG"] = str(host.with_name("jaro-save-video"))
         environment["JARO_LINUX_PEN"] = str(host.with_name("jaro-pen"))
+        environment["JARO_WAYLAND_FOCUS"] = str(host.with_name("jaro-focused-window"))
+        environment["JARO_WAYLAND_CLIPBOARD"] = str(host.with_name("jaro-wayland-clipboard"))
         environment["JARO_DICTATION_INDICATOR"] = str(host.with_name("jaro-indicator"))
         environment["JARO_CALL_SURFACE"] = str(host.with_name("jaro-call-surface"))
     scheduled = False
@@ -133,16 +140,28 @@ def take_open(instance, tray):
     return b""
 
 
+def update_startup_folder():
+    if not (value := os.environ.get(STARTUP_ENV)):
+        return None
+    folder = Path(value)
+    if (not folder.is_absolute() or folder.parent.resolve() != Path(tempfile.gettempdir()).resolve()
+            or not folder.name.startswith("jaro-update-") or not folder.is_dir() or folder.is_symlink()):
+        raise ValueError("Invalid Jaro update startup folder.")
+    return folder
+
+
 def run_desktop(instance, host, record, engine, tray, *, background):
     connection = HTTPConnection("127.0.0.1", record["port"], timeout=3)
     try:
         verify_service(connection, record)
     finally:
         connection.close()
-    key = record.get("workspaceKey")
+    key = record.get("workspaceDesktopKey")
     if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key):
         raise RuntimeError("Jaro’s workspace did not return a valid connection key.")
     base = {**os.environ, "JARO_WORKSPACE_PORT": str(record["port"]), "JARO_WORKSPACE_KEY": key}
+    base.pop(STARTUP_ENV, None)
+    update_startup = None if background else update_startup_folder()
     result = 0
     activation = None
     if background:
@@ -152,17 +171,19 @@ def run_desktop(instance, host, record, engine, tray, *, background):
             except subprocess.TimeoutExpired:
                 continue
     while engine.poll() is None:
+        closed = tray / "workspace-closed"
+        closed.unlink(missing_ok=True)
         environment = dict(base)
         if activation is not None:
             for name in STARTUP_VARIABLES:
                 environment.pop(name, None)
             environment.update(startup_environment(activation))
-        result = run_window(instance, host, engine, tray, environment)
+        result = run_window(instance, host, engine, tray, environment, update_startup=update_startup)
+        update_startup = None
         if result != 0 or engine.poll() is not None:
             return result
+        closed.touch()
         while (activation := take_open(instance, tray)) is None:
-            if not (tray / "ready").is_file():
-                return result
             try:
                 return engine.wait(timeout=0.2)
             except subprocess.TimeoutExpired:
@@ -170,7 +191,20 @@ def run_desktop(instance, host, record, engine, tray, *, background):
     return engine.returncode
 
 
-def run_window(instance, host, engine, tray, environment):
+def confirm_update_startup(folder, tray):
+    if not (tray / WORKSPACE_CONNECTED).is_file():
+        return False
+    replace_private(folder / STARTUP_RECEIPT, b"ready\n")
+    return True
+
+
+def run_window(instance, host, engine, tray, environment, *, update_startup=None):
+    if sys.platform == "win32":
+        # The default WebView2 profile follows the versioned executable path.
+        # Keep workspace drafts and preferences with this library across updates.
+        environment = environment.copy()
+        environment.setdefault("WEBVIEW2_USER_DATA_FOLDER", str(library_path() / ".webview2"))
+    startup_deadline = time.monotonic() + WINDOW_STARTUP_SECONDS if update_startup is not None else None
     with subprocess.Popen([host], stdin=subprocess.PIPE, bufsize=0, env=environment) as window:
         try:
             with suppress(OSError):
@@ -183,16 +217,24 @@ def run_window(instance, host, engine, tray, environment):
                 forwarding = False
             pending = b""
             while engine.poll() is None:
+                if update_startup is not None:
+                    if confirm_update_startup(update_startup, tray):
+                        update_startup = None
+                    elif time.monotonic() >= startup_deadline:
+                        return 1
                 if forwarding and not pending and (activation := take_open(instance, tray)) is not None:
                     pending = activation[1:] + b"\n"
                 if pending:
                     with suppress(OSError):
                         pending = pending[window.stdin.write(pending) or 0:]
                 try:
-                    return window.wait(timeout=0.2)
+                    result = window.wait(timeout=0.2)
                 except subprocess.TimeoutExpired:
                     continue
-            return engine.returncode
+                if update_startup is not None and not confirm_update_startup(update_startup, tray):
+                    return 1
+                return result
+            return 1 if update_startup is not None else engine.returncode
         finally:
             with suppress(OSError):
                 (tray / "window-pid").unlink(missing_ok=True)
@@ -211,10 +253,17 @@ def main():
     parser.add_argument("--background", action="store_true", help="Start the engine and wait for a request to open the workspace.")
     parser.add_argument("host", type=Path, help="Path to the built Jaro Native SDK executable.")
     args = parser.parse_args()
+    if sys.platform == "linux" and STARTUP_ENV in os.environ:
+        signal.signal(signal.SIGTERM, exit_update_probe)
     try:
         return open_workspace(args.host.resolve(strict=True), installed=args.installed, background=args.background)
     except (OSError, RuntimeError, ValueError) as error:
         parser.exit(1, f"{error}\n")
+
+
+def exit_update_probe(_signal, _frame):
+    # Unwind the workspace and engine owners when the updater cancels a probe.
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

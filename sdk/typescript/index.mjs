@@ -1,18 +1,39 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto"
-import { spawn } from "node:child_process"
+import { execFile, spawn } from "node:child_process"
 import { constants } from "node:fs"
 import { open, realpath, stat } from "node:fs/promises"
 import { Agent, request } from "node:http"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join } from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
 import { fileURLToPath } from "node:url"
+import { promisify } from "node:util"
 
 const DISCOVERY_FILE = ".jard-sdk.json"
 const SDK_VERSION = 1
 const API = "/api/sdk/v1"
 const MAX_RESPONSE = 8 * 1024 * 1024
 const DEFAULT_HELPER = fileURLToPath(new URL("../../../Helpers/jard-engine", import.meta.url))
+const execute = promisify(execFile)
+
+function installedPython(entry) {
+  const root = fileURLToPath(new URL("../../", import.meta.url))
+  const python = process.platform === "win32" ? join(root, "python", "python.exe") : join(root, "venv", "bin", "python")
+  return [python, "-EsB", "-X", "utf8", join(root, "engine", entry)]
+}
+
+function defaultLibrary() {
+  if (process.env.RUMBLE_DATA_DIR) return process.env.RUMBLE_DATA_DIR
+  if (process.platform === "win32") {
+    const base = process.env.LOCALAPPDATA ?? ""
+    return join(isAbsolute(base) ? base : join(homedir(), "AppData", "Local"), "Jaro")
+  }
+  if (process.platform === "linux") {
+    const base = process.env.XDG_DATA_HOME ?? ""
+    return join(isAbsolute(base) ? base : join(homedir(), ".local", "share"), "jaro")
+  }
+  return join(homedir(), "Library", "Application Support", "Rumble")
+}
 
 export class JardSDKError extends Error {
   constructor(code, message, status) {
@@ -23,7 +44,27 @@ export class JardSDKError extends Error {
   }
 }
 
-async function discover(path) {
+function checkDiscovery(record, libraryId) {
+  if (!record || record.libraryId !== libraryId || !/^[0-9a-f]{64}$/.test(libraryId) || !/^[0-9a-f]{64}$/.test(record.token)
+      || !Number.isSafeInteger(record.pid) || record.pid < 1 || !Number.isInteger(record.port)
+      || record.port < 1 || record.port > 65535) throw new Error("Invalid discovery record")
+}
+
+async function discoverWindows(path, signal) {
+  const [python, ...args] = installedPython("sdk_discovery.py")
+  try {
+    const { stdout } = await execute(python, [...args, path], { windowsHide: true, timeout: 3000, maxBuffer: 8192, signal })
+    const record = JSON.parse(stdout)
+    checkDiscovery(record, record?.libraryId)
+    return record
+  } catch (error) {
+    signal?.throwIfAborted()
+    if (error.code === 2) throw new JardSDKError("not-running", "Start Jaro to use its SDK.")
+    throw new JardSDKError("invalid-discovery", "Could not read Jard’s private SDK discovery record.")
+  }
+}
+
+async function discoverFile(path) {
   const folder = path.startsWith("~/") ? join(homedir(), path.slice(2)) : path
   let root, file
   try {
@@ -43,16 +84,11 @@ async function discover(path) {
     record = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"))
     const folder = await stat(root, { bigint: true })
     const libraryId = createHash("sha256").update(`${folder.dev}:${folder.ino}`).digest("hex")
-    if (!record || record.libraryId !== libraryId || !/^[0-9a-f]{64}$/.test(record.token)
-        || !Number.isSafeInteger(record.pid) || record.pid < 1 || !Number.isInteger(record.port)
-        || record.port < 1 || record.port > 65535) throw new Error()
+    checkDiscovery(record, libraryId)
   } catch {
     throw new JardSDKError("invalid-discovery", "Jard’s SDK discovery record is invalid or has unsafe permissions.")
   } finally {
     await file.close()
-  }
-  if (record.apiVersion !== SDK_VERSION) {
-    throw new JardSDKError("incompatible-service", "This Jard SDK version cannot connect to the running engine.")
   }
   return record
 }
@@ -234,9 +270,12 @@ function recordingFor(record, { id, ownerToken, sampleRate }) {
   })
 }
 
-export async function connect({ library = process.env.RUMBLE_DATA_DIR || join(homedir(), "Library", "Application Support", "Rumble"),
-  signal } = {}) {
-  const record = await discover(library)
+export async function connect({ library = defaultLibrary(), signal } = {}) {
+  signal?.throwIfAborted()
+  const record = process.platform === "win32" ? await discoverWindows(library, signal) : await discoverFile(library)
+  if (record.apiVersion !== SDK_VERSION) {
+    throw new JardSDKError("incompatible-service", "This Jard SDK version cannot connect to the running engine.")
+  }
   await verifiedExchange(record, "/health", { signal })
   return Object.freeze({
     ...clientFor(record),
@@ -257,43 +296,67 @@ export async function connect({ library = process.env.RUMBLE_DATA_DIR || join(ho
   })
 }
 
-function readReady(child, exited, signal, timeoutMs) {
+function readReady(child, signal, timeoutMs, onProgress) {
   return new Promise((resolve, reject) => {
     let buffer = Buffer.alloc(0)
     let finished = false
+    const invalid = new JardSDKError("invalid-handshake", "Jard returned an invalid embedded startup record.")
     const finish = (error, record) => {
       if (finished) return
       finished = true
       clearTimeout(timer)
       signal?.removeEventListener("abort", abort)
       child.stdout.off("data", receive)
+      child.off("close", closed)
       child.stdout.resume()
       if (error) reject(error)
       else resolve(record)
     }
     const abort = () => finish(signal.reason || new JardSDKError("aborted", "The embedded Jard startup was cancelled."))
+    const closed = () => finish(new JardSDKError("startup-failed", "The embedded Jard helper stopped before it was ready. Check that Jard’s model is installed."))
     const receive = chunk => {
-      if (buffer.length + chunk.length > 4096) {
-        finish(new JardSDKError("invalid-handshake", "Jard returned an invalid embedded startup record."))
-        return
-      }
       buffer = Buffer.concat([buffer, chunk])
-      const newline = buffer.indexOf(10)
-      if (newline < 0) return
-      try {
-        const record = JSON.parse(buffer.subarray(0, newline).toString("utf8"))
+      while (!finished) {
+        const newline = buffer.indexOf(10)
+        if (newline < 0) {
+          if (buffer.length > 4096) finish(invalid)
+          return
+        }
+        if (newline > 4096) return finish(invalid)
+        let record
+        try { record = JSON.parse(buffer.subarray(0, newline).toString("utf8")) }
+        catch { return finish(invalid) }
+        buffer = buffer.subarray(newline + 1)
+        if (!record || typeof record !== "object") return finish(invalid)
+        if (onProgress && record.type === "progress") {
+          const { phase, completedBytes, totalBytes } = record
+          let progress = { phase }
+          if (phase === "installing") {
+            if (!Number.isSafeInteger(completedBytes) || !Number.isSafeInteger(totalBytes) || totalBytes <= 0
+                || completedBytes < 0 || completedBytes > totalBytes) return finish(invalid)
+            progress = { phase, completedBytes, totalBytes }
+          } else if (phase !== "checking" && phase !== "loading") return finish(invalid)
+          try { onProgress(progress) } catch (error) { return finish(error) }
+          continue
+        }
+        if (onProgress && record.type === "error") {
+          if (record.code === "model-prepare-failed") {
+            return finish(new JardSDKError(record.code, "Could not verify and install the pinned Rumble2 Flash files."))
+          }
+          if (record.code === "model-load-failed") {
+            return finish(new JardSDKError(record.code, "The installed Rumble2 Flash model could not start."))
+          }
+        }
         if (record.type !== "ready" || record.pid !== child.pid || record.apiVersion !== SDK_VERSION
             || !Number.isInteger(record.port) || record.port < 1 || record.port > 65535
             || record.url !== `http://127.0.0.1:${record.port}` || !/^[0-9a-f]{64}$/.test(record.token)
-            || !/^[0-9a-f]{64}$/.test(record.libraryId) || buffer.subarray(newline + 1).toString("utf8").trim()) throw new Error()
+            || !/^[0-9a-f]{64}$/.test(record.libraryId) || buffer.toString("utf8").trim()) return finish(invalid)
         finish(undefined, record)
-      } catch {
-        finish(new JardSDKError("invalid-handshake", "Jard returned an invalid embedded startup record."))
       }
     }
     const timer = setTimeout(() => finish(new JardSDKError("startup-timeout", "The embedded Jard helper did not become ready.")), timeoutMs)
     signal?.addEventListener("abort", abort, { once: true })
-    void exited.then(() => finish(new JardSDKError("startup-failed", "The embedded Jard helper stopped before it was ready. Check that Jard’s model is installed.")))
+    child.once("close", closed)
     child.stdout.on("data", receive)
     if (signal?.aborted) abort()
   })
@@ -310,7 +373,9 @@ async function exitsWithin(exited, milliseconds) {
   }
 }
 
-export async function create({ command = [DEFAULT_HELPER, "service", "--embedded"], library, signal, startupTimeoutMs = 60_000 } = {}) {
+export async function create({ command = process.platform === "darwin" ? [DEFAULT_HELPER, "service", "--embedded"]
+  : [...installedPython("server.py"), "--embedded"], library, signal, prepare = false, onProgress,
+  startupTimeoutMs = prepare ? 30 * 60_000 : 60_000 } = {}) {
   signal?.throwIfAborted()
   if (!Array.isArray(command) || !command.length || command.some(part => typeof part !== "string" || !part)) {
     throw new JardSDKError("invalid-command", "Pass an executable and its arguments to start embedded Jard.")
@@ -318,7 +383,21 @@ export async function create({ command = [DEFAULT_HELPER, "service", "--embedded
   if (!Number.isInteger(startupTimeoutMs) || startupTimeoutMs < 1 || startupTimeoutMs > 2147483647) {
     throw new JardSDKError("invalid-timeout", "Pass a positive startup timeout in milliseconds.")
   }
-  const child = spawn(command[0], command.slice(1), {
+  if (typeof prepare !== "boolean" && (!prepare || typeof prepare !== "object" || Array.isArray(prepare))) {
+    throw new JardSDKError("invalid-preparation", "Pass true or a preparation options object.")
+  }
+  const { from, repair } = prepare === false ? {} : prepare
+  if ((from !== undefined && (typeof from !== "string" || !from.trim()))
+      || (repair !== undefined && typeof repair !== "boolean") || (onProgress !== undefined && typeof onProgress !== "function")) {
+    throw new JardSDKError("invalid-preparation", "Pass a model cache path, a repair boolean, and an optional progress function.")
+  }
+  const args = command.slice(1)
+  if (prepare) {
+    args.push("--prepare-speech-model")
+    if (from !== undefined) args.push("--speech-model-source", from)
+    if (repair) args.push("--repair-speech-model")
+  }
+  const child = spawn(command[0], args, {
     detached: process.platform !== "win32", windowsHide: true, stdio: ["pipe", "pipe", "ignore"],
     env: library === undefined ? process.env : { ...process.env, RUMBLE_DATA_DIR: library },
   })
@@ -342,7 +421,7 @@ export async function create({ command = [DEFAULT_HELPER, "service", "--embedded
     }
   })()
   try {
-    const record = await readReady(child, exited, signal, startupTimeoutMs)
+    const record = await readReady(child, signal, startupTimeoutMs, prepare ? onProgress ?? (() => {}) : undefined)
     const health = await verifiedExchange(record, "/health", { signal })
     if (health?.status !== "ready") throw new JardSDKError("model-unavailable", "The embedded Jard model is unavailable.")
     const client = clientFor(record)

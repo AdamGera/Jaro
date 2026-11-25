@@ -474,17 +474,33 @@ static void exerciseRollout(ChannelFixtureUpdater *updater, NSURL *root) {
     [updater cancel];
 }
 
-int main(void) {
+int main(int argc, const char *argv[]) {
     @autoreleasepool {
+        if (argc > 1 && !strcmp(argv[1], "--jaro-relaunch-update")) return JardRunUpdateRelaunch(argc, argv);
         NSBundle *bundle = NSBundle.mainBundle;
         NSURL *root = bundle.bundleURL.URLByStandardizingPath.URLByDeletingLastPathComponent;
         NSString *version = [bundle objectForInfoDictionaryKey:@"CFBundleVersion"];
+        NSString *flavor = [bundle objectForInfoDictionaryKey:@"FixtureFlavor"];
+        if ([flavor isEqual:@"broken-update"]) return 2;
         ChannelFixtureUpdater *updater = makeUpdater(bundle, root);
         NSDictionary *state = [updater status];
         assert(![state[@"staged"] boolValue] && ![state[@"updatesDisabled"] boolValue]);
         NSString *channel = state[@"installedChannel"];
         assert(([state[@"channels"] isEqual:@[@"stable", @"dev"]]));
         NSString *failure = nil;
+        if ([flavor isEqual:@"rollback-installed"]) {
+            [updater check];
+            if ([NSProcessInfo.processInfo.environment[@"JARD_UPDATE_ROLLED_BACK"] isEqual:@"1"]) {
+                assert([version isEqual:@"3.0.0"]);
+                state = awaitPhase(updater, @"error");
+                assert(![state[@"staged"] boolValue] && [state[@"message"] containsString:@"failed to start"]);
+                writeAt(root, @"rollback-reoffer-checked", @"restored the previous bundle and skipped the failed archive");
+            } else {
+                assert([awaitPhase(updater, @"ready")[@"version"] isEqual:@"4.0.0"]);
+                if (argc == 1) assert(awaitInstall(updater, YES, &failure));
+            }
+            return 0;
+        }
         if ([[bundle objectForInfoDictionaryKey:@"FixtureFlavor"] isEqual:@"rollout-installed"]) {
             exerciseRollout(updater, root);
             return 0;

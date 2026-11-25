@@ -1,14 +1,15 @@
 # Contributing to Jaro
 
-Use [GitHub Issues](https://github.com/AdamGera/Jaro/issues) for bugs and feature ideas. For a bug, include the macOS version, app version, steps to reproduce, and what you expected. A synthetic recording or a short, redacted log excerpt is enough for most reports. Use the [security policy](SECURITY.md) for vulnerability reports.
+Use [GitHub Issues](https://github.com/AdamGera/Jaro/issues) for bugs and feature ideas. For a bug, include the operating system and app versions, steps to reproduce, and what you expected. A synthetic recording or a short, redacted log excerpt is enough for most reports. Use the [security policy](SECURITY.md) for vulnerability reports.
 
 ## Find the code
 
 | Directory | What's inside |
 | --- | --- |
 | [engine/](engine/) | Python audio engine, HTTP service, local models, session storage, and CLI |
-| [src/](src/) | React workspace shared by the Mac app and the local browser |
-| [desktop/](desktop/) | AppKit host, native recording, permissions, updater, and macOS packaging |
+| [src/](src/) | React workspace shared by the desktop apps and the local browser |
+| [desktop/](desktop/) | Native desktop hosts, platform capture helpers, installers, and integration fixtures |
+| [mobile/](mobile/) | Native iOS and Android keyboards, offline dictation, and their build and release guides |
 | [sdk/](sdk/) | TypeScript integration with the local transcription service |
 | [tests/](tests/) | Python unit tests |
 | [desktop/tests/](desktop/tests/) | Native, bridge, and WebKit integration fixtures |
@@ -16,7 +17,7 @@ Use [GitHub Issues](https://github.com/AdamGera/Jaro/issues) for bugs and featur
 
 ## Build and check
 
-Use the shared [Sessions and Meetings architecture](docs/recording-workspace.md) for new recording features and platform ports.
+Implement new recording features in the layers shared by **New session** and **Record Meeting**. Use the [Sessions and Meetings architecture and verification checklist](docs/recording-workspace.md) for changes to capture, transcription, storage, the workspace, or a desktop port.
 
 Use Apple Silicon macOS 26 or later for native builds. For the Python and web workspace, install Python 3.13 through uv, Bun, and the FFmpeg tools. Run these commands from the repository root:
 

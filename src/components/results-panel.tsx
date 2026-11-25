@@ -1,7 +1,8 @@
+import { MeetingTranscriptEdit } from "./meeting-transcript-edit"
 import { useInterfaceLanguage } from "@/interface-language"
-import { Component, lazy, Suspense, useCallback, useDeferredValue, useMemo, useEffect, useRef, useState, type ReactNode, type RefObject } from "react"
+import { Component, lazy, Suspense, useCallback, useDeferredValue, useMemo, useEffect, useRef, useState, type ReactNode } from "react"
 import { createPortal } from "react-dom"
-import { AudioLines, CalendarDays, ChartNoAxesColumnIncreasing, Check, ChevronUp, Clock3, Copy, Download, FileText, LayoutDashboard, ListTree, Pencil, RotateCw, StickyNote, UsersRound } from "lucide-react"
+import { AudioLines, CalendarDays, ChartNoAxesColumnIncreasing, Check, ChevronUp, Clock3, Copy, Download, FileText, LayoutDashboard, ListTree, Pencil, Play, RotateCw, Scissors, StickyNote, UsersRound } from "lucide-react"
 import { isSettledMeeting, type MeetingBrief, type MeetingExport, type SavedSession, type Transcript } from "@/audio"
 import { clock } from "@/speaker-activity"
 import { overviewDraftKey, readOverviewDraft } from "@/overview-draft"
@@ -33,6 +34,7 @@ type Props = {
   working: boolean; recording: boolean; followLive: boolean; emptyText: string; progress: ReactNode
   copied: boolean; onCopy: () => void
   dictationEnabled: boolean; onDictationBusy: (busy: boolean) => void
+  onMeetingEdited: (session: SavedSession) => void
   onMeetingRenamed: (id: string, title: string, exported: MeetingExport | null) => void
 }
 const date = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" })
@@ -64,25 +66,74 @@ const missingAnnotationVideo = {
   screenInterrupted: "The video source stopped before it saved a usable picture.",
 } as const
 
-function AnnotationPanel({ id, annotation, movie, movieName, videoExpired, unavailable, video, onPlay, onListen }: {
+function AnnotationPanel({ id, annotation, movie, movieName, videoExpired, unavailable, setVideo, onPlay, onListen }: {
   id: string; annotation: NonNullable<SavedSession["annotation"]>; movie: string | null; movieName: string
-  videoExpired: boolean; unavailable: boolean; video: RefObject<HTMLVideoElement | null>; onPlay: () => void; onListen?: () => void
+  videoExpired: boolean; unavailable: boolean; setVideo: (node: HTMLVideoElement | null) => void; onPlay: () => void; onListen?: () => void
 }) {
   const { t } = useInterfaceLanguage()
   const [busy, setBusy] = useState(false)
   const [canSeek, setCanSeek] = useState(false)
+  const [duration, setDuration] = useState(0)
+  const [clip, setClip] = useState<{ startMs: number; endMs: number } | null>(null)
+  const previewing = useRef(false)
+  const video = useRef<HTMLVideoElement>(null)
+  const attachVideo = useCallback((node: HTMLVideoElement | null) => {
+    video.current = node
+    setVideo(node)
+  }, [setVideo])
   const [error, setError] = useState("")
   const [shareStatus, setShareStatus] = useState("")
   const native = desktopBridge()
+  const portableSave = document.documentElement.hasAttribute("data-jaro-portable-video-export")
+  const canSaveVideo = !!native || portableSave
 
-  async function save(kind: "audio" | "annotation-manifest" | "annotation-contact-sheet") {
-    if (!native) return
+  async function save(kind: "audio" | "annotation-manifest" | "annotation-contact-sheet" | "annotation-clip") {
+    if (kind === "annotation-clip" && !clip) return
     setShareStatus("")
     setError("")
     setBusy(true)
-    try { await native.request("export", { id, kind }) }
+    try {
+      if (native) {
+        if (kind !== "annotation-clip") await native.request("export", { id, kind })
+        else if (clip) await native.request("export", { id, kind, ...clip })
+      } else if (portableSave) {
+        const response = await fetch(`/api/portable/annotations/${id}/export`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ span: kind === "annotation-clip" ? clip : null }),
+        })
+        const value = await response.json()
+        if (!response.ok) throw new Error(typeof value.detail === "string" ? value.detail : t("Could not export the annotation."))
+        if (value.saved) setShareStatus(t(kind === "annotation-clip" ? "Saved video clip." : "Saved video."))
+      }
+    }
     catch (failure) { setError(failure instanceof Error ? failure.message : "Could not export the annotation.") }
     finally { setBusy(false) }
+  }
+
+  function setClipBoundary(boundary: "startMs" | "endMs", ms: number) {
+    if (!clip || !video.current) return
+    previewing.current = false
+    video.current.pause()
+    video.current.currentTime = ms / 1000
+    setClip({ ...clip, [boundary]: ms })
+  }
+
+  function toggleTrim() {
+    previewing.current = false
+    video.current?.pause()
+    setClip(clip ? null : { startMs: 0, endMs: duration })
+  }
+
+  async function previewClip() {
+    if (!clip || !video.current) return
+    const player = video.current
+    player.currentTime = clip.startMs / 1000
+    previewing.current = true
+    try { await player.play() }
+    catch {
+      previewing.current = false
+      setError(t("Could not play the video clip."))
+    }
   }
 
   async function shareAnnotation(action: "copyAnnotation" | "pasteAnnotation") {
@@ -109,13 +160,42 @@ function AnnotationPanel({ id, annotation, movie, movieName, videoExpired, unava
 
   return <div className="annotation-review">
     {movie && <>
-      <video ref={video} src={movie} controls playsInline preload="metadata" aria-label={t("Annotation recording")}
-        onPlay={onPlay} onLoadedMetadata={() => setCanSeek(true)} />
+      <video ref={attachVideo} src={movie} controls playsInline preload="metadata" aria-label={t("Annotation recording")}
+        onPlay={onPlay} onPause={() => { previewing.current = false }} onLoadedMetadata={event => {
+          const seconds = event.currentTarget.duration
+          setDuration(Number.isFinite(seconds) ? Math.round(seconds * 1000) : 0)
+          setCanSeek(true)
+        }} onTimeUpdate={event => {
+          if (!clip || !previewing.current || event.currentTarget.currentTime < clip.endMs / 1000) return
+          previewing.current = false
+          event.currentTarget.pause()
+          event.currentTarget.currentTime = clip.endMs / 1000
+        }} />
       <div className="annotation-review-tools">
-        {native
+        {canSaveVideo
           ? <Button variant="outline" size="sm" disabled={busy} onClick={() => void save("audio")}><Download />{t("Save video…")}</Button>
           : <Button asChild variant="outline" size="sm"><a href={movie} download={movieName}><Download />{t("Download video")}</a></Button>}
+        {canSaveVideo && duration > 500 && <Button variant="outline" size="sm" aria-expanded={!!clip}
+          disabled={busy} onClick={toggleTrim}><Scissors />{t("Trim video")}</Button>}
       </div>
+      {clip && <div className="annotation-trim" role="group" aria-label={t("Video clip range")}>
+        <label>{t("Clip start")}
+          <input type="range" min={0} max={Math.floor((clip.endMs - 500) / 100)} value={Math.floor(clip.startMs / 100)}
+            aria-label={t("Clip start")} aria-valuetext={annotationTime(clip.startMs / 1000)} disabled={busy}
+            onChange={event => setClipBoundary("startMs", event.currentTarget.valueAsNumber * 100)} />
+          <span>{annotationTime(clip.startMs / 1000)}</span>
+        </label>
+        <label>{t("Clip end")}
+          <input type="range" min={Math.ceil((clip.startMs + 500) / 100)} max={Math.ceil(duration / 100)} value={Math.ceil(clip.endMs / 100)}
+            aria-label={t("Clip end")} aria-valuetext={annotationTime(clip.endMs / 1000)} disabled={busy}
+            onChange={event => setClipBoundary("endMs", Math.min(duration, event.currentTarget.valueAsNumber * 100))} />
+          <span>{annotationTime(clip.endMs / 1000)}</span>
+        </label>
+        <div className="annotation-review-tools">
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => void previewClip()}><Play />{t("Preview clip")}</Button>
+          <Button variant="outline" size="sm" disabled={busy} onClick={() => void save("annotation-clip")}><Download />{t("Save clip…")}</Button>
+        </div>
+      </div>}
     </>}
     {annotation.missingVideo && <p className="annotation-interruption">{t(missingAnnotationVideo[annotation.missingVideo])}</p>}
     {onListen && <div><Button variant="outline" size="sm" onClick={onListen}>{t("Open narration player")}</Button></div>}
@@ -342,7 +422,7 @@ function ManagedMeetingExport({ id, initial, title }: { id: string; initial: Mee
   </>
 }
 
-export function ResultsPanel({ result, session, source, tab, onTab, jump, toolbar, working, recording, followLive, emptyText, progress, copied, onCopy, dictationEnabled, onDictationBusy, onMeetingRenamed }: Props) {
+export function ResultsPanel({ result, session, source, tab, onTab, jump, toolbar, working, recording, followLive, emptyText, progress, copied, onCopy, dictationEnabled, onDictationBusy, onMeetingRenamed, onMeetingEdited }: Props) {
   const { t } = useInterfaceLanguage()
   const complete = session?.status === "complete"
   const reviewable = complete || !!session?.annotation || isSettledMeeting(session)
@@ -369,6 +449,7 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
   const [track, setTrack] = useState<"mix" | "mic" | "system">("mix")
   const tracks = session?.recordingTracks
   const video = useRef<HTMLVideoElement>(null)
+  const setVideo = useCallback((node: HTMLVideoElement | null) => { video.current = node }, [])
   const openPlayer = useCallback(() => { video.current?.pause(); setDock("audio") }, [])
   const player = usePlayback((track === "mix" ? source : tracks?.[track]) ?? source, result.durationSeconds, openPlayer)
   const audioTrigger = useRef<HTMLButtonElement>(null)
@@ -493,7 +574,7 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
     session.provisionalTitle || draft?.title || version?.title || session.name
   const canRegenerate = !meetingsManaged && !!writingTab && !!version && !!writing && version.language === writing.target
   const regenerateLabel = t(writingTab === "overview" ? "Regenerate overview" : "Regenerate timeline")
-  const canCopyOverview = tab === "overview" && !!session.meeting && !!overviewText && !editing
+  const canCopyOverview = tab === "overview" && !!overviewText && !editing
   const canEditOverview = tab === "overview" && !!version && !!editRevision && !editing
   const canUseTranscriptTools = tab === "transcript" && !!result.text && !recording && !working
   const toolbarActions = <>
@@ -584,10 +665,10 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
           </Suspense>}
         </div>}
         {!editing && <SessionImages key={session.id} session={session}>
-          {session.annotation && <AnnotationPanel id={session.id} annotation={session.annotation}
+          {session.annotation && <AnnotationPanel key={session.audioUrl} id={session.id} annotation={session.annotation}
             movie={session.annotation.missingVideo ? null : session.audioUrl} movieName={session.audioName}
             onListen={session.annotation.missingVideo && session.audioUrl ? openPlayer : undefined}
-            videoExpired={!!session.audioRemovedAt} unavailable={!!session.annotationStorageUnavailable} video={video}
+            videoExpired={!!session.audioRemovedAt} unavailable={!!session.annotationStorageUnavailable} setVideo={setVideo}
             onPlay={() => player.audio.current?.pause()} />}
         </SessionImages>}
       </TabsContent>
@@ -606,7 +687,9 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
       </TabsContent>
       <TabsContent value="transcript" className={transcriptClass}
         onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
-        {transcriptContent}
+        {session.transcriptEditRevision && !working && !recording
+          ? <MeetingTranscriptEdit session={session} onEdited={onMeetingEdited}>{transcriptContent}</MeetingTranscriptEdit>
+          : transcriptContent}
       </TabsContent>
       {complete && <TabsContent value="notes" forceMount hidden={tab !== "notes"} className="note-body personal-note-body"
         onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>

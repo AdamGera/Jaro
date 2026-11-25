@@ -1,9 +1,10 @@
 """A transcription-only process whose lifetime is owned by its parent."""
 import asyncio
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 import hmac
 from http.client import HTTPConnection, HTTPException as HTTPProtocolError
 import json
+import logging
 import os
 from pathlib import Path
 from queue import Empty, Queue
@@ -24,16 +25,84 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from sdk_discovery import SDK_VERSION, sdk_identity, sdk_proof
 
 SDK_PATH = "/api/sdk/v1"
+logger = logging.getLogger(__name__)
 
 
-def run_embedded(router, inference_factory, model_factory):
+@contextmanager
+def embedded_installation_lock(payload):
+    """Keep the installed runtime and decoders available for the owned helper."""
+    if not (payload / "portable-release.json").is_file():
+        yield
+    elif sys.platform == "win32":
+        from portable_update import windows_installation_lock
+
+        with windows_installation_lock(exclusive=False):
+            yield
+    elif sys.platform == "linux":
+        from linux_direct import installation_lock, managed_root
+
+        if (lock_path := payload / "in-use").is_file():
+            import fcntl
+
+            with lock_path.open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                if Path("/run/jaro-package-changing").is_dir():
+                    raise RuntimeError("Jaro is being installed or removed. Try again when it finishes.")
+                yield
+        elif root := managed_root(payload):
+            with installation_lock(root):
+                if managed_root(payload) != root:
+                    raise RuntimeError("Import the SDK from the current Jaro installation.")
+                yield
+        else:
+            raise RuntimeError("Import the SDK from the current Jaro installation.")
+    else:
+        yield
+
+
+async def prepare_embedded_speech(state, source, repair):
+    from model_installation import install_models
+
+    state.startup_event({"type": "progress", "phase": "checking"})
+
+    def progress(completed, total):
+        state.startup_event({"type": "progress", "phase": "installing", "completedBytes": completed, "totalBytes": total})
+
+    install = asyncio.create_task(install_models(progress, repair=repair, source=source))
+    try:
+        while not install.done():
+            await asyncio.wait((install,), timeout=.1)
+            if not install.done() and state.is_shutting_down():
+                raise asyncio.CancelledError
+        await install
+    finally:
+        if not install.done():
+            install.cancel()
+            with suppress(asyncio.CancelledError):
+                await install
+
+
+def run_embedded(router, inference_factory, model_factory, *, prepare=False, source=None, repair=False):
     from saved_dictations import shared_vocabulary
 
     def build_app(root, record):
         @asynccontextmanager
         async def lifespan(app):
+            if prepare:
+                try:
+                    await prepare_embedded_speech(app.state, source, repair)
+                except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+                    logger.exception("Could not prepare speech for the embedded SDK.")
+                    app.state.startup_event({"type": "error", "code": "model-prepare-failed"})
+                    raise
+                app.state.startup_event({"type": "progress", "phase": "loading"})
             app.state.embedded_vocabulary = await asyncio.to_thread(shared_vocabulary)
-            app.state.model = await asyncio.to_thread(model_factory)
+            try:
+                app.state.model = await asyncio.to_thread(model_factory)
+            except Exception:
+                if prepare:
+                    app.state.startup_event({"type": "error", "code": "model-load-failed"})
+                raise
             app.state.status = "ready"
             yield
 
@@ -81,6 +150,11 @@ def run_owned_service(build_app, *, allow_audio_restore=False):
             app.state.request_shutdown = lambda: setattr(server, "should_exit", True)
             app.state.is_shutting_down = lambda: server.should_exit
 
+            def startup_event(event):
+                print(json.dumps(event), file=handshake, flush=True)
+
+            app.state.startup_event = startup_event
+
             def watch_parent():
                 try:
                     while os.read(0, 4096):
@@ -100,8 +174,7 @@ def run_owned_service(build_app, *, allow_audio_restore=False):
                         return
                     if server.started:
                         try:
-                            print(json.dumps({"type": "ready", "url": f"http://127.0.0.1:{port}", **record}),
-                                  file=handshake, flush=True)
+                            startup_event({"type": "ready", "url": f"http://127.0.0.1:{port}", **record})
                         except OSError:
                             server.should_exit = True
                         return
@@ -188,16 +261,38 @@ def owned_service(command, *, stderr=subprocess.DEVNULL, env=None):
                     raise RuntimeError("The owned Jard helper did not exit.") from error
 
 
-def verify_service(connection, record):
+def verify_service(connection, record, *, identify_path=SDK_PATH + "/identify"):
     challenge = secrets.token_hex(16)
-    connection.request("GET", SDK_PATH + "/identify?" + urlencode({"challenge": challenge}))
+    connection.request("GET", identify_path + "?" + urlencode({"challenge": challenge}))
     identity = connection.getresponse()
     received = json.loads(identity.read(4096)).get("proof")
     if (identity.status != 200 or not isinstance(received, str)
-            or not hmac.compare_digest(received, sdk_proof(record, challenge)) or connection.sock is None):
+            or not received.isascii() or not hmac.compare_digest(received, sdk_proof(record, challenge))
+            or connection.sock is None):
         raise RuntimeError("Could not verify the local Jaro transcription service.")
     # Send credentials and audio on the socket that proved its identity.
     connection.auto_open = False
+
+
+def sdk_service_status(record):
+    """Return the verified service's health, or None if it stopped listening."""
+    connection = HTTPConnection("127.0.0.1", record["port"], timeout=3)
+    try:
+        try:
+            connection.connect()
+        except ConnectionRefusedError:
+            return None
+        verify_service(connection, record)
+        connection.request("GET", SDK_PATH + "/health", headers={"Authorization": "Bearer " + record["token"]})
+        response = connection.getresponse()
+        status = json.loads(response.read(4096)).get("status")
+        if response.status != 200 or status not in ("loading", "ready", "error", "stopping"):
+            raise ValueError("Invalid service health.")
+        return status
+    except (OSError, HTTPProtocolError, ValueError, AttributeError) as error:
+        raise RuntimeError("Could not check the local Jaro transcription service.") from error
+    finally:
+        connection.close()
 
 
 def sdk_transcription(record, audio, languages):

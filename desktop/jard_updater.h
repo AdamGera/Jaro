@@ -3,6 +3,9 @@
 BOOL JardVerifyUpdateBundle(NSURL *current, NSURL *candidate, NSString *version, NSString **reason);
 BOOL JardSwapUpdateBundles(NSURL *current, NSURL *candidate, NSString **reason);
 NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason);
+int JardRunUpdateRelaunch(int argc, const char *argv[]);
+BOOL JardIsUpdateStartupProbe(void);
+void JardConfirmUpdateStartup(void);
 
 typedef void (^JardUpdateInstallReply)(BOOL applied, NSString *reason);
 
@@ -19,6 +22,7 @@ typedef void (^JardUpdateInstallReply)(BOOL applied, NSString *reason);
 - (void)checkBeforeRestart:(void (^)(void))completion;
 - (void)restoreStagedUpdateWithCompletion:(void (^)(BOOL restored))completion;
 - (BOOL)canInstallStagedUpdate;
+- (void)confirmStartup;
 - (BOOL)prepareToInstallOnQuit;
 - (void)resumeAfterCancelledQuit;
 - (void)restartWithCompletion:(JardUpdateInstallReply)completion;

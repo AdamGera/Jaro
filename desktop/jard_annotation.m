@@ -1489,7 +1489,7 @@ static unsigned annotationModifiers(CGEventFlags flags) {
 
 - (BOOL)stop {
     if ([self.phase isEqual:@"picking"] || [self.phase isEqual:@"selecting"] ||
-        ([self.phase isEqual:@"starting"] && !self.screenStartRequested && !self.narrationRequested && !self.phone)) {
+        ([self.phase isEqual:@"starting"] && !self.phone && (!self.stream || !self.screenStartRequested))) {
         return [self cancel];
     }
     if (![self.phase isEqual:@"recording"] && ![self.phase isEqual:@"starting"]) return NO;
@@ -1502,6 +1502,10 @@ static unsigned annotationModifiers(CGEventFlags flags) {
         return YES;
     }
     SCStream *stream = self.stream;
+    if (!stream) {
+        [self fail:@"The screen recording stopped unexpectedly." keepMovie:YES];
+        return YES;
+    }
     [stream stopCaptureWithCompletionHandler:^(NSError *error) {
         if (error) dispatch_async(dispatch_get_main_queue(), ^{
             if (stream == self.stream && self.recording) [self screenRecordingFailed:error];

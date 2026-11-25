@@ -1192,7 +1192,8 @@ static void testPhonePicture(void) {
 
 static void testRoutingOrigin(void) {
     NSDictionary *browser = @{@"app": @"com.fixture.Browser", @"name": @"Jard"};
-    NSDictionary *site = @{@"app": @"com.fixture.Browser", @"name": @"Jard", @"site": @"example.test"};
+    NSDictionary *site = @{@"app": @"com.fixture.Browser", @"name": @"Jard", @"site": @"example.test",
+        @"siteUrl": @"https://example.test/project/notes"};
     CGRect frame = CGRectMake(20, 40, 600, 420);
     NSDictionary *sample = @{@"pid": @42, @"app": site, @"title": @"Example",
         @"bounds": [NSValue valueWithRect:frame]};

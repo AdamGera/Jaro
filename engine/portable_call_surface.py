@@ -50,10 +50,10 @@ def current_control(watcher):
             mode = "saving"
         elif active.stop_at is not None:
             mode = "switching" if active.ending_reason == "page" else "ending"
-            return CallControl(active.id, mode, recording_label(active.call), active.stop_at)
+            return CallControl(active.id, mode, active.name, active.stop_at)
         else:
             mode = "automatic" if active.automatic else "recording"
-        return CallControl(active.id, mode, recording_label(active.call), active.started)
+        return CallControl(active.id, mode, active.name, active.started)
     return None
 
 

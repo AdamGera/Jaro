@@ -7,6 +7,23 @@
 
 #ifndef JARO_CONSOLE
 static BOOL background_launch;
+static BOOL update_probe;
+static BOOL repair_shortcuts;
+void repair_versioned_shortcuts(const wchar_t *install);
+
+static BOOL own_update_probe(void)
+{
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    if (!job)
+        return FALSE;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) &&
+        AssignProcessToJobObject(job, GetCurrentProcess()))
+        return TRUE;  // The non-inheritable job handle stays open for the launcher's lifetime.
+    CloseHandle(job);
+    return FALSE;
+}
 #endif
 
 static int fail(const wchar_t *message)
@@ -15,7 +32,7 @@ static int fail(const wchar_t *message)
     fputws(message, stderr);
     fputws(L"\n", stderr);
 #else
-    if (!background_launch)
+    if (!background_launch && !update_probe)
         MessageBoxW(NULL, message, L"Jaro", MB_OK | MB_ICONERROR);
 #endif
     return 1;
@@ -153,7 +170,7 @@ static int run_version(const wchar_t *payload)
         GetExitCodeProcess(child.hProcess, &result);
     CloseHandle(child.hProcess);
 #ifndef JARO_CONSOLE
-    if (result != 0)
+    if (result != 0 && !update_probe)
         return fail(L"Jaro could not open its workspace. Close any open Jaro windows and try again.");
 #endif
     return (int)result;
@@ -172,10 +189,19 @@ static int launch(void)
     if (!separator)
         return fail(L"Jaro could not locate its installation.");
     *separator = L'\0';
+    wchar_t version[48];
+#ifndef JARO_CONSOLE
+    if (repair_shortcuts) {
+        // Setup already holds the exclusive installation lock.
+        if (!active_version(root, version))
+            return 1;
+        repair_versioned_shortcuts(root);
+        return 0;
+    }
+#endif
     HANDLE lock = application_lock();
     if (lock == INVALID_HANDLE_VALUE)
         return fail(L"Jaro could not open its installation lock. If Setup is running, try again after it finishes.");
-    wchar_t version[48];
     wchar_t payload[PATH_CAPACITY];
     int size = active_version(root, version) ?
         swprintf(payload, PATH_CAPACITY, L"%ls\\versions\\%ls", root, version) : -1;
@@ -196,7 +222,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, LPWSTR command, int 
     (void)instance;
     (void)previous;
     (void)show;
-    background_launch = wcscmp(command, L"--background") == 0;
+    repair_shortcuts = wcscmp(command, L"--repair-shortcuts") == 0;
+    background_launch = repair_shortcuts || wcscmp(command, L"--background") == 0;
+    if (repair_shortcuts)
+        return launch();
+    wchar_t probe[2];
+    update_probe = GetEnvironmentVariableW(L"JARO_UPDATE_PROBE", probe, 2) == 1 && probe[0] == L'1';
+    if (update_probe && !own_update_probe())
+        return fail(L"Jaro could not own the update startup processes.");
     return launch();
 }
 #endif

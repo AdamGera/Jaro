@@ -2,11 +2,15 @@
 
 For a suspected vulnerability, use [GitHub private reporting](https://github.com/AdamGera/Jaro/security/advisories/new) if the repository offers it. If that form is unavailable, contact [Jard](https://www.jard.ai/) to arrange private reporting.
 
-Include the app version, macOS version, and a reproducible example with synthetic data. Keep recordings, transcripts, unredacted logs, local service tokens, and signing keys out of public issues.
+Include the Jaro build number, operating system and version, and a reproducible example with synthetic data. For keyboard reports, include the device model and the app or field type where the issue occurred. Keep recordings, transcripts, unredacted logs, local service tokens, and signing keys out of public issues.
 
 ## Trust boundaries
 
 Jaro processes recordings and notes locally. First-run model setup and update checks contact their configured download services. The desktop bridge and transcription service use authenticated local control paths. The updater verifies its signed release feed and the candidate bundle before replacement.
+
+The mobile keyboards process speech on the device. The [mobile privacy guide](mobile/PRIVACY.md) describes microphone access, iOS Full Access, local typing data, and optional model downloads.
+
+The shared macOS engine requires a private credential for session data, media, and recording operations. Opening Jaro or choosing **Open in Browser** authorizes that browser session. The workspace cookie grants workspace access. Native controls and the SDK use separate credentials.
 
 Optional commands and integrations can run code or send content with the user's permissions. Review the commands and destinations you configure.
 

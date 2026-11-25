@@ -9,7 +9,9 @@ import wave
 
 import numpy as np
 
-from native_recordings import recording_marker, recording_metadata, source_tracks, write_recording_metadata
+from native_recordings import (open_portable_recording_marker, portable_draft_frames as draft_frames,
+                               recording_marker, recording_metadata, source_tracks, write_recording_metadata)
+from meeting_rolling import rolling_path
 from rumble_model import SAMPLE_RATE
 
 
@@ -51,6 +53,7 @@ class PortableRecording:
         self.seconds = seconds
         self.microphone = microphone
         self.dictation = False
+        self.watch_microphone = False
         self.interrupted = False
         self.stopping = False
         self.pcm_epoch = None
@@ -77,7 +80,7 @@ class PortableRecording:
             raise
         with suppress(OSError):
             await self.stop()
-        if not self.frames:
+        if not self.frames and not self.meeting:
             clear_draft(self.path)
         label = {"mic": "microphone audio", "system": "computer audio", "both": "both audio sources"}[self.mode]
         raise CaptureError(f"Jaro could not capture {label}. Check your system sound settings and try again.")
@@ -243,18 +246,6 @@ def trim_pcm(path, frames):
         file.truncate(size + 44)
 
 
-def draft_frames(path):
-    if path.is_symlink() or not path.is_file():
-        return 0
-    try:
-        with wave.open(str(path), "rb") as audio:
-            if (audio.getframerate(), audio.getnchannels(), audio.getsampwidth()) != (SAMPLE_RATE, 1, FRAME_BYTES):
-                return 0
-            return min(audio.getnframes(), max(0, path.stat().st_size - 44) // FRAME_BYTES)
-    except (EOFError, OSError, wave.Error):
-        return 0
-
-
 def draft_tracks(path, committed_frames):
     tracks = {}
     for kind, track in source_tracks(path).items():
@@ -267,15 +258,17 @@ def draft_tracks(path, committed_frames):
     return tracks
 
 
-def save_draft_metadata(path, metadata):
-    fd = os.open(recording_marker(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+def claim_meeting_draft(path, metadata):
+    marker = recording_marker(path)
+    claim = open_portable_recording_marker(marker, create=True)
     try:
-        with os.fdopen(fd, "wb") as file:
-            write_recording_metadata(file, metadata)
-    except OSError:
+        write_recording_metadata(claim, metadata)
+    except BaseException:
+        claim.close()
         with suppress(OSError):
-            recording_marker(path).unlink()
+            marker.unlink()
         raise
+    return claim
 
 
 def draft_metadata(path):
@@ -290,5 +283,5 @@ def draft_metadata(path):
 
 
 def clear_draft(path):
-    for file in (*source_tracks(path).values(), path, recording_marker(path)):
+    for file in (*source_tracks(path).values(), path, recording_marker(path), rolling_path(path)):
         file.unlink(missing_ok=True)

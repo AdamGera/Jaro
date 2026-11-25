@@ -1,38 +1,27 @@
-import { AudioLines, Clock, Ellipsis, Phone, Square } from "lucide-react"
+import { AudioLines, Ellipsis, Phone, Square } from "lucide-react"
 import { useInterfaceLanguage } from "@/interface-language"
 import type { DetectedCall, PortableCallControls } from "@/portable-calls"
 import { clock } from "@/speaker-activity"
-import { SettingGroup, SettingRow } from "./settings-rows"
+import { MeetingCalls } from "./meeting-calls"
 import { Button } from "./ui/button"
 
 export function PortableCallSettings({ calls }: { calls: PortableCallControls }) {
-  const { t } = useInterfaceLanguage()
-  const { status, pending } = calls
+  const { status, pending, error } = calls
   if (!status) return null
-  const { enabled, autoStop, policies } = status
-  return <SettingGroup id="meeting-detection-title" title={t("Detected calls")}>
-    <SettingRow icon={Phone} title={t("Offer to record detected calls")} detail={t("Check locally which supported apps are using the microphone.")}>
-      {labels => <input {...labels} type="checkbox" role="switch" checked={enabled} disabled={pending}
-        onChange={event => void calls.update({ enabled: event.target.checked, autoStop, policies })} />}
-    </SettingRow>
-    {enabled && <>
-      <SettingRow icon={Clock} title={t("Stop when the call ends")}
-        detail={t("Automatically started recordings save 30 seconds after the call app stops using both microphone and playback.")}>
-        {labels => <input {...labels} type="checkbox" role="switch" checked={autoStop} disabled={pending}
-          onChange={event => void calls.update({ enabled, autoStop: event.target.checked, policies })} />}
-      </SettingRow>
-      {status.providers.map(app => <SettingRow key={app.id} icon={Phone} title={app.name}>
-        {labels => <select {...labels} disabled={pending} value={policies[app.id] ?? "ask"}
-          onChange={event => void calls.update({ enabled, autoStop,
-            policies: { ...policies, [app.id]: event.target.value as "ask" | "auto" | "never" } })}>
-          <option value="ask">{t("Ask")}</option>
-          {!app.browser && <option value="auto">{t("Always record")}</option>}
-          <option value="never">{t("Never offer")}</option>
-        </select>}
-      </SettingRow>)}
-    </>}
-    {calls.error && <p className="meeting-status" role="alert">{t(calls.error)}</p>}
-  </SettingGroup>
+  const { enabled, autoStop, defaultPolicy = "ask", policies } = status
+  const providerPolicies = status.providers.map(app => {
+    const canAlwaysRecord = app.canAlwaysRecord ?? !app.browser
+    const policy = policies[app.id] ?? defaultPolicy
+    return {
+      provider: app.id, label: app.name, website: app.website, lastSeen: app.lastSeen ?? undefined,
+      policy: !canAlwaysRecord && policy === "auto" ? "ask" as const : policy,
+      canAlwaysRecord, inheritsPolicy: !Object.hasOwn(policies, app.id),
+    }
+  })
+  return <MeetingCalls meeting={{ detection: enabled, autoStop, defaultPolicy, providerPolicies }} pending={pending} feedback={error} warning={status.settingsWarning}
+    stopDetail="Automatically started recordings save 30 seconds after the call app stops using both microphone and playback."
+    requestedStop={{ enabled: !!status.stopRequestedCalls, change: enabled => calls.update({ action: "stopRequestedCalls", enabled }) }}
+    act={calls.update} />
 }
 
 export type PortableCallBarProps = {

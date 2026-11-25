@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
 import importlib.util
 from io import BytesIO, StringIO
@@ -82,6 +82,26 @@ class ModelInstallationTests(unittest.TestCase):
         self.assertFalse(model_installation.model_status()["ready"])
         self.assertFalse((self.install_dir / ".speech-complete").exists())
 
+    def test_cli_repair_replaces_same_size_damage_and_preserves_healthy_files(self):
+        self.assertTrue(model_installation.install_model(self.source)["ready"])
+        weights = self.install_dir / "ctc/weights"
+        original = weights.read_bytes()
+        weights.write_bytes(b"x" * len(original))
+        weights.with_suffix(".partial").write_bytes(original)
+        license_file = self.install_dir / "LICENSE"
+        before = license_file.stat()
+        self.assertTrue(model_installation.model_status()["ready"])
+
+        output = StringIO()
+        with patch("sys.argv", ["jardctl", "model", "install", "--repair", "--json"]), patch("sys.stdout", output):
+            jardctl.main()
+
+        self.assertTrue(json.loads(output.getvalue())["ready"])
+        self.assertEqual(weights.read_bytes(), original)
+        self.assertFalse(weights.with_suffix(".partial").exists())
+        self.assertEqual(license_file.stat().st_ino, before.st_ino)
+        self.assertEqual(license_file.stat().st_mtime_ns, before.st_mtime_ns)
+
     def test_portable_model_install_publishes_and_repairs_the_writing_runtime(self):
         spec = importlib.util.spec_from_file_location("model_setup_fixture", self.installer)
         installer = importlib.util.module_from_spec(spec)
@@ -112,6 +132,14 @@ class ModelInstallationTests(unittest.TestCase):
             self.assertFalse(installer.status(portable=True)["ready"])
             with patch.object(installer, "fetch") as fetch:
                 installer.install(None, portable=True)
+                library = runtime / "libggml.so.1"
+                inode = library.stat().st_ino
+                installer.install(None, portable=True, repair=True)
+                self.assertEqual(library.stat().st_ino, inode)
+                library.write_bytes(b"z")
+                self.assertTrue(installer.status(portable=True)["ready"])
+                installer.install(None, portable=True, repair=True)
+                self.assertEqual(library.read_bytes(), b"a")
                 fetch.assert_not_called()
             self.assertTrue(installer.status(portable=True)["ready"])
 
@@ -132,6 +160,11 @@ class ModelInstallationTests(unittest.TestCase):
             self.assertTrue(installer.runtime_ready(runtime))
             self.assertTrue((runtime / "ggml-cpu-haswell.dll").is_file())
             self.assertFalse((runtime / "llama-connect.exe").exists())
+            variant = runtime / "ggml-cpu-haswell.dll"
+            variant.write_bytes(b"damaged")
+            self.assertTrue(installer.runtime_ready(runtime))
+            installer.install_runtime(root)
+            self.assertEqual(variant.read_bytes(), b"fixture")
             (runtime / ".verified").write_text(installer.LLAMA_ARCHIVE["sha256"])
             self.assertFalse(installer.runtime_ready(runtime))
 
@@ -189,3 +222,44 @@ class ModelInstallationTests(unittest.TestCase):
         install.assert_called_once_with(progress=True)
         self.assertEqual([item.args[1][44:] for item in send.call_args_list], [first, second])
         self.assertEqual(stdout.getvalue(), "First. Second.\n")
+
+    def test_portable_cli_waits_for_running_engine_without_preparing_a_second_model(self):
+        record = {"port": 12345}
+        for platform in ("linux", "win32"):
+            with self.subTest(platform=platform), ExitStack() as scope, \
+                    patch("jardctl.sys.platform", platform), patch("jardctl.ensure_model") as prepare, \
+                    patch("sdk_discovery.read_sdk_record", return_value=record) as discover, \
+                    patch("sdk_embedded.sdk_service_status", side_effect=["loading", "ready"]), \
+                    patch("jardctl.time.sleep"):
+                self.assertIs(jardctl.transcription_service(self.work, scope, allow_prompt=False), record)
+                self.assertEqual([call.args for call in discover.call_args_list], [(self.work,), (self.work,)])
+                prepare.assert_not_called()
+
+    def test_portable_cli_checks_again_after_preparing_offline_model(self):
+        record = {"port": 12345}
+        for status in (None, "ready"):
+            with self.subTest(status=status), ExitStack() as scope, \
+                    patch("jardctl.sys.platform", "linux"), patch("jardctl.ensure_model") as prepare, \
+                    patch("sdk_discovery.read_sdk_record", return_value=record), \
+                    patch("sdk_embedded.sdk_service_status", side_effect=[None, status]), \
+                    patch("sdk_embedded.owned_transcriber", return_value=nullcontext("embedded")) as start:
+                result = jardctl.transcription_service(self.work, scope, allow_prompt=False)
+                prepare.assert_called_once_with(allow_prompt=False)
+                if status is None:
+                    self.assertEqual(result, "embedded")
+                    start.assert_called_once_with()
+                else:
+                    self.assertIs(result, record)
+                    start.assert_not_called()
+
+    def test_portable_cli_rejects_live_service_errors_without_starting_another_engine(self):
+        for error, status in ((RuntimeError("bad discovery"), None), (None, "error")):
+            with self.subTest(error=error, status=status), ExitStack() as scope, \
+                    patch("jardctl.sys.platform", "win32"), patch("jardctl.ensure_model") as prepare, \
+                    patch("sdk_discovery.read_sdk_record", return_value={"port": 12345}, side_effect=error), \
+                    patch("sdk_embedded.sdk_service_status", return_value=status), \
+                    patch("sdk_embedded.owned_transcriber") as start:
+                with self.assertRaisesRegex(RuntimeError, "bad discovery|speech model is unavailable"):
+                    jardctl.transcription_service(self.work, scope, allow_prompt=False)
+                prepare.assert_not_called()
+                start.assert_not_called()

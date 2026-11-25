@@ -35,7 +35,7 @@ function updateControl(controls: DesktopUpdateControls, busy: boolean, t: Return
     : visibleProgress ? t(visibleProgress) : switchLabel ?? t(phase === "download" ? "Download Update" : "Look for new versions")
   const result = managed ? "Updates managed by your organization"
     : restarting ? ""
-    : restartBlocked ? "Finish your current work to restart Jaro."
+    : restartBlocked ? update.restartBlockReason || "Finish your current work to restart Jaro."
     : error || update.restartError || (unavailable ? "Updates are disabled for this installation."
     : checking ? (ready ? checking : "")
     : phase === "error" ? (manual ? message || "Could not check for updates." : "")

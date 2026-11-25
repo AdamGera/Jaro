@@ -1,0 +1,16 @@
+<resources>
+    <bool name="light_bars">true</bool>
+    <color name="page">#F8F6FB</color>
+    <color name="sheet">#F0ECFA</color>
+    <color name="ink">#211A30</color>
+    <color name="quiet">#5F536B</color>
+    <color name="rule">#D9D0E5</color>
+    <color name="keyboard">#E4DDEE</color>
+    <color name="key">#FBF9FF</color>
+    <color name="modifier">#D4C9E5</color>
+    <color name="emoji_pressed">#33655396</color>
+    <color name="pressed">#C9BCD8</color>
+    <color name="launcher_background">#E1DFF1</color>
+    <color name="accent">#5E4394</color>
+    <color name="on_accent">#FFFFFF</color>
+</resources>

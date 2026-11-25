@@ -34,6 +34,8 @@ BOOL JardShowDockIconEnabled(void);
 - (BOOL)sessionUnavailable;
 - (BOOL)hasActivity;
 - (BOOL)sharesMicrophone;
+- (BOOL)vocabularyMenuEnabled;
+- (NSArray<NSDictionary *> *)menuVocabularyEntries;
 - (void)configurePasteLastMenuItem:(NSMenuItem *)item;
 - (void)pasteLastFromMenu;
 - (NSDictionary *)sdkMicrophoneSettings;

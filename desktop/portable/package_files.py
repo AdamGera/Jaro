@@ -23,12 +23,16 @@ def stage_workspace(target, dist):
     if not (dist / "index.html").is_file():
         raise ValueError("Build the web workspace with bun run build.")
     shutil.copytree(dist, target / "dist")
+    (target / "portable-startup-v1").touch()
     files = [
         Path("pyproject.toml"),
         Path("desktop/portable/open_workspace.py"),
         Path("desktop/portable/desktop_instance.py"),
         Path("desktop/build-tools/model_setup.py"),
         Path("desktop/build-tools/models.json"),
+        Path("sdk/typescript/index.mjs"),
+        Path("sdk/typescript/index.d.mts"),
+        Path("sdk/typescript/README.md"),
     ]
     for path in files:
         if (ROOT / path).is_symlink():

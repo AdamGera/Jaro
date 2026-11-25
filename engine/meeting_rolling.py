@@ -7,6 +7,7 @@ RATE = 48_000
 MAX_LINE = 1024 * 1024
 MIXED_SPEAKERS = "mixed"
 SOURCE_LABELS = {"1": "You", "2": "Them"}
+FILE_FLAGS = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
 
 
 def rolling_path(source):
@@ -17,7 +18,10 @@ def append_rolling(source, start, end, result):
     line = json.dumps([start, end, result], ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode() + b"\n"
     if len(line) > MAX_LINE:
         raise ValueError("The provisional transcript window is too large.")
-    descriptor = os.open(rolling_path(source), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    path = rolling_path(source)
+    if path.is_symlink():
+        raise ValueError("The provisional transcript path is unavailable.")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | FILE_FLAGS, 0o600)
     with os.fdopen(descriptor, "ab") as stream:
         stream.write(line)
         stream.flush()
@@ -28,7 +32,10 @@ def read_rolling(source, frames):
     """Read complete records only. A process can die during its final write."""
     last = 0
     try:
-        stream = os.fdopen(os.open(rolling_path(source), os.O_RDONLY | os.O_NOFOLLOW), "rb")
+        path = rolling_path(source)
+        if path.is_symlink():
+            return
+        stream = os.fdopen(os.open(path, os.O_RDONLY | FILE_FLAGS), "rb")
     except OSError:
         return
     with stream:

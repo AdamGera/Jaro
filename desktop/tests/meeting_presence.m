@@ -100,7 +100,7 @@ static void exerciseAutoStop(BOOL manualStop) {
     NSString *chrome = @"com.google.chrome";
     JardCall *original = JardMeetingBrowserCall([NSURL URLWithString:@"https://meet.google.com/abc-defg-hij"], chrome);
     JardCall *named = JardMeetingBrowserTitleCall(@"Meet – Design sync", chrome);
-    JardCall *changed = JardMeetingBrowserTitleCall(@"Meet - abc-defg-xyz - Google Chrome", chrome);
+    JardCall *changed = JardMeetingBrowserCall([NSURL URLWithString:@"https://meet.google.com/abc-defg-xyz"], chrome);
     JardCall *third = JardMeetingBrowserCall([NSURL URLWithString:@"https://meet.google.com/xyz-wxyz-xyz"], chrome);
     __block NSString *identifier;
     __block NSUInteger starts = 0, stops = 0;
@@ -121,10 +121,15 @@ static void exerciseAutoStop(BOOL manualStop) {
     meeting.autoStop = YES;
     NSDate *date = NSDate.date;
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    [meeting observeCalls:@[named] now:now date:date];
-    [meeting observeCalls:@[named] now:now + 2 date:date];
+    [meeting observeCalls:@[original] now:now date:date];
+    [meeting observeCalls:@[original] now:now + 2 date:date];
     assert(identifier && starts == 1);
     [meeting handleCapture:@{@"meeting": identifier, @"event": @"started"}];
+    JardCall *unverifiedChange = JardMeetingBrowserTitleCall(@"Meet - abc-defg-xyz", chrome);
+    [meeting observeCalls:@[unverifiedChange] now:now + 3 date:date];
+    [meeting observeCalls:@[unverifiedChange] now:now + 7 date:date];
+    assert([[meeting status][@"phase"] isEqual:@"recording"]);
+    now += 5;
     [meeting observeCalls:@[original] now:now + 3 date:date];
     [meeting observeCalls:@[named] now:now + 4 date:date];
     assert([[meeting status][@"phase"] isEqual:@"recording"]);
@@ -167,7 +172,7 @@ static void exerciseAutoStop(BOOL manualStop) {
         [meeting observeCalls:@[original] now:now + second date:date];
     assert(starts == 1 && meeting.lastPresent == now + 99);
     [meeting handleCapture:@{@"meeting": identifier, @"event": @"accepted", @"id": NSUUID.UUID.UUIDString.lowercaseString}];
-    [meeting observeCalls:@[named] now:now + 100 date:date];
+    [meeting observeCalls:@[third] now:now + 100 date:date];
     assert(starts == 2 && ![identifier isEqual:prior]);
     [meeting handleCapture:@{@"meeting": identifier, @"event": @"started"}];
     [meeting observeCalls:@[original] now:now + 101 date:date];
@@ -295,7 +300,13 @@ static void exerciseOfferLifecycle(void) {
 static void exerciseProviderSettings(void) {
     NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
     NSString *key = @"JardMeetingProviderPolicies";
+    NSString *defaultKey = @"JardMeetingDefaultPolicy";
+    NSString *recentKey = @"JardMeetingRecentCallSources";
     id previous = [defaults objectForKey:key];
+    id previousDefault = [defaults objectForKey:defaultKey];
+    id previousRecent = [defaults objectForKey:recentKey];
+    [defaults removeObjectForKey:defaultKey];
+    [defaults removeObjectForKey:recentKey];
     [defaults setObject:@{
         @"site:zoom.us": @{@"provider": @"site:zoom.us", @"label": @"Zoom", @"policy": @"never"},
         @"browser:com.google.chrome": @{@"provider": @"browser:com.google.chrome", @"label": @"Google Chrome", @"policy": @"never"},
@@ -310,8 +321,13 @@ static void exerciseProviderSettings(void) {
         } send:nil changed:nil];
     NSArray *rows = [meeting status][@"providerPolicies"];
     assert(rows.count == 20);
-    assert([rows[1][@"provider"] isEqual:@"app:zoom"] && [rows[1][@"policy"] isEqual:@"never"]);
-    assert([rows[2][@"provider"] isEqual:@"site:meet.google.com"] && [rows[2][@"policy"] isEqual:@"ask"]);
+    NSDictionary *(^row)(NSArray *, NSString *) = ^NSDictionary *(NSArray *sources, NSString *provider) {
+        for (NSDictionary *source in sources) if ([source[@"provider"] isEqual:provider]) return source;
+        return nil;
+    };
+    assert([[meeting status][@"defaultPolicy"] isEqual:@"ask"]);
+    assert([row(rows, @"app:zoom")[@"policy"] isEqual:@"never"] && [row(rows, @"app:zoom")[@"inheritsPolicy"] boolValue]);
+    assert([row(rows, @"site:meet.google.com")[@"policy"] isEqual:@"ask"]);
     NSString *chrome = @"com.google.chrome";
     JardCall *zoom = JardMeetingDirectCall(@"us.zoom.xos");
     JardCall *webZoom = JardMeetingBrowserCall([NSURL URLWithString:@"https://zoom.us/j/123"], chrome);
@@ -325,6 +341,24 @@ static void exerciseProviderSettings(void) {
         [meeting request:@{@"action": @"setPolicy", @"provider": provider, @"policy": policy}
             reply:^(id result, NSString *error) { assert(result && !error); }];
     };
+    void (^setDefault)(NSString *) = ^(NSString *policy) {
+        [meeting request:@{@"action": @"setDefaultPolicy", @"policy": policy}
+            reply:^(id result, NSString *error) { assert(!error && [result[@"defaultPolicy"] isEqual:policy]); }];
+    };
+    JardCall *unnamedSafari = JardMeetingUnnamedBrowser(@"com.apple.safari", @"Safari");
+    JardCall *slack = JardMeetingDirectCall(@"com.tinyspeck.slackmacgap");
+    assert(slack && [[meeting policyForCall:slack] isEqual:@"ask"]);
+    setDefault(@"auto");
+    assert(automaticStarts == 0 && [[meeting policyForCall:slack] isEqual:@"auto"]);
+    assert([[meeting policyForCall:unnamedSafari] isEqual:@"ask"]);
+    assert([[meeting policyForCall:unnamed] isEqual:@"never"]);
+    save(slack.provider, @"ask");
+    assert([[meeting policyForCall:slack] isEqual:@"ask"]);
+    save(slack.provider, @"inherit");
+    assert([[meeting policyForCall:slack] isEqual:@"auto"]);
+    setDefault(@"never");
+    assert([[meeting policyForCall:unnamedSafari] isEqual:@"never"]);
+    setDefault(@"auto");
     save(zoom.provider, @"auto");
     assert(automaticStarts == 0 && [[meeting policyForCall:zoomAlias] isEqual:@"auto"]);
     assert([[meeting policyForCall:webZoom] isEqual:@"never"]);
@@ -344,6 +378,9 @@ static void exerciseProviderSettings(void) {
     [meeting observeCalls:@[webZoom] now:30 date:date];
     [meeting observeCalls:@[webZoom] now:32 date:date];
     assert(automaticStarts == 0 && [[[meeting status] objectForKey:@"phase"] isEqual:@"offered"]);
+    rows = [meeting status][@"providerPolicies"];
+    assert([rows.firstObject[@"provider"] isEqual:webZoom.provider] && [rows.firstObject[@"lastSeen"] doubleValue] > 0);
+    assert(![rows.firstObject[@"inheritsPolicy"] boolValue]);
     save(webZoom.provider, @"never");
     assert([[[meeting status] objectForKey:@"phase"] isEqual:@"idle"]);
     [meeting observeCalls:@[zoom] now:35 date:date];
@@ -352,13 +389,38 @@ static void exerciseProviderSettings(void) {
     [meeting shutdown];
     TestMeetings *reopened = [[TestMeetings alloc] initWithManaged:NO start:nil send:nil changed:nil];
     assert([[reopened policyForCall:zoom] isEqual:@"auto"] && [[reopened policyForCall:webZoom] isEqual:@"never"]);
+    assert([[reopened status][@"defaultPolicy"] isEqual:@"auto"]);
+    assert([row([reopened status][@"providerPolicies"], webZoom.provider)[@"lastSeen"] doubleValue] > 0);
+    for (NSTimeInterval sample = 100; sample <= 120; sample += 2) {
+        [reopened observeCalls:@[unnamedSafari] now:sample date:[date dateByAddingTimeInterval:sample]];
+    }
+    assert([reopened.offered.provider isEqual:unnamedSafari.provider]);
+    NSArray *recentRows = [reopened status][@"providerPolicies"];
+    assert([recentRows.firstObject[@"provider"] isEqual:unnamedSafari.provider]);
+    assert([recentRows.firstObject[@"policy"] isEqual:@"ask"]);
+    assert(![recentRows.firstObject[@"canAlwaysRecord"] boolValue]);
+    for (NSUInteger index = 0; index < 80; ++index) {
+        NSString *provider = [NSString stringWithFormat:@"site:previous-%lu.test", (unsigned long)index];
+        reopened.policies[provider] = @{@"provider": provider, @"label": provider, @"policy": @"ask"};
+    }
+    [reopened request:@{@"action": @"setPolicy", @"provider": unnamedSafari.provider, @"policy": @"never"}
+        reply:^(id result, NSString *error) { assert(!error && [result[@"phase"] isEqual:@"idle"]); }];
     [reopened shutdown];
+    TestMeetings *full = [[TestMeetings alloc] initWithManaged:NO start:nil send:nil changed:nil];
+    assert([[full policyForCall:unnamedSafari] isEqual:@"never"]);
+    assert([full.policies[@"site:previous-79.test"][@"policy"] isEqual:@"ask"]);
+    [full shutdown];
     TestMeetings *managed = [[TestMeetings alloc] initWithManaged:YES start:nil send:nil changed:nil];
     [managed request:@{@"action": @"setPolicy", @"provider": zoom.provider, @"policy": @"ask"}
         reply:^(id result, NSString *error) { assert(!result && [error containsString:@"managed"]); }];
+    [managed request:@{@"action": @"setDefaultPolicy", @"policy": @"never"}
+        reply:^(id result, NSString *error) { assert(!result && [error containsString:@"managed"]); }];
     [managed shutdown];
     assert([[[defaults dictionaryForKey:key][zoom.provider] objectForKey:@"policy"] isEqual:@"auto"]);
+    assert([[defaults stringForKey:defaultKey] isEqual:@"auto"]);
     [defaults setObject:previous forKey:key];
+    [defaults setObject:previousDefault forKey:defaultKey];
+    [defaults setObject:previousRecent forKey:recentKey];
     puts("Provider settings listed built-in and scoped options, retained legacy choices, and applied only authorized recording policies.");
 }
 

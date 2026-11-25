@@ -1,7 +1,7 @@
 """Record a desktop source selected in Jaro through Windows Graphics Capture."""
 import asyncio
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import os
 from pathlib import Path
@@ -113,6 +113,16 @@ async def validate_target(source, target):
         raise LookupError("That screen source changed. Choose it again.")
 
 
+async def cursor_display():
+    try:
+        target = (await output("cursor-display")).decode("ascii").strip()
+    except (OSError, TimeoutError, UnicodeError) as failure:
+        raise CaptureError("Could not find the display under the pointer.") from failure
+    if not TARGET_ID.fullmatch(target) or not target.endswith(":0"):
+        raise CaptureError("Could not find the display under the pointer.")
+    return target
+
+
 async def snapshot(source, target):
     handle, pid = target.split(":")
     data = await output("snapshot", source, handle, pid, timeout=10)
@@ -185,10 +195,11 @@ class WindowsPen(PenProcess):
 
 
 class WindowsScreenRecording:
-    def __init__(self, staging, source, target, microphone=False, computer_audio=False):
+    def __init__(self, staging, source, target, microphone=False, computer_audio=False, *, microphone_device="", notice=None):
         audio_sources = tuple(name for name, enabled in (("mic", microphone), ("system", computer_audio)) if enabled)
         self.draft = ScreenDraft(staging / str(uuid4()), source, audio_sources)
         self.target = target
+        self.microphone_device = microphone_device
         self.phase = "previewing" if source == "area" else "starting"
         self.started = None
         self.elapsed = 0
@@ -208,6 +219,7 @@ class WindowsScreenRecording:
         self.pen = WindowsPen(self.drawing, target, source, self.recording_time)
         self.frame_bytes = 0
         self.bytes_encoded = 0
+        self.notice = notice
 
     def recording_time(self):
         # Follow the frames sent to the encoder so slow encodes cannot move ink ahead of the video.
@@ -216,11 +228,15 @@ class WindowsScreenRecording:
         return (self.bytes_encoded // self.frame_bytes) / CAPTURE_FPS
 
     def status(self):
-        status = {"phase": "saving" if self.saving else self.phase, "seconds": self.recording_time(), "error": self.error}
+        status = {"phase": "saving" if self.saving else self.phase, "seconds": self.recording_time(),
+                  "id": self.draft.key, "error": self.error}
         if self.phase == "recording":
-            status["id"] = self.draft.key
             status["desktopDrawing"] = self.pen.available
             status["desktopDrawingActive"] = self.pen.active
+            if self.audio and self.audio.unavailable and not self.error:
+                sources = {"mic": "Microphone", "system": "Computer audio"}
+                missing = " and ".join(label for source, label in sources.items() if source in self.audio.unavailable)
+                status["error"] = f"{missing} unavailable. Jaro is trying to reconnect."
         if self.phase == "selecting" and self.preview_id:
             width, height = self.picture.size
             status["preview"] = {"id": self.preview_id, "width": width, "height": height}
@@ -305,7 +321,8 @@ class WindowsScreenRecording:
         names = self.draft.audio_sources
         if not names or self.stopped:
             return
-        audio = self.audio = WindowsScreenAudio(self.draft.key, self.draft.narration, "both" if len(names) == 2 else names[0])
+        audio = self.audio = WindowsScreenAudio(self.draft.key, self.draft.narration, "both" if len(names) == 2 else names[0],
+                                               microphone=self.microphone_device)
         try:
             await audio.start()
             delay = (audio.started_ticks - video_ticks) / 10_000_000
@@ -317,6 +334,11 @@ class WindowsScreenRecording:
             with suppress(OSError):
                 await audio.stop()
             self.audio = None
+            self.draft = replace(self.draft, audio_sources=())
+            try:
+                self.draft.write_metadata()
+            except OSError:
+                logger.warning("Could not update the saved screen draft after audio setup failed.")
 
     async def record(self):
         try:
@@ -328,6 +350,11 @@ class WindowsScreenRecording:
                 return
             if self.draft.source == "area":
                 self.region = await self.choose_region()
+            if self.notice is not None:
+                await self.notice.show(self)
+                if self.stopped or self.notice.lost:
+                    self.phase = "cancelled"
+                    return
             self.draft.create()
             with writer_lock(self.draft.folder, create=True), self.draft.movie.with_suffix(".log").open("xb") as diagnostics:
                 await self.run_encoder(helper, diagnostics)
@@ -337,6 +364,8 @@ class WindowsScreenRecording:
                 self.error = str(error) if isinstance(error, CaptureError) else "Could not start or finish the Windows recording."
                 logger.warning("Windows screen recording stopped: %s", type(error).__name__)
         finally:
+            if self.notice is not None:
+                await self.notice.close()
             await self.pen.close()
             self.picture = None
             self.drawing.frame = None

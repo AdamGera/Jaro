@@ -45,7 +45,7 @@ def boost_microphone(pcm):
 
 
 def replace_mixed_microphone(mixed, original, replacement):
-    """Update the microphone's half of a two-source meeting mix for ASR."""
+    """Update the microphone's half of a two-source meeting mix."""
     mix, mic, enhanced = (np.frombuffer(value, dtype="<f4") for value in (mixed, original, replacement))
     return np.clip(mix + (enhanced - mic) * np.float32(0.5), -1, 1).astype("<f4", copy=False).tobytes()
 
@@ -61,11 +61,11 @@ class StuPASECleanup:
         self.lock = asyncio.Lock()
 
     def status(self):
-        if checkpoints_ready(self.root):
-            return "ready"
         if self.downloading:
             return "downloading"
-        return "error" if self.error else "notInstalled"
+        if self.error:
+            return "error"
+        return "ready" if checkpoints_ready(self.root) else "notInstalled"
 
     def prepare(self, *, retry=False):
         status = self.status()
@@ -97,17 +97,18 @@ class StuPASECleanup:
             self.downloading = None
 
     async def clean(self, pcm, *, wait=True):
-        if self.prepare() != "ready":
-            raise CleanupFailed()
         if not wait and self.lock.locked():
             raise CleanupFailed()
         async with self.lock:
+            if self.prepare() != "ready":
+                raise CleanupFailed()
             self.worker_generation += 1
             if self.idle:
                 self.idle.cancel()
                 self.idle = None
+            starting = self.worker is None or self.worker.returncode is not None
             try:
-                if self.worker is None or self.worker.returncode is not None:
+                if starting:
                     async with asyncio.timeout(STARTUP_TIMEOUT):
                         self.worker = await asyncio.create_subprocess_exec(
                             sys.executable, str(RUNNER), "serve", str(self.root),
@@ -117,6 +118,7 @@ class StuPASECleanup:
                         ready, = HEADER.unpack(await self.worker.stdout.readexactly(HEADER.size))
                         if ready != 0:
                             raise CleanupFailed()
+                    starting = False
                 async with asyncio.timeout(CLEANUP_TIMEOUT):
                     worker = self.worker
                     worker.stdin.write(HEADER.pack(len(pcm)) + pcm)
@@ -126,6 +128,11 @@ class StuPASECleanup:
                         raise CleanupFailed()
                     return await worker.stdout.readexactly(size)
             except (OSError, TimeoutError, EOFError, CleanupFailed) as error:
+                if starting:
+                    self.error = True
+                    # Recheck the saved weights on the next setup attempt.
+                    with suppress(OSError):
+                        (self.root / ".verified").unlink(missing_ok=True)
                 await self.stop_worker(log_stderr=True)
                 raise CleanupFailed() from error
             except asyncio.CancelledError:

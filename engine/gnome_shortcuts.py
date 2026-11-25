@@ -1,4 +1,4 @@
-"""Install this library's command shortcuts in the current GNOME session."""
+"""Read GNOME portal assignments and manage this library's command shortcuts."""
 from ast import literal_eval
 import json
 import logging
@@ -22,7 +22,43 @@ BINDINGS = (
     ("paste-last", "Jaro · Paste last dictation", "paste-last", "<Control><Alt>v"),
     ("cancel", "Jaro · Cancel dictation", "cancel", "<Control><Alt><Shift>x"),
 )
+ANNOTATE_BINDING = ("annotate", "Jaro · Annotate", "annotate", "<Control><Alt><Shift>s")
 logger = logging.getLogger(__name__)
+
+# Read GNOME's typed setting for this app. The portal remains the only code
+# that binds the shortcuts or asks for approval.
+PORTAL_SHORTCUTS = """
+const {Gio} = imports.gi;
+const schema = Gio.SettingsSchemaSource.get_default()?.lookup(
+    "org.gnome.settings-daemon.global-shortcuts.application", true);
+if (!schema?.has_key("shortcuts")) {
+    print("null");
+} else {
+    const path = "/org/gnome/settings-daemon/global-shortcuts/" + ARGV[0] + "/";
+    const settings = new Gio.Settings({settings_schema: schema, path});
+    const entries = settings.get_value("shortcuts").deepUnpack();
+    print(JSON.stringify(entries.filter(([, properties]) => {
+        const accelerators = properties.shortcuts?.deepUnpack();
+        return Array.isArray(accelerators) && accelerators.some(value => typeof value === "string" && value.trim());
+    }).map(([id]) => id)));
+}
+"""
+
+
+def portal_shortcut_ids(application):
+    """Return enabled IDs, or None when GNOME's setting cannot be read."""
+    gjs = shutil.which("gjs")
+    if gjs is None:
+        return None
+    try:
+        result = subprocess.run([gjs, "-c", PORTAL_SHORTCUTS, application], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, encoding="utf-8", timeout=2, check=True)
+        ids = json.loads(result.stdout)
+        if isinstance(ids, list) and all(isinstance(key, str) for key in ids):
+            return set(ids)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        logger.debug("Could not read saved GNOME portal assignments.", exc_info=True)
+    return None
 
 
 def supported():
@@ -72,24 +108,30 @@ def repeat_window():
 
 
 class GnomeShortcuts:
-    def __init__(self, root):
+    def __init__(self, root, *, annotation=False):
         self.prefix = command_prefix(root, gnome=True)
+        prefix = f"{BASE}jaro-{library_id(root)}-"
+        self.annotation_entry = prefix + "annotate/"
+        bindings = BINDINGS + (ANNOTATE_BINDING,) if annotation else BINDINGS
         self.entries = {
-            f"{BASE}jaro-{library_id(root)}-{identifier}/": (label, action, default)
-            for identifier, label, action, default in BINDINGS
+            f"{prefix}{identifier}/": (label, action, default)
+            for identifier, label, action, default in bindings
         }
+        self.owned = self.entries.keys() | {self.annotation_entry}
 
     def installed(self):
         return bool(self.installed_entries())
 
     def installed_entries(self):
-        return self.entries.keys() & paths()
+        return self.owned.intersection(paths())
 
     def install(self):
         listed = paths()
         taken = set()
         for path in listed:
-            if path not in self.entries and re.fullmatch(r"/(?:[a-zA-Z0-9_-]+/)+", path):
+            if path in self.owned and path not in self.entries:
+                continue
+            if re.fullmatch(r"/(?:[a-zA-Z0-9_-]+/)+", path):
                 value = variant(gsettings("get", f"{ENTRY}:{path}", "binding"))
                 if isinstance(value, str):
                     taken.add(accelerator(value))
@@ -107,19 +149,23 @@ class GnomeShortcuts:
             missing_key |= not binding
         # Read again to retain bindings added elsewhere while the new entries were staged.
         latest = paths()
-        missing = [path for path in self.entries if path not in latest]
-        if missing:
-            gsettings("set", SCHEMA, KEY, json.dumps(latest + missing, ensure_ascii=False))
-        if not self.entries.keys() <= set(paths()):
+        obsolete = self.owned.difference(self.entries).intersection(latest)
+        kept = [path for path in latest if path not in obsolete]
+        kept.extend(path for path in self.entries if path not in latest)
+        if kept != latest:
+            gsettings("set", SCHEMA, KEY, json.dumps(kept, ensure_ascii=False))
+        if self.installed_entries() != self.entries.keys():
             raise CaptureError("GNOME did not save the custom shortcuts.")
+        for path in obsolete:
+            gsettings("reset-recursively", f"{ENTRY}:{path}")
         return missing_key
 
     def remove(self):
         listed = paths()
-        kept = [path for path in listed if path not in self.entries]
+        kept = [path for path in listed if path not in self.owned]
         if listed != kept:
             gsettings("set", SCHEMA, KEY, json.dumps(kept, ensure_ascii=False))
             if self.installed():
                 raise CaptureError("GNOME did not remove the custom shortcuts.")
-        for path in self.entries:
+        for path in self.owned:
             gsettings("reset-recursively", f"{ENTRY}:{path}")

@@ -3,21 +3,39 @@
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
+        if (argc > 1 && !strcmp(argv[1], "--jaro-relaunch-update")) return JardRunUpdateRelaunch(argc, argv);
         NSBundle *bundle = NSBundle.mainBundle;
         NSURL *installed = bundle.bundleURL.URLByStandardizingPath;
         NSURL *root = installed.URLByDeletingLastPathComponent;
         NSString *version = [bundle objectForInfoDictionaryKey:@"CFBundleVersion"];
+        NSDictionary *environment = NSProcessInfo.processInfo.environment;
+        NSURL *marker = [root URLByAppendingPathComponent:@"launched"];
+        NSString *stagePath = [root URLByAppendingPathComponent:@".jard-update-fixture"].path;
+        NSURL *expectedLibrary = [root URLByAppendingPathComponent:@"Library" isDirectory:YES].URLByResolvingSymlinksInPath;
+        NSURL *openedLibrary = [NSURL fileURLWithPath:environment[@"RUMBLE_DATA_DIR"] isDirectory:YES].URLByResolvingSymlinksInPath;
+        if ([environment[@"JARD_UPDATE_ROLLED_BACK"] isEqual:@"1"]) {
+            assert([version isEqual:@"1.1.0"]);
+            assert([openedLibrary.path isEqual:expectedLibrary.path]);
+            [@"old version restored" writeToURL:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            return 0;
+        }
         NSDictionary *configuration = @{@"feed_url": @"https://example.invalid/feed", @"public_key": @"unused"};
         if ([version isEqual:@"1.2.0"]) {
+            assert([openedLibrary.path isEqual:expectedLibrary.path]);
             JardUpdater *updater = [[JardUpdater alloc] initWithConfiguration:configuration bundle:bundle stateChanged:nil];
             assert(updater);
-            NSString *stagePath = [root URLByAppendingPathComponent:@".jard-update-fixture"].path;
+            BOOL quitOnly = [NSFileManager.defaultManager fileExistsAtPath:[root URLByAppendingPathComponent:@"quit-only"].path];
+            assert(JardIsUpdateStartupProbe() != quitOnly);
+            [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.3]];
+            assert([NSFileManager.defaultManager fileExistsAtPath:stagePath]);
+            if ([[bundle objectForInfoDictionaryKey:@"FixtureFailsAtLaunch"] boolValue]) return 2;
+            [updater confirmStartup];
             NSDate *until = [NSDate dateWithTimeIntervalSinceNow:8];
             while ([NSFileManager.defaultManager fileExistsAtPath:stagePath] && until.timeIntervalSinceNow > 0)
                 [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.02]];
             BOOL backup = [NSFileManager.defaultManager fileExistsAtPath:stagePath];
             NSString *proof = backup ? @"new version launched; backup remains" : @"new version launched; backup cleaned";
-            [proof writeToURL:[root URLByAppendingPathComponent:@"launched"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [proof writeToURL:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
             return 0;
         }
         NSURL *stage = [root URLByAppendingPathComponent:@".jard-update-fixture" isDirectory:YES];

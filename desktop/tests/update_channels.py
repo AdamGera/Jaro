@@ -213,6 +213,7 @@ def exercise(root, executable):
                 "CFBundleIdentifier": identity, "CFBundleVersion": version, "CFBundleShortVersionString": version,
                 "CFBundlePackageType": "APPL", "CFBundleExecutable": "fixture", "LSUIElement": True,
                 "JardUpdates": updates, "FixtureFlavor": flavor,
+                "JardUpdateStartupConfirmation": flavor == "broken-update",
                 "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
             }))
             run("codesign", "--force", "--sign", "-", "-r", f'=designated => identifier "{identity}"', app)
@@ -413,6 +414,22 @@ def exercise(root, executable):
             assert result["CFBundleVersion"] == "4.0.0" and result["JardUpdates"]["channel"] == "stable", result
             assert requests[since:] == ["stable-four.json", "stable-four.zip", "dev-first.json"], requests[since:]
             print("Quit installed the verified Stable update at the same path while a Development offer awaited confirmation.")
+
+            run("defaults", "delete", identity, "JardUpdateChannel")
+            publish("broken-update", "stable", "stable", "4.0.0")
+            publish("corrected-update", "stable", "stable", "4.0.0")
+            recovery = bundle(root / "recovery-install", "stable", "3.0.0", "rollback-installed")
+            recovery = recovery.rename(root / "Recovery.app")
+            recovery_entry = recovery / "Contents/MacOS/fixture"
+            (root / "stable-feed").write_text("broken-update")
+            since = len(requests)
+            subprocess.run([recovery_entry], check=True, timeout=25)
+            wait_for(root / "rollback-reoffer-checked")
+            assert requests[since:] == ["broken-update.json", "broken-update.zip", "broken-update.json"], requests[since:]
+            (root / "stable-feed").write_text("corrected-update")
+            subprocess.run([recovery_entry, "--corrected"], check=True, timeout=25)
+            assert requests[since + 3:] == ["corrected-update.json", "corrected-update.zip"], requests[since:]
+            print("The signed archive that failed startup was never restaged. A corrected archive with the same version reached Restart to Update.")
         finally:
             server.shutdown()
             thread.join()

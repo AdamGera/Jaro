@@ -1,6 +1,13 @@
-# Jard local transcription SDK
+# Jaro local transcription SDK
 
-Run Jaro, then import the SDK from the app’s `Contents/Resources/sdk/typescript/index.mjs` in a trusted Node or Electron main process. The client uses the bundled Rumble2 Flash service. Supply audio bytes with `transcribe()`, or request a recording from the running Mac app.
+Run Jaro, then import `sdk/typescript/index.mjs` from the installed payload in a trusted Node or Electron main process. The client uses the bundled Rumble2 Flash service. Supply audio bytes with `transcribe()`, or request a recording when the running app reports that microphone capture is available.
+
+| Platform | Installed payload |
+| --- | --- |
+| macOS | `/Applications/Jaro.app/Contents/Resources` |
+| Linux package | `/usr/lib/jaro` |
+| Linux direct install | `${XDG_DATA_HOME:-$HOME/.local/share}/jaro-app/current` |
+| Windows | `%LOCALAPPDATA%\Programs\Jaro\versions\<active version>` from `current-version` |
 
 ```js
 import { readFile } from "node:fs/promises"
@@ -16,15 +23,15 @@ const result = await jard.transcribe(await readFile("note.wav"), {
 console.log(result.transcript, result.durationMs)
 ```
 
-`connect({ library })` can target a custom Jard library. By default it uses `RUMBLE_DATA_DIR` or the installed app’s Application Support library. The Node SDK verifies the process identified by the owner-only discovery file over loopback. Requests carrying audio or a bearer credential use the verified connection.
+`connect({ library })` can target a custom Jaro library. By default it uses `RUMBLE_DATA_DIR` or the platform’s usual Jaro library. The SDK reads an owner-only discovery file on macOS and Linux or a current-user registry record on Windows. It verifies the engine over loopback and sends audio and credentials only on the verified connection.
 
 Transcription accepts a `Uint8Array` or `ArrayBuffer` and returns final text and the duration of decoded audio in milliseconds. `capabilities()` reports the current upload and duration limits. A missing language lets Rumble2 Flash detect the language. Two requests can be admitted at a time. Errors expose `code`, an explanatory message, and an HTTP `status` when available.
 
-File transcription creates no Session or history entry and never pastes. Aborting a request disconnects the client. A Metal inference block already in progress finishes before Jard discards the request’s temporary audio.
+File transcription creates no Session or history entry and never pastes. Aborting a request disconnects the client. An inference block already in progress finishes before Jaro discards the request’s temporary audio.
 
-## Record with the Mac app
+## Record with the desktop app
 
-`connect()` can use Jard’s Microphone grant and its selected input device. If `capabilities().serviceCapture` is `true`, request a take when the user chooses to record. The desktop app refuses the request if it needs Microphone access or another capture is active.
+`connect()` can use Jaro’s microphone access and its selected input device. If `capabilities().serviceCapture` is `true`, request a take when the user chooses to record. The desktop app refuses the request if it needs microphone access or another capture is active. On Windows and Linux, takes last up to two minutes.
 
 ```js
 const recording = await jard.dictation.start({ source: "My app" })
@@ -55,3 +62,17 @@ try {
 ```
 
 Each embedded client owns a helper and an independent port. `close()` waits for that helper to exit. Cancelling an in-flight embedded transcription also closes the helper before the request rejects. Start a new client for the next take. The helper reads existing model files and discards temporary audio on exit. `jardctl transcribe` also uses an owned helper when the shared engine is stopped.
+
+### Prepare the speech model
+
+After the user agrees to install Rumble2 Flash, pass `prepare: true` to download missing pinned speech files before the helper starts. To install from an existing pinned cache, pass `prepare: { from: "/path/to/model-cache" }`. Include `repair: true` in that object to recheck and replace damaged files. Ordinary `create()` and `transcribe()` calls use installed weights.
+
+```js
+const jard = await create({
+  prepare: true,
+  signal: abortController.signal,
+  onProgress: event => console.log(event),
+})
+```
+
+Progress reports `checking`, `installing` with `completedBytes` and `totalBytes`, and `loading`. Preparation defaults to a 30-minute startup timeout. Cancelling startup closes the helper and leaves partial files available for a retry. A custom `command` must launch Jaro’s embedded helper and accept the appended preparation arguments.

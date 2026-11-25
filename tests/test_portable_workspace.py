@@ -1,11 +1,15 @@
 import asyncio
+import base64
+from contextlib import nullcontext
 from importlib.util import find_spec
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import sys
 from tempfile import TemporaryDirectory
+from time import monotonic, time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -14,18 +18,663 @@ from uuid import uuid4
 
 import httpx
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from portable_workspace import BOOTSTRAP, configure_workspace
-from server import begin_screencast, discard_screencast, portable_screenshot, screencast_status, screenshot_targets
+from server import begin_screencast, discard_screencast, portable_screenshot, screencast_microphones, screencast_status, screenshot_targets
 from server import append_screencast_ink, screencast_pen, screencast_preview, screencast_targets, set_screencast_region, start_model_setup, start_workspace_speech
-from linux_capture import capture_args, default_computer_audio, default_microphone, microphone_inputs
+from linux_capture import LinuxRecording, capture_args, default_computer_audio, default_microphone, microphone_inputs
+from portable_dictation import OutputContext
 from portable_capture import CaptureError, PortableRecording, SAMPLE_RATE, draft_frames, draft_tracks, private_wav, release_cutoff, split_audio
 from native_recordings import source_tracks
-from windows_capture import parse_microphones, WindowsMeetingRecording, WindowsRecording
+from windows_capture import parse_microphones, WindowsMeetingRecording, WindowsRecording, WindowsScreenAudio
 
 
 class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rules_manager_creates_a_source_once_before_recording(self):
+        from annotation_deliveries import AnnotationDeliveries
+        from server import portable_annotation_rules
+
+        origin = "http://127.0.0.1:43723"
+        record = {"port": 43723}
+        route = "/api/portable/annotation-rules"
+        app = FastAPI()
+        configure_workspace(app, record, origin)
+        app.add_api_route(route, portable_annotation_rules, methods=["POST"])
+        app.state.draining = False
+        app.state.jobs = set()
+        command = {"action": "add", "kind": "app", "source": "ReviewPad.EXE", "target": "ses_new", "service": "a" * 64}
+        headers = {"Origin": origin}
+        with TemporaryDirectory() as folder:
+            store = AnnotationDeliveries(folder)
+            app.state.library = SimpleNamespace(root=Path(folder))
+            with (patch("server.URL", origin), patch("server.sys", SimpleNamespace(platform="win32")),
+                  patch("annotation_routing.verify_rule_destination", new_callable=AsyncMock) as verify):
+                verify.return_value = (SimpleNamespace(channel="service.json"), {"id": "ses_new", "title": "Review chat"})
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+                    await client.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
+                    self.assertEqual((await client.post(route, headers=headers, json=command)).status_code, 403)
+                    await client.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceDesktopKey"]})
+                    malformed = {**command, "kind": "site", "source": "https://example.test/%2E%2E/private"}
+                    self.assertEqual((await client.post(route, headers=headers, json=malformed)).status_code, 409)
+                    verify.assert_not_awaited()
+                    results = await asyncio.gather(
+                        client.post(route, headers=headers, json=command),
+                        client.post(route, headers=headers, json={**command, "source": "windows.reviewpad"}),
+                    )
+                    self.assertEqual(sorted(response.status_code for response in results), [200, 409])
+                    saved, = store.list_rules()
+                    self.assertEqual((saved["source"], saved["target"], saved["automatic"]), ("windows.reviewpad", "ses_new", False))
+                    self.assertEqual((await client.post(route, headers=headers, json=command)).status_code, 409)
+                    self.assertEqual(store.list_rules(), [saved])
+                    terminal = {**command, "kind": "terminal", "source": r"C:\Work\Jaro"}
+                    response = await client.post(route, headers=headers, json=terminal)
+                    self.assertEqual(response.status_code, 200)
+                    folder_rule = next(rule for rule in response.json()["rules"] if rule["kind"] == "terminal")
+                    self.assertEqual(folder_rule["source"], r"c:\work\jaro")
+
+    async def test_rules_manager_requires_the_desktop_and_retargets_the_exact_rule(self):
+        from annotation_deliveries import AnnotationDeliveries
+        from annotation_routing import RouteUnavailable
+        from server import portable_annotation_rules
+
+        origin = "http://127.0.0.1:43722"
+        record = {"port": 43722}
+        route = "/api/portable/annotation-rules"
+        app = FastAPI()
+        configure_workspace(app, record, origin)
+        app.add_api_route(route, portable_annotation_rules, methods=["POST"])
+        app.state.draining = False
+        app.state.jobs = set()
+        with TemporaryDirectory() as folder:
+            store = AnnotationDeliveries(folder)
+            app.state.library = SimpleNamespace(root=Path(folder))
+            old = store.remember_rule({"kind": "site", "key": "example.test", "label": "example.test"},
+                                      "Earlier chat", "ses_old", "service.json", automatic=True)
+            save = {"action": "retarget", "id": old["id"], "target": "ses_new", "service": "a" * 64}
+            headers = {"Origin": origin}
+            with (patch("server.URL", origin), patch("server.sys", SimpleNamespace(platform="win32")),
+                  patch("annotation_routing.verify_rule_destination", new_callable=AsyncMock) as verify):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+                    await client.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
+                    self.assertEqual((await client.post(route, headers=headers, json={"action": "list"})).status_code, 403)
+                    await client.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceDesktopKey"]})
+                    self.assertEqual((await client.post(route, json=save)).status_code, 403)
+                    self.assertEqual((await client.post(route, headers=headers, json={**save, "automatic": True})).status_code, 422)
+                    verify.assert_not_awaited()
+                    verify.side_effect = RouteUnavailable("OpenCode is offline.")
+                    self.assertEqual((await client.post(route, headers=headers, json=save)).status_code, 409)
+                    self.assertEqual(store.list_rules()[0]["id"], old["id"])
+                    verify.side_effect = None
+                    verify.return_value = (SimpleNamespace(channel="wsl:service.json"), {"id": "ses_new", "title": "New chat"})
+                    changed = await client.post(route, headers=headers, json=save)
+                    current, = changed.json()["rules"]
+                    self.assertEqual((current["source"], current["target"], current["channel"], current["automatic"]),
+                                     ("example.test", "ses_new", "wsl:service.json", False))
+                    self.assertNotEqual(current["id"], old["id"])
+                    self.assertEqual((await client.post(route, headers=headers, json={"action": "remove", "id": old["id"]})).status_code, 409)
+                    removed = await client.post(route, headers=headers, json={"action": "remove", "id": current["id"]})
+                    self.assertEqual(removed.json()["rules"], [])
+                    self.assertEqual(verify.await_count, 2)
+
+    async def test_windows_annotation_handoff_uses_the_desktop_command_credential(self):
+        from server import windows_annotation_command
+        from windows_dictation_commands import ANNOTATION_COMMAND_ROUTE
+
+        route = ANNOTATION_COMMAND_ROUTE
+        origin = "http://127.0.0.1:43721"
+        record = {"port": 43721}
+        app = FastAPI()
+        configure_workspace(app, record, origin)
+        app.state.windows_dictation_control = {"token": "b" * 64}
+        app.add_api_route(route, windows_annotation_command, methods=["POST"])
+        payload = {"action": "destinations", "query": "Review"}
+        headers = {"Origin": origin}
+        auth = {**headers, "Authorization": "Bearer " + "b" * 64}
+        reply = {"service": "a" * 64, "sessions": []}
+        with (patch("server.URL", origin),
+              patch("server.run_portable_annotation_handoff", new_callable=AsyncMock, return_value=reply) as run):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+                await client.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceDesktopKey"]})
+                self.assertEqual((await client.post(route, headers=headers, json=payload)).status_code, 403)
+                self.assertEqual((await client.post(route, headers={**auth, "Origin": "https://elsewhere.test"},
+                                                    json=payload)).status_code, 403)
+                self.assertEqual((await client.post(route, headers=auth, json={"action": "send-session"})).status_code, 400)
+                run.assert_not_awaited()
+                self.assertEqual((await client.post(route, headers=auth, json=payload)).json(), reply)
+                run.assert_awaited_once()
+                self.assertEqual(run.await_args.args[1].query, "Review")
+
+    async def test_session_handoff_requires_the_owned_window_and_shares_saved_context(self):
+        import personal_notes
+        import session_images
+        from server import missing_session, portable_annotation_handoff, remove_session_image, session_image
+        from session_notes import publish
+        from session_store import MissingSession, SessionStore
+
+        origin = "http://127.0.0.1:43721"
+        endpoint = "/api/portable/annotation-handoff"
+        record = {"port": 43721}
+        app = FastAPI()
+        configure_workspace(app, record, origin)
+        app.add_api_route(endpoint, portable_annotation_handoff, methods=["POST"])
+        image_route = "/api/sessions/{key}/images/{image_id}"
+        app.add_api_route(image_route, session_image, methods=["GET"])
+        app.add_api_route(image_route, remove_session_image, methods=["DELETE"])
+        app.add_exception_handler(MissingSession, missing_session)
+        app.state.draining = False
+        app.state.jobs = set()
+        jpeg = bytes.fromhex("ffd8 ffc0 000b 08 0002 0003 01 01 1100 ffd9")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture.wav"
+            source.write_bytes(b"fixture audio")
+            library = SessionStore(root)
+            app.state.library = library
+            key, media = library.create(source, source.name, "audio/wav", {"recording": False, "diarization": False}, 3)
+            library.append(key, {"text": "Fixture transcript", "language": "English", "words": [], "segments": []}, 3)
+            library.finish(key)
+            with library.connection() as db:
+                publish(db, key, "en", {"language": "en", "title": "Fixture overview",
+                                        "summary": "Overview point ⟦2⟧", "markdown": "", "topics": []})
+                note = personal_notes.NoteEdit(revision=0, document={"type": "doc", "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": "User-authored note"}]},
+                ]})
+                personal_notes.save(db, key, note)
+                image = session_images.add(db, key, jpeg)
+            headers = {"Origin": origin}
+            service = "a" * 64
+            payload = {"action": "send-session", "id": key, "target": "ses_fixture", "service": service}
+            with (patch("server.URL", origin), patch("server.sys", SimpleNamespace(platform="linux")),
+                  patch("annotation_routing.send_session_prompt", new_callable=AsyncMock) as send,
+                  patch("annotation_agents.deliver", new_callable=AsyncMock) as deliver):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+                    self.assertEqual((await client.post(endpoint, headers=headers, json=payload)).status_code, 403)
+                    self.assertEqual((await client.get(image["url"])).status_code, 403)
+                    await client.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
+                    self.assertEqual((await client.post(endpoint, headers=headers, json=payload)).status_code, 403)
+                    await client.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceDesktopKey"]})
+                    self.assertEqual((await client.post(endpoint, json=payload)).status_code, 403)
+                    wrong_origin = {"Origin": "https://example.test"}
+                    self.assertEqual((await client.post(endpoint, headers=wrong_origin, json=payload)).status_code, 403)
+                    send.assert_not_awaited()
+                    response = await client.post(endpoint, headers=headers, json=payload)
+                    self.assertEqual(response.json(), {"images": "attached"})
+                    self.assertEqual(response.headers["Cache-Control"], "no-store")
+                    send.assert_awaited_once()
+                    body, target, identity = send.await_args.args
+                    self.assertEqual((target, identity, body["delivery"]), ("ses_fixture", service, "queue"))
+                    for text in ("Overview point (00:02)", "User-authored note", "Fixture transcript"):
+                        self.assertIn(text, body["text"])
+                    self.assertEqual(body["files"], [{
+                        "name": "jaro-image-1.jpg", "uri": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode(),
+                    }])
+                    for agent in ("codex", "claude", "t3"):
+                        destination = "fixture_thread" if agent == "t3" else str(uuid4())
+                        request = {"action": "send-session", "id": key, "agent": agent, "target": destination}
+                        reply = await client.post(endpoint, headers=headers, json=request)
+                        self.assertEqual(reply.raise_for_status().json(),
+                                         {"images": "references" if agent == "t3" else "attached"})
+                        sent_agent, target, text, files = deliver.await_args.args
+                        self.assertEqual((sent_agent, target), (agent, destination))
+                        for item in ("Overview point (00:02)", "User-authored note", "Fixture transcript"):
+                            self.assertIn(item, text)
+                        if agent == "t3":
+                            self.assertEqual(files, [])
+                            self.assertNotIn(origin, text)
+                            local_file = Path(json.loads(text.splitlines()[-1].removeprefix("- ")))
+                            self.assertEqual(local_file.parent.parent, media.parent)
+                            self.assertEqual(local_file.read_bytes(), jpeg)
+                        else:
+                            self.assertEqual(files, [("image/jpeg", base64.b64encode(jpeg).decode())])
+                    (await client.delete(image["url"], headers=headers)).raise_for_status()
+                    self.assertFalse(local_file.exists())
+                    self.assertEqual((await client.get(image["url"])).status_code, 404)
+
+    async def test_windows_dictation_cli_has_its_own_library_bound_credential(self):
+        from sdk_discovery import sdk_proof
+        from server import identify_windows_dictation, run_windows_dictation
+        from windows_dictation_commands import ROUTE
+
+        origin = "http://127.0.0.1:43211"
+        app = FastAPI()
+        configure_workspace(app, {"port": 43211, "token": "a" * 64}, origin)
+        record = {"apiVersion": 1, "pid": 20, "port": 43211, "libraryId": "b" * 64, "token": "c" * 64}
+        app.state.windows_dictation_control = record
+        app.state.portable_recording_dir = Path(".")
+        command = AsyncMock(return_value={"status": "starting"})
+        app.state.portable_dictation = SimpleNamespace(platform="windows", run_command=command)
+        app.add_api_route(ROUTE, identify_windows_dictation, methods=["GET"])
+        app.add_api_route(ROUTE, run_windows_dictation, methods=["POST"])
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+            headers = {"Origin": origin, "Authorization": "Bearer " + record["token"]}
+            with patch("server.URL", origin):
+                request = {"action": "start", "raw": True}
+                self.assertEqual((await client.post(ROUTE, json=request)).status_code, 403)
+                self.assertEqual((await client.post(ROUTE, headers={**headers, "Origin": "https://example.org"},
+                                                    json=request)).status_code, 403)
+                self.assertEqual((await client.post(ROUTE, headers={**headers, "Authorization": "Bearer " + "a" * 64},
+                                                    json=request)).status_code, 403)
+                self.assertEqual((await client.post(ROUTE, headers=headers,
+                                                    json={"action": "toggle", "printed": True})).status_code, 422)
+                command.assert_not_awaited()
+                challenge = "d" * 32
+                self.assertEqual((await client.get(ROUTE, params={"challenge": challenge})).json(),
+                                 {"proof": sdk_proof(record, challenge)})
+                self.assertEqual((await client.post(ROUTE, headers=headers, json=request)).json(), {"status": "starting"})
+                command.assert_awaited_once_with("start", raw=True, printed=False)
+
+    async def test_windows_meeting_trash_uses_the_owner_command_credential(self):
+        from server import trash_meeting_from_windows_command
+        from windows_dictation_commands import MEETING_TRASH_ROUTE
+
+        origin = "http://127.0.0.1:43211"
+        app = FastAPI()
+        configure_workspace(app, {"port": 43211, "token": "a" * 64}, origin)
+        app.state.windows_dictation_control = {"token": "b" * 64}
+        app.add_api_route(MEETING_TRASH_ROUTE, trash_meeting_from_windows_command, methods=["POST"])
+        key = str(uuid4())
+        payload = {"id": key}
+        headers = {"Origin": origin, "Authorization": "Bearer " + "b" * 64}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+            with patch("server.URL", origin), patch("server.remove_saved_session", new_callable=AsyncMock, return_value=True) as remove:
+                self.assertEqual((await client.post(MEETING_TRASH_ROUTE, json=payload)).status_code, 403)
+                self.assertEqual((await client.post(MEETING_TRASH_ROUTE, headers={**headers, "Authorization": "Bearer " + "a" * 64},
+                                                    json=payload)).status_code, 403)
+                self.assertEqual((await client.post(MEETING_TRASH_ROUTE, headers={**headers, "Origin": "https://example.org"},
+                                                    json=payload)).status_code, 403)
+                self.assertEqual((await client.post(MEETING_TRASH_ROUTE, headers=headers, json={"id": "latest"})).status_code, 422)
+                remove.assert_not_called()
+                response = await client.post(MEETING_TRASH_ROUTE, headers=headers, json=payload)
+                self.assertEqual(response.json(), {"id": key, "trashPending": True})
+                remove.assert_awaited_once_with(app.state, key, meeting_only=True)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux abstract sockets and peer credentials")
+    async def test_linux_meeting_trash_uses_the_owned_library_socket_without_dictation(self):
+        from wayland_dictation_commands import dispatch_meeting_trash, listen
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            key = str(uuid4())
+            result = {"id": key, "trashPending": False}
+            archive = AsyncMock(return_value=result)
+            async with await listen(root, None, trash_meeting=archive):
+                self.assertEqual(await asyncio.to_thread(dispatch_meeting_trash, root, key), result)
+                archive.assert_awaited_once_with(key)
+                with self.assertRaisesRegex(RuntimeError, "Open Jaro for this library"):
+                    await asyncio.to_thread(dispatch_meeting_trash, root / "different", key)
+                with self.assertRaises(ValueError):
+                    await asyncio.to_thread(dispatch_meeting_trash, root, "latest")
+
+    async def test_windows_meeting_commands_require_the_owner_credential(self):
+        from server import windows_meeting_command
+        from windows_dictation_commands import MEETING_COMMAND_ROUTE
+
+        origin = "http://127.0.0.1:43211"
+        app = FastAPI()
+        configure_workspace(app, {"port": 43211, "token": "a" * 64}, origin)
+        app.state.windows_dictation_control = {"token": "b" * 64}
+        app.post(MEETING_COMMAND_ROUTE)(windows_meeting_command)
+        headers = {"Origin": origin, "Authorization": "Bearer " + "b" * 64}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+            with patch("server.URL", origin), patch("server.run_portable_meeting_command", new_callable=AsyncMock,
+                                                   return_value={"phase": "recording"}) as command:
+                payload = {"action": "record", "title": "Réunion"}
+                for rejected in ({}, {**headers, "Authorization": "Bearer " + "a" * 64},
+                                 {**headers, "Origin": "https://example.org"}):
+                    self.assertEqual((await client.post(MEETING_COMMAND_ROUTE, headers=rejected, json=payload)).status_code, 403)
+                self.assertEqual((await client.post(MEETING_COMMAND_ROUTE, headers=headers, json={"action": "cancel"})).status_code, 422)
+                command.assert_not_awaited()
+                response = await client.post(MEETING_COMMAND_ROUTE, json=payload, headers=headers)
+                self.assertEqual(response.json(), {"phase": "recording"})
+                self.assertEqual(command.await_args.args[1].model_dump(), payload)
+
+    async def test_portable_meeting_commands_use_both_sources_and_keep_a_named_draft(self):
+        from portable_calls import CallWatcher
+        from portable_capture import draft_metadata
+        from server import PortableMeetingCommand, begin_portable_recording, finish_portable_capture, run_portable_meeting_command
+        from session_store import SessionStore
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = SessionStore(root / "library")
+            spool = root / "drafts"
+            spool.mkdir()
+            opening = asyncio.Event()
+            ready = asyncio.Event()
+            ready.set()
+
+            def recorder(key, path, mode):
+                self.assertEqual(mode, "both")
+
+                async def start():
+                    opening.set()
+                    await ready.wait()
+                    for output in (path, *source_tracks(path).values()):
+                        with private_wav(output) as (wav, _):
+                            wav.writeframes(b"\x01\x02" * 1600)
+
+                return SimpleNamespace(key=key, start=start, stop=AsyncMock(), frames=1600, worker=asyncio.Future())
+
+            state = SimpleNamespace(library=library, draining=False, status="ready", portable_recording=None,
+                                    portable_recording_dir=spool, portable_recording_lock=asyncio.Lock(),
+                                    portable_screencast=None, portable_dictation=None,
+                                    portable_meeting_recorder=recorder, diarizer=object(), jobs=set())
+
+            async def start(languages, _call, *, title=""):
+                return (await begin_portable_recording(state, "both", True, languages, title=title))["id"]
+
+            async def finish(key):
+                return await finish_portable_capture(state, key, (), diarization=True)
+
+            async def transcribe(_state, key, *_args, **_options):
+                text = "Design review has one decision."
+                library.append(key, {"text": text, "segments": [dict(start=0, end=.1, speaker=1, text=text)], "words": []}, .1)
+                library.finish(key)
+
+            async def command(action, **options):
+                return await run_portable_meeting_command(state, PortableMeetingCommand(action=action, **options))
+
+            state.portable_calls = CallWatcher(state, AsyncMock(), AsyncMock(), start, finish, lambda: True)
+            ordinary = SimpleNamespace(key=uuid4(), meeting=False, stop=AsyncMock())
+            state.portable_recording = ordinary
+            self.assertEqual(await command("status"), {"phase": "unavailable"})
+            self.assertFalse((await command("stop"))["changed"])
+            with self.assertRaises(HTTPException) as busy:
+                await command("record")
+            self.assertEqual(busy.exception.status_code, 409)
+            ordinary.stop.assert_not_awaited()
+            state.portable_recording = None
+            with (patch("recording_power.keep_awake_until"), patch("server.audio_duration", return_value=.1),
+                  patch("server.process_saved_audio", side_effect=transcribe),
+                  patch("desktop_clipboard.copy_text", new_callable=AsyncMock) as clipboard):
+                started = await command("record", title="  Réunion  de conception  ")
+                key = started["id"]
+                self.assertTrue(started["changed"])
+                self.assertEqual(started["title"], "Réunion de conception")
+                self.assertEqual(draft_metadata(spool / f"{key}.wav")["meetingTitle"], "Réunion de conception")
+                self.assertEqual((await command("status"))["id"], key)
+                self.assertEqual(state.portable_calls.status()["active"]["name"], "Réunion de conception")
+                self.assertFalse((await command("record", title="Ignore duplicate"))["changed"])
+                self.assertEqual((await command("stop"))["id"], key)
+                await asyncio.gather(*state.jobs)
+                saved = library.get(key)
+                self.assertTrue(saved["meeting"])
+                self.assertEqual(saved["meetingTitle"], "Réunion de conception")
+                self.assertEqual(set(saved["recordingTracks"]), {"mic", "system"})
+                self.assertTrue(saved["diarization"])
+                self.assertIsNone(state.portable_calls.active)
+                self.assertEqual(state.portable_calls.completed, key)
+                self.assertEqual(await command("copy-last"), {"id": key, "copied": True})
+                self.assertIn("Design review", clipboard.await_args.args[0])
+
+                opening.clear()
+                ready.clear()
+                recording = asyncio.create_task(command("record"))
+                await opening.wait()
+                stopping = asyncio.create_task(command("stop"))
+                await asyncio.sleep(0)
+                self.assertFalse(stopping.done())
+                ready.set()
+                started, stopped = await asyncio.gather(recording, stopping)
+                self.assertEqual(stopped["id"], started["id"])
+                await asyncio.gather(*state.jobs)
+
+    async def test_portable_live_meeting_shares_and_recovers_the_rolling_transcript(self):
+        from contextlib import asynccontextmanager
+        from meeting_mcp import reply
+        from meeting_rolling import rolling_path
+        from saved_meetings import meetings, read_portable_live_meeting
+        from server import (begin_portable_recording, copy_latest_portable_meeting, recover_pending_recording,
+                            portable_live_meeting, portable_recording_preview, stopped_portable_recording)
+        from session_store import SessionStore
+
+        @asynccontextmanager
+        async def audio_priority():
+            yield
+
+        with TemporaryDirectory() as directory:
+            library = SessionStore(Path(directory))
+            spool = library.root / "microphone-drafts"
+            spool.mkdir()
+            earlier_audio = library.root / "earlier.wav"
+            with private_wav(earlier_audio) as (audio, _):
+                audio.writeframes(b"\x01\x02" * SAMPLE_RATE)
+            earlier, _ = library.create(earlier_audio, "Earlier review", "audio/wav",
+                                        {"recording": True, "meeting": True, "diarization": False}, 1)
+            earlier_text = "The previous meeting."
+            library.append(earlier, {"text": earlier_text, "words": [],
+                                    "segments": [dict(start=0, end=1, speaker=1, text=earlier_text)]}, 1)
+            library.finish(earlier)
+
+            def recorder(key, path, mode):
+                frames = 4 * SAMPLE_RATE
+                worker = asyncio.Future()
+
+                async def start():
+                    for target in (path, *source_tracks(path).values()):
+                        with private_wav(target) as (audio, _):
+                            audio.writeframes(b"\x01\x02" * frames)
+
+                async def stop():
+                    worker.set_result(None)
+
+                return SimpleNamespace(key=key, path=path, frames=frames, worker=worker, start=start, stop=stop)
+
+            app = FastAPI()
+            app.get("/recording/{key}/preview")(portable_recording_preview)
+            state = app.state
+            state.library = library
+            state.portable_workspace = True
+            state.draining = False
+            state.status = "ready"
+            state.portable_recording = state.portable_screencast = state.portable_dictation = None
+            state.portable_recording_dir = spool
+            state.portable_recording_lock = asyncio.Lock()
+            state.portable_meeting_recorder = recorder
+            state.jobs = set()
+            state.diarizer = SimpleNamespace(session=Mock(return_value=object()))
+            state.insights = SimpleNamespace(model=SimpleNamespace(audio_priority=audio_priority))
+            finish_gate = asyncio.Event()
+            rolling_result = {"text": "The provisional budget.", "language": "English", "words": [],
+                              "segments": [dict(start=0, end=4, speaker=1, text="The provisional budget.")]}
+
+            async def finalize(_state, key, *_args, **_options):
+                await finish_gate.wait()
+                text = "The final budget."
+                library.append(key, {"text": text, "segments": [dict(start=0, end=4, speaker=1, text=text)], "words": []},
+                               4, next_frame=192_000)
+                library.finish(key)
+
+            with (patch("recording_power.keep_awake_until"), patch("server.speech_vocabulary", new_callable=AsyncMock, return_value=()),
+                  patch("server.decode_pcm", new_callable=AsyncMock, return_value=rolling_result) as decode,
+                  patch("server.audio_duration", return_value=4), patch("server.process_saved_audio", side_effect=finalize),
+                  patch("desktop_clipboard.copy_text", new_callable=AsyncMock) as clipboard):
+                started = await begin_portable_recording(state, "both", True, ("en",), title="Budget review")
+                key = started["id"]
+                identifier = str(key)
+                capture = state.portable_recording
+                state.portable_dictation = SimpleNamespace(busy=True)
+                await asyncio.sleep(.4)
+                decode.assert_not_awaited()
+                self.assertEqual((await copy_latest_portable_meeting(state))["id"], earlier)
+                self.assertIn(earlier_text, clipboard.await_args.args[0])
+                state.portable_dictation.busy = False
+                async with asyncio.timeout(3):
+                    while not capture.preview_processed:
+                        await asyncio.sleep(.03)
+                live = read_portable_live_meeting(library.root, portable_live_meeting(state))
+                self.assertEqual(live["duration"], 4)
+                self.assertEqual(live["meetingTurns"], rolling_result["segments"])
+                self.assertEqual((await copy_latest_portable_meeting(state))["id"], identifier)
+                self.assertIn("provisional budget", clipboard.await_args.args[0])
+                request = {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                           "params": {"name": "get_transcript", "arguments": {"meeting_id": identifier}}}
+                response = json.loads(reply(library, request, lambda **_: live)["result"]["content"][0]["text"])
+                self.assertEqual(response["transcriptSource"], "rolling")
+                self.assertEqual(response["turns"][0]["speaker"], "Speaker 1")
+                path = f"/recording/{identifier}/preview"
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as browser:
+                    preview = (await browser.get(path)).json()
+                    self.assertEqual(preview["text"], rolling_result["text"])
+                    self.assertEqual((await browser.get(path, params={"after": preview["through"]})).status_code, 204)
+                self.assertEqual([row["id"] for row in meetings(library, include_in_progress=False)], [earlier])
+                async with stopped_portable_recording(state, key):
+                    self.assertIsNone(portable_live_meeting(state))
+                    self.assertEqual([row["id"] for row in meetings(library)], [earlier])
+                self.assertTrue(rolling_path(capture.path).is_file())
+                rows = meetings(library, "Budget review", include_in_progress=False)
+                self.assertEqual([(row["id"], row["status"], row["duration"]) for row in rows], [(identifier, "interrupted", 4)])
+                response = json.loads(reply(library, request)["result"]["content"][0]["text"])
+                self.assertEqual(response["status"], "interrupted")
+                self.assertEqual(response["transcriptSource"], "rolling")
+                self.assertEqual(response["turns"], [{"start": 0, "end": 4, "speaker": "Speaker 1", "text": "The provisional budget."}])
+                stranded = {identifier}
+                state.portable_dictation.busy = True
+                self.assertTrue(await recover_pending_recording(state, stranded))
+                self.assertEqual(stranded, {identifier})
+                self.assertFalse(library.exists(identifier))
+                state.portable_dictation.busy = False
+                self.assertTrue(await recover_pending_recording(state, stranded))
+                self.assertFalse(stranded)
+                self.assertEqual(library.get(identifier, include_turns=True)["transcript"]["transcriptSource"], "rolling")
+                self.assertFalse(rolling_path(capture.path).exists())
+                finish_gate.set()
+                await asyncio.gather(*state.jobs)
+                self.assertEqual(library.get(identifier, include_turns=True)["transcript"]["text"], "The final budget.")
+                self.assertEqual([row["id"] for row in meetings(library, "Budget review")], [identifier])
+                decode.assert_awaited_once()
+
+    async def test_failed_portable_startup_import_leaves_meeting_available_on_home(self):
+        from portable_capture import claim_meeting_draft
+        from server import portable_recording_drafts, recover_pending_recording
+        from session_store import SessionStore
+
+        with TemporaryDirectory() as directory:
+            app = FastAPI()
+            app.get("/drafts")(portable_recording_drafts)
+            state = app.state
+            state.library = SessionStore(Path(directory))
+            state.portable_workspace = state.startup_recovery = True
+            state.status = "ready"
+            state.draining = False
+            state.portable_recording = state.portable_screencast = state.portable_dictation = None
+            state.portable_recording_lock = asyncio.Lock()
+            state.portable_recording_dir = state.library.root / "microphone-drafts"
+            state.portable_recording_dir.mkdir()
+            meeting, recording = (str(uuid4()) for _ in range(2))
+            state.startup_stranded = {meeting}
+            source = state.portable_recording_dir / f"{meeting}.wav"
+            with claim_meeting_draft(source, {"meetingProvider": "Meeting"}), private_wav(source) as (audio, _):
+                audio.writeframes(bytes(SAMPLE_RATE * 2))
+            with private_wav(state.portable_recording_dir / f"{recording}.wav") as (audio, _):
+                audio.writeframes(bytes(SAMPLE_RATE * 2))
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as browser:
+                drafts = await browser.get("/drafts")
+                self.assertEqual(drafts.headers["X-Jard-Meeting-Recovery"], "pending")
+                self.assertEqual([draft["id"] for draft in drafts.json()], [recording])
+                state.status = "error"
+                drafts = await browser.get("/drafts")
+                self.assertNotIn("X-Jard-Meeting-Recovery", drafts.headers)
+                self.assertEqual({draft["id"] for draft in drafts.json()}, {meeting, recording})
+                state.status = "ready"
+                with patch("server.accept_audio", side_effect=HTTPException(503, "Storage temporarily unavailable.")):
+                    self.assertTrue(await recover_pending_recording(state, state.startup_stranded))
+                self.assertFalse(await recover_pending_recording(state, state.startup_stranded))
+                self.assertFalse(state.library.exists(meeting))
+                self.assertTrue(source.is_file())
+                self.assertEqual({draft["id"] for draft in (await browser.get("/drafts")).json()}, {meeting, recording})
+
+    async def test_clear_history_revokes_an_unsaved_paste_last_and_an_in_flight_write(self):
+        from portable_dictation import PortableDictation
+        from portable_dictation_history import PortableDictationHistory
+
+        class Dictation(PortableDictation):
+            enabled = True
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            history = PortableDictationHistory(root)
+            history.initialize()
+            controller = Dictation(SimpleNamespace(), None, history)
+            job = SimpleNamespace(captured_at=time(), application="Editor", frames=16000,
+                                  started=monotonic(), path=root / "speech.wav", raw=False, printed=None)
+            result = {"text": "Unsaved dictation", "inferenceMs": 20}
+            with patch.object(history, "record", side_effect=PermissionError), self.assertLogs():
+                self.assertEqual(await controller.retain(result, job), "Could not save dictation history.")
+            self.assertEqual(controller.snapshot()["text"], result["text"])
+            unavailable = root / "unavailable.sqlite3"
+            history.path.rename(unavailable)
+            try:
+                self.assertEqual(controller.snapshot()["text"], "")
+            finally:
+                unavailable.rename(history.path)
+            other_process = PortableDictationHistory(root)
+            self.assertEqual(other_process.remove(), 0)
+            self.assertEqual(controller.snapshot()["text"], "")
+            with patch.object(history, "status", side_effect=OSError):
+                self.assertEqual(controller.snapshot()["text"], "")
+
+            record = history.record
+
+            def clear_then_save(*args, **options):
+                other_process.remove()
+                return record(*args, **options)
+
+            with patch.object(history, "record", side_effect=clear_then_save):
+                self.assertEqual(await controller.retain(result, job), "")
+            self.assertEqual(controller.snapshot()["text"], "")
+            self.assertEqual(history.page(legacy=True)["entries"], [])
+
+            fresh = {"text": "New dictation", "inferenceMs": 30}
+            with private_wav(job.path) as (audio, _):
+                audio.writeframes(b"\x01\x02" * 16000)
+            self.assertEqual(await controller.retain(fresh, job), "")
+            self.assertEqual(controller.snapshot()["text"], fresh["text"])
+            self.assertEqual(history.page(legacy=True)["entries"][0]["text"], fresh["text"])
+
+            printed = {"text": "Returned to the command", "inferenceMs": 30}
+            job.printed = asyncio.get_running_loop().create_future()
+            with private_wav(job.path) as (audio, _):
+                audio.writeframes(b"\x01\x02" * 16000)
+            self.assertEqual(await controller.retain(printed, job), "")
+            self.assertEqual(controller.snapshot()["text"], fresh["text"])
+            kinds = {entry["text"]: entry["kind"] for entry in history.page(legacy=True)["entries"]}
+            self.assertEqual(kinds[printed["text"]], "printed")
+
+    async def test_saving_regular_dual_audio_preserves_tracks_without_creating_a_meeting(self):
+        from server import audio_recording_drafts, finish_portable_capture
+        from session_store import SessionStore
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = SessionStore(root / "library")
+            staging = root / "drafts"
+            staging.mkdir()
+            key = uuid4()
+            source = staging / f"{key}.wav"
+            pcm = b"\x01\x02" * 1600
+            for path in (source, *source_tracks(source).values()):
+                with private_wav(path) as (wav, _):
+                    wav.writeframes(pcm)
+            state = SimpleNamespace(library=library, portable_recording_dir=staging, portable_recording=None,
+                                    portable_recording_lock=asyncio.Lock(), draining=False, diarizer=object(), jobs=set(),
+                                    status="ready")
+            self.assertFalse(audio_recording_drafts(state)[1][0]["meeting"])
+
+            async def finish(_state, identifier, *_args, **_options):
+                library.finish(identifier)
+
+            with (patch("server.audio_duration", return_value=.1), patch("server.process_saved_audio", side_effect=finish)):
+                response = await finish_portable_capture(state, key, ("en",), diarization=True)
+                await asyncio.gather(*state.jobs)
+            self.assertEqual(response.status_code, 202)
+            saved = library.get(str(key))
+            self.assertFalse(saved["meeting"])
+            self.assertTrue(saved["diarization"])
+            self.assertEqual(set(saved["recordingTracks"]), {"mic", "system"})
+            self.assertEqual(library.list("", meetings_only=True), [])
+
     async def test_queued_dictation_records_while_processing_and_delivers_in_order(self):
         from portable_dictation import PASTE_SENT, PortableDictation
         from portable_dictation_history import PortableDictationHistory
@@ -216,6 +865,81 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(meeting_monitors([virtual], "effects"), ("effects.monitor",))
         self.assertEqual(meeting_monitors([virtual], "missing"), ())
 
+    async def test_windows_launch_at_login_respects_startup_approval(self):
+        from portable_login import APPROVAL_KEY, RUN_KEY, VALUE_NAME, PortableLogin, WindowsLogin
+        from server import change_portable_login, get_portable_login, open_portable_login_settings
+
+        origin = "http://127.0.0.1:43721"
+        record = {"port": 43721}
+        app = FastAPI()
+        endpoint = "/api/portable/login-item"
+        app.add_api_route(endpoint, get_portable_login, methods=["GET"])
+        app.add_api_route(endpoint, change_portable_login, methods=["POST"])
+        app.add_api_route(endpoint + "/open-settings", open_portable_login_settings, methods=["POST"])
+        configure_workspace(app, record, origin)
+        registration = WindowsLogin(Path("C:/Program Files/Jaro/bin/Jaro.exe"))
+        app.state.portable_login = PortableLogin(registration)
+        values = {RUN_KEY: {}, APPROVAL_KEY: {}}
+
+        def open_key(_root, name, _reserved, access):
+            if name == APPROVAL_KEY:
+                self.assertEqual(access, 1)
+            return nullcontext(values[name])
+
+        def query_value(key, name):
+            if name not in key:
+                raise FileNotFoundError(name)
+            return key[name]
+
+        registry = SimpleNamespace(
+            HKEY_CURRENT_USER=1, KEY_QUERY_VALUE=1, KEY_SET_VALUE=2, REG_SZ=1, REG_BINARY=3,
+            OpenKey=open_key, QueryValueEx=query_value,
+            SetValueEx=lambda key, name, _reserved, kind, data: key.update({name: (data, kind)}),
+            DeleteValue=lambda key, name: key.pop(name),
+        )
+        blocked = (b"\x03" + bytes(3) + b"01234567", registry.REG_BINARY)
+        values[APPROVAL_KEY][VALUE_NAME] = blocked
+        headers = {"Origin": origin}
+        with (patch.dict(sys.modules, winreg=registry), patch("server.URL", origin),
+              patch("portable_login.os.startfile", create=True) as startfile):
+            self.assertEqual(registration.set_state(None), {"state": "disabled"})
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as browser:
+                await browser.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
+                enabled = await browser.post(endpoint, headers=headers, json={"enabled": True})
+                self.assertEqual(enabled.json(), {"state": "approval"})
+                self.assertEqual(values[RUN_KEY][VALUE_NAME], (registration.command, registry.REG_SZ))
+                denied = await browser.post(endpoint + "/open-settings")
+                self.assertEqual(denied.status_code, 403)
+                startfile.assert_not_called()
+                accepted = await browser.post(endpoint + "/open-settings", headers=headers)
+                self.assertEqual(accepted.json(), {"state": "approval"})
+                startfile.assert_called_once_with("ms-settings:startupapps")
+                self.assertEqual(values[APPROVAL_KEY][VALUE_NAME], blocked)
+                startfile.side_effect = OSError("Unable to open Settings")
+                with self.assertLogs():
+                    failed = await browser.post(endpoint + "/open-settings", headers=headers)
+                self.assertEqual(failed.status_code, 503)
+                self.assertIn("Apps → Startup", failed.json()["detail"])
+
+                for flag, state in ((2, "enabled"), (6, "enabled"), (7, "approval"), (42, "unknown")):
+                    values[APPROVAL_KEY][VALUE_NAME] = (bytes([flag]) + bytes(11), registry.REG_BINARY)
+                    status = await browser.get(endpoint)
+                    self.assertEqual(status.json()["state"], state)
+                values[APPROVAL_KEY].clear()
+                self.assertEqual((await browser.get(endpoint)).json(), {"state": "enabled"})
+
+                values[APPROVAL_KEY][VALUE_NAME] = blocked
+                foreign = ('"C:/Other/Jaro.exe" --background', registry.REG_SZ)
+                values[RUN_KEY][VALUE_NAME] = foreign
+                for enabled in (True, False):
+                    self.assertEqual(registration.set_state(enabled)["state"], "unknown")
+                self.assertEqual(values[RUN_KEY][VALUE_NAME], foreign)
+                values[RUN_KEY][VALUE_NAME] = (registration.command, registry.REG_SZ)
+                disabled = await browser.post(endpoint, headers=headers, json={"enabled": False})
+                self.assertEqual(disabled.json(), {"state": "disabled"})
+                self.assertNotIn(VALUE_NAME, values[RUN_KEY])
+                self.assertEqual(values[APPROVAL_KEY][VALUE_NAME], blocked)
+
     @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires POSIX no-follow file access")
     def test_launch_at_login_respects_the_users_autostart_entries(self):
         from portable_login import LinuxLogin
@@ -313,7 +1037,9 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         endpoint = "/api/portable/screencast"
         app.add_api_route(endpoint, begin_screencast, methods=["POST"], status_code=202)
         app.add_api_route(endpoint + "/targets", screencast_targets, methods=["GET"])
+        app.add_api_route(endpoint + "/microphones", screencast_microphones, methods=["GET"])
         app.state.draining = False
+        app.state.status = "ready"
         app.state.portable_recording = app.state.portable_dictation = app.state.portable_screencast = None
         app.state.portable_recording_lock = asyncio.Lock()
         app.state.jobs = set()
@@ -321,9 +1047,13 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         listed = capture_targets("1a\t12345\tAperçu\r\n2b\t0\tDisplay\r\ninvalid\t1\tSkip".encode(), "window")
         self.assertEqual(listed, [{"id": "1a:12345", "label": "Aperçu"}])
         opener = AsyncMock(return_value=listed)
+        inputs = [{"id": "usb input", "label": "USB Microphone", "default": False}]
+        inventory = AsyncMock(return_value=inputs)
         headers = {"Origin": origin}
         with (TemporaryDirectory() as staging, patch("server.URL", origin),
               patch("server.sys", SimpleNamespace(platform="win32")),
+              patch("server.transcription_languages", return_value=()),
+              patch("windows_capture.microphone_inputs", inventory),
               patch("windows_screencast.targets", opener),
               patch("windows_screencast.WindowsScreenRecording.record", new_callable=AsyncMock) as record_screen):
             app.state.screen_draft_dir = Path(staging)
@@ -331,17 +1061,26 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 list_windows = endpoint + "/targets?source=window"
                 start = endpoint + "?source=window&target=1a%3A12345"
                 self.assertEqual((await browser.get(list_windows)).status_code, 403)
+                self.assertEqual((await browser.get(endpoint + "/microphones")).status_code, 403)
                 self.assertEqual((await browser.post(start, headers=headers)).status_code, 403)
                 opener.assert_not_awaited()
+                inventory.assert_not_awaited()
                 await browser.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
                 self.assertEqual((await browser.get(list_windows)).json(), {"targets": listed})
                 self.assertEqual((await browser.post(start)).status_code, 403)
                 self.assertEqual((await browser.post(endpoint + "?source=area", headers=headers)).status_code, 422)
                 self.assertEqual((await browser.post(endpoint + "?source=window&target=1a%3A8", headers=headers)).status_code, 409)
-                result = await browser.post(start, headers=headers)
+                self.assertEqual((await browser.get(endpoint + "/microphones")).json(), {"inputs": inputs})
+                self.assertEqual((await browser.post(start + "&microphone_device=usb+input", headers=headers)).status_code, 422)
+                audio = "&microphone=true&computer_audio=true"
+                self.assertEqual((await browser.post(start + audio + "&microphone_device=removed", headers=headers)).status_code, 409)
+                self.assertIsNone(app.state.portable_screencast)
+                result = await browser.post(start + audio + "&microphone_device=usb+input", headers=headers)
                 self.assertEqual(result.status_code, 202)
                 self.assertEqual(result.json()["phase"], "starting")
+                self.assertEqual(result.json()["id"], app.state.portable_screencast.draft.key)
                 self.assertEqual(app.state.portable_screencast.target, "1a:12345")
+                self.assertEqual(app.state.portable_screencast.microphone_device, inputs[0]["id"])
                 await app.state.portable_screencast.task
                 record_screen.assert_awaited_once()
 
@@ -385,6 +1124,8 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(window.pen.binary)
             take.draft.create()
             app.state.portable_screencast = take
+            app.state.portable_recording_lock = asyncio.Lock()
+            app.state.jobs = set()
             take.region = (100, 70, 500, 400, 1920, 1080)
             take.phase, take.started = "recording", 5
             take.frame_bytes, take.bytes_encoded = 100, 4800
@@ -410,6 +1151,47 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(take.status()["desktopDrawing"])
                 self.assertEqual((await browser.delete("/api/portable/screencast", headers=headers)).status_code, 204)
                 self.assertFalse(take.draft.folder.exists())
+
+    async def test_screen_discard_owns_the_take_after_the_request_is_cancelled(self):
+        from server import finish_screencast
+
+        async def discard():
+            stopping.set()
+            await release.wait()
+            stopped.set()
+
+        key = uuid4()
+        stopping, release, stopped = (asyncio.Event() for _ in range(3))
+        take = SimpleNamespace(draft=SimpleNamespace(key=str(key)), phase="recorded", saving=False, discard=discard)
+        origin = "http://127.0.0.1:43721"
+        app = FastAPI()
+        app.state.portable_screencast = take
+        app.state.portable_recording_lock = asyncio.Lock()
+        app.state.jobs = set()
+        endpoint = "/api/portable/screencast"
+        app.add_api_route(endpoint, discard_screencast, methods=["DELETE"], status_code=204)
+        app.add_api_route(endpoint + "/finish", finish_screencast, methods=["POST"])
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as browser:
+            with patch("server.screencast_action", return_value=app.state):
+                request = asyncio.create_task(browser.delete(f"{endpoint}?key={key}"))
+                try:
+                    await asyncio.wait_for(stopping.wait(), 1)
+                    request.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await request
+                    self.assertIs(app.state.portable_screencast, take)
+                    self.assertTrue(take.saving)
+                    self.assertEqual((await browser.delete(f"{endpoint}?key={key}")).status_code, 409)
+                finally:
+                    release.set()
+                    await asyncio.gather(request, *app.state.jobs, return_exceptions=True)
+                self.assertTrue(stopped.is_set())
+                self.assertIsNone(app.state.portable_screencast)
+                take.draft.key = str(uuid4())
+                app.state.portable_screencast = take
+                self.assertEqual((await browser.post(f"{endpoint}/finish?key={key}")).status_code, 409)
+                self.assertEqual((await browser.delete(f"{endpoint}?key={key}")).status_code, 409)
+                self.assertIs(app.state.portable_screencast, take)
 
     async def test_windows_screenshot_requires_a_current_target_and_workspace_origin(self):
         origin = "http://127.0.0.1:43721"
@@ -443,6 +1225,152 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 command.assert_awaited_once_with("snapshot", "window", "ab", "42", timeout=10)
             self.assertFalse(app.state.screenshot_pending)
             self.assertFalse(list(Path(directory).iterdir()))
+
+    async def test_annotation_command_requires_its_credential_even_with_a_workspace_cookie(self):
+        from server import windows_annotation_command
+        from windows_dictation_commands import ANNOTATION_COMMAND_ROUTE
+
+        origin = "http://127.0.0.1:43721"
+        record = {"port": 43721}
+        app = FastAPI()
+        app.add_api_route(ANNOTATION_COMMAND_ROUTE, windows_annotation_command, methods=["POST"])
+        configure_workspace(app, record, origin)
+        app.state.windows_dictation_control = {"token": "fixture desktop token"}
+        app.state.portable_annotation_shortcut = SimpleNamespace(saved=None)
+        app.state.portable_screencast = None
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+            request = {"json": {"action": "status"}}
+            credentials = {"Origin": origin, "Authorization": "Bearer fixture desktop token"}
+            with patch("server.URL", origin), patch("server.require_annotation"):
+                self.assertEqual((await client.post(ANNOTATION_COMMAND_ROUTE, **request)).status_code, 403)
+                await client.post(BOOTSTRAP, headers={"Origin": origin,
+                                                    "X-Jaro-Workspace-Key": record["workspaceDesktopKey"]})
+                self.assertEqual((await client.post(ANNOTATION_COMMAND_ROUTE, **request)).status_code, 403)
+                result = await client.post(ANNOTATION_COMMAND_ROUTE, headers=credentials, **request)
+                self.assertEqual(result.json(), {"phase": "idle"})
+
+    async def test_annotation_commands_share_the_take_and_keep_language_hints_for_the_save(self):
+        from server import PortableAnnotationCommand, run_portable_annotation_command
+
+        state = SimpleNamespace(portable_annotation_shortcut=SimpleNamespace(saved=None), portable_screencast=None,
+                                portable_dictation=SimpleNamespace(platform="wayland", language="fr",
+                                    output_context=AsyncMock(return_value=OutputContext(
+                                        "Firefox", site_url="https://docs.example.test/project/work?private=1"))),
+                                portable_recording_lock=asyncio.Lock(), screen_draft_dir=Path("fixture-screen-drafts"))
+        take = SimpleNamespace(draft=SimpleNamespace(key=str(uuid4())), phase="recording", saving=False,
+                               annotation_languages=("de",), observe_annotation_origin=True, stop=AsyncMock(), discard=AsyncMock())
+        take.status = lambda: {"phase": take.phase, "id": take.draft.key}
+
+        async def run(action, **options):
+            return await run_portable_annotation_command(state, PortableAnnotationCommand(action=action, **options))
+
+        with (patch("server.require_annotation"),
+              patch("server.start_screen_take", return_value=take.status()) as start,
+              patch("server.start_job", side_effect=lambda _, task: asyncio.create_task(task)),
+              patch("server.save_screen_draft") as save):
+            self.assertEqual(await run("start", languages=["de", "de"]), take.status())
+            start.assert_awaited_once_with(state, "display", True, False, "", notice=None,
+                                           require_shortcut=False, annotation_languages=("de",), draw_on_start=False, area=None,
+                                           show_area_picker=None, observe_origin=True)
+            with self.assertRaisesRegex(HTTPException, "native X11"):
+                await run("start", source="area", area=[10, 20, 320, 240])
+            start.assert_awaited_once()
+            state.portable_screencast = take
+            self.assertEqual(await run("status"), take.status())
+            take.phase = "choosing"
+            self.assertEqual(await run("toggle"), take.status())
+            take.phase = "recording"
+            take.saving = True
+            self.assertEqual(await run("toggle"), take.status())
+            save.assert_not_awaited()
+            take.saving = False
+            result = await run("toggle")
+            self.assertEqual(result, {"phase": "saved", "id": take.draft.key})
+            save.assert_awaited_once_with(state, take.draft, ("de",),
+                                          origin={"app": "linux.firefox", "name": "Firefox", "site": "docs.example.test",
+                                                  "siteUrl": "https://docs.example.test/project/work"})
+            state.portable_dictation.output_context.assert_awaited_once_with(read_site=True, annotation=True)
+            self.assertIsNone(state.portable_screencast)
+            self.assertEqual(await run("status"), result)
+            self.assertEqual(await run("cancel"), {"phase": "idle"})
+            state.portable_screencast = take
+            take.phase = "cancelled"
+            await run("draw")
+            take.discard.assert_awaited_once()
+            self.assertIsNone(state.portable_screencast)
+            start.assert_awaited_with(state, "display", True, False, "", notice=None,
+                                     require_shortcut=False, annotation_languages=("fr",), draw_on_start=True, area=None,
+                                      show_area_picker=None, observe_origin=True)
+            state.portable_dictation.platform = "x11"
+            with patch.dict(os.environ, {"JARO_DESKTOP_TRAY": ""}):
+                await run("start", source="area", area=[10, 20, 320, 240])
+            self.assertEqual(start.call_args.kwargs["area"], [10, 20, 320, 240])
+            state.portable_dictation.platform = "wayland"
+            with TemporaryDirectory() as tray, patch.dict(os.environ, {"JARO_DESKTOP_TRAY": tray}):
+                await run("start", source="area")
+                marker = Path(tray) / "open"
+                self.assertFalse(marker.exists())
+                start.call_args.kwargs["show_area_picker"]()
+                self.assertTrue(marker.is_file())
+
+    async def test_saving_from_a_project_validates_the_folder_before_stopping(self):
+        from server import PortableAnnotationCommand, run_portable_annotation_command
+
+        take = SimpleNamespace(draft=SimpleNamespace(key=str(uuid4())), phase="recording", saving=False,
+                               annotation_languages=("de",), observe_annotation_origin=True, stop=AsyncMock())
+        state = SimpleNamespace(portable_annotation_shortcut=SimpleNamespace(saved=None), portable_screencast=take,
+                                portable_dictation=SimpleNamespace(platform="x11", output_context=AsyncMock()),
+                                portable_recording_lock=asyncio.Lock(), screen_draft_dir=Path("fixture-screen-drafts"), jobs=set())
+        with TemporaryDirectory() as folder, patch("server.require_annotation"), patch("server.require_opencode"), patch("server.save_screen_draft") as save:
+            project = Path(folder).resolve() / "project"
+            (project / ".git").mkdir(parents=True)
+            work = project / "src"
+            work.mkdir()
+            with self.assertRaisesRegex(HTTPException, "only when stopping"):
+                await run_portable_annotation_command(state, PortableAnnotationCommand(action="status", terminalFolder=str(work)))
+            with self.assertRaisesRegex(HTTPException, "project or working folder"):
+                await run_portable_annotation_command(state, PortableAnnotationCommand(action="stop", terminalFolder=str(project / "missing")))
+            take.stop.assert_not_awaited()
+            result = await run_portable_annotation_command(state, PortableAnnotationCommand(action="stop", terminalFolder=str(work)))
+            self.assertEqual(result, {"phase": "saved", "id": take.draft.key})
+            take.stop.assert_awaited_once()
+            save.assert_awaited_once_with(state, take.draft, ("de",), origin={"app": "linux.shell", "name": "Terminal",
+                "terminal": {"folder": str(work), "project": str(project)}})
+            state.portable_dictation.output_context.assert_not_awaited()
+
+    @unittest.skipUnless(sys.platform == "linux", "requires the Linux workspace")
+    async def test_annotation_binding_requires_the_desktop_and_refuses_changes_during_capture(self):
+        from server import configure_annotation_shortcut, start_screen_take
+
+        origin = "http://127.0.0.1:43721"
+        record, headers = {"port": 43721}, {"Origin": origin}
+        app = FastAPI()
+        configure_workspace(app, record, origin)
+        endpoint = "/api/portable/screencast/shortcut"
+        app.add_api_route(endpoint, configure_annotation_shortcut, methods=["POST"])
+        state = app.state
+        state.draining = False
+        state.portable_screencast = None
+        state.screen_draft_dir = Path("fixture-screen-drafts")
+        state.portable_recording_lock = asyncio.Lock()
+        state.portable_dictation = SimpleNamespace(control=asyncio.Lock())
+        state.desktop_annotation = SimpleNamespace(configure=AsyncMock(), status=lambda: {"enabled": True})
+        with patch("server.URL", origin):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as browser:
+                payload = {"enabled": True, "shortcut": "Ctrl+Alt+Shift+S"}
+                await browser.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
+                self.assertEqual((await browser.post(endpoint, headers=headers, json=payload)).status_code, 403)
+                await browser.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceDesktopKey"]})
+                state.portable_screencast = object()
+                self.assertEqual((await browser.post(endpoint, headers=headers, json=payload)).status_code, 409)
+                state.desktop_annotation.configure.assert_not_awaited()
+                state.portable_screencast = None
+                self.assertEqual((await browser.post(endpoint, headers=headers, json=payload)).json(), {"enabled": True})
+                state.desktop_annotation.configure.assert_awaited_once_with(enabled=True, shortcut="Ctrl+Alt+Shift+S")
+                state.desktop_annotation.status = lambda: {"enabled": False}
+                with self.assertRaises(HTTPException) as blocked:
+                    await start_screen_take(state, "display", True, False, "", notice=object())
+                self.assertEqual(blocked.exception.detail, "The Annotate shortcut is disabled.")
 
     @unittest.skipUnless(sys.platform == "linux" and find_spec("dbus_fast"), "requires the Linux ScreenCast portal client")
     async def test_live_ink_is_owned_and_recovers_completed_strokes(self):
@@ -487,6 +1415,7 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         from linux_pen import monitor_arguments
         from linux_screencast import ScreenRecording
         from screencast_ink import load_events
+        from server import close_live_screencast_preview, live_screencast_preview
 
         self.assertEqual(monitor_arguments({"mapping_id": Variant("s", "DP-1"),
                                             "position": Variant("(ii)", [-1280, 160]),
@@ -496,7 +1425,10 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         record = {"port": 43721}
         app = FastAPI()
         path = "/api/portable/screencast/{key}"
+        app.add_api_route("/api/portable/screencast", screencast_status, methods=["GET"])
         app.add_api_route(path + "/pen", screencast_pen, methods=["POST", "DELETE"])
+        app.add_api_route(path + "/preview", live_screencast_preview, methods=["GET"])
+        app.add_api_route(path + "/preview", close_live_screencast_preview, methods=["DELETE"], status_code=204)
         app.add_api_route(path + "/ink", append_screencast_ink, methods=["POST"], status_code=204)
         configure_workspace(app, record, origin)
         headers = {"Origin": origin}
@@ -525,6 +1457,19 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                     with patch.object(take.pen, "close", new_callable=AsyncMock) as close:
                         self.assertEqual((await browser.delete(endpoint + "/pen", headers=headers)).status_code, 200)
                         close.assert_awaited_once()
+                    take.pen.monitor = None
+                    with patch.dict(os.environ, {"JARO_DESKTOP_TRAY": directory}):
+                        await take.toggle_drawing()
+                    self.assertTrue((Path(directory) / "open").is_file())
+                    view = take.status()["drawingView"]
+                    self.assertNotIn("drawingView", (await browser.get("/api/portable/screencast")).json())
+                    await browser.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceDesktopKey"]})
+                    self.assertEqual((await browser.get("/api/portable/screencast")).json()["drawingView"], view)
+                    self.assertEqual((await browser.get(endpoint + "/preview", params={"view": "stale"})).status_code, 409)
+                    await browser.delete(endpoint + "/preview", headers=headers, params={"view": "stale"})
+                    self.assertEqual(take.status()["drawingView"], view)
+                    await browser.delete(endpoint + "/preview", headers=headers, params={"view": view})
+                    self.assertNotIn("drawingView", take.status())
             take.pen.keep_stroke({
                 "released": (take.started + 1.5) * 1_000_000,
                 "points": [[.1, .2, (take.started + 1.2) * 1_000_000]],
@@ -532,6 +1477,81 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(load_events(take.draft.ink), [{
                 "time": 1.2, "stroke": 0, "from": [.1, .8], "to": [.1, .8], "liftedAt": 1.5, "captured": True,
             }])
+
+    @unittest.skipUnless(sys.platform == "linux" and find_spec("dbus_fast"), "requires the Linux ScreenCast portal client")
+    async def test_native_x11_screen_sources_work_without_screen_share_but_xwayland_cannot_bypass_it(self):
+        from linux_desktop_portal import ScreenCastPortal
+        from server import screencast_sources
+
+        origin = "http://127.0.0.1:43721"
+        record, headers = {"port": 43721}, {"Origin": origin}
+        app = FastAPI()
+        state = app.state
+        state.draining = False
+        state.status = "ready"
+        state.portable_recording = state.portable_dictation = state.portable_screencast = None
+        state.portable_recording_lock = asyncio.Lock()
+        state.jobs = set()
+        endpoint = "/api/portable/screencast"
+        app.add_api_route(endpoint + "/sources", screencast_sources, methods=["GET"])
+        app.add_api_route(endpoint + "/microphones", screencast_microphones, methods=["GET"])
+        app.add_api_route(endpoint, begin_screencast, methods=["POST"], status_code=202)
+        app.add_api_route(endpoint, discard_screencast, methods=["DELETE"], status_code=204)
+        configure_workspace(app, record, origin)
+        portal = AsyncMock(spec=ScreenCastPortal)
+        portal.connect.side_effect = OSError("No portal")
+        inputs = [{"id": "usb", "label": "USB microphone", "default": False}]
+        with (TemporaryDirectory() as staging, patch("server.URL", origin),
+              patch.dict(os.environ, {"DISPLAY": ":88", "WAYLAND_DISPLAY": "", "XDG_SESSION_TYPE": "tty"}),
+              patch("server.transcription_languages", return_value=()),
+              patch("linux_capture.microphone_inputs", new=AsyncMock(return_value=inputs)),
+              patch("linux_screencast.supported", return_value=True),
+              patch("linux_desktop_portal.ScreenCastPortal", return_value=portal),
+              patch("linux_screencast.ScreenCastPortal", return_value=portal) as recording_portal,
+              patch("linux_screencast.ScreenRecording.record", new_callable=AsyncMock)):
+            state.screen_draft_dir = Path(staging)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as browser:
+                self.assertEqual((await browser.get(endpoint + "/microphones")).status_code, 403)
+                await browser.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
+                self.assertEqual((await browser.get(endpoint + "/microphones")).json(), {"inputs": inputs})
+                self.assertEqual((await browser.get(endpoint + "/sources")).json(), {"sources": ["display", "area"]})
+                audio = {"microphone": "true", "microphone_device": "usb"}
+                stale = {**audio, "source": "display", "microphone_device": "removed"}
+                self.assertEqual((await browser.post(endpoint, params=stale, headers=headers)).status_code, 409)
+                for source in ("display", "area"):
+                    response = await browser.post(endpoint, params={**audio, "source": source}, headers=headers)
+                    self.assertEqual(response.status_code, 202)
+                    self.assertIsNone(state.portable_screencast.portal)
+                    self.assertEqual(state.portable_screencast.microphone_device, "usb")
+                    key = response.json()["id"]
+                    self.assertEqual((await browser.delete(f"{endpoint}?key={key}", headers=headers)).status_code, 204)
+                recording_portal.assert_not_called()
+                with patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0"}):
+                    self.assertEqual((await browser.get(endpoint + "/sources")).json(), {"sources": []})
+                with patch.dict(os.environ, {"XDG_SESSION_TYPE": "wayland"}):
+                    self.assertEqual((await browser.get(endpoint + "/sources")).json(), {"sources": []})
+                portal.connect.side_effect = None
+                portal.sources.return_value = ["window"]
+                self.assertEqual((await browser.get(endpoint + "/sources")).json(), {"sources": ["display", "area", "window"]})
+                response = await browser.post(endpoint, params={**audio, "source": "window"}, headers=headers)
+                self.assertEqual(response.status_code, 202)
+                self.assertIs(state.portable_screencast.portal, portal)
+                self.assertEqual(state.portable_screencast.microphone_device, "usb")
+                self.assertEqual((await browser.delete(endpoint, headers=headers)).status_code, 204)
+
+    @unittest.skipUnless(sys.platform == "linux" and find_spec("dbus_fast"), "requires the Linux screen recorder")
+    async def test_linux_screen_rechecks_narration_input_after_source_selection(self):
+        from linux_screencast import ScreenRecording
+
+        with (TemporaryDirectory() as staging,
+              patch("linux_capture.microphone_sources", new=AsyncMock(return_value=[{"name": "builtin"}])),
+              patch("linux_screencast.asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn):
+            take = ScreenRecording(Path(staging), "display", True, microphone_device="disconnected", native_x11=True)
+            take.target = (0, 0, 800, 600)
+            with self.assertRaisesRegex(CaptureError, "selected microphone is unavailable"):
+                await take.start_encoder(9)
+            spawn.assert_not_awaited()
+            self.assertFalse(take.draft.folder.exists())
 
     @unittest.skipUnless(sys.platform == "linux" and find_spec("dbus_fast"), "requires the Linux ScreenCast portal client")
     async def test_screen_recording_dismissal_releases_the_workspace(self):
@@ -628,6 +1648,107 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(bounds=bounds), self.assertRaises(ValueError):
                 Region(*bounds, 800, 600)
 
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires FFmpeg")
+    async def test_screen_video_saves_after_audio_setup_failure_and_legacy_recovery(self):
+        from annotation_assets import annotation_movie_tracks
+        from screen_draft import ScreenDraft, writer_lock
+        from server import finish_screencast, portable_recording_drafts, save_portable_recording, session_annotation_asset
+        from session_store import SessionStore
+        from windows_screencast import WindowsScreenRecording
+
+        app = FastAPI()
+        app.add_api_route("/api/portable/screencast/finish", finish_screencast, methods=["POST"])
+        app.add_api_route("/api/portable/recording/{key}/finish", save_portable_recording, methods=["POST"])
+        app.add_api_route("/api/portable/recording/drafts", portable_recording_drafts, methods=["GET"])
+        app.add_api_route("/api/sessions/{key}/annotation/{kind}", session_annotation_asset, methods=["GET"])
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            state = app.state
+            state.library = SessionStore(root / "library")
+            state.screen_draft_dir = root
+            state.portable_recording = None
+            state.portable_recording_dir = root / "microphone"
+            state.portable_recording_dir.mkdir()
+            state.portable_recording_lock = asyncio.Lock()
+            state.jobs = set()
+            state.draining = False
+            state.status = "loading"
+            state.diarizer = None
+
+            async def generate_video(draft, *, audio=False):
+                with writer_lock(draft.folder, create=True):
+                    source = ["-f", "lavfi", "-i", "color=black:s=64x64:r=10:d=1"]
+                    if audio:
+                        source += ["-f", "lavfi", "-i", "sine=frequency=523:duration=1", "-c:a", "aac", "-shortest"]
+                    process = await asyncio.create_subprocess_exec(
+                        "ffmpeg", "-v", "error", *source, "-c:v", "mpeg4",
+                        "-movflags", "+frag_keyframe+empty_moov", draft.movie,
+                    )
+                    self.assertEqual(await process.wait(), 0)
+
+            take = state.portable_screencast = WindowsScreenRecording(root, "display", "1a:0", microphone=True)
+            take.draft.create()
+            await generate_video(take.draft)
+            take.phase = "recorded"
+            failed = SimpleNamespace(start=AsyncMock(side_effect=CaptureError("Microphone unavailable.")), stop=AsyncMock())
+            with patch("windows_screencast.WindowsScreenAudio", return_value=failed):
+                await take.start_audio(100_000)
+            self.assertIsNone(take.audio)
+            self.assertEqual(ScreenDraft.read(take.draft.folder).audio_sources, ())
+            self.assertEqual(take.status()["error"], "Microphone unavailable.")
+
+            previous = ScreenDraft(root / str(uuid4()), "window", ("mic", "system"))
+            previous.create()
+            await generate_video(previous)
+            audible = ScreenDraft(root / str(uuid4()), "window", ("mic", "system"))
+            audible.create()
+            await generate_video(audible, audio=True)
+            without_preview = ScreenDraft(root / str(uuid4()), "area", ())
+            without_preview.create()
+            await generate_video(without_preview)
+
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                with patch("server.screencast_action", return_value=state), patch("server.portable_capture_state", return_value=state):
+                    drafts = (await client.get("/api/portable/recording/drafts")).raise_for_status().json()
+                    self.assertEqual({draft["id"]: draft["videoOnly"] for draft in drafts},
+                                     {previous.key: True, audible.key: False, without_preview.key: True})
+                    saved = await client.post(f"/api/portable/screencast/finish?key={take.draft.key}")
+                    self.assertEqual(saved.status_code, 202, saved.text)
+                    self.assertEqual(saved.json(), {"id": take.draft.key})
+                    self.assertIsNone(state.portable_screencast)
+                    recovered = await client.post(f"/api/portable/recording/{previous.key}/finish")
+                    self.assertEqual(recovered.status_code, 202, recovered.text)
+                    self.assertEqual(recovered.json(), {"id": previous.key})
+                    pending = await client.post(f"/api/portable/recording/{audible.key}/finish")
+                    self.assertEqual(pending.status_code, 503, pending.text)
+                    self.assertTrue(audible.movie.is_file())
+                    with patch("screen_contact_sheet.read_preview_frame", side_effect=TimeoutError):
+                        saved_without_preview = await client.post(f"/api/portable/recording/{without_preview.key}/finish")
+                    self.assertEqual(saved_without_preview.status_code, 202, saved_without_preview.text)
+
+                for draft in (take.draft, previous):
+                    annotation = state.library.get(draft.key)["annotation"]
+                    manifest = (await client.get(annotation["manifestUrl"])).raise_for_status().json()
+                    self.assertEqual(annotation["frames"], manifest["frames"])
+                    self.assertEqual(len(manifest["frames"]), 2)
+                    self.assertAlmostEqual(manifest["frames"][0], 0.)
+                    self.assertAlmostEqual(manifest["frames"][1], .9)
+                    sheet = (await client.get(annotation["contactSheetUrl"])).raise_for_status()
+                    self.assertEqual(sheet.headers["Content-Type"], "image/png")
+                    self.assertEqual(sheet.content[:8], b"\x89PNG\r\n\x1a\n")
+                    self.assertEqual(struct.unpack(">II", sheet.content[16:24]), (872, 282))
+                annotation = state.library.get(without_preview.key)["annotation"]
+                self.assertEqual(annotation["frames"], [])
+                self.assertIsNone(annotation["contactSheetUrl"])
+
+            for draft in (take.draft, previous, without_preview):
+                self.assertFalse(draft.folder.exists())
+                path, mime = state.library.media(draft.key)
+                self.assertEqual(mime, "video/mp4")
+                duration, audio_tracks = await annotation_movie_tracks(path)
+                self.assertAlmostEqual(duration, 1.0)
+                self.assertEqual(audio_tracks, 0)
+
     @unittest.skipUnless(sys.platform == "linux" and find_spec("dbus_fast"), "requires the Linux ScreenCast portal client")
     def test_screen_draft_can_be_opened_only_after_its_recorder_releases_it(self):
         from linux_screencast import ScreenDraft, writer_lock
@@ -653,7 +1774,7 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(sys.platform == "linux" and find_spec("dbus_fast"), "requires the Linux ScreenCast portal client")
     async def test_screen_recording_meters_select_the_loudest_channel(self):
-        from linux_screencast import input_level
+        from linux_screencast import ScreenRecording, input_level
 
         prefix = b'Got message #42 from element "system_level" (element): level, endtime=(guint64)200000000, '
         self.assertEqual(input_level(prefix + b"peak=(GValueArray)< -699, -699 >;"), ("system", 0))
@@ -662,6 +1783,26 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(peak, 0.5)
         self.assertIsNone(input_level(prefix + b"peak=(GValueArray)< invalid >;"))
         self.assertIsNone(input_level(b'Got message #11 from element "filesink0" (state-changed): '))
+
+        with TemporaryDirectory() as folder:
+            take = ScreenRecording(Path(folder), "display", True, True, native_x11=True)
+            take.phase = "recording"
+            stdout = asyncio.StreamReader()
+            take.recorder = SimpleNamespace(stdout=stdout)
+            watcher = asyncio.create_task(take.read_levels())
+            try:
+                stdout.feed_data(prefix + b"peak=(GValueArray)<-6, -18>;\njaro-screen-audio mic unavailable\n")
+                await asyncio.sleep(0)
+                status = take.status()
+                self.assertEqual(status["phase"], "recording")
+                self.assertIn("microphone to reconnect", status["error"])
+                self.assertGreater(status["levels"]["system"], 0.5)
+                stdout.feed_data(b"jaro-screen-audio mic ready\n")
+                await asyncio.sleep(0)
+                self.assertIsNone(take.status()["error"])
+            finally:
+                stdout.feed_eof()
+                await asyncio.wait_for(watcher, 2)
 
     @unittest.skipUnless(sys.platform == "linux" and find_spec("dbus_fast"), "requires the Linux screenshot portal client")
     async def test_screenshot_picker_requires_its_workspace_and_handles_cancel(self):
@@ -673,6 +1814,8 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         app.add_api_route("/api/portable/screenshots", screenshot_targets, methods=["GET"])
         app.add_api_route("/api/portable/screenshots", portable_screenshot, methods=["POST"])
         app.state.draining = False
+        app.state.portable_screencast = None
+        app.state.portable_recording_lock = asyncio.Lock()
         configure_workspace(app, record, origin)
         endpoint = "/api/portable/screenshots"
         portal = AsyncMock(spec=ScreenshotPortal)
@@ -697,6 +1840,70 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.headers["content-type"], "image/png")
                 self.assertEqual(response.headers["cache-control"], "no-store")
                 self.assertFalse(app.state.screenshot_pending)
+
+    @unittest.skipUnless(sys.platform == "linux" and find_spec("dbus_fast"), "requires the Linux screenshot portal client")
+    async def test_linux_screenshot_and_screen_share_cannot_open_two_pickers(self):
+        from linux_desktop_portal import PortalResponseError, ScreenshotPortal, ScreenCastPortal
+
+        async def choose_still(_source):
+            picking_still.set()
+            await release.wait()
+            raise PortalResponseError(1, {})
+
+        async def choose_video(_source):
+            picking_video.set()
+            await release.wait()
+            raise PortalResponseError(1, {})
+
+        still_portal, video_portal = AsyncMock(spec=ScreenshotPortal), AsyncMock(spec=ScreenCastPortal)
+        still_portal.screenshot.side_effect, video_portal.select.side_effect = choose_still, choose_video
+        picking_still, picking_video, release = (asyncio.Event() for _ in range(3))
+        origin = "http://127.0.0.1:43721"
+        app = FastAPI()
+        state = app.state
+        state.draining = False
+        state.portable_recording = state.portable_dictation = state.portable_screencast = None
+        state.portable_recording_lock = asyncio.Lock()
+        state.jobs = set()
+        still, video = "/api/portable/screenshots", "/api/portable/screencast"
+        app.add_api_route(still, portable_screenshot, methods=["POST"])
+        app.add_api_route(video, begin_screencast, methods=["POST"], status_code=202)
+        app.add_api_route(video, discard_screencast, methods=["DELETE"], status_code=204)
+        record, headers = {"port": 43721}, {"Origin": origin}
+        configure_workspace(app, record, origin)
+        with (TemporaryDirectory() as staging, patch("server.URL", origin),
+              patch("linux_screencast.supported", return_value=True),
+              patch("linux_desktop_portal.ScreenshotPortal", return_value=still_portal),
+              patch("linux_screencast.ScreenCastPortal", return_value=video_portal)):
+            state.screen_draft_dir = Path(staging)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as browser:
+                await browser.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
+                shot = asyncio.create_task(browser.post(still + "?source=picker", headers=headers))
+                try:
+                    await asyncio.wait_for(picking_still.wait(), 1)
+                    self.assertEqual((await browser.post(video + "?source=display", headers=headers)).status_code, 409)
+                    video_portal.connect.assert_not_awaited()
+                finally:
+                    shot.cancel()
+                    await asyncio.gather(shot, return_exceptions=True)
+                    if take := state.portable_screencast:
+                        take.task.cancel()
+                        await asyncio.gather(take.task, return_exceptions=True)
+                self.assertFalse(state.screenshot_pending)
+                still_portal.close.assert_awaited_once()
+
+                started = await browser.post(video + "?source=display", headers=headers)
+                started.raise_for_status()
+                try:
+                    await asyncio.wait_for(picking_video.wait(), 1)
+                    self.assertEqual((await asyncio.wait_for(browser.post(still + "?source=picker", headers=headers), 1)).status_code, 409)
+                    still_portal.connect.assert_awaited_once()
+                finally:
+                    release.set()
+                    await state.portable_screencast.task
+                key = started.json()["id"]
+                self.assertEqual((await browser.delete(f"{video}?key={key}", headers=headers)).status_code, 204)
+                self.assertEqual((await browser.post(still + "?source=picker", headers=headers)).status_code, 204)
 
     @unittest.skipUnless(sys.platform == "linux" and find_spec("dbus_fast"), "requires the Linux screenshot portal client")
     async def test_screenshot_targets_and_untrusted_file_uris(self):
@@ -739,13 +1946,14 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         installing = asyncio.Event()
         finish = asyncio.Event()
 
-        async def install(report):
+        async def install(report, *, repair):
+            self.assertFalse(repair)
             report(25, 100)
             installing.set()
             await finish.wait()
             raise RuntimeError("Interrupted download.")
 
-        async def resume(report):
+        async def resume(report, *, repair):
             report(100, 100)
 
         async def load(owner):
@@ -753,12 +1961,16 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
             owner.state.status = "ready"
 
         with (patch("server.URL", origin), patch("server.install_workspace_models", side_effect=install) as download,
-              patch("server.load_speech", side_effect=load), patch("server.logger.exception")):
+              patch("server.load_speech", side_effect=load), patch("server.additional_models_ready", return_value=True),
+              patch("server.logger.exception")):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as webview:
                 endpoint = "/api/portable/models"
                 headers = {"Origin": origin}
                 self.assertEqual((await webview.post(endpoint, headers=headers)).status_code, 403)
                 await webview.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
+                self.assertEqual((await webview.post(endpoint, headers=headers)).status_code, 403)
+                download.assert_not_awaited()
+                await webview.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceDesktopKey"]})
                 self.assertEqual((await webview.post(endpoint)).status_code, 403)
                 self.assertEqual((await webview.post(endpoint, headers={"Origin": "https://other.example"})).status_code, 403)
                 response = await webview.post(endpoint, headers=headers)
@@ -779,11 +1991,19 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.state.status, "ready")
                 self.assertEqual(download.await_count, 2)
                 app.state.model_setup = {"phase": "load-error", "total": 100}
+                download.side_effect = RuntimeError("Interrupted repair.")
                 response = await webview.post(endpoint, headers=headers)
                 self.assertEqual(response.status_code, 202)
+                self.assertTrue(response.json()["modelSetup"]["repair"])
                 await asyncio.gather(*app.state.jobs)
+                self.assertEqual(app.state.model_setup["phase"], "download-error")
+                self.assertTrue(download.await_args.kwargs["repair"])
+                download.side_effect = resume
+                await webview.post(endpoint, headers=headers)
+                await asyncio.gather(*app.state.jobs)
+                self.assertTrue(download.await_args.kwargs["repair"])
                 self.assertIsNone(app.state.model_setup)
-                self.assertEqual(download.await_count, 2)
+                self.assertEqual(download.await_count, 4)
 
     async def test_model_setup_distinguishes_missing_models_from_failed_startup(self):
         app = FastAPI()
@@ -792,11 +2012,17 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         async def load(owner):
             owner.state.status = status
 
-        with (patch("server.load_speech", side_effect=load), patch("server.model_status") as installed):
+        with (patch("server.load_speech", side_effect=load), patch("server.model_status") as installed,
+              patch("server.additional_models_ready", return_value=True) as additional):
             status = "ready"
             await start_workspace_speech(app)
             self.assertIsNone(app.state.model_setup)
             installed.assert_not_called()
+
+            additional.return_value = False
+            installed.return_value = {"ready": False, "bytes": 4100}
+            await start_workspace_speech(app)
+            self.assertEqual(app.state.model_setup, {"phase": "needed", "total": 4100, "additional": True})
 
             status = "error"
             installed.return_value = {"ready": False, "bytes": 4100}
@@ -807,6 +2033,43 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
             await start_workspace_speech(app)
             self.assertEqual(app.state.model_setup, {"phase": "load-error", "total": 4100})
 
+    async def test_additional_setup_keeps_ready_speech_and_attaches_to_the_existing_model(self):
+        from server import SpeechInference, setup_workspace_speech
+
+        app = FastAPI()
+        state = app.state
+        state.model = model = SimpleNamespace(aligner=None)
+        state.diarizer = None
+        state.status = "ready"
+        state.inference = SpeechInference()
+        state.model_setup = {"phase": "downloading", "additional": True}
+
+        async def attach(owner):
+            self.assertEqual(owner.status, "ready")
+            self.assertIs(owner.model, model)
+            self.assertTrue(owner.inference.active)
+            owner.diarizer = object()
+            owner.model.aligner = object()
+
+        with (patch("server.install_workspace_models", new_callable=AsyncMock, side_effect=RuntimeError) as install,
+              patch("server.load_speaker_tools", side_effect=attach) as extras,
+              patch("server.load_speech", new_callable=AsyncMock) as speech, patch("server.logger.exception"),
+              patch("server.writing_model_installed", return_value=False) as writing):
+            await setup_workspace_speech(app)
+            self.assertEqual(state.model_setup["phase"], "download-error")
+            self.assertEqual(state.status, "ready")
+            extras.assert_not_awaited()
+
+            install.side_effect = None
+            await setup_workspace_speech(app)
+            self.assertEqual(state.model_setup["phase"], "load-error")
+            self.assertEqual(state.status, "ready")
+            writing.return_value = True
+            await setup_workspace_speech(app, repair=True)
+            self.assertIsNone(state.model_setup)
+            self.assertIs(state.model, model)
+            speech.assert_not_awaited()
+
     async def test_linux_capture_requires_a_microphone_instead_of_a_playback_monitor(self):
         sources = '[{"name":"mic","properties":{}},{"name":"speaker.monitor","properties":{"device.class":"monitor"}}]'
         with patch("linux_capture.pulse_info", new=AsyncMock(side_effect=["mic\n", sources])):
@@ -814,6 +2077,16 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
         with patch("linux_capture.pulse_info", new=AsyncMock(side_effect=["speaker.monitor\n", sources])):
             with self.assertRaisesRegex(CaptureError, "Select a microphone"):
                 await default_microphone()
+
+    async def test_linux_sdk_capture_stops_when_the_input_disappears(self):
+        capture = LinuxRecording(uuid4(), Path("fixture.wav"), "mic", microphone="usb")
+        capture.capture_source = "usb"
+        capture.process = SimpleNamespace(returncode=None, terminate=Mock())
+        with patch("linux_capture.pulse_info", side_effect=CaptureError("Device removed")) as pulse:
+            await capture.watch_input()
+        pulse.assert_awaited_once_with("get-source-volume", "usb")
+        self.assertTrue(capture.interrupted)
+        capture.process.terminate.assert_called_once()
 
     async def test_dictation_microphones_list_and_capture_only_input_sources(self):
         sources = ('[{"name":"builtin","description":"Built-in microphone"},'
@@ -1034,7 +2307,6 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(dictation.enabled)
 
     async def test_portable_language_and_voice_input_are_saved_and_used_for_each_take(self):
-        from dictation_input import CleanupFailed
         from linux_dictation import LinuxDictation
         from portable_dictation_history import PortableDictationHistory
         from server import (change_portable_language, change_portable_shortcut_mode, change_portable_voice_input,
@@ -1107,9 +2379,9 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual((await browser.post(mode_url, headers=headers, json={"mode": "tap"})).status_code, 409)
                     await dictation.toggle()
                     self.assertEqual(recognized.await_args.args[2], ("fr",))
-                    self.assertTrue(recognized.await_args.kwargs["screen_nonspeech"])
+                    self.assertTrue(recognized.await_args.kwargs["screen_recording"])
                     self.assertFalse(recognized.await_args.kwargs["boost"])
-                    self.assertNotIn("cleanup", recognized.await_args.kwargs)
+                    self.assertIsNone(recognized.await_args.kwargs.get("cleanup"))
                     self.assertEqual(history.page(legacy=True)["entries"][0]["text"], "Bonjour, ceci est un essai.")
                     self.assertEqual((await browser.post(url, headers=headers, json={"language": ""})).json()["language"], "")
                     await dictation.toggle()
@@ -1126,17 +2398,13 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(status["cleanupStatus"], "downloading")
                     cleanup.prepare.assert_called_once_with(retry=True)
                     dictation = state.portable_dictation = Dictation(state, transcribe_portable_dictation, history)
-                    for unusable in (CleanupFailed(), {"text": "", "inferenceMs": 80}):
-                        recognized.reset_mock()
-                        recognized.side_effect = [unusable, transcript]
-                        await dictation.toggle()
-                        await dictation.toggle()
-                        first, fallback = recognized.await_args_list
-                        self.assertIs(first.kwargs["cleanup"], cleanup)
-                        self.assertNotIn("cleanup", fallback.kwargs)
-                        self.assertTrue(first.kwargs["boost"] and fallback.kwargs["boost"])
-                        self.assertEqual(first.args[1], fallback.args[1])
-                        dictation.deliver.assert_awaited_with(transcript["text"])
+                    recognized.reset_mock()
+                    await dictation.toggle()
+                    await dictation.toggle()
+                    recognized.assert_awaited_once()
+                    self.assertIs(recognized.await_args.kwargs["cleanup"], cleanup)
+                    self.assertTrue(recognized.await_args.kwargs["boost"])
+                    dictation.deliver.assert_awaited_with(transcript["text"])
                     status = (await browser.post(voice_url, headers=headers, json={**noise, "enabled": False})).json()
                     self.assertFalse(status["noiseCleanup"])
                     self.assertTrue(status["boostMicrophone"])
@@ -1219,9 +2487,9 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 profiles = [{"target": "default", "steps": ["lowercase"]},
                             {"target": "app:Example", "steps": ["rewrite", "lowercase"],
                              "vocabulary": ["Example project"], "corrections": "Bluewheel => Cog",
-                             "instruction": "Remove filler while keeping all numbers."}]
+                             "instruction": "Remove filler while keeping all numbers."},
+                            {"target": "site:*.example.net", "steps": ["no-trailing-punctuation"], "vocabulary": ["Website project"]}]
                 self.assertEqual((await set_profiles([{"target": "default", "steps": ["script"]}])).status_code, 400)
-                self.assertEqual((await set_profiles([{"target": "site:example.net", "steps": ["lowercase"]}])).status_code, 400)
                 self.assertEqual((await set_profiles([{"target": "default", "steps": ["rewrite"]}])).status_code, 400)
                 (await set_profiles(profiles)).raise_for_status()
                 self.assertEqual((await set_profiles([])).status_code, 409)
@@ -1233,7 +2501,10 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 })
                 dictation.platform = "wayland"
                 simulated = await browser.post(endpoint + "/output-profiles/preview", headers=headers, json=preview)
-                self.assertEqual(simulated.raise_for_status().json()["profile"], "default")
+                self.assertEqual(simulated.raise_for_status().json()["profile"], "app:Example")
+                simulated = await browser.post(endpoint + "/output-profiles/preview", headers=headers,
+                                               json={**preview, "site": "https://work.example.net/private"})
+                self.assertEqual(simulated.raise_for_status().json()["profile"], "site:*.example.net")
 
                 async def generate(*_args, **_kwargs):
                     yield json.dumps({"text": rewritten})
@@ -1243,7 +2514,8 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 dictation = state.portable_dictation = Dictation(state, transcribe_portable_dictation, history)
                 capture_text = "The blue wheel, 12 times."
                 with patch("server.transcribe_dictation", new_callable=AsyncMock,
-                           return_value={"text": capture_text, "inferenceMs": 42}) as recognize:
+                           return_value={"text": capture_text, "inferenceMs": 42}) as recognize, \
+                     patch.object(dictation, "output_context", new=AsyncMock(return_value=OutputContext("Example"))) as context:
                     for rewritten, delivered in (("Polished 12 times.", "polished 12 times."),
                                                 ("Polished 13 times.", "the cog, 12 times.")):
                         dictation.application = "Example"
@@ -1255,6 +2527,14 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("changed a number", dictation.feedback)
                     self.assertEqual(state.insights.chat_count, 0)
                     self.assertEqual(model.ready.await_count, 2)
+                    dictation.application = "Original"
+                    await dictation.toggle()
+                    context.return_value = OutputContext("Endpoint", "work.example.net")
+                    await dictation.toggle()
+                    dictation.deliver.assert_awaited_with("The Bluewheel, 12 times")
+                    self.assertEqual(recognize.await_args.args[3], ("Website project", "Jaro Notebook"))
+                    self.assertEqual(history.page(legacy=True)["entries"][0]["app"], "Endpoint")
+                    context.return_value = OutputContext()
                     await dictation.toggle()
                     await dictation.toggle()
                     dictation.deliver.assert_awaited_with("the bluewheel, 12 times.")
@@ -1445,6 +2725,40 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                     await dictation.sounds.task
                     self.assertEqual(dictation.deliver.await_count, 3)
 
+    async def test_windows_cues_stop_before_the_next_in_process_playback(self):
+        from portable_dictation_sounds import DictationSounds, SoundPreferences
+
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "cue.wav"
+            with wave.open(str(path), "wb") as clip:
+                clip.setparams((1, 2, 16000, 0, "NONE", ""))
+                clip.writeframes(struct.pack("<4h", 16000, -16000, 8000, -8000) * 800)
+            player = DictationSounds()
+            player.available = True
+            player.pulse_player = None
+            started = asyncio.Event()
+
+            def play_sound(buffer, _module, _flags):
+                if buffer is not None:
+                    self.assertEqual(struct.unpack_from("<4h", buffer, 44), (8000, -8000, 4000, -4000))
+                    started.set()
+                return 1
+
+            native = Mock(side_effect=play_sound)
+            winmm = SimpleNamespace(PlaySoundW=native)
+            winsound = SimpleNamespace(SND_ASYNC=1, SND_NODEFAULT=2, SND_MEMORY=4)
+            with (patch("ctypes.windll", SimpleNamespace(winmm=winmm), create=True),
+                  patch.dict(sys.modules, {"winsound": winsound}),
+                  patch("portable_dictation_sounds.sound_path", return_value=path)):
+                first = player.play("start", SoundPreferences(volume=50))
+                await asyncio.wait_for(started.wait(), 1)
+                started.clear()
+                second = player.play("stop", SoundPreferences(volume=50))
+                await asyncio.wait_for(started.wait(), 1)
+                self.assertTrue(first.cancelled())
+                self.assertTrue(await second)
+                self.assertEqual([call.args[2] for call in native.call_args_list], [7, 0, 7, 0])
+
     async def test_cancel_discards_a_processing_take_and_never_interrupts_delivery(self):
         from portable_dictation import PortableDictation
         from portable_dictation_history import PortableDictationHistory
@@ -1617,6 +2931,62 @@ sys.stdout.buffer.write(frame * 31)
             (helper, "meeting", "120", "call", "chrome.exe", "google-chrome.exe"),
         ])
 
+    async def test_windows_screen_audio_passes_clock_and_exact_microphone(self):
+        helper = Path("jaro-capture.exe")
+        with (patch("windows_capture.helper_path", return_value=helper),
+              patch("windows_capture.subprocess.CREATE_NO_WINDOW", 0, create=True),
+              patch("windows_capture.asyncio.create_subprocess_exec", new_callable=AsyncMock) as spawn):
+            for mode, selected in (("mic", ""), ("mic", "USB microphone"), ("both", "USB microphone"), ("system", "")):
+                audio = WindowsScreenAudio(uuid4(), Path("narration.wav"), mode, seconds=120, microphone=selected)
+                await audio.spawn()
+        self.assertEqual([call.args for call in spawn.await_args_list], [
+            (helper, "mic", "120", "clock"),
+            (helper, "mic", "120", "clock", "device", "USB microphone"),
+            (helper, "both", "120", "clock", "device", "USB microphone"),
+            (helper, "system", "120", "clock"),
+        ])
+
+    async def test_windows_screen_audio_keeps_playback_through_microphone_reconnect(self):
+        from windows_screencast import WindowsScreenRecording
+
+        with TemporaryDirectory() as folder:
+            take = WindowsScreenRecording(Path(folder), "display", "1a:0", True, True)
+            take.draft.create()
+            take.phase = "recording"
+            audio = take.audio = WindowsScreenAudio(uuid4(), take.draft.narration, "both")
+            pcm, updates = asyncio.StreamReader(), asyncio.StreamReader()
+            audio.process = SimpleNamespace(stdout=pcm, stderr=updates)
+            worker = asyncio.create_task(audio.collect())
+            try:
+                pcm.feed_data(struct.pack("<q", 100_000) + struct.pack("<hh", 500, 1000) * 1600)
+                await asyncio.wait_for(audio.ready.wait(), 2)
+                self.assertEqual(audio.started_ticks, 100_000)
+                self.assertIsNone(take.status()["error"])
+
+                updates.feed_data(b"jaro-screen-audio mic unavailable\r\n")
+                pcm.feed_data(struct.pack("<hh", 0, 1000) * 1600)
+                await asyncio.sleep(0)
+                status = take.status()
+                self.assertEqual(status["phase"], "recording")
+                self.assertIn("Microphone unavailable", status["error"])
+                self.assertEqual(status["levels"]["mic"], 0)
+                self.assertGreater(status["levels"]["system"], 0)
+
+                updates.feed_data(b"jaro-screen-audio mic ready\r\n")
+                pcm.feed_data(struct.pack("<hh", 500, 1000) * 1600)
+                await asyncio.sleep(0)
+                self.assertIsNone(take.status()["error"])
+            finally:
+                pcm.feed_eof()
+                updates.feed_eof()
+                await asyncio.wait_for(worker, 2)
+
+            tracks = source_tracks(audio.path)
+            with wave.open(str(tracks["system"]), "rb") as stream:
+                self.assertEqual(stream.readframes(4800), struct.pack("<h", 1000) * 4800)
+            with wave.open(str(tracks["mic"]), "rb") as stream:
+                self.assertEqual(stream.readframes(4800), struct.pack("<h", 500) * 1600 + b"\0" * 3200 + struct.pack("<h", 500) * 1600)
+
     async def test_owner_key_unlocks_only_its_loopback_workspace(self):
         origin = "http://127.0.0.1:43721"
         app = FastAPI()
@@ -1655,6 +3025,48 @@ sys.stdout.buffer.write(frame * 31)
                 "Cookie": "jaro-workspace-43722=" + record["workspaceKey"],
             })).status_code, 403)
 
+    async def test_video_export_requires_the_desktop_and_rejects_overlapping_saves(self):
+        from server import export_portable_annotation
+
+        origin = "http://127.0.0.1:43721"
+        app = FastAPI()
+        app.post("/export/{key}")(export_portable_annotation)
+        record = {"port": 43721}
+        configure_workspace(app, record, origin)
+        app.state.draining = False
+        app.state.jobs = set()
+        app.state.library = object()
+        key = str(uuid4())
+        route = "/export/" + key
+        entered, finish = asyncio.Event(), asyncio.Event()
+
+        async def save(*_):
+            entered.set()
+            await finish.wait()
+            return {"saved": True}
+
+        auth = {"Origin": origin}
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+            with (patch("server.URL", origin), patch("desktop_file_dialog.file_dialog", return_value=Path("jaro-save-video")),
+                  patch("portable_video_export.save_annotation_video", new_callable=AsyncMock, side_effect=save) as export):
+                await client.post(BOOTSTRAP, headers={**auth, "X-Jaro-Workspace-Key": record["workspaceKey"]})
+                self.assertEqual((await client.post(route, headers=auth, json={})).status_code, 403)
+                await client.post(BOOTSTRAP, headers={**auth, "X-Jaro-Workspace-Key": record["workspaceDesktopKey"]})
+                self.assertEqual((await client.post(route, json={})).status_code, 403)
+                for span in ({"startMs": True, "endMs": 800}, {"startMs": 350, "endMs": 800}):
+                    self.assertEqual((await client.post(route, headers=auth, json={"span": span})).status_code, 422)
+                export.assert_not_called()
+
+                pending = asyncio.create_task(client.post(route, headers=auth, json={"span": {"startMs": 100, "endMs": 800}}))
+                try:
+                    await asyncio.wait_for(entered.wait(), 2)
+                    self.assertEqual((await client.post(route, headers=auth, json={})).status_code, 409)
+                    self.assertTrue(app.state.jobs)
+                finally:
+                    finish.set()
+                self.assertEqual((await pending).json(), {"saved": True})
+                export.assert_awaited_once_with(app.state.library, Path("jaro-save-video"), key, (100, 800))
+
     async def test_stupase_worker_passes_silent_chunks_and_guards_stale_retire(self):
         from dictation_input import StuPASECleanup
         from stupase_runner import HEADER
@@ -1682,6 +3094,64 @@ sys.stdout.buffer.write(frame * 31)
                     await cleanup.retire_worker(stale_gen)
                     self.assertIsNotNone(cleanup.worker)
                     self.assertEqual(cleanup.worker.pid, first_pid)
+                finally:
+                    await cleanup.close()
+
+    async def test_stupase_startup_failure_waits_for_verified_repair(self):
+        import hashlib
+
+        from dictation_input import CleanupFailed, StuPASECleanup
+        import stupase_runner
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            cleanup = StuPASECleanup(root)
+            cleanup.root.mkdir(parents=True)
+            checkpoint = cleanup.root / "weights.pt"
+            checkpoint.write_bytes(b"wrong")
+            marker = cleanup.root / ".verified"
+            marker.write_text(stupase_runner.REVISION)
+            # Repair can promote a previously downloaded, verified replacement.
+            checkpoint.with_suffix(".pt.partial").write_bytes(b"right")
+            expected = ("weights.pt", 5, hashlib.sha256(b"right").hexdigest())
+            launches = root / "launches"
+            worker = root / "worker.py"
+            worker.write_text(
+                "import sys\n"
+                "from pathlib import Path\n"
+                "import struct\n"
+                "action, folder = sys.argv[1:]\n"
+                "folder = Path(folder)\n"
+                "if action == 'download':\n"
+                f"    sys.path.insert(0, {str(Path(stupase_runner.__file__).parent)!r})\n"
+                "    import stupase_runner\n"
+                f"    stupase_runner.CHECKPOINTS = ({expected!r},)\n"
+                "    stupase_runner.download(folder)\n"
+                "    sys.exit(0)\n"
+                f"with Path({str(launches)!r}).open('a') as log: log.write('start\\n')\n"
+                "if (folder / 'weights.pt').read_bytes() != b'right': sys.exit(1)\n"
+                "sys.stdout.buffer.write(bytes(4)); sys.stdout.buffer.flush()\n"
+                "while header := sys.stdin.buffer.read(4):\n"
+                "    data = sys.stdin.buffer.read(struct.unpack('<I', header)[0])\n"
+                "    sys.stdout.buffer.write(header + data); sys.stdout.buffer.flush()\n",
+                encoding="utf8",
+            )
+            pcm = bytes(4)
+            with patch("stupase_runner.CHECKPOINTS", (expected,)), patch("dictation_input.RUNNER", worker):
+                try:
+                    self.assertEqual(cleanup.status(), "ready")
+                    failures = await asyncio.gather(cleanup.clean(pcm), cleanup.clean(pcm), return_exceptions=True)
+                    self.assertTrue(all(isinstance(error, CleanupFailed) for error in failures))
+                    self.assertEqual(launches.read_text().splitlines(), ["start"])
+                    self.assertEqual(cleanup.prepare(), "error")
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(checkpoint.read_bytes(), b"wrong")
+                    self.assertEqual(cleanup.prepare(retry=True), "downloading")
+                    await cleanup.downloading
+                    self.assertEqual(cleanup.status(), "ready")
+                    self.assertEqual(checkpoint.read_bytes(), b"right")
+                    self.assertEqual(await cleanup.clean(pcm), pcm)
+                    self.assertEqual(launches.read_text().splitlines(), ["start", "start"])
                 finally:
                     await cleanup.close()
 
@@ -1717,16 +3187,66 @@ sys.stdout.buffer.write(frame * 31)
                 recording.end_frame = 0
                 await blocks.aclose()
 
+    async def test_linux_ordinary_dual_recording_keeps_microphone_while_playback_is_silent(self):
+        from linux_capture import LinuxRecording
+        from linux_meeting_audio import LinuxDualRecording, Source, linux_recording
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "ordinary.wav"
+            capture = linux_recording(uuid4(), path, "both", seconds=10)
+            self.assertIsInstance(capture, LinuxDualRecording)
+            self.assertIsInstance(linux_recording(uuid4(), path, "mic"), LinuxRecording)
+            playback = asyncio.Event()
+
+            async def read(source):
+                if source.name == "default-monitor":
+                    await playback.wait()
+                tone = 6000 if source.name == "microphone" else 12000
+                data = struct.pack("<h", tone) * (SAMPLE_RATE // 50)
+                while True:
+                    source.push(data)
+                    await asyncio.sleep(.02)
+
+            with (patch.object(Source, "read", read),
+                  patch("linux_meeting_audio.default_microphone", AsyncMock(return_value="microphone")),
+                  patch("linux_meeting_audio.default_computer_audio", AsyncMock(return_value="default-monitor")),
+                  patch("linux_meeting_audio.read_monitors", AsyncMock()) as enumerate_monitors):
+                try:
+                    await asyncio.wait_for(capture.start(), 2)
+                    self.assertFalse(capture.meeting)
+                    self.assertGreater(capture.levels[0], 0)
+                    self.assertEqual(capture.levels[1], 0)
+                    playback.set()
+                    async with asyncio.timeout(2):
+                        while capture.levels[1] == 0:
+                            await asyncio.sleep(.02)
+                    enumerate_monitors.assert_not_awaited()
+                finally:
+                    await capture.stop()
+
+            originals = draft_tracks(path, capture.frames)
+            self.assertEqual(set(originals), {"mic", "system"})
+            arrays = []
+            for wav_path in (path, originals["mic"], originals["system"]):
+                with wave.open(str(wav_path), "rb") as wav:
+                    self.assertEqual(wav.getnframes(), capture.frames)
+                    arrays.append(np.frombuffer(wav.readframes(capture.frames), dtype="<i2"))
+            mix, mic, system = arrays
+            self.assertTrue(np.any((mic > 0) & (system == 0)))
+            self.assertTrue(np.any(system > 0))
+            np.testing.assert_array_equal(mix, (mic.astype(np.int32) + system) // 2)
+
     def test_tray_quit_focuses_workspace_while_busy_and_windows_encoder_falls_back(self):
+        from engine_lifecycle import ClientLeases
         from portable_tray import MeetingTray
         from screen_draft import windows_h264_encoder
 
         with TemporaryDirectory() as directory:
             tray_dir = Path(directory)
             shutdown = Mock()
-            state = SimpleNamespace(request_shutdown=shutdown)
+            state = SimpleNamespace(request_shutdown=shutdown, leases=ClientLeases())
             busy_flag = True
-            tray = MeetingTray(state, tray_dir, lambda: busy_flag, lambda: None, lambda _: "", AsyncMock())
+            tray = MeetingTray(state, tray_dir, lambda: busy_flag, lambda: None, lambda _: "")
             tray.submit("quit")
             shutdown.assert_not_called()
             self.assertTrue((tray_dir / "open").is_file())

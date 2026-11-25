@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useEffectEvent, useMemo, useRef, useState } from "react"
 import { BookOpen, ChevronRight, Plus, X } from "lucide-react"
 import { Dialog } from "radix-ui"
 import { useInterfaceLanguage } from "@/interface-language"
@@ -69,7 +69,25 @@ function project(rows: Row[]) {
 
 export type SaveDictationVocabulary = (base: DictationVocabularyEntry[], entries: DictationVocabularyEntry[]) => Promise<DictationVocabularyEntry[]>
 
-export function DictationVocabulary({ saved, saveVocabulary }: {
+export type VocabularyRequest = { addTerm: boolean }
+
+export function VocabularySetting({ saved, onOpen }: {
+  saved: DictationVocabularyEntry[] | undefined
+  onOpen: () => void
+}) {
+  const { t } = useInterfaceLanguage()
+  const count = saved?.length ?? 0
+  return <SettingRow icon={BookOpen} title={t("Vocabulary")} label={false} find="Names, terms and alternate spellings">
+    <Button type="button" variant="ghost" size="sm" aria-haspopup="dialog" aria-label={t("Edit vocabulary")} disabled={!saved} onClick={onOpen}>
+      {count === 0 ? t("None") : count === 1 ? t("1 term") : t("{count} terms").replace("{count}", String(count))}
+      <ChevronRight aria-hidden="true" />
+    </Button>
+  </SettingRow>
+}
+
+export function DictationVocabulary({ saved, saveVocabulary, external, request }: {
+  external?: boolean
+  request?: VocabularyRequest
   saved: DictationVocabularyEntry[] | undefined
   saveVocabulary: SaveDictationVocabulary
 }) {
@@ -79,6 +97,8 @@ export function DictationVocabulary({ saved, saveVocabulary }: {
   const [closing, setClosing] = useState(false)
   const [failure, setFailure] = useState("")
   const [added, setAdded] = useState<string>()
+  const lastRequest = useRef<VocabularyRequest>(undefined)
+  const returnFocus = useRef<HTMLElement | null>(null)
   const nextId = useRef(0)
   const list = useRef<HTMLDivElement>(null)
   const rows = editor?.rows
@@ -121,7 +141,7 @@ export function DictationVocabulary({ saved, saveVocabulary }: {
 
   useEffect(() => {
     if (!added) return
-    const field = list.current?.querySelector<HTMLInputElement>(`[data-row="${added}"] input`)
+    const field = list.current?.querySelector<HTMLInputElement>(`[data-row="${CSS.escape(added)}"] input`)
     field?.focus({ preventScroll: true })
     field?.scrollIntoView({ block: "nearest", behavior: "instant" })
   }, [added])
@@ -133,6 +153,7 @@ export function DictationVocabulary({ saved, saveVocabulary }: {
   function changeOpen(open: boolean) {
     if (open) {
       if (!saved) return
+      returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
       setFailure("")
       setClosing(false)
       setAdded(undefined)
@@ -142,6 +163,27 @@ export function DictationVocabulary({ saved, saveVocabulary }: {
       setClosing(true)
     }
   }
+
+  const openRequested = useEffectEvent((current: VocabularyRequest) => {
+    if (!saved || lastRequest.current === current) return
+    lastRequest.current = current
+    if (!editor) changeOpen(true)
+    else setClosing(false)
+    if (!current.addTerm) return
+    const existing = editor?.rows ?? savedRows(saved)
+    const empty = existing.find(row => !row.term.trim())
+    if (!empty && existing.length >= 32) return
+    const target = empty ?? blankRow()
+    setEditor({ rows: empty ? existing : [...existing, target], base: editor?.base ?? saved })
+    setAdded(target.id)
+    if (target.id === added) list.current?.querySelector<HTMLInputElement>(`[data-row="${CSS.escape(target.id)}"] input`)?.focus()
+  })
+  const ready = !!saved
+  useEffect(() => {
+    if (!ready || !request) return
+    const frame = requestAnimationFrame(() => openRequested(request))
+    return () => cancelAnimationFrame(frame)
+  }, [request, ready])
 
   function changeRows(update: (rows: Row[]) => Row[]) {
     setFailure("")
@@ -167,19 +209,19 @@ export function DictationVocabulary({ saved, saveVocabulary }: {
     if (editor?.rows.length === 1 && editor.rows[0].id === id) setAdded(replacement.id)
   }
 
-  const count = saved?.length ?? 0
   return <Dialog.Root open={!!editor} onOpenChange={changeOpen}>
-    <SettingRow icon={BookOpen} title={t("Vocabulary")} label={false} find="Names, terms and alternate spellings">
-      <Dialog.Trigger asChild>
-        <Button type="button" variant="ghost" size="sm" aria-label={t("Edit vocabulary")} disabled={!saved}>
-          {count === 0 ? t("None") : count === 1 ? t("1 term") : t("{count} terms").replace("{count}", String(count))}
-          <ChevronRight aria-hidden="true" />
-        </Button>
-      </Dialog.Trigger>
-    </SettingRow>
+    {!external && <VocabularySetting saved={saved} onOpen={() => changeOpen(true)} />}
     <Dialog.Portal>
       <Dialog.Overlay className="dictation-tour-overlay" />
-      <Dialog.Content className="dictation-tour dictation-vocabulary-dialog">
+      <Dialog.Content className="dictation-tour dictation-vocabulary-dialog"
+        onOpenAutoFocus={event => {
+          const target = added && list.current?.querySelector<HTMLInputElement>(`[data-row="${CSS.escape(added)}"] input`)
+          if (target) { event.preventDefault(); target.focus() }
+        }}
+        onCloseAutoFocus={event => {
+          event.preventDefault()
+          if (returnFocus.current?.isConnected) returnFocus.current.focus({ preventScroll: true })
+        }}>
         <Dialog.Title>{t("Vocabulary")}</Dialog.Title>
         <Dialog.Description>{t("Give Rumble2 Flash up to 32 names or terms. Alternate spellings match whole phrases.")}</Dialog.Description>
         <div className="dictation-vocabulary-headings" aria-hidden="true">

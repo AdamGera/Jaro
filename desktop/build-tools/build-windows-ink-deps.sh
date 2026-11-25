@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cross-compile static ASS rendering dependencies for Windows FFmpeg.
+# Cross-compile static screen video dependencies for Windows FFmpeg.
 set -euo pipefail
 cd "$1"
 cache="$PWD"
@@ -60,3 +60,6 @@ compile freetype-2.13.3 -Dzlib=disabled
 compile fribidi-1.0.16 -Dbin=false -Ddocs=false -Dtests=false
 compile harfbuzz-10.4.0 -Dtests=disabled -Dutilities=disabled -Dwith_libstdcxx=true
 compile libass-0.17.4 -Ddirectwrite=enabled
+make -C "$prefix/openh264-2.7.0" -j "$jobs" OS=mingw_nt ARCH=x86_64 USE_ASM=No \
+    CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ AR=x86_64-w64-mingw32-ar \
+    RANLIB=x86_64-w64-mingw32-ranlib PREFIX="$prefix" install-static

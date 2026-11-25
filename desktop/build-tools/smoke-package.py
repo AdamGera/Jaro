@@ -212,7 +212,7 @@ def verify_retention(library, helper, api, base, managed_meeting):
     trash = disposable_trash_location(library, helper)
     managed_id, transcript_file, notes_file = managed_meeting
     trashed_export = trash / transcript_file.name
-    managed_archive = trash / f"Jard Meeting {managed_id}"
+    managed_archive = trash / f"Jaro Meeting {managed_id}"
     transcript_contents = transcript_file.read_bytes()
     edited_notes = notes_file.read_bytes() + b"\nKeep this user edit.\n"
     notes_file.write_bytes(edited_notes)
@@ -223,7 +223,7 @@ def verify_retention(library, helper, api, base, managed_meeting):
     audio = library / "audio" / identifier
     audio.mkdir()
     (audio / "source.wav").write_bytes(b"disposable recording")
-    retained = trash / f"Jard Meeting {identifier}"
+    retained = trash / f"Jaro Meeting {identifier}"
     details = {"text": "Disposable transcript.", "durationSeconds": 1, "segments": [
         {"speaker": 2, "start": 0.1, "end": 0.9, "text": "Disposable transcript."}],
         "words": [], "speakerNames": {"2": "Them"}}
@@ -267,7 +267,7 @@ def verify_manual_meeting_trash(library, helper, api, base, status):
     source = library / "audio" / identifier / "source.wav"
     source.parent.mkdir()
     source.write_bytes(b"Disposable meeting audio.")
-    archive = trash / f"Jard Meeting {identifier}"
+    archive = trash / f"Jaro Meeting {identifier}"
     text = "Disposable meeting transcript."
     transcript = {"text": text, "durationSeconds": 1, "words": [],
                   "segments": [{"speaker": 1, "start": 0.1, "end": 0.8, "text": text}], "speakerNames": {"1": "You"}}
@@ -284,8 +284,8 @@ def verify_manual_meeting_trash(library, helper, api, base, status):
             assert Path(files["path"]) == source.resolve()
         with api(f"/api/sessions/{identifier}/transcript-clipboard") as response:
             assert response.read().decode() == f"**00:00 · You**  \n{text}"
-        with api(f"/api/sessions/{identifier}", headers={"Origin": base}, method="DELETE") as response:
-            assert response.status == 204
+        result = json.loads(helper("jardctl", "meetings", "delete", identifier, "--json"))
+        assert result == {"id": identifier, "trashPending": False}, result
         assert (archive / "Audio" / source.name).read_bytes() == b"Disposable meeting audio."
         assert transcript["text"] in (archive / "Transcript.md").read_text()
         assert (archive / "Meeting.json").is_file() and (archive / "Notes.md").is_file()
@@ -305,7 +305,7 @@ def verify_audio_retention(library, helper, api, base):
     files = {"source.wav": b"Disposable mix.", "mic.wav": b"Disposable mic.", "system.wav": b"Disposable remote."}
     for name, data in files.items():
         (folder / name).write_bytes(data)
-    moved = trash / f"Jard Meeting Audio {identifier}"
+    moved = trash / f"Jaro Meeting Audio {identifier}"
     transcript = {"text": "Disposable transcript.", "durationSeconds": 1, "segments": [
         {"speaker": 2, "start": 0.1, "end": 0.9, "text": "Disposable transcript."}], "words": []}
     with closing(sqlite3.connect(library / "sessions.sqlite3", timeout=10)) as db, db:
@@ -432,6 +432,11 @@ def run(app, model_source):
                    RUMBLE_LOG_DIR=str(work / "logs"), RUMBLE_PORT=str(port))
         def helper(*args):
             return subprocess.check_output([str(helpers / args[0]), *args[1:]], cwd=work, env=env, text=True)
+        def api(path, data=None, headers=None, *, method=None):
+            token = (library / ".native-token").read_text().strip()
+            req = Request(base + path, data=data, headers={"X-Jard-Token": token, **(headers or {})}, method=method)
+            return urlopen(req, timeout=120)
+        expected = hashlib.sha256(os.fsencode(library.resolve())).hexdigest()
         preferences = work / "Library" / "Preferences" / (info["CFBundleIdentifier"] + ".plist")
         preferences.parent.mkdir(parents=True)
         preferences.write_bytes(plistlib.dumps({
@@ -504,6 +509,15 @@ def run(app, model_source):
         muxers = {line.split()[1] for line in helper("ffmpeg", "-muxers").splitlines() if len(line.split()) > 1}
         assert {"amix", "apad"} <= filters and "mp4" in muxers
         if model_source is None:
+            helper("jard-engine", "start")
+            try:
+                status = wait_ready(api)
+                assert status["libraryId"] == expected and status["status"] == "error", status
+                with api("/") as response:
+                    assert b'id="root"' in response.read(), "The packaged workspace HTML is missing."
+            finally:
+                stop_engine(api, base, library)
+            print("The standalone packaged engine served its workspace before model setup and shut down cleanly.", flush=True)
             return
         assert json.loads(helper("jard-engine", "models", "--from", str(model_source.resolve())).splitlines()[-1])["ready"]
         previous_logs = []
@@ -517,12 +531,8 @@ def run(app, model_source):
                 log.write(recent)
             previous_logs.append((destination, destination.stat().st_ino, recent))
         helper("jard-engine", "start")
-        def api(path, data=None, headers=None, *, method=None):
-            req = Request(base + path, data=data, headers=headers or {}, method=method)
-            return urlopen(req, timeout=120)
         with api("/api/status") as r:
             status = json.load(r)
-        expected = hashlib.sha256(os.fsencode(library.resolve())).hexdigest()
         assert status["libraryId"] == expected, "The engine is serving a different library."
         try:
             status = wait_ready(api)
@@ -725,7 +735,7 @@ console.log("Packaged Node SDK verified endpoint ownership and transcribed real 
             assert {turn["speaker"] for turn in excerpt["turns"]} == {turn["speaker"] for turn in transcript["segments"]}
             with api(f"/api/sessions/{meeting_key}/export?kind=srt") as r:
                 assert b"Speaker " in r.read()
-            removed_audio = disposable_trash_location(library, helper) / f"Jard Meeting Audio {meeting_key}"
+            removed_audio = disposable_trash_location(library, helper) / f"Jaro Meeting Audio {meeting_key}"
             try:
                 with api(f"/api/sessions/{meeting_key}/audio", headers={"Origin": base}, method="DELETE") as r:
                     assert json.load(r)["audioRemovedAt"]

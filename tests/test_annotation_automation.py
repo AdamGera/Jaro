@@ -1,14 +1,17 @@
 import asyncio
+from contextlib import asynccontextmanager
 import tempfile
+from types import SimpleNamespace
 import unittest
 from time import time
 from unittest.mock import AsyncMock, patch
 
 from annotation_deliveries import ReceiptError
 from annotation_routing import RouteUnavailable
-from desktop.annotation_automation import AnnotationAutomation
+from annotation_automation import AnnotationAutomation
 from annotation_routing import route_scopes
 from managed_preferences import OPENCODE_MANAGED, opencode_managed
+from portable_annotation_panel import PortableAnnotationPanel
 
 
 class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
@@ -30,7 +33,7 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.routes.close)
         self.scope = route_scopes({"origin": self.origin})[0]
         self.routes.receipts.remember_rule(self.scope, "Test", "ses_test", "service.json", True)
-        restore = patch("desktop.annotation_automation.resolve_automatic_rule",
+        restore = patch("annotation_automation.resolve_automatic_rule",
                         new_callable=AsyncMock, return_value=("bound", {"id": "ses_test", "title": "Test"}))
         self.resolve = restore.start()
         self.addCleanup(restore.stop)
@@ -75,6 +78,7 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.events[-1]["receiptStatus"], "queued")
         self.assertGreater(self.events[-1]["undoUntil"], time() * 1000)
         automatic = self.routes.automatic_receipt("demo")
+        self.assertEqual(self.events[-1]["deliveryId"], automatic["deliveryId"])
         manual = self.routes.receipts.begin("demo", "different", {"id": "ses_other", "title": "Other"}, False)
         self.assertNotEqual(automatic["deliveryId"], manual)
         self.assertEqual(self.routes.automatic_receipt("demo"), automatic)
@@ -84,7 +88,7 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("undoUntil", status)
 
     async def test_headless_or_cancelled_never_sends(self):
-        with patch("desktop.annotation_automation.OFFER_TIMEOUT", .05):
+        with patch("annotation_automation.OFFER_TIMEOUT", .05):
             await self.routes.enqueue("headless", self.origin, time())
             await self.wait_phase("headless", "cancelled")
         await self.routes.enqueue("visible", self.origin, time())
@@ -95,7 +99,7 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.sent)
 
     async def test_missing_or_unavailable_confirmation_never_claims_a_send(self):
-        with patch("desktop.annotation_automation.CONFIRMATION_TIMEOUT", .12):
+        with patch("annotation_automation.CONFIRMATION_TIMEOUT", .12):
             for capture in ("gone", "locked", "closed"):
                 await self.routes.enqueue(capture, self.origin, time())
                 await self.wait_phase(capture, "offer")
@@ -126,6 +130,34 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.routes.confirm_from_panel("replaced", await self.wait_confirmation("replaced"), "ready"))
         self.assertIn("changed", (await self.wait_phase("replaced", "failed"))["message"])
         self.assertFalse(self.sent)
+
+    async def test_project_countdown_stays_bound_to_the_shown_chat_and_its_project(self):
+        project = f"{self.folder.name}/project"
+        self.routes.receipts.remember_rule(self.scope, "Project", f"project:{project}", "service.json", True)
+        self.resolve.return_value = ("bound", {"id": "ses_shown", "title": "Chosen", "directory": project})
+        current = {"id": "ses_shown", "title": "Chosen", "directory": project + "/subfolder"}
+
+        async def deliver(capture, target, service, authorize):
+            self.assertEqual(target, "ses_shown")
+            receipt = await authorize(service, current, False)
+            self.sent.append(target)
+            self.routes.receipts.change(receipt, "queued", "msg_test")
+
+        self.routes.deliver = deliver
+        await self.routes.enqueue("first", self.origin, time())
+        await self.wait_phase("first", "offer")
+        self.routes.routes["first"].remaining = .01
+        await self.routes.panel_action("first", "shown")
+        self.assertTrue(self.routes.confirm_from_panel("first", await self.wait_confirmation("first"), "ready"))
+        await self.wait_phase("first", "sent")
+        await self.routes.enqueue("moved", self.origin, time())
+        await self.wait_phase("moved", "offer")
+        current["directory"] = f"{self.folder.name}/other"
+        self.routes.routes["moved"].remaining = .01
+        await self.routes.panel_action("moved", "shown")
+        self.assertIn("left the saved project", (await self.wait_phase("moved", "failed"))["message"])
+        self.assertEqual(self.sent, ["ses_shown"])
+        self.assertEqual(self.routes.receipts.recent("moved"), [])
 
     async def test_unavailable_route_reopens_with_fresh_countdown_and_can_cancel_offline(self):
         self.resolve.side_effect = RouteUnavailable("OpenCode is temporarily unavailable.")
@@ -215,3 +247,28 @@ class AnnotationAutomationTests(unittest.IsolatedAsyncioTestCase):
         await self.routes.close()
         await other.resume()
         self.assertEqual((await other.query("in-flight"))["phase"], "unconfirmed")
+
+
+class PortableAnnotationPanelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_undo_uses_the_receipt_shown_and_reports_the_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            undo = AsyncMock(return_value={"status": "withdrawn"})
+            panel = PortableAnnotationPanel("fixture", directory, AsyncMock(), AsyncMock(), undo)
+            presentations = []
+
+            @asynccontextmanager
+            async def launch(mode, title, seconds):
+                presentations.append((mode, title, seconds))
+                yield SimpleNamespace(stdout=SimpleNamespace(readline=AsyncMock(return_value=b"undo\n")), wait=AsyncMock())
+
+            panel.launch = launch
+            detail = {"capture": "shown-capture", "deliveryId": "shown-receipt", "phase": "sent", "title": "Release review",
+                      "receiptStatus": "queued", "undoUntil": int((time() + 30) * 1000)}
+            panel.notify(detail)
+            await asyncio.wait_for(panel.presentation, 1)
+            undo.assert_awaited_once_with("shown-receipt")
+            self.assertEqual(presentations, [("annotation-undo", "Release review", 5),
+                                             ("annotation-result", "Annotation withdrawn", 3)])
+            panel.notify({**detail, "receiptStatus": "unconfirmed"})
+            panel.notify({**detail, "undoUntil": 0})
+            self.assertIsNone(panel.presentation)

@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager
 import errno
+from filecmp import cmp
 import hashlib
 import json
 import os
@@ -82,8 +83,6 @@ def runtime_ready(runtime):
 
 def install_runtime(root):
     target = runtime_directory(root)
-    if runtime_ready(target):
-        return
     asset = runtime_archive()
     path = root / asset["file"]
     with TemporaryDirectory(prefix=".llama-install-", dir=target.parent) as folder:
@@ -109,10 +108,19 @@ def install_runtime(root):
                 archive.extractall(stage, filter=required)
         if not runtime_files_present(extracted):
             raise ValueError("The verified writing runtime archive is incomplete.")
+        if runtime_ready(target) and all((target / path.name).is_file()
+                and cmp(path, target / path.name, shallow=False) for path in extracted.iterdir()):
+            return
         (extracted / ".verified").write_text(asset["sha256"] + "\n")
+        previous = stage / "previous"
         if target.exists() or target.is_symlink():
-            target.replace(stage / "previous")
-        extracted.replace(target)
+            target.replace(previous)
+        try:
+            extracted.replace(target)
+        except BaseException:
+            if previous.exists() or previous.is_symlink():
+                previous.replace(target)
+            raise
 
 
 def installed_size_matches(root, item):
@@ -196,7 +204,7 @@ def install_lock(path):
         yield
 
 
-def install(source, speech_only=False, portable=False):
+def install(source, speech_only=False, portable=False, *, repair=False):
     root = model_directory(speech_only, portable)
     files = SPEECH_FILES if speech_only else FILES
     if portable:
@@ -205,7 +213,7 @@ def install(source, speech_only=False, portable=False):
     marker_name = ".speech-complete" if speech_only else ".complete"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with install_lock(root / ".lock"):
-        if (speech_only or portable) and source is None and (ready := status(speech_only, portable))["ready"]:
+        if not repair and (speech_only or portable) and source is None and (ready := status(speech_only, portable))["ready"]:
             emit(event="ready", **ready)
             return
         (root / marker_name).unlink(missing_ok=True)
@@ -257,6 +265,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["model-status", "models", "model-path"])
     parser.add_argument("--from", dest="source", type=Path)
+    parser.add_argument("--repair", action="store_true", help="Verify and repair files even if setup reports ready.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--speech-only", action="store_true", help=argparse.SUPPRESS)
     mode.add_argument("--portable", action="store_true", help=argparse.SUPPRESS)
@@ -269,7 +278,7 @@ if __name__ == "__main__":
         elif args.action == "model-path":
             print(directory())
         else:
-            install(args.source, args.speech_only, args.portable)
+            install(args.source, args.speech_only, args.portable, repair=args.repair)
     except (OSError, ValueError, RuntimeError, tarfile.TarError, zipfile.BadZipFile) as error:
         emit(event="error", message=str(error))
         sys.exit(1)

@@ -2,7 +2,8 @@ import { useEffect, useId, useRef, useState } from "react"
 import { Search } from "lucide-react"
 import { AlertDialog, Dialog, Popover, Tooltip } from "radix-ui"
 import { useInterfaceLanguage } from "@/interface-language"
-import type { AnnotationAgent, AnnotationDelivery, AnnotationDestinations, AnnotationRouteScope, AnnotationRouteStatus, DesktopBridge } from "@/desktop"
+import { portableAnnotationHandoff } from "@/portable-annotation"
+import type { AnnotationAgent, AnnotationDelivery, AnnotationDestinations, AnnotationRouteStatus, DesktopBridge } from "@/desktop"
 import claudeLogo from "@/assets/agent-logos/claude-code.png"
 import codexDarkLogo from "@/assets/agent-logos/codex-dark.png"
 import codexLightLogo from "@/assets/agent-logos/codex-light.png"
@@ -28,7 +29,7 @@ function AgentLogo({ agent }: { agent: AnnotationAgent }) {
 }
 
 type AgentPickerProps = {
-  native: DesktopBridge
+  native?: DesktopBridge
   id: string
   annotation: boolean
   disabled: boolean
@@ -107,7 +108,7 @@ export function AnnotationAgentPicker({ native, id, annotation, disabled, allowO
 }
 
 function AnnotationDestinationPicker({ native, id, agent, annotation, disabled, onChanged, onClose, onRestoreFocus }: {
-  native: DesktopBridge
+  native?: DesktopBridge
   id: string
   agent: AnnotationAgent
   annotation: boolean
@@ -124,16 +125,19 @@ function AnnotationDestinationPicker({ native, id, agent, annotation, disabled, 
   const [target, setTarget] = useState("")
   const [failure, setFailure] = useState("")
   const [working, setWorking] = useState<"send" | "remember" | "forget">()
-  const [ruleScope, setRuleScope] = useState<AnnotationRouteScope["kind"]>()
+  const [ruleScope, setRuleScope] = useState<string>()
   const [automatic, setAutomatic] = useState(false)
   const sending = working !== undefined
-  const scope = results?.scopes?.find(item => item.kind === ruleScope) ?? results?.scopes?.[0]
+  const scope = results?.scopes?.find(item => `${item.kind}:${item.key}` === ruleScope) ?? results?.scopes?.[0]
   const [attempt, setAttempt] = useState(0)
 
   useEffect(() => {
     let current = true
+    const controller = new AbortController()
     const wait = window.setTimeout(() => {
-      const request = agent === "opencode"
+      const request = !native
+        ? portableAnnotationHandoff("destinations", { query, agent, ...(annotation && { id }) }, controller.signal)
+        : agent === "opencode"
         ? native.request("annotationDestinations", { query, ...(annotation && { id }) })
         : native.request("annotationAgentDestinations", { agent, query }).then(list => ({ ...list, service: null }))
       void request.then(list => {
@@ -142,7 +146,7 @@ function AnnotationDestinationPicker({ native, id, agent, annotation, disabled, 
         if (current) setFailure(error instanceof Error ? error.message : `Could not list ${name} sessions.`)
       })
     }, query ? 250 : 0)
-    return () => { current = false; window.clearTimeout(wait) }
+    return () => { current = false; controller.abort(); window.clearTimeout(wait) }
   }, [native, query, attempt, id, agent, name, annotation])
 
   function reset() {
@@ -153,15 +157,16 @@ function AnnotationDestinationPicker({ native, id, agent, annotation, disabled, 
 
   async function deliver() {
     const selected = results?.sessions.find(item => item.id === target)
-    if (!selected || sending || disabled) return
+    const service = results?.service ?? ""
+    if (!selected || sending || disabled || (agent === "opencode" && !service)) return
     setWorking("send")
     setFailure("")
     try {
-      const delivery = await native.request("sendSessionToAgent", {
-        agent, id, target, service: results?.service ?? undefined, open: true,
-      })
+      const delivery = native
+        ? await native.request("sendSessionToAgent", { agent, id, target, service: service || undefined, open: true })
+        : await portableAnnotationHandoff("send-session", { agent, id, target, service: service || undefined })
       const shared = delivery.images === "attached" ? "Session context and images sent"
-        : delivery.images === "references" ? "Session context and image links sent" : "Session context sent"
+        : delivery.images === "references" ? "Session context and image references sent" : "Session context sent"
       onChanged(`${shared} to ${selected.title} in ${name}.`)
       onClose()
     } catch (error) {
@@ -173,14 +178,18 @@ function AnnotationDestinationPicker({ native, id, agent, annotation, disabled, 
   }
 
   async function editRule(action: "remember" | "forget") {
-    if (!results || sending) return
+    if (!results || sending || disabled) return
     setFailure("")
     setWorking(action)
     try {
       if (action === "remember" && scope && target && results.service) {
-        await native.request("rememberAnnotationDestination", { id, service: results.service, target, scope: scope.kind, automatic })
+        const choice = { id, service: results.service, target, scope: scope.kind, scopeKey: scope.key }
+        if (native) await native.request("rememberAnnotationDestination", { ...choice, automatic })
+        else await portableAnnotationHandoff("remember", { ...choice, automatic })
       } else if (action === "forget" && results.rule) {
-        await native.request("forgetAnnotationDestination", { id, ruleId: results.rule.id })
+        const choice = { id, ruleId: results.rule.id }
+        if (native) await native.request("forgetAnnotationDestination", choice)
+        else await portableAnnotationHandoff("forget", choice)
       }
       reset()
       setAttempt(value => value + 1)
@@ -199,7 +208,7 @@ function AnnotationDestinationPicker({ native, id, agent, annotation, disabled, 
         onCloseAutoFocus={event => { event.preventDefault(); onRestoreFocus() }}>
         <Dialog.Title>Send to {name}</Dialog.Title>
         <Dialog.Description>{agent === "t3"
-          ? "Send the overview, transcript, My Notes, and local image links to an existing chat."
+          ? "Send the overview, transcript, My Notes, and paths to local images to an existing chat."
           : "Send the overview, transcript, My Notes, and available images to an existing chat."}</Dialog.Description>
         <label className="annotation-destination-search">
           <Search aria-hidden="true" />
@@ -225,16 +234,19 @@ function AnnotationDestinationPicker({ native, id, agent, annotation, disabled, 
           {results?.rule && <div>
             <p role="status">{results.rule.title} {results.rule.available ? "· Saved for " : "· Unavailable · Saved for "}
               {results.rule.scope.label}{results.rule.automatic && " · Automatic"}</p>
-            <Button size="sm" variant="ghost" disabled={sending} onClick={() => void editRule("forget")}>Forget</Button>
+            <Button size="sm" variant="ghost" disabled={sending || disabled} onClick={() => void editRule("forget")}>Forget</Button>
           </div>}
           {target && <div>
             <label>Use this destination for
-              <select aria-label="Destination scope" value={scope.kind} disabled={sending}
-                onChange={event => setRuleScope(event.target.value as AnnotationRouteScope["kind"])}>
-                {results?.scopes?.map(item => <option key={item.kind} value={item.kind}>{item.label}</option>)}
+              <select aria-label="Destination scope" value={`${scope.kind}:${scope.key}`} disabled={sending}
+                onChange={event => setRuleScope(event.target.value)}>
+                {results?.scopes?.map(item => {
+                  const value = `${item.kind}:${item.key}`
+                  return <option key={value} value={value}>{item.label}</option>
+                })}
               </select>
             </label>
-            <Button size="sm" variant="outline" disabled={sending} onClick={() => void editRule("remember")}>Remember destination</Button>
+            <Button size="sm" variant="outline" disabled={sending || disabled || !results?.service} onClick={() => void editRule("remember")}>Remember destination</Button>
           </div>}
           {target && <label className="annotation-auto-option">
             <input type="checkbox" checked={automatic} disabled={sending} onChange={event => setAutomatic(event.target.checked)} />
@@ -279,7 +291,7 @@ const rememberedOutcome = {
 }
 
 export function AnnotationDeliveryLog({ native, id, revision, remoteEnabled }: {
-  native: DesktopBridge; id: string; revision: number; remoteEnabled: boolean
+  native?: DesktopBridge; id: string; revision: number; remoteEnabled: boolean
 }) {
   const [deliveries, setDeliveries] = useState<AnnotationDelivery[]>([])
   const [working, setWorking] = useState("")
@@ -290,6 +302,30 @@ export function AnnotationDeliveryLog({ native, id, revision, remoteEnabled }: {
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
+    if (!native) {
+      const controller = new AbortController()
+      let timer: number
+      let phase: AnnotationRouteStatus["phase"] | undefined
+      let receiptStatus: AnnotationRouteStatus["receiptStatus"]
+      async function poll() {
+        try {
+          const result = await portableAnnotationHandoff("route", { id, routeAction: "status" }, controller.signal)
+          if (controller.signal.aborted) return
+          setRoute(result)
+          if ((phase !== result.phase || receiptStatus !== result.receiptStatus) &&
+            (result.phase === "sent" || result.phase === "unconfirmed")) {
+            setRouteRevision(value => value + 1)
+          }
+          phase = result.phase
+          receiptStatus = result.receiptStatus
+        } catch {
+          // The ordinary delivery log remains available if routing is unavailable.
+        }
+        if (!controller.signal.aborted) timer = window.setTimeout(poll, 1000)
+      }
+      void poll()
+      return () => { controller.abort(); window.clearTimeout(timer) }
+    }
     let valid = true
     let latest = false
     const received = (event: WindowEventMap["native-sdk:jard-annotation-routing"]) => {
@@ -315,12 +351,16 @@ export function AnnotationDeliveryLog({ native, id, revision, remoteEnabled }: {
 
   useEffect(() => {
     let current = true
-    void native.request("annotationDeliveries", { id }).then(result => {
+    const controller = new AbortController()
+    const request = native
+      ? native.request("annotationDeliveries", { id })
+      : portableAnnotationHandoff("deliveries", { id }, controller.signal)
+    void request.then(result => {
       if (current) setDeliveries(result.deliveries)
     }).catch(error => {
       if (current) setError(error instanceof Error ? error.message : "Could not read annotation deliveries.")
     })
-    return () => { current = false }
+    return () => { current = false; controller.abort() }
   }, [native, id, revision, routeRevision])
 
   useEffect(() => {
@@ -335,7 +375,9 @@ export function AnnotationDeliveryLog({ native, id, revision, remoteEnabled }: {
     setError("")
     setWorking(deliveryId)
     try {
-      const result = action === "undoAnnotationDelivery"
+      const result = !native
+        ? await portableAnnotationHandoff(action === "undoAnnotationDelivery" ? "undo" : "correct", { id: deliveryId })
+        : action === "undoAnnotationDelivery"
         ? await native.request(action, { deliveryId, ...(restoreFiles && { restoreFiles: true }) })
         : await native.request(action, { deliveryId })
       setDeliveries(rows => rows.map(item => item.deliveryId === deliveryId ? result : item))
@@ -352,10 +394,12 @@ export function AnnotationDeliveryLog({ native, id, revision, remoteEnabled }: {
       : route?.message
 
   return <>
-    {route?.title && routeMessage && <div className="annotation-route-status">
+    {route?.capture === id && route.title && routeMessage && <div className="annotation-route-status">
       <p role="status"><strong>{route.title}</strong> · {routeMessage}</p>
       {routePending && <Button variant="outline" size="sm" onClick={() => {
-        void native.request("annotationRoute", { id, action: "cancel" }).then(setRoute).catch(failure => {
+        const request = native ? native.request("annotationRoute", { id, action: "cancel" })
+          : portableAnnotationHandoff("route", { id, routeAction: "cancel" })
+        void request.then(setRoute).catch(failure => {
           setError(failure instanceof Error ? failure.message : "Could not cancel the automatic send.")
         })
       }}>Cancel automatic send</Button>}
@@ -363,9 +407,10 @@ export function AnnotationDeliveryLog({ native, id, revision, remoteEnabled }: {
     {!!deliveries.length && <section className="annotation-deliveries" aria-label="OpenCode deliveries">
       <h3>OpenCode deliveries</h3>
       <ul>{deliveries.map(item => {
-        const canUndo = item.canUndo && item.undoUntil > now
-        const needsReview = item.status === "rollback-staged" || item.status === "rollback-unconfirmed"
-          || item.status === "rollback-commit-unconfirmed"
+        const canUndo = item.canUndo && item.undoUntil > now &&
+          (native || item.status === "queued" || item.status === "withdrawal-unconfirmed")
+        const needsReview = native && (item.status === "rollback-staged" || item.status === "rollback-unconfirmed"
+          || item.status === "rollback-commit-unconfirmed")
         const restoring = item.status === "rollback-files"
         return <li key={item.deliveryId}>
           <div>

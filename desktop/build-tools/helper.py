@@ -30,9 +30,9 @@ elif action[0] == "control":
 elif action[1:] == ["start"]:
     script = root / "server.py"
     args = ["--background", "--no-open"]
-elif action[1:] == ["service", "--embedded"]:
+elif action[1:3] == ["service", "--embedded"]:
     script = root / "server.py"
-    args = ["--embedded"]
+    args = action[2:]
 elif action[1:2] in (["models"], ["model-status"]):
     script = tools / "model_setup.py"
     args = action[1:]

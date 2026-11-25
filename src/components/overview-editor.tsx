@@ -5,7 +5,8 @@ import { EditorContent, useEditor } from "@tiptap/react"
 import StarterKit from "@tiptap/starter-kit"
 import { clock } from "@/speaker-activity"
 import type { EditableOverview } from "@/overview"
-import { overviewDraftKey, readOverviewDraft, rememberOverviewDraft } from "@/overview-draft"
+import { overviewDraftKey, readOverviewDraft } from "@/overview-draft"
+import { rememberWorkspaceDraft } from "@/workspace-drafts"
 import { useInterfaceLanguage } from "@/interface-language"
 import { Button } from "./ui/button"
 import { NotesCommands } from "./notes-commands"
@@ -78,7 +79,7 @@ export default function OverviewEditor({ sessionId, version, onSave, onClose }: 
     editorProps: { attributes: { class: "personal-note-document", role: "textbox",
       "aria-label": "Edit overview", "aria-multiline": "true" } },
     onUpdate: ({ editor }) => {
-      setDraftProtected(rememberOverviewDraft(draftKey, { revision: base, document: editor.getJSON() }))
+      setDraftProtected(rememberWorkspaceDraft(draftKey, { revision: base, document: editor.getJSON() }))
       setDirty(true)
     },
   })
@@ -97,7 +98,7 @@ export default function OverviewEditor({ sessionId, version, onSave, onClose }: 
     editor.setEditable(false, false)
     try {
       await onSave(version, summary, markdown.serialize({ ...document, content: plainLead ? content.slice(1) : content }))
-      rememberOverviewDraft(draftKey, null)
+      rememberWorkspaceDraft(draftKey, null)
       onClose()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not save the overview. Try again.")
@@ -112,7 +113,7 @@ export default function OverviewEditor({ sessionId, version, onSave, onClose }: 
       {!draftProtected && <span role="alert">{t("Save your overview before closing or restarting Jaro. This draft could not be stored.")}</span>}
       {stale && <span role="status">{t("The saved overview changed since you started this draft.")}</span>}
       <Button type="button" variant="ghost" size="sm" disabled={saving} onClick={() => {
-        rememberOverviewDraft(draftKey, null)
+        rememberWorkspaceDraft(draftKey, null)
         onClose()
       }}>{t(stale ? "Discard draft" : "Cancel")}</Button>
       <Button type="button" size="sm" disabled={!dirty || saving} onClick={() => void save()}>

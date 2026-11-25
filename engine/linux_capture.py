@@ -66,12 +66,12 @@ async def microphone_inputs():
              "default": source["name"] == default} for source in sources]
 
 
-async def audio_stream_apps(kind, sources=None):
+async def audio_stream_processes(kind, sources=None):
     try:
         streams = json.loads(await pulse_info("--format=json", "list", kind))
         if not isinstance(streams, list):
             raise ValueError("Expected a list of audio streams.")
-        binaries = set()
+        binaries = {}
         for stream in streams:
             if stream.get("corked") not in (False, "false", "no"):
                 continue
@@ -79,7 +79,7 @@ async def audio_stream_apps(kind, sources=None):
                 continue
             properties = stream.get("properties") or {}
             pid = str(properties.get("application.process.id", ""))
-            if not pid.isascii() or not pid.isdigit():
+            if not pid.isascii() or not pid.isdigit() or len(pid) > 10 or int(pid) <= 0:
                 continue
             process = Path("/proc") / pid
             with suppress(OSError):
@@ -87,7 +87,8 @@ async def audio_stream_apps(kind, sources=None):
                     executable = (process / "exe").readlink().name
                     reported = properties.get("application.process.binary")
                     command = (process / "comm").read_text().rstrip("\n")
-                    binaries.add(command if command == reported else executable)
+                    binary = command if command == reported else executable
+                    binaries.setdefault(binary, set()).add(int(pid))
         return binaries
     except (AttributeError, ValueError):
         raise CaptureError("Jaro could not identify the active audio streams.") from None
@@ -99,11 +100,11 @@ async def microphone_users():
         inputs = {str(item["index"]) for item in sources}
     except KeyError:
         raise CaptureError("Jaro could not identify an active microphone.") from None
-    return await audio_stream_apps("source-outputs", inputs)
+    return await audio_stream_processes("source-outputs", inputs)
 
 
 async def playback_users():
-    return await audio_stream_apps("sink-inputs")
+    return set(await audio_stream_processes("sink-inputs"))
 
 
 async def default_microphone():
@@ -111,6 +112,14 @@ async def default_microphone():
     if not microphone_source(source):
         raise CaptureError("Select a microphone in your system sound settings, then try again.")
     return source["name"]
+
+
+async def resolve_microphone(selected):
+    if not selected:
+        return await default_microphone()
+    if not any(source["name"] == selected for source in await microphone_sources()):
+        raise CaptureError("The selected microphone is unavailable.")
+    return selected
 
 
 async def default_computer_audio():
@@ -122,35 +131,52 @@ async def default_computer_audio():
 
 
 async def capture_args(mode, microphone="", *, dictation=False):
-    if mode != "both":
-        if mode == "mic" and microphone:
-            if not any(item["name"] == microphone for item in await microphone_sources()):
-                raise CaptureError("The selected microphone is unavailable.")
-            source = microphone
-        else:
-            source = await (default_microphone() if mode == "mic" else default_computer_audio())
-        if dictation:
-            return ("-f", "pulse", "-sample_rate", str(SAMPLE_RATE), "-channels", "1",
-                    "-fragment_size", str(VOICE_FRAME * FRAME_BYTES),
-                    "-analyzeduration", "0", "-probesize", "32", "-i", source, "-flush_packets", "1")
-        return ("-f", "pulse", "-i", source, "-ac", "1", "-ar", str(SAMPLE_RATE))
+    if mode not in ("mic", "system"):
+        raise ValueError("Single-source Linux capture requires microphone or computer audio.")
+    source = await (resolve_microphone(microphone) if mode == "mic" else default_computer_audio())
+    return pulse_capture_options(source, dictation)
 
-    microphone, monitor = await asyncio.gather(default_microphone(), default_computer_audio())
-    input_options = ("-thread_queue_size", "128", "-analyzeduration", "0", "-probesize", "32", "-f", "pulse")
-    # Use the Pulse packet clocks to align the inputs before joining them into one pipe.
-    resample = f"aresample={SAMPLE_RATE}:async=1000:first_pts=0,aformat=channel_layouts=mono"
-    return ("-copyts", "-start_at_zero",
-            *input_options, "-i", microphone,
-            *input_options, "-isync", "0", "-i", monitor,
-            "-filter_complex", f"[0:a]{resample}[mic];[1:a]{resample}[system];"
-            "[mic][system]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR")
+
+def pulse_capture_options(source, dictation):
+    if dictation:
+        return ("-f", "pulse", "-sample_rate", str(SAMPLE_RATE), "-channels", "1",
+                "-fragment_size", str(VOICE_FRAME * FRAME_BYTES),
+                "-analyzeduration", "0", "-probesize", "32", "-i", source, "-flush_packets", "1")
+    return ("-f", "pulse", "-i", source, "-ac", "1", "-ar", str(SAMPLE_RATE))
 
 
 class LinuxRecording(PortableRecording):
     async def spawn(self):
-        options = await capture_args(self.mode, self.microphone, dictation=self.dictation)
+        if self.watch_microphone:
+            self.capture_source = await resolve_microphone(self.microphone)
+            options = pulse_capture_options(self.capture_source, self.dictation)
+        else:
+            options = await capture_args(self.mode, self.microphone, dictation=self.dictation)
         return await asyncio.create_subprocess_exec(
             "ffmpeg", "-v", "error", "-nostdin", *options, "-t", str(self.seconds),
             "-f", "s16le", "pipe:1",
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
+
+    async def collect(self):
+        if not self.watch_microphone:
+            await super().collect()
+            return
+        monitor = asyncio.create_task(self.watch_input())
+        try:
+            await super().collect()
+        finally:
+            monitor.cancel()
+            await asyncio.gather(monitor, return_exceptions=True)
+
+    async def watch_input(self):
+        # Pulse can move a capture to another source without ending the stream.
+        while not self.stopping and self.process.returncode is None:
+            await asyncio.sleep(.25)
+            try:
+                await pulse_info("get-source-volume", self.capture_source)
+            except CaptureError:
+                if not self.stopping:
+                    self.interrupted = True
+                    self.request_stop()
+                return

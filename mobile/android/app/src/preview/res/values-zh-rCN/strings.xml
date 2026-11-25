@@ -1,0 +1,26 @@
+<resources xmlns:tools="http://schemas.android.com/tools" tools:ignore="MissingTranslation">
+    <string name="setup_welcome_detail">Jaro Preview 会在 GitHub 上检查更新。你的声音和文字保留在这台设备上。你也可以下载更大的语音模型。</string>
+    <string name="setup_title">设置 Jaro Preview</string>
+    <string name="setup_detail">允许使用麦克风，然后选择 Jaro Preview 作为键盘。</string>
+    <string name="setup_microphone_detail">让 Jaro Preview 能听见你</string>
+    <string name="setup_keyboard">Jaro Preview 键盘</string>
+    <string name="setup_keyboard_enabled">在列表中选择 Jaro Preview</string>
+    <string name="setup_keyboard_off">在“设置”中打开 Jaro Preview</string>
+    <string name="setup_choose_jaro">选择 Jaro Preview 键盘</string>
+    <string name="keyboard_hint_microphone">请在 Jaro Preview 中允许使用麦克风</string>
+    <string name="settings_privacy_detail">Jaro 在这台手机上处理语音和键盘输入。Jaro Preview 会向 GitHub 查询发布信息。GitHub 会收到你的 IP 地址等常规连接信息。检查更新不会发送音频、文字或词汇。你可以关闭“自动检查更新”。</string>
+    <string name="updates_available">Jaro Preview %1$s（版本号 %2$d）已可更新</string>
+    <string name="updates_update">下载更新</string>
+    <string name="updates_browser_note">浏览器会从 GitHub 下载更新。打开下载的文件，在 Android 询问时点按“更新”。第一次时，Android 可能会请你允许浏览器安装应用。</string>
+    <string name="updates_keyboard_note">更新时键盘会暂时关闭，点按文本框即可重新打开。</string>
+    <string name="updates_auto">自动检查更新</string>
+    <string name="updates_auto_detail">打开 Jaro Preview 时，以及每天一次从键盘检查</string>
+    <string name="updates_check_now">立即检查</string>
+    <string name="updates_installed">版本 %1$s，版本号 %2$d</string>
+    <string name="updates_checking">正在检查…</string>
+    <string name="updates_current">已是最新版本</string>
+    <string name="updates_check_failed">无法检查</string>
+    <string name="updates_ready">有可用更新</string>
+    <string name="updates_strip">Jaro Preview 有可用更新</string>
+    <string name="updates_strip_dismiss">关闭</string>
+</resources>

@@ -5,18 +5,35 @@ static const NSUInteger unicodeLimit = 20;
 
 static BOOL affectedChromium(NSURL *bundle) {
     if (!bundle.isFileURL) return NO;
+    NSString *path = bundle.path;
+    if (!path.length) return NO;
+    static NSRegularExpression *version;
+    static NSCache<NSString *, NSNumber *> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        version = [NSRegularExpression regularExpressionWithPattern:
+            @"^15[56]\\.[0-9]+\\.[0-9]+\\.[0-9]+$" options:0 error:nil];
+        cache = NSCache.new;
+        cache.countLimit = 256;
+    });
+    NSNumber *cached = [cache objectForKey:path];
+    if (cached) return cached.boolValue;
+    BOOL affected = NO;
     NSFileManager *manager = NSFileManager.defaultManager;
     NSURL *folder = [bundle URLByAppendingPathComponent:@"Contents/Frameworks" isDirectory:YES];
-    NSRegularExpression *version = [NSRegularExpression regularExpressionWithPattern:
-        @"^15[56]\\.[0-9]+\\.[0-9]+\\.[0-9]+$" options:0 error:nil];
     for (NSURL *framework in [manager contentsOfDirectoryAtURL:folder includingPropertiesForKeys:nil options:0 error:nil]) {
         if (![framework.lastPathComponent hasSuffix:@"Framework.framework"]) continue;
         NSURL *versions = [framework URLByAppendingPathComponent:@"Versions" isDirectory:YES];
         for (NSString *name in [manager contentsOfDirectoryAtPath:versions.path error:nil]) {
-            if ([version numberOfMatchesInString:name options:0 range:NSMakeRange(0, name.length)]) return YES;
+            if ([version numberOfMatchesInString:name options:0 range:NSMakeRange(0, name.length)]) {
+                affected = YES;
+                break;
+            }
         }
+        if (affected) break;
     }
-    return NO;
+    [cache setObject:@(affected) forKey:path];
+    return affected;
 }
 
 JardInsertionStyle JardInsertionForApp(NSString *mode, NSString *bundleIdentifier, NSURL *bundleURL) {

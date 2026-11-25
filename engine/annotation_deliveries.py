@@ -6,10 +6,13 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import sys
 from time import monotonic, time
 from uuid import uuid4
 
-from annotation_assets import terminal_path
+from annotation_assets import terminal_path, terminal_scope
+from annotation_projects import PROJECT_TARGET
+from annotation_sites import site_candidates
 
 UNDO_SECONDS = 10 * 60
 KEEP_SECONDS = 7 * 24 * 60 * 60
@@ -27,22 +30,28 @@ class AnnotationDeliveries:
 
     @contextmanager
     def connection(self, *, write=False):
-        flags = os.O_RDWR | os.O_CREAT if write else os.O_RDONLY
         try:
-            descriptor = os.open(self.path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            if sys.platform == "win32":
+                from windows_handoff_identity import open_private_file
+
+                descriptor = open_private_file(self.path, write=write)
+            else:
+                flags = os.O_RDWR | os.O_CREAT if write else os.O_RDONLY
+                descriptor = os.open(self.path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
         except FileNotFoundError:
             if write:
                 raise ReceiptError("The annotation receipt store is unavailable.") from None
             yield None
             return
-        except OSError as error:
+        except (OSError, ValueError) as error:
             raise ReceiptError("The annotation receipt store is unavailable.") from error
         try:
-            metadata = os.fstat(descriptor)
+            if sys.platform != "win32":
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+                    raise ReceiptError("The annotation receipt store is unavailable.")
         finally:
             os.close(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
-            raise ReceiptError("The annotation receipt store is unavailable.")
         mode = "rw" if write else "ro"
         try:
             with closing(sqlite3.connect(self.path.absolute().as_uri() + "?mode=" + mode, uri=True, timeout=1.5)) as db:
@@ -196,15 +205,49 @@ class AnnotationDeliveries:
                 return None
             return self.match_rule(db, scopes)
 
+    def list_rules(self):
+        with self.connection() as db:
+            if db is None or not self.has_table(db, "annotation_rules"):
+                return []
+            rows = db.execute("SELECT * FROM annotation_rules ORDER BY kind, source")
+            return [{"id": row["id"], "kind": row["kind"], "source": row["source"], "title": row["title"],
+                     "target": row["target"], "channel": row["channel"],
+                     "automatic": "automatic" in row.keys() and bool(row["automatic"])} for row in rows]
+
+    def manage_rule(self, identifier, *, automatic=None):
+        with self.connection(write=True) as db:
+            if automatic is None:
+                changed = db.execute("DELETE FROM annotation_rules WHERE id=?", (identifier,))
+            elif type(automatic) is bool:
+                # A pending delivery or stale settings window holds the previous ID.
+                changed = db.execute("UPDATE annotation_rules SET id=?, automatic=?, updated=? WHERE id=?",
+                                     (str(uuid4()), int(automatic), time(), identifier))
+            else:
+                raise ReceiptError("Choose whether to send annotations automatically.")
+            if not changed.rowcount:
+                raise ReceiptError("This rule has changed. Reopen the rules list to see the current destination.")
+
+    def retarget_rule(self, identifier, title, target, channel):
+        with self.connection(write=True) as db:
+            # Rotate the ID so stale settings and pending deliveries can't use the new target.
+            changed = db.execute("""UPDATE annotation_rules SET id=?, title=?, target=?, channel=?, automatic=0, updated=?
+                WHERE id=?""", (str(uuid4()), title, target, channel, time(), identifier))
+            if not changed.rowcount:
+                raise ReceiptError("This rule has changed. Reopen the rules list to see the current destination.")
+
     @staticmethod
     def scope_candidates(scopes):
         for scope in scopes:
-            yield scope
-            if scope["kind"] == "terminal" and (project := terminal_path(scope["key"])):
-                for parent in project.parents:
-                    if not terminal_path(str(parent)):
+            if scope["kind"] == "site" and "location" in scope:
+                for key in site_candidates(scope["location"]):
+                    yield {"kind": "site", "key": key, "label": key}
+            elif scope["kind"] == "terminal" and (folder := terminal_path(scope.get("location", scope["key"]))):
+                for candidate in (folder, *folder.parents):
+                    if not terminal_path(str(candidate)):
                         break
-                    yield {"kind": "terminal", "key": str(parent), "label": parent.name}
+                    yield terminal_scope(candidate)
+            else:
+                yield scope
 
     @classmethod
     def match_rule(cls, db, scopes):
@@ -216,10 +259,15 @@ class AnnotationDeliveries:
                         "updated": row["updated"] if "updated" in row.keys() else 0}
         return None
 
-    def remember_rule(self, scope, title, target, channel, automatic=False):
+    def remember_rule(self, scope, title, target, channel, automatic=False, *, create_only=False):
         identifier = str(uuid4())
         updated = time()
         with self.connection(write=True) as db:
+            if create_only:
+                if not db.in_transaction:
+                    db.execute("BEGIN IMMEDIATE")
+                if self.exact_rule(db, scope):
+                    raise ReceiptError("This source already has a rule. Change its chat from the rules list.")
             self.write_rule(db, kind=scope["kind"], source=scope["key"], id=identifier, title=title, target=target,
                             channel=channel, automatic=automatic, updated=updated)
         return {"id": identifier, "scope": scope, "title": title, "target": target, "channel": channel,
@@ -264,7 +312,8 @@ class AnnotationDeliveries:
             return bool(db.execute("""UPDATE annotation_outbox SET state=?,message=?
                                    WHERE capture=? AND state='pending'""", (state, message, capture)).rowcount)
 
-    def claim_route(self, capture, scopes, rule_id, service, destination, included_sheet, *, confirmed_before=None):
+    def claim_route(self, capture, scopes, rule_id, service, destination, included_sheet, *,
+                    confirmed_before=None, confirmed_project=None):
         with self.connection(write=True) as db:
             if not db.in_transaction:
                 db.execute("BEGIN IMMEDIATE")
@@ -274,7 +323,8 @@ class AnnotationDeliveries:
             if row["created"] + ROUTE_LIFETIME <= time():
                 raise ReceiptError("The pending automatic send expired.")
             rule = self.match_rule(db, scopes)
-            if not rule or not rule["automatic"] or rule["id"] != rule_id or rule["target"] != destination["id"]:
+            target = confirmed_project if confirmed_project and confirmed_project.startswith(PROJECT_TARGET) else destination["id"]
+            if not rule or not rule["automatic"] or rule["id"] != rule_id or rule["target"] != target:
                 raise ReceiptError("The saved destination changed before sending.")
             if confirmed_before is not None and monotonic() >= confirmed_before:
                 raise ReceiptError("The automatic send panel’s confirmation expired.")

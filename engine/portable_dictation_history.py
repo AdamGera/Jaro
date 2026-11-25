@@ -22,7 +22,14 @@ SECONDS_PER_DAY = 86_400
 # A two-minute dictation is at most 3.84 MB of 16 kHz mono PCM plus its WAV header.
 MAX_CLIP_BYTES = 4 * 1024 * 1024
 logger = logging.getLogger(__name__)
-SCHEMA = """
+DICTATION_KIND = "TEXT NOT NULL DEFAULT 'dictation' CHECK (kind IN ('dictation','raw','printed'))"
+DICTATION_COLUMNS = "id,time,text,app,seconds,inferenceMs,totalMs,kind"
+DICTATION_FIELDS = f"""(
+    id TEXT PRIMARY KEY, time REAL NOT NULL, text TEXT NOT NULL, app TEXT NOT NULL,
+    seconds REAL NOT NULL, inferenceMs INTEGER NOT NULL, totalMs INTEGER NOT NULL,
+    kind {DICTATION_KIND}
+)"""
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS preferences (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     retention INTEGER NOT NULL DEFAULT 7 CHECK (retention IN (0,1,7,30)),
@@ -35,8 +42,17 @@ CREATE TABLE IF NOT EXISTS preferences (
     language TEXT NOT NULL DEFAULT '',
     windowsShortcutMode TEXT NOT NULL DEFAULT 'hold',
     linuxShortcutMode TEXT NOT NULL DEFAULT 'tap',
+    x11Shortcut TEXT NOT NULL DEFAULT '',
+    x11RawShortcut TEXT NOT NULL DEFAULT '',
+    x11AnnotationShortcut TEXT NOT NULL DEFAULT '',
+    x11AnnotationEnabled INTEGER NOT NULL DEFAULT 0 CHECK (x11AnnotationEnabled IN (0,1)),
+    windowsAnnotationShortcut TEXT NOT NULL DEFAULT '',
+    windowsAnnotationEnabled INTEGER NOT NULL DEFAULT 0 CHECK (windowsAnnotationEnabled IN (0,1)),
+    windowsShortcut TEXT NOT NULL DEFAULT '',
+    windowsRawShortcut TEXT NOT NULL DEFAULT '',
     shortcutEnabled INTEGER NOT NULL DEFAULT 0 CHECK (shortcutEnabled IN (0,1)),
     portalShortcutEnabled INTEGER NOT NULL DEFAULT 0 CHECK (portalShortcutEnabled IN (0,1)),
+    portalRawShortcut INTEGER NOT NULL DEFAULT 0 CHECK (portalRawShortcut IN (0,1)),
     pasteRestoreToken TEXT NOT NULL DEFAULT '',
     vocabularyEntries TEXT NOT NULL DEFAULT '[]',
     replacements TEXT NOT NULL DEFAULT '',
@@ -48,13 +64,11 @@ CREATE TABLE IF NOT EXISTS preferences (
     otherAudio TEXT NOT NULL DEFAULT 'none',
     otherAudioPercent INTEGER NOT NULL DEFAULT 20 CHECK (otherAudioPercent BETWEEN 0 AND 100),
     noiseCleanup INTEGER NOT NULL DEFAULT 0 CHECK (noiseCleanup IN (0,1)),
-    boostMicrophone INTEGER NOT NULL DEFAULT 0 CHECK (boostMicrophone IN (0,1))
+    boostMicrophone INTEGER NOT NULL DEFAULT 0 CHECK (boostMicrophone IN (0,1)),
+    virtualPasteEnabled INTEGER NOT NULL DEFAULT 0 CHECK (virtualPasteEnabled IN (0,1))
 );
 INSERT OR IGNORE INTO preferences(singleton) VALUES (1);
-CREATE TABLE IF NOT EXISTS dictations (
-    id TEXT PRIMARY KEY, time REAL NOT NULL, text TEXT NOT NULL, app TEXT NOT NULL,
-    seconds REAL NOT NULL, inferenceMs INTEGER NOT NULL, totalMs INTEGER NOT NULL
-);
+CREATE TABLE IF NOT EXISTS dictations {DICTATION_FIELDS};
 CREATE INDEX IF NOT EXISTS dictations_recent ON dictations(time DESC, id DESC);
 """
 
@@ -113,6 +127,13 @@ class PortableDictationHistory:
                 db.execute("ALTER TABLE preferences ADD COLUMN windowsShortcutMode TEXT NOT NULL DEFAULT 'hold'")
             if "linuxShortcutMode" not in columns:
                 db.execute("ALTER TABLE preferences ADD COLUMN linuxShortcutMode TEXT NOT NULL DEFAULT 'tap'")
+            if "x11Shortcut" not in columns:
+                db.execute("ALTER TABLE preferences ADD COLUMN x11Shortcut TEXT NOT NULL DEFAULT ''")
+            if "windowsShortcut" not in columns:
+                db.execute("ALTER TABLE preferences ADD COLUMN windowsShortcut TEXT NOT NULL DEFAULT ''")
+            for column in ("x11AnnotationShortcut", "windowsAnnotationShortcut", "x11RawShortcut", "windowsRawShortcut"):
+                if column not in columns:
+                    db.execute(f"ALTER TABLE preferences ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
             if "pasteRestoreToken" not in columns:
                 db.execute("ALTER TABLE preferences ADD COLUMN pasteRestoreToken TEXT NOT NULL DEFAULT ''")
             if "vocabularyEntries" not in columns:
@@ -135,10 +156,26 @@ class PortableDictationHistory:
             if "otherAudioPercent" not in columns:
                 db.execute("ALTER TABLE preferences ADD COLUMN otherAudioPercent INTEGER NOT NULL DEFAULT 20 "
                            "CHECK (otherAudioPercent BETWEEN 0 AND 100)")
-            for column in ("shortcutEnabled", "portalShortcutEnabled", "noiseCleanup", "boostMicrophone"):
+            for column in ("shortcutEnabled", "portalShortcutEnabled", "portalRawShortcut", "noiseCleanup", "boostMicrophone", "virtualPasteEnabled",
+                           "x11AnnotationEnabled", "windowsAnnotationEnabled"):
                 if column not in columns:
                     db.execute(f"ALTER TABLE preferences ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0 CHECK ({column} IN (0,1))")
+            self.migrate_dictation_kind(db)
         self.expire()
+
+    @staticmethod
+    def migrate_dictation_kind(db):
+        if "kind" not in {row["name"] for row in db.execute("PRAGMA table_info(dictations)")}:
+            db.execute(f"ALTER TABLE dictations ADD COLUMN kind {DICTATION_KIND}")
+            return
+        sql = db.execute("SELECT sql FROM sqlite_schema WHERE name='dictations'").fetchone()[0]
+        if "'printed'" not in sql:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(f"CREATE TABLE new_dictations {DICTATION_FIELDS}")
+            db.execute(f"INSERT INTO new_dictations ({DICTATION_COLUMNS}) SELECT {DICTATION_COLUMNS} FROM dictations")
+            db.execute("DROP TABLE dictations")
+            db.execute("ALTER TABLE new_dictations RENAME TO dictations")
+            db.execute("CREATE INDEX dictations_recent ON dictations(time DESC, id DESC)")
 
     @staticmethod
     def preferences(db):
@@ -146,8 +183,8 @@ class PortableDictationHistory:
             "SELECT retention, previousRetention, terminal, revision, clearEpoch FROM preferences"
         ).fetchone()) if db is not None else DEFAULT.copy()
 
-    def status(self, last_id=None):
-        with self.connection() as db:
+    def status(self, last_id=None, *, required=False):
+        with self.connection(required=required) as db:
             if db is not None:
                 db.execute("BEGIN")
             settings = self.preferences(db)
@@ -293,27 +330,56 @@ class PortableDictationHistory:
         with self.connection(required=True) as db:
             return db.execute("SELECT linuxShortcutMode FROM preferences").fetchone()[0]
 
+    def desktop_shortcut(self, *, windows=False, raw=False):
+        column = ("windowsRawShortcut" if raw else "windowsShortcut") if windows else ("x11RawShortcut" if raw else "x11Shortcut")
+        with self.connection(required=True) as db:
+            return db.execute(f"SELECT {column} FROM preferences").fetchone()[0]
+
+    def save_desktop_shortcut(self, shortcut, *, windows=False, raw=False):
+        column = ("windowsRawShortcut" if raw else "windowsShortcut") if windows else ("x11RawShortcut" if raw else "x11Shortcut")
+        with self.connection(write=True, required=True) as db, db:
+            db.execute(f"UPDATE preferences SET {column}=?", (shortcut,))
+
     def shortcut_enabled(self, *, portal=False):
         column = "portalShortcutEnabled" if portal else "shortcutEnabled"
         with self.connection(required=True) as db:
             return bool(db.execute(f"SELECT {column} FROM preferences").fetchone()[0])
+
+    def annotation_shortcut(self, *, windows=False):
+        prefix = "windows" if windows else "x11"
+        with self.connection(required=True) as db:
+            shortcut, enabled = db.execute(f"SELECT {prefix}AnnotationShortcut,{prefix}AnnotationEnabled FROM preferences").fetchone()
+        return shortcut, bool(enabled)
+
+    def save_annotation_shortcut(self, shortcut, enabled, *, windows=False):
+        prefix = "windows" if windows else "x11"
+        with self.connection(write=True, required=True) as db, db:
+            db.execute(f"UPDATE preferences SET {prefix}AnnotationShortcut=?,{prefix}AnnotationEnabled=?", (shortcut, int(enabled)))
 
     def save_shortcut_enabled(self, enabled, *, portal=False):
         column = "portalShortcutEnabled" if portal else "shortcutEnabled"
         with self.connection(write=True, required=True) as db, db:
             db.execute(f"UPDATE preferences SET {column}=?", (int(enabled),))
 
+    def portal_raw_shortcut(self):
+        with self.connection(required=True) as db:
+            return bool(db.execute("SELECT portalRawShortcut FROM preferences").fetchone()[0])
+
+    def save_portal_raw_shortcut(self, enabled):
+        with self.connection(write=True, required=True) as db, db:
+            db.execute("UPDATE preferences SET portalRawShortcut=?", (int(enabled),))
+
     def consume_paste_grant(self):
         with self.connection(write=True, required=True) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            token = db.execute("SELECT pasteRestoreToken FROM preferences").fetchone()[0]
+            token, virtual = db.execute("SELECT pasteRestoreToken, virtualPasteEnabled FROM preferences").fetchone()
             if token:
                 db.execute("UPDATE preferences SET pasteRestoreToken=''")
-            return token
+            return token, bool(virtual)
 
-    def save_paste_grant(self, token):
+    def save_paste_grant(self, token, virtual=False):
         with self.connection(write=True, required=True) as db, db:
-            db.execute("UPDATE preferences SET pasteRestoreToken=?", (token,))
+            db.execute("UPDATE preferences SET pasteRestoreToken=?, virtualPasteEnabled=?", (token, int(virtual)))
 
     def forget_paste_grant(self, token):
         with self.connection(write=True, required=True) as db, db:
@@ -402,16 +468,19 @@ class PortableDictationHistory:
             if indicator_position is not None:
                 db.execute("UPDATE preferences SET indicatorPosition=?", (indicator_position,))
 
-    def record(self, entry, audio=None):
+    def record(self, entry, audio=None, *, clear_epoch=None):
         with self.connection(write=True, required=True) as db, db:
             db.execute("BEGIN IMMEDIATE")
             settings = self.preferences(db)
+            epoch = settings["clearEpoch"]
+            if clear_epoch is not None and clear_epoch != epoch:
+                return False, clear_epoch
             now = time()
             self._expire(db, settings, now)
             if not settings["retention"]:
-                return False, settings["clearEpoch"]
-            db.execute("""INSERT INTO dictations(id,time,text,app,seconds,inferenceMs,totalMs)
-                VALUES(:id,:time,:text,:app,:seconds,:inferenceMs,:totalMs)""", entry)
+                return False, epoch
+            db.execute("""INSERT INTO dictations(id,time,text,app,seconds,inferenceMs,totalMs,kind)
+                VALUES(:id,:time,:text,:app,:seconds,:inferenceMs,:totalMs,:kind)""", {"kind": "dictation", **entry})
             trimmed = db.execute("""DELETE FROM dictations WHERE id IN (
                 SELECT id FROM (
                     SELECT id, row_number() OVER ordered AS sequence,
@@ -426,7 +495,7 @@ class PortableDictationHistory:
                     and not any(row["id"] == entry["id"] for row in trimmed)):
                 self._save_audio(entry["id"], audio)
             db.execute("UPDATE preferences SET revision=revision+1")
-            return True, settings["clearEpoch"]
+            return True, epoch
 
     def remove(self, ids=None):
         with self.connection(write=True) as db:
@@ -454,7 +523,7 @@ class PortableDictationHistory:
                 "SELECT * FROM dictations WHERE time>=? ORDER BY time DESC, id DESC LIMIT ?",
                 (self.cutoff(settings, now), HISTORY_LIMIT))]
         snapshot = {"JardSystemDictation": {**settings, "vocabulary": ""},
-                    "JardSystemDictationHistory": [{**entry, "kind": "dictation"} for entry in entries]}
+                    "JardSystemDictationHistory": [{"kind": "dictation", **entry} for entry in entries]}
         result = history_page(None, snapshot=snapshot, now=datetime.fromtimestamp(now, timezone.utc), **filters)
         if include_timing:
             details = {entry["id"]: entry for entry in entries}

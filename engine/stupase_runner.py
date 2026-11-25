@@ -22,7 +22,7 @@ def checkpoints_ready(root):
     try:
         return ((root / ".verified").read_text().strip() == REVISION
                 and all((root / name).stat().st_size == size for name, size, _ in CHECKPOINTS))
-    except OSError:
+    except (OSError, UnicodeError):
         return False
 
 

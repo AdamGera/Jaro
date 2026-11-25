@@ -16,6 +16,11 @@ Apache License 2.0. Original model by the Qwen Team.
 https://huggingface.co/axteam/Qwen3.5-2B-GGUF/tree/271502ee0817e5f4ac3242ae5b1d334f74939871
 https://huggingface.co/Qwen/Qwen3.5-2B
 
+llama.cpp writing runtime (b12521)
+MIT License. Windows builds also download LLVM OpenMP, under Apache License 2.0
+with LLVM Exceptions. Its license is included alongside the downloaded runtime.
+https://github.com/ggml-org/llama.cpp/tree/b12521
+
 Cisco StuPASE (optional dictation and meeting noise cleanup)
 Apache License 2.0, with MIT components from ASLP-lab, Microsoft, and jishengpeng.
 https://huggingface.co/cisco-ai/stupase/tree/539963f425ae201ac8c379b6480e3b182a4840ad

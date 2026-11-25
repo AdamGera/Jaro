@@ -17,8 +17,8 @@ case "$target" in
         jobs=${JARO_CODEC_JOBS:-4}
         programs=(ffmpeg.exe ffprobe.exe)
         screen_flags=(--enable-mediafoundation --enable-demuxer=rawvideo --enable-decoder=rawvideo,h264
-            --enable-encoder=h264_mf,mjpeg --enable-muxer=mpjpeg
-            --enable-filter=adelay,ass,fps,scale,split --enable-libass
+            --enable-encoder=h264_mf,libopenh264,mjpeg,rawvideo --enable-muxer=mpjpeg,rawvideo --enable-libopenh264
+            --enable-filter=adelay,ass,format,fps,scale,showinfo,split,trim --enable-libass
             --pkg-config=pkg-config --pkg-config-flags=--static --extra-libs=-lstdc++)
         ;;
     *) printf 'Unsupported codec target: %s\n' "$target" >&2; exit 1 ;;

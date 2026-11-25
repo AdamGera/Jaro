@@ -1,8 +1,8 @@
 import { useInterfaceLanguage } from "@/interface-language"
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react"
 import { ArrowDown, ArrowUp, FileCode, FolderOpen, Plus, Sparkles, Trash2 } from "lucide-react"
 import type { DesktopBridge } from "@/desktop"
-import type { DictationLocalTransform, DictationOutputPreview, DictationOutputProfile, DictationScriptReview, DictationTransformGrants, DictationStatus, SystemDictationControls } from "@/system-dictation"
+import type { ProfileApplication, DictationLocalTransform, DictationOutputPreview, DictationOutputProfile, DictationScriptReview, DictationTransformGrants, DictationStatus, SystemDictationControls } from "@/system-dictation"
 import { profileName } from "@/system-dictation"
 import { Button } from "./ui/button"
 import { SettingGroup } from "./settings-rows"
@@ -327,23 +327,95 @@ export function OutputProfiles({ native, value, script, pending, save, run }: {
     throw new Error("Could not preview profiles.")
   }, [native])
 
+  const loadApplications = useCallback(async () => {
+    const result = await native.request("systemDictation", { action: "profileApplications" })
+    if ("applications" in result) return result.applications
+    throw new Error("Could not list installed applications.")
+  }, [native])
+
+  const chooseApplication = useCallback(async () => {
+    const result = await native.request("systemDictation", { action: "chooseProfileApplication" })
+    if ("application" in result) return result.application
+    throw new Error("Could not read the selected application.")
+  }, [native])
+
   return <OutputProfileEditor value={value} pending={pending} save={save} describe={describe} previewOutput={preview}
-    onOpenChange={setOpen} nativeScript={{ path: script, transforms, run }} />
+    onOpenChange={setOpen} loadApplications={loadApplications} chooseApplication={chooseApplication} nativeScript={{ path: script, transforms, run }} />
 }
 
 type PreviewOutput = (input: { text: string; profiles: string; app: string; site: string }) => Promise<DictationOutputPreview>
 
-export function OutputProfileEditor({ value, pending, save, describe, previewOutput, nativeScript, onOpenChange, wayland }: {
+function ApplicationTarget({ value, onChange, load, choose, manualLabel }: {
+  value: string; onChange: (value: string) => void; load: () => Promise<ProfileApplication[]>; choose?: () => Promise<ProfileApplication | null>; manualLabel: string
+}) {
+  const { t } = useInterfaceLanguage()
+  const [applications, setApplications] = useState<ProfileApplication[]>([])
+  const [manual, setManual] = useState(false)
+  const [picked, setPicked] = useState<ProfileApplication>()
+  const [error, setError] = useState("")
+  const mounted = useRef(false)
+  useLayoutEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+
+  async function browse() {
+    if (!choose) return
+    setError("")
+    try {
+      const app = await choose()
+      if (app && mounted.current) {
+        setManual(false)
+        setPicked(app)
+        onChange(app.id)
+      }
+    } catch (failure) {
+      if (mounted.current) setError(failure instanceof Error ? failure.message : "Could not choose an application.")
+    }
+  }
+  useEffect(() => {
+    let active = true
+    void load().then(items => { if (active) setApplications(items) }).catch(() => { if (active) setApplications([]) })
+    return () => { active = false }
+  }, [load])
+  const choices = picked && !applications.some(app => app.id.toLowerCase() === picked.id.toLowerCase())
+    ? [picked, ...applications] : applications
+  const selected = manual ? undefined : choices.find(app => app.id.toLowerCase() === value.toLowerCase())
+  return <>
+    {choices.length > 0 && <label>{t("Installed application")}
+      <select value={selected?.id ?? ""} onChange={event => {
+        setManual(!event.target.value)
+        onChange(event.target.value)
+      }}>
+        <option value="">{t("Enter an application manually…")}</option>
+        {choices.map(app => <option key={app.id} value={app.id}>{app.name}</option>)}
+      </select>
+    </label>}
+    {!selected && <label>{t(manualLabel)}
+      <input value={value} maxLength={300} onChange={event => { setManual(true); onChange(event.target.value) }} />
+    </label>}
+    {choose && <Button type="button" variant="outline" size="sm" onClick={() => void browse()}>
+      <FolderOpen />{t("Browse for an application…")}
+    </Button>}
+    {error && <p className="dictation-error" role="alert">{error}</p>}
+  </>
+}
+
+export function OutputProfileEditor({ value, pending, save, describe, previewOutput, loadApplications, chooseApplication, nativeScript, onOpenChange, wayland, websiteRules }: {
   value: string
   pending: boolean
   save: (value: string, base: string) => Promise<boolean | void>
   describe: (value: string) => Promise<DictationOutputProfile[]>
+  chooseApplication?: () => Promise<ProfileApplication | null>
+  loadApplications: () => Promise<ProfileApplication[]>
   previewOutput: PreviewOutput
   nativeScript?: { path: string; transforms: DictationLocalTransform[]; run: SystemDictationControls["run"] }
   onOpenChange?: (open: boolean) => void
   wayland?: boolean
+  websiteRules?: boolean
 }) {
   const { t } = useInterfaceLanguage()
+  const websites = websiteRules || !!nativeScript
   const [open, setOpen] = useState(false)
   const transforms = nativeScript?.transforms ?? []
   const stepOptions = [...Object.entries(stepNames).filter(([step]) => nativeScript || step !== "script"),
@@ -381,8 +453,18 @@ export function OutputProfileEditor({ value, pending, save, describe, previewOut
   }, [describe, draft, open, saved?.value, value])
 
   function update(patch: Partial<DictationOutputProfile>) {
-    setDraft(rows?.map((row, index) => index === selected ? { ...row, ...patch } : row))
+    setDraft(current => (current ?? rows)?.map((row, index) => index === selected ? { ...row, ...patch } : row))
     setPreview(undefined)
+  }
+
+  async function browseApplication() {
+    if (!chooseApplication) return null
+    setWorking(true)
+    try {
+      return await chooseApplication()
+    } finally {
+      setWorking(false)
+    }
   }
 
   function add() {
@@ -423,7 +505,7 @@ export function OutputProfileEditor({ value, pending, save, describe, previewOut
 
   const scope = profile?.target.toLowerCase().split(":")[0] || "default"
   return <details className="dictation-history" data-setting-title="Ordered output profiles"
-    data-setting-description={nativeScript ? "App and website rules, scripts and rewriting" : "Application rules and local rewriting"}
+    data-setting-description={nativeScript ? "App and website rules, scripts and rewriting" : "App and website rules and local rewriting"}
     onToggle={event => {
       const open = event.currentTarget.open
       setOpen(open)
@@ -447,16 +529,17 @@ export function OutputProfileEditor({ value, pending, save, describe, previewOut
         {nativeScript?.path && <p className="dictation-output-note">Review the selected version in Dictation → Output.</p>}
         {profile && <fieldset className="dictation-profile-card" disabled={busy} aria-label="Profile settings">
           <label>Applies to
-            {wayland && <small>Application profiles are used on Windows and X11. This Wayland session uses the default profile.</small>}
+            {wayland && <small>{t("On Wayland, Jaro uses the default when the compositor cannot identify the active app.")}</small>}
             <select value={scope} onChange={event => update({ target: event.target.value === "default" ? "default" : event.target.value + ":" })}>
               <option value="default">{t("Default")}</option><option value="app">{t("Application")}</option>
-              {nativeScript && <option value="site">Website</option>}
+              {websites && <option value="site">{t("Website")}</option>}
             </select>
           </label>
-          {scope !== "default" && <label>{scope === "app" ? nativeScript ? "App name or bundle ID" : "Application name" : "Website host or URL"}
-            <input value={profile.target.slice(scope.length + 1)} maxLength={300}
-              placeholder={scope === "site" ? "example.com or *.example.com" : undefined}
-              onChange={event => update({ target: scope + ":" + event.target.value })} />
+          {scope === "app" && <ApplicationTarget key={selected} value={profile.target.slice(4)} load={loadApplications} choose={chooseApplication && browseApplication}
+            manualLabel={nativeScript ? "App name or bundle ID" : "Application name"} onChange={id => update({ target: "app:" + id })} />}
+          {scope === "site" && <label>Website host or URL
+            <input value={profile.target.slice(5)} maxLength={300} placeholder="example.com or *.example.com"
+              onChange={event => update({ target: "site:" + event.target.value })} />
           </label>}
           {profile.steps.length > 0 && <ol className="dictation-profile-steps" aria-label="Output steps">
             {profile.steps.map((step, index) => <li key={index}>
@@ -520,9 +603,9 @@ export function OutputProfileEditor({ value, pending, save, describe, previewOut
           <div className="dictation-options dictation-profile-card">
             <label>Sample<textarea dir="auto" rows={3} value={sample} disabled={busy}
               onChange={event => { setSample(event.target.value); setPreview(undefined) }} maxLength={8000} /></label>
-            {!wayland && <label>{nativeScript ? "Sample app name or bundle ID" : "Sample application name"}<input value={app} disabled={busy}
-              onChange={event => { setApp(event.target.value); setPreview(undefined) }} maxLength={300} /></label>}
-            {nativeScript && <label>Sample website host or URL<input value={site} disabled={busy}
+            <label>{nativeScript ? "Sample app name or bundle ID" : "Sample application name"}<input value={app} disabled={busy}
+              onChange={event => { setApp(event.target.value); setPreview(undefined) }} maxLength={300} /></label>
+            {websites && <label>Sample website host or URL<input value={site} disabled={busy}
               onChange={event => { setSite(event.target.value); setPreview(undefined) }} maxLength={300} /></label>}
             <small>{nativeScript ? "Preview skips the executable script." : "Preview runs the text steps. Qwen runs during dictation."}</small>
             <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void apply(false)}>Preview</Button>

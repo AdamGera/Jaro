@@ -1,0 +1,167 @@
+name: JaroMobile
+options:
+  minimumXcodeGenVersion: 2.46.0
+  bundleIdPrefix: ai.jard.jaro.ios
+  deploymentTarget:
+    iOS: "18.0"
+  xcodeVersion: "2650"
+packages:
+  FluidAudio:
+    url: https://github.com/FluidInference/FluidAudio.git
+    exactVersion: 0.15.5
+settings:
+  base:
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.0.9
+    SWIFT_VERSION: 6.0
+    # The compiler finds the interface's strings for the String Catalogs (Localizable.xcstrings).
+    SWIFT_EMIT_LOC_STRINGS: YES
+    LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+targets:
+  JaroMobile:
+    type: application
+    platform: iOS
+    sources:
+      - JaroMobile
+      - JaroShared
+      - JaroActivity
+      - path: LICENSE
+        buildPhase: resources
+      - path: THIRD_PARTY_NOTICES.md
+        buildPhase: resources
+      - path: licenses
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - package: FluidAudio
+      - target: JaroKeyboard
+        embed: true
+      - target: JaroWidgets
+        embed: true
+    info:
+      path: JaroMobile/Info.plist
+      properties:
+        CFBundleDisplayName: Jaro
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CADisableMinimumFrameDurationOnPhone: true
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: ai.jard.jaro.ios.keyboard-session
+            CFBundleURLSchemes:
+              - jaro-dictation
+        NSMicrophoneUsageDescription: Jaro turns what you say into text on this device. Audio never leaves it and is deleted once it's transcribed.
+        NSSpeechRecognitionUsageDescription: Jaro uses Apple's on-device speech recognition to turn what you say into text. Nothing you say is sent to a server.
+        NSSupportsLiveActivities: true
+        ITSAppUsesNonExemptEncryption: false
+        UIBackgroundModes:
+          - audio
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    settings:
+      base:
+        ASSETCATALOG_COMPILER_ACCENT_COLOR_NAME: AccentColor
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: JaroMobile/JaroMobile.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        OTHER_LDFLAGS: $(inherited) -weak_framework FoundationModels
+        OTHER_SWIFT_FLAGS: $(inherited) -Xfrontend -disable-autolink-framework -Xfrontend FoundationModels
+        PRODUCT_BUNDLE_IDENTIFIER: ai.jard.jaro.ios
+        PRODUCT_NAME: Jaro
+    scheme:
+      gatherCoverageData: false
+      testTargets:
+        - JaroMobileTests
+  JaroKeyboard:
+    type: app-extension
+    platform: iOS
+    sources:
+      - JaroKeyboard
+      - JaroShared
+      # The app's String Catalog, so the keyboard's words (the Jaro key menu first) follow
+      # the iPhone's language where Jaro is translated.
+      - JaroMobile/Localizable.xcstrings
+    dependencies:
+      # Experiments › Speech model in keyboard: Parakeet in the keyboard (KeyboardParakeet).
+      - package: FluidAudio
+    info:
+      path: JaroKeyboard/Info.plist
+      properties:
+        CFBundleDisplayName: Jaro Keyboard
+        NSMicrophoneUsageDescription: Jaro turns what you say into text on this device. Audio never leaves it and is deleted once it's transcribed.
+        NSSpeechRecognitionUsageDescription: Jaro uses Apple's on-device speech recognition to turn what you say into text. Nothing you say is sent to a server.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionAttributes:
+            IsASCIICapable: true
+            PrefersRightToLeft: false
+            PrimaryLanguage: mul
+            RequestsOpenAccess: true
+          NSExtensionPointIdentifier: com.apple.keyboard-service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).KeyboardViewController
+    settings:
+      base:
+        APPLICATION_EXTENSION_API_ONLY: YES
+        CODE_SIGN_ENTITLEMENTS: JaroKeyboard/JaroKeyboard.entitlements
+        COREML_CODEGEN_LANGUAGE: None
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        PRODUCT_BUNDLE_IDENTIFIER: ai.jard.jaro.ios.keyboard
+        PRODUCT_NAME: JaroKeyboard
+        SKIP_INSTALL: YES
+      configs:
+        Release:
+          EXCLUDED_SOURCE_FILE_NAMES: $(inherited) JaroCleanupTagger.mlpackage
+  JaroWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - JaroWidgets
+      - JaroActivity
+      - JaroShared/JaroTheme.swift
+    info:
+      path: JaroWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Jaro
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        APPLICATION_EXTENSION_API_ONLY: YES
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        PRODUCT_BUNDLE_IDENTIFIER: ai.jard.jaro.ios.widgets
+        PRODUCT_NAME: JaroWidgets
+        SKIP_INSTALL: YES
+  JaroMobileTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - JaroMobileTests
+      - path: Fixtures/fixture-silence.wav
+        buildPhase: resources
+    dependencies:
+      - target: JaroMobile
+    settings:
+      base:
+        BUNDLE_LOADER: $(TEST_HOST)
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: ai.jard.jaro.ios.tests
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Jaro.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Jaro

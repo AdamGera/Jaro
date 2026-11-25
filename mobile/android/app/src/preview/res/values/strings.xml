@@ -1,0 +1,31 @@
+<resources xmlns:tools="http://schemas.android.com/tools" tools:ignore="MissingTranslation">
+    <!-- Jaro Preview only (the APK outside Google Play): its name, its privacy note and its updater. Every
+         translatable string here has a Simplified Chinese one in values-zh-rCN. -->
+    <string name="app_name" translatable="false">Jaro Preview</string>
+    <!-- Setup names the app as Android's lists do (the launcher, the keyboard list and picker, the microphone
+         prompt), so someone with Jaro from Google Play as well picks the right one. "The Jaro key" stays. -->
+    <string name="setup_welcome_detail">Jaro Preview checks for updates on GitHub. Your voice and words stay on this device. You can also download a larger speech model.</string>
+    <string name="setup_title">Set up Jaro Preview</string>
+    <string name="setup_detail">Allow the microphone, then choose Jaro Preview as your keyboard.</string>
+    <string name="setup_microphone_detail">So Jaro Preview can hear you</string>
+    <string name="setup_keyboard">Jaro Preview keyboard</string>
+    <string name="setup_keyboard_enabled">Choose Jaro Preview in the list</string>
+    <string name="setup_keyboard_off">Turn on Jaro Preview in Settings</string>
+    <string name="setup_choose_jaro">Choose Jaro Preview keyboard</string>
+    <string name="keyboard_hint_microphone">Allow the microphone in Jaro Preview</string>
+    <string name="settings_privacy_detail">Jaro processes speech and typing on this phone. Jaro Preview checks GitHub for a release manifest. GitHub receives the usual connection information, such as your IP address. Update checks do not include your audio, text, or vocabulary. Turn them off with Check for updates automatically.</string>
+    <string name="updates_available">Jaro Preview %1$s (build %2$d) is available</string>
+    <string name="updates_update">Download update</string>
+    <string name="updates_browser_note">Your browser downloads it from GitHub. Open the download and tap Update when Android asks. The first time, Android may ask you to allow your browser to install apps.</string>
+    <string name="updates_keyboard_note">Updating closes the keyboard for a moment. Tap a text field to bring it back.</string>
+    <string name="updates_auto">Check for updates automatically</string>
+    <string name="updates_auto_detail">When you open Jaro Preview, and once a day from the keyboard</string>
+    <string name="updates_check_now">Check now</string>
+    <string name="updates_installed">Version %1$s, build %2$d</string>
+    <string name="updates_checking">Checking…</string>
+    <string name="updates_current">Up to date</string>
+    <string name="updates_check_failed">Couldn’t check</string>
+    <string name="updates_ready">Update available</string>
+    <string name="updates_strip">Jaro Preview update available</string>
+    <string name="updates_strip_dismiss">Dismiss</string>
+</resources>

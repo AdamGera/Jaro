@@ -3,11 +3,13 @@
 ## Use Jaro
 
 - [Install and use the Mac app](../README.md)
+- [Install and use the Linux app](../desktop/portable/linux/README.md)
 - [System Dictation setup, shortcuts, and settings](system-dictation.md)
 - [TypeScript SDK and local transcription service](../sdk/typescript/README.md)
 
 ## Develop and release
 
+- [Build Jaro for iOS and Android](../mobile/README.md)
 - [Repository layout and development checks](../CONTRIBUTING.md)
 - [Shared Sessions and Meetings architecture](recording-workspace.md)
 - [Build and test the signed Mac app](../desktop/build-tools/README.md)

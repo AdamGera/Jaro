@@ -5,6 +5,7 @@ import { AlertDialog } from "radix-ui"
 import type { DesktopAnnotation, DesktopAnnotationAction, DesktopAnnotationSource, DesktopBridge } from "@/desktop"
 import type { SystemDictationControls } from "@/system-dictation"
 import { AnnotationAccess } from "./annotation-access"
+import { AnnotationRules } from "./annotation-rules"
 import { SettingGroup, SettingRow } from "./settings-rows"
 import { Button } from "./ui/button"
 
@@ -110,6 +111,7 @@ export function DesktopAnnotationControls({ native, busy, languages, controls, a
     {!annotation.managed && enabled && <AnnotationAccess native={native} busy={busy || pending || !!annotation.busy} />}
     {!annotation.managed && <AnnotationShortcut native={native} controls={controls} busy={busy || pending || !!annotation.busy} />}
     {!annotation.managed && <AnnotationStorage native={native} busy={busy || pending || !!annotation.busy} />}
+    {!annotation.managed && <AnnotationRules native={native} />}
     <AlertDialog.Root open={discarding} onOpenChange={setDiscarding}>
       <AlertDialog.Portal>
         <AlertDialog.Overlay className="note-language-scrim" />

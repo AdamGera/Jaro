@@ -1,5 +1,6 @@
 """Play Jaro's bundled dictation cues on the desktop's default output."""
 
+from array import array
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
@@ -7,7 +8,6 @@ from io import BytesIO
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 from typing import Literal
 import wave
@@ -34,18 +34,23 @@ def sound_path(style: SoundStyle, cue: str):
 
 
 def scaled_wav(path, volume):
-    import numpy as np
-
     with wave.open(str(path), "rb") as source:
         if source.getsampwidth() != 2 or source.getnframes() * source.getnchannels() * 2 > MAX_WAV - 44:
             raise ValueError("Invalid dictation sound.")
-        frames = np.frombuffer(source.readframes(source.getnframes()), dtype="<i2")
-        scaled = np.rint(frames.astype(np.float32) * (volume / 100)).astype("<i2")
+        frames = array("h")
+        frames.frombytes(source.readframes(source.getnframes()))
+        if sys.byteorder != "little":
+            frames.byteswap()
+        gain = volume / 100
+        scaled = array("h", (round(sample * gain) for sample in frames))
+        if sys.byteorder != "little":
+            scaled.byteswap()
         data = BytesIO()
         with wave.open(data, "wb") as writer:
             writer.setparams(source.getparams())
             writer.writeframes(scaled.tobytes())
-    return data.getvalue()
+        duration = source.getnframes() / source.getframerate()
+    return data.getvalue(), duration
 
 
 class DictationSounds:
@@ -53,6 +58,7 @@ class DictationSounds:
         self.pulse_player = shutil.which("paplay") if sys.platform == "linux" else None
         self.available = (self.pulse_player is not None or os.name == "nt") and sound_path("classic", "start").is_file()
         self.task = None
+        self.playback_lock = asyncio.Lock()
 
     def play(self, cue, preferences, *, delay=0, while_valid=None, ready=None, after=None):
         if not self.available or not preferences.enabled or not preferences.volume:
@@ -89,24 +95,15 @@ class DictationSounds:
             path = sound_path(preferences.style, cue)
             if not path.is_file():
                 return False
-            payload = None
-            options = {}
-            if self.pulse_player is not None:
-                # Pulse's nominal gain is 65536 and its software volume is cubic.
-                volume = round(65536 * (preferences.volume / 100) ** (1 / 3))
-                command = (self.pulse_player, "--client-name=Jaro", "--stream-name=Dictation cue",
-                           f"--volume={volume}", path)
-            else:
-                # A short-lived child can stop memory-backed WinMM playback on
-                # cancellation without touching the system output level.
-                payload = scaled_wav(path, preferences.volume)
-                command = (sys.executable, "-B", __file__)
-                options["creationflags"] = subprocess.CREATE_NO_WINDOW
+            if self.pulse_player is None:
+                return await self._play_windows(path, preferences.volume)
+            # Pulse's nominal gain is 65536 and its software volume is cubic.
+            volume = round(65536 * (preferences.volume / 100) ** (1 / 3))
             process = await asyncio.create_subprocess_exec(
-                *command, stdin=asyncio.subprocess.PIPE if payload else asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, **options,
+                self.pulse_player, "--client-name=Jaro", "--stream-name=Dictation cue", f"--volume={volume}", path,
+                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(process.communicate(payload), 3)
+            await asyncio.wait_for(process.wait(), 3)
             return process.returncode == 0
         except (OSError, EOFError, ValueError, wave.Error, TimeoutError):
             return False
@@ -116,11 +113,21 @@ class DictationSounds:
                     process.kill()
                 await process.wait()
 
+    async def _play_windows(self, path, volume):
+        from ctypes import c_char_p, c_int, c_uint32, c_void_p, windll
+        from winsound import SND_ASYNC, SND_MEMORY, SND_NODEFAULT
 
-if __name__ == "__main__" and os.name == "nt":
-    import winsound
-
-    audio = sys.stdin.buffer.read(MAX_WAV + 1)
-    if not 0 < len(audio) <= MAX_WAV:
-        sys.exit(2)
-    winsound.PlaySound(audio, winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+        # The audio suppressor already excludes this process. Keep the memory
+        # buffer alive until WinMM has finished with it, including on cancellation.
+        play_sound = windll.winmm.PlaySoundW
+        play_sound.argtypes = (c_char_p, c_void_p, c_uint32)
+        play_sound.restype = c_int
+        audio, duration = scaled_wav(path, volume)
+        async with self.playback_lock:
+            if not play_sound(audio, None, SND_ASYNC | SND_MEMORY | SND_NODEFAULT):
+                return False
+            try:
+                await asyncio.sleep(duration + .05)
+                return True
+            finally:
+                play_sound(None, None, 0)

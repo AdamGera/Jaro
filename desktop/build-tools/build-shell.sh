@@ -27,7 +27,16 @@ replacement = """    dispatch_source_set_event_handler(sigterm_source, ^{
 code = source.read_text(encoding="utf-8")
 if code.count(original) != 1:
     raise SystemExit("Native SDK SIGTERM handler changed. Review Jaro's AppKit termination handoff.")
-target.write_text(code.replace(original, replacement), encoding="utf-8")
+navigation = "- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {"
+if code.count(navigation) != 1 or "webViewWebContentProcessDidTerminate:" in code:
+    raise SystemExit("Native SDK WebKit delegate changed. Review Jaro's workspace recovery.")
+termination = """- (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
+    if (self.webViews[@1] == webView)
+        [NSNotificationCenter.defaultCenter postNotificationName:@"JaroWorkspaceContentTerminated" object:webView];
+}
+
+"""
+target.write_text(code.replace(original, replacement).replace(navigation, termination + navigation), encoding="utf-8")
 PY
     xcrun clang "${flags[@]}" -Wno-deprecated-declarations -Wno-incompatible-pointer-types -c "$sdk_source" -o "$object.$$"
     mv "$object.$$" "$object"

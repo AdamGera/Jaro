@@ -1,5 +1,9 @@
 """Private image attachments for saved sessions."""
-from uuid import uuid4
+import os
+from pathlib import Path
+import shutil
+from tempfile import NamedTemporaryFile
+from uuid import UUID, uuid4
 
 import meeting_retention
 
@@ -69,3 +73,35 @@ def get(db, key, identifier):
     row = db.execute(f"""SELECT i.image FROM session_images i JOIN {source} s ON s.id=i.session_id
                          WHERE i.session_id=? AND i.id=?""", (key, identifier)).fetchone()
     return row["image"] if row else None
+
+
+def handoff_folder(folder: Path):
+    images = folder / ".agent-images"
+    if folder.is_symlink() or images.is_symlink():
+        raise OSError("The saved image folder is unavailable.")
+    return images
+
+
+def handoff_file(folder: Path, identifier: str):
+    return handoff_folder(folder) / f"{UUID(identifier)}.jpg"
+
+
+def export_for_agent(folder: Path, identifier: str, image: bytes):
+    target = handoff_file(folder, identifier)
+    folder.mkdir(mode=0o700, exist_ok=True)
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    output = NamedTemporaryFile(dir=target.parent, delete=False)
+    temporary = Path(output.name)
+    try:
+        with output:
+            output.write(image)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target.absolute()
+
+
+def clear_handoff_files(folder: Path):
+    images = handoff_folder(folder)
+    if images.exists():
+        shutil.rmtree(images)

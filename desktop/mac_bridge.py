@@ -30,13 +30,14 @@ import httpx
 workspace = Path(__file__).resolve().parents[1]
 engine = workspace / "engine" if (workspace / "pyproject.toml").is_file() else workspace
 sys.path[:0] = [str(engine), str(workspace)] if engine != workspace else [str(engine)]
-from engine_lifecycle import HOST, PORT, URL, library_path, running_engine
-from annotation_assets import (ASSETS as ANNOTATION_ASSETS, annotation_input, annotation_movie_info,
+from engine_lifecycle import HOST, PORT, URL, library_path, open_browser_workspace, read_native_token, running_engine, workspace_key
+from annotation_assets import (ASSETS as ANNOTATION_ASSETS, MAX_TIMELINE_SECONDS, annotation_input, annotation_movie_info,
                                annotation_origin, staged_annotation_paths)
 from annotation_rollback import undo_annotation
 from annotation_routing import send_session_prompt
-from annotation_routing import (RouteUnavailable, capture_for_routing, correct_annotation, destinations as annotation_destinations,
-                                forget_destination_rule, recent_deliveries, route_scopes, send_annotation, set_destination_rule)
+from annotation_routing import (RouteUnavailable, annotation_rule_scope, capture_for_routing, captured_rule_scope, correct_annotation,
+                                destinations as annotation_destinations, forget_destination_rule, recent_deliveries,
+                                save_rule_destination, send_annotation, set_destination_rule)
 from diagnostics import write_dictation_timing, write_event
 from managed_preferences import ManagedFeatureError, meetings_managed, opencode_managed, require_annotation, require_meetings, require_opencode
 from output_transform_runtime import CAPABILITIES, is_embedded_config
@@ -51,9 +52,10 @@ from meeting_rolling import MIXED_SPEAKERS, append_rolling
 from native_recordings import normalize_meeting_title, recording_metadata, write_meeting_title, write_recording_metadata
 from saved_annotations import annotation_context, annotation_detail
 from saved_meetings import latest_transcript, saved_meeting_clipboard
+from session_agent_context import opencode_body, session_payload
 from session_store import MissingSession, SessionStore
-from desktop import annotation_agents
-from desktop.annotation_automation import AnnotationAutomation, describe_delivery
+import annotation_agents
+from annotation_automation import AnnotationAutomation, describe_delivery
 from desktop.sdk_capture import CaptureError, SDKCapture
 
 
@@ -242,9 +244,12 @@ class MacBridge:
             return await self.connect_if_ready()
 
     async def connect_if_ready(self):
+        if self.updating:
+            raise ValueError("Jaro is preparing to restart.")
         # Never pass a token or expose native controls to an unrelated local service.
         existing = await asyncio.to_thread(running_engine)
         if existing:
+            self.http.headers["X-Jard-Token"] = read_native_token(self.root)
             response = await self.http.get("/", timeout=5)
             if response.status_code in (500, 503) and not self.connected:
                 await self.recover_workspace()
@@ -260,11 +265,9 @@ class MacBridge:
             await run_helper(self.helpers / "jard-engine", "start")
             if not await asyncio.to_thread(running_engine):
                 raise RuntimeError("The local engine stopped during startup.")
+            self.http.headers["X-Jard-Token"] = read_native_token(self.root)
             response = await self.http.get("/", timeout=5)
             response.raise_for_status()
-        self.http.headers["X-Jard-Token"] = (
-            (self.root / ".native-token").read_text().strip()
-        )
         await self.api("POST", "clients/" + self.client_id)
         if not self.connected:
             write_event("desktop", "connected")
@@ -274,7 +277,7 @@ class MacBridge:
         await self.start_control()
         if self.lease_task is None:
             self.lease_task = asyncio.create_task(self.lease())
-        send({"navigate": "app"})
+        send({"navigate": "app", "workspaceKey": workspace_key(self.http.headers["X-Jard-Token"])})
         if not self.updating:
             with contextlib.suppress(ValueError, OSError):
                 await self.automatic_annotations.resume()
@@ -291,7 +294,7 @@ class MacBridge:
     async def recover_workspace(self):
         # An earlier install can leave its engine healthy but its bundled page missing.
         # The restart guard protects every other client and admitted engine job.
-        token = (self.root / ".native-token").read_text().strip()
+        token = read_native_token(self.root)
         await self.api("POST", "native/update-quiesce/" + self.client_id, headers={"X-Jard-Token": token})
         await self.wait_for_engine_exit()
 
@@ -328,10 +331,12 @@ class MacBridge:
                     raise ValueError("Invalid Jard control credentials.")
                 action = request.get("action")
                 if action not in ("status", "start", "stop", "toggle", "cancel", "paste-last", "setup", "history",
-                                  "dictation-start-raw", "dictation-toggle-raw", "dictation-stop-print", "history-clear",
+                                  "dictation-start-raw", "dictation-toggle-raw", "dictation-stop-print",
+                                  "dictation-start-print", "dictation-start-raw-print", "history-clear",
                                   "history-checkpoint", "history-snapshot",
                                   "meeting-status", "meeting-record", "meeting-stop", "meeting-copy-last", "meeting-live",
-                                  "annotation-status", "annotation-start", "annotation-stop", "annotation-cancel", "annotation-storage",
+                                  "annotation-status", "annotation-start", "annotation-stop", "annotation-toggle", "annotation-cancel",
+                                  "annotation-storage",
                                   "annotation-route", "annotation-destinations", "annotation-remember", "annotation-forget", "annotation-send", "annotation-undo", "annotation-correct",
                                   "desktop-status", "desktop-quit", "desktop-restart", "settings-list", "settings-get", "settings-apply",
                                   "vocabulary-list", "vocabulary-add", "vocabulary-remove",
@@ -381,6 +386,8 @@ class MacBridge:
                 options = {}
                 if action == "dictation-stop-print":
                     deadline.reschedule(asyncio.get_running_loop().time() + 65)
+                elif action in ("dictation-start-print", "dictation-start-raw-print"):
+                    deadline.reschedule(asyncio.get_running_loop().time() + 31 * 60 + 5)
                 elif action == "history":
                     query, offset = request.get("query", ""), request.get("offset", 0)
                     if not isinstance(query, str) or len(query) > 500 or type(offset) is not int or not 0 <= offset <= 100_000:
@@ -555,6 +562,8 @@ class MacBridge:
 
     async def setup(self, source):
         async with self.setup_lock:
+            if self.updating:
+                raise ValueError("Jaro is preparing to restart.")
             args = []
             if source == "folder":
                 path = (await self.dialog("open-models")).get("path")
@@ -929,7 +938,7 @@ class MacBridge:
                 elif notes_draft:
                     marker.write(notes_draft.encode("ascii"))
                     marker.flush()
-                options = self.input_options(args) if global_dictation else ()
+                options = self.input_options(args) if mode != "system" else ()
                 worker = self.warm_worker
                 cold_recovery = global_dictation and args.get("keep") is not True
                 if cold_recovery and not shared_worker:
@@ -1067,9 +1076,8 @@ class MacBridge:
                 continue
             available = max(0, (path.stat().st_size - 44) // 2)
             cut = copy_state.get("cut") if copy_state else None
-            if not capture["live"] and cut is None:
-                if not copy_state:
-                    start = available
+            if not capture["live"] and not copy_state:
+                start = available
                 continue
             size = min(block, cut - start) if cut is not None and cut > start else block
             if available - start < size:
@@ -1229,7 +1237,8 @@ class MacBridge:
                            **({"microphoneAvailable": event["microphoneAvailable"]}
                               if meeting and type(event.get("microphoneAvailable")) is bool else {}))
                 elif kind == "meetingSystemAudio" and meeting and take.started and type(event.get("available")) is bool:
-                    notify(kind, available=event["available"])
+                    notify(kind, available=event["available"],
+                           **({"permissionDenied": True} if event.get("permissionDenied") is True else {}))
                 elif kind == "meetingMicWarning" and meeting and take.started and type(event.get("active")) is bool:
                     active = event["active"]
                     if active and not capture.get("meetingMicrophoneWarning"):
@@ -1391,7 +1400,7 @@ class MacBridge:
     async def export(self, args):
         key, kind = str(UUID(args["id"])), args["kind"]
         annotation_kind = kind.removeprefix("annotation-") if isinstance(kind, str) and kind.startswith("annotation-") else ""
-        if kind not in ("audio", "json", "md", "notes", "srt", "vtt") and annotation_kind not in ANNOTATION_ASSETS:
+        if kind not in ("audio", "json", "md", "notes", "srt", "vtt", "annotation-clip") and annotation_kind not in ANNOTATION_ASSETS:
             raise ValueError("Unsupported export format.")
         session = await self.api("GET", "sessions/" + key)
         library = SessionStore(self.root, read_only=True)
@@ -1401,7 +1410,15 @@ class MacBridge:
             with contextlib.suppress(MissingSession):
                 capture_folder = (await asyncio.to_thread(library.annotation_asset, key, "manifest"))[0].parent
         data = None
-        if annotation_kind:
+        if kind == "annotation-clip":
+            start, end = args.get("startMs"), args.get("endMs")
+            if type(start) is not int or type(end) is not int or not 0 <= start <= end - 500 or end > MAX_TIMELINE_SECONDS * 1000:
+                raise ValueError("Select at least half a second within the recording to export.")
+            annotation = session.get("annotation")
+            if not annotation or annotation.get("missingVideo") or not session.get("audioUrl"):
+                raise ValueError("The annotation video is unavailable.")
+            name = Path(session["audioName"]).stem + "-clip.mp4"
+        elif annotation_kind in ANNOTATION_ASSETS:
             name = Path(session["audioName"]).stem + "-" + ANNOTATION_ASSETS[annotation_kind][0]
             response = await self.http.get(f"/api/sessions/{key}/annotation/{annotation_kind}")
             response.raise_for_status()
@@ -1426,6 +1443,14 @@ class MacBridge:
             raise ValueError(
                 "Choose an export destination outside the session library."
             )
+
+        if kind == "annotation-clip":
+            source, _ = await asyncio.to_thread(library.media, key)
+            with tempfile.TemporaryDirectory(dir=dest.parent, prefix=".jaro-export-") as directory:
+                partial = Path(directory) / "clip.mp4"
+                await run_helper(self.helpers / "jard-capture", "trim-annotation", source, partial, str(start), str(end))
+                partial.replace(dest)
+            return {"saved": True}
 
         def write():
             with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as temp:
@@ -1726,7 +1751,8 @@ class MacBridge:
         if action == "destinations":
             return await annotation_destinations(args.get("query", ""), root=self.root, capture=capture)
         if action == "remember":
-            return await set_destination_rule(self.root, capture, args.get("scope"), args.get("target"), args.get("service"), args.get("automatic", False))
+            return await set_destination_rule(self.root, capture, args.get("scope"), args.get("target"), args.get("service"),
+                                              args.get("automatic", False), scope_key=args.get("scopeKey"))
         return await asyncio.to_thread(forget_destination_rule, self.root, capture, args.get("ruleId"))
 
     async def automatic_capture(self, identifier):
@@ -1750,13 +1776,9 @@ class MacBridge:
         self.annotation_delivery_busy = True
         try:
             text, images, has_images, annotation = await asyncio.to_thread(
-                annotation_agents.session_payload, self.root, identifier, agent, URL)
+                session_payload, self.root, identifier, agent)
             if agent == "opencode":
-                annotation_agents.check_size(agent, text, images)
-                files = [{"name": f"jaro-image-{index}.{'png' if mime == 'image/png' else 'jpg'}",
-                          "uri": f"data:{mime};base64,{data}"}
-                         for index, (mime, data) in enumerate(images, 1)]
-                body = {"text": text, "files": files, "delivery": "queue"}
+                body = opencode_body(text, images)
                 if annotation:
                     await self.automatic_annotations.cancel(identifier, "Automatic send replaced by a manual send.")
                     await send_annotation(self.root, identifier, target, args.get("service"), body=body)
@@ -1828,7 +1850,7 @@ class MacBridge:
             scope = None
             if remember_kind is not None:
                 detail = await asyncio.to_thread(capture_for_routing, root, identifier)
-                scope = next((value for value in route_scopes(detail) if value["kind"] == remember_kind), None)
+                scope = captured_rule_scope(detail, remember_kind)
                 if not scope:
                     raise ValueError("This annotation does not have that captured app, site, or terminal project.")
             route = await asyncio.to_thread(receipts.get_route, identifier)
@@ -1908,15 +1930,21 @@ class MacBridge:
         return result["text"]
 
     async def quiesce_for_update(self):
-        async with self.capture_lock:
+        # A startup probe may ask before the first workspace connection.
+        if self.setup_lock.locked():
+            raise ValueError("Jaro is still preparing its workspace.")
+        async with self.setup_lock, self.capture_lock:
             if self.annotation_delivery_busy:
                 raise ValueError("Wait for the annotation delivery to finish before restarting.")
             if self.annotation or self.captures or self.dictation_stages or self.dictation_jobs or self.sdk_capture.busy:
                 raise ValueError("Finish your recording or dictation before restarting Jard.")
             self.updating = True
-            await self.automatic_annotations.close()
             try:
-                await self.api("POST", "native/update-quiesce/" + self.client_id)
+                await self.automatic_annotations.close()
+                if self.connected or await asyncio.to_thread(running_engine):
+                    token = read_native_token(self.root)
+                    await self.api("POST", "native/update-quiesce/" + self.client_id,
+                                   headers={"X-Jard-Token": token}, timeout=5)
                 await self.close_warm()
                 await self.wait_for_engine_exit()
                 return {"ready": True}
@@ -1967,6 +1995,8 @@ class MacBridge:
             return await self.prepare()
         if command == "jard.setup":
             return await self.setup(args.get("source"))
+        if command == "jard.updateQuiesce":
+            return await self.quiesce_for_update()
         if command == "jard.diagnosticPhase":
             phase = args.get("phase")
             if self.connected and phase in ("starting", "listening", "processing", "inserted", "saved", "cancelled", "empty", "error"):
@@ -1991,6 +2021,30 @@ class MacBridge:
             return await self.import_annotation(args)
         if command == "jard.annotationRoutingPolicy":
             return {"managed": opencode_managed()}
+        if command == "jard.annotationRules":
+            if args.get("action") == "list" and opencode_managed():
+                return {"managed": True, "rules": []}
+            require_opencode()
+            store = self.automatic_annotations.receipts
+            action = args.get("action")
+            if action in ("add", "retarget"):
+                require_annotation()
+                if action == "add":
+                    scope = annotation_rule_scope(args.get("kind"), args.get("source"), "darwin")
+                    await self.change_annotation_delivery(save_rule_destination, args.get("target"), args.get("service"),
+                                                          scope=scope, project=args.get("project", False))
+                else:
+                    await self.change_annotation_delivery(save_rule_destination, args.get("target"), args.get("service"),
+                                                          identifier=str(UUID(args["id"])), project=args.get("project", False))
+            elif action in ("remove", "setAutomatic"):
+                identifier = str(UUID(args["id"]))
+                if action == "setAutomatic" and type(args.get("enabled")) is not bool:
+                    raise ValueError("Choose whether to send annotations automatically.")
+                await asyncio.to_thread(store.manage_rule, identifier,
+                                        automatic=args.get("enabled") if action == "setAutomatic" else None)
+            elif action != "list":
+                raise ValueError("Choose a saved annotation rule action.")
+            return {"managed": False, "rules": await asyncio.to_thread(store.list_rules)}
         if command == "jard.annotationStorage":
             return await self.annotation_storage(args)
         if command == "jard.annotationRoute":
@@ -2052,8 +2106,6 @@ class MacBridge:
             if future and not future.done():
                 future.set_result(args.get("response"))
             return None
-        if command == "jard.updateQuiesce":
-            return await self.quiesce_for_update()
         if command == "jard.desktopQuiesce":
             return await self.quiesce_desktop(force=args.get("force") is True)
         if command == "jard.updateAbort":
@@ -2317,7 +2369,7 @@ class MacBridge:
         if command == "jard.open":
             if not await asyncio.to_thread(running_engine):
                 raise ValueError("Local engine is unavailable.")
-            await run_helper("/usr/bin/open", URL)
+            await asyncio.to_thread(open_browser_workspace, self.root)
             return None
         if command == "jard.meetingDrafts":
             if meetings_managed():

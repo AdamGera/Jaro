@@ -3,31 +3,36 @@
 import asyncio
 from dataclasses import dataclass, field
 from hashlib import sha256
-from ipaddress import ip_address
 from itertools import islice
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import sqlite3
 import stat
 import subprocess
+import sys
 from time import time
-from urllib.parse import urlsplit
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import httpx
 
-from annotation_assets import TERMINAL_APPS, terminal_path
+from annotation_assets import TERMINAL_APPS, annotation_origin, terminal_path, terminal_scope
 from annotation_deliveries import AnnotationDeliveries, ReceiptError
+from annotation_projects import PROJECT_TARGET, match_project_paths, project_path
+from annotation_sites import SHARED_SITES, allowed_scope, site_choices, site_scope
 from managed_preferences import require_opencode
 from saved_annotations import annotation_context, annotation_detail, inline_contact_sheet
 from session_store import MissingSession, SessionStore
+from opencode_wsl_worker import MAX_REGISTRATION, owns_linux_listener, registration_data
+
+if TYPE_CHECKING:
+    from opencode_wsl import Distribution
 
 SESSION_ID = re.compile(r"ses[A-Za-z0-9_-]{1,127}")
 SERVICE_ID = re.compile(r"[0-9a-f]{64}")
 MESSAGE_ID = re.compile(r"msg[A-Za-z0-9_-]{1,127}")
-MAX_REGISTRATION = 64 * 1024
 MAX_RESPONSE = 8 * 1024 * 1024
 PAGE_SIZE = 100
 PAGE_COUNT = 5
@@ -50,10 +55,12 @@ class Registration:
     version: str | None
     password: str | None = field(repr=False)
     channel: str
+    wsl: "Distribution | None" = None
+    guest_key: str | None = None
 
     @property
     def key(self):
-        return sha256(f"{self.origin}|{self.pid}|{self.version}".encode()).hexdigest()
+        return self.guest_key or sha256(f"{self.origin}|{self.pid}|{self.version}".encode()).hexdigest()
 
     @property
     def auth(self):
@@ -68,36 +75,24 @@ def state_directory():
 def read_registration(path):
     # Do not follow links or open a named pipe in place of a registration.
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        if sys.platform == "win32":
+            from windows_handoff_identity import open_private_file
+
+            descriptor = open_private_file(path)
+        else:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as source:
-            details = os.fstat(source.fileno())
-            if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() or details.st_mode & 0o077:
-                return None
+            if sys.platform != "win32":
+                details = os.fstat(source.fileno())
+                if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() or details.st_mode & 0o077:
+                    return None
             raw = source.read(MAX_REGISTRATION + 1)
         if len(raw) > MAX_REGISTRATION:
             return None
-        value = json.loads(raw)
-        if not isinstance(value, dict):
-            return None
-        url = urlsplit(value["url"])
-        if url.scheme != "http" or url.username is not None or url.password is not None or url.path not in ("", "/"):
-            return None
-        if url.query or url.fragment or url.hostname is None:
-            return None
-        ip = ip_address("127.0.0.1" if url.hostname == "localhost" else url.hostname)
-        if ip.is_unspecified:
-            ip = ip_address("127.0.0.1" if ip.version == 4 else "::1")
-        pid = value["pid"]
-        version = value.get("version")
-        password = value.get("password")
-        port = 80 if url.port is None else url.port
-        if (not ip.is_loopback or "%" in str(ip) or type(pid) is not int or not 0 < pid <= 2**31 - 1 or not port or
-                (version is not None and (not isinstance(version, str) or len(version) > 160)) or
-                (password is not None and not isinstance(password, str))):
-            return None
-        host = f"[{ip}]" if ip.version == 6 else str(ip)
-        return Registration(f"http://{host}:{port}", host, port, pid, version,
-                            password or os.environ.get("OPENCODE_PASSWORD"), path.name)
+        data = registration_data(raw)
+        if data is not None:
+            data["password"] = data["password"] or os.environ.get("OPENCODE_PASSWORD")
+            return Registration(**data, channel=path.name)
     except (OSError, TypeError, ValueError, KeyError, UnicodeError):
         return None
 
@@ -114,6 +109,17 @@ def registrations(directory):
 
 
 def owns_listener(record):
+    if record.wsl:
+        # The request performs the listener proof where the socket lives.
+        from opencode_wsl import default_distribution, enabled
+
+        return enabled() and default_distribution() == record.wsl
+    if sys.platform == "linux":
+        return owns_linux_listener(record.pid, record.address, record.port)
+    if sys.platform == "win32":
+        from windows_handoff_identity import owns_listener as owns_windows_listener
+
+        return owns_windows_listener(record.pid, record.address, record.port)
     try:
         rows = subprocess.run(
             ["/usr/sbin/lsof", "-nP", "-a", "-p", str(record.pid), f"-iTCP:{record.port}", "-sTCP:LISTEN", "-Fpun"],
@@ -125,8 +131,13 @@ def owns_listener(record):
     return f"p{record.pid}" in rows and f"u{os.geteuid()}" in rows and bool(bound.intersection(rows))
 
 
+
 async def request(client, record, method, path, *, seconds, **options):
     require_opencode()
+    if record.wsl:
+        from opencode_wsl import request as wsl_request
+
+        return await wsl_request(record.wsl, record, method, path, seconds, **options)
     async with asyncio.timeout(seconds):
         async with client.stream(method, record.origin + path, auth=record.auth, **options) as response:
             status = response.status_code
@@ -152,6 +163,31 @@ def value_of(data):
 
 
 async def discover(client, expected, directory, *, channel=None):
+    require_opencode()
+    if sys.platform == "win32" and directory == state_directory():
+        from opencode_wsl import default_distribution, discover as guest_discover, enabled
+
+        if enabled() and (channel is None or channel.startswith("wsl:")) and (distribution := default_distribution()):
+            native, guest = await asyncio.gather(
+                discover_native(client, expected, directory, channel=channel),
+                guest_discover(distribution, expected, channel.removeprefix("wsl:") if channel else None),
+                return_exceptions=True,
+            )
+            if isinstance(guest, dict):
+                key = guest.get("key", "")
+                name = guest.get("channel", "")
+                data = registration_data(json.dumps({"url": guest.get("origin"), "pid": guest.get("pid"),
+                                                     "version": guest.get("version")}))
+                if (data and isinstance(key, str) and SERVICE_ID.fullmatch(key) and (not expected or expected == key)
+                        and isinstance(name, str) and (channel is None or "wsl:" + name == channel)):
+                    return Registration(**data, channel="wsl:" + name, wsl=distribution, guest_key=key)
+            if isinstance(native, BaseException):
+                raise native
+            return native
+    return await discover_native(client, expected, directory, channel=channel)
+
+
+async def discover_native(client, expected, directory, *, channel=None):
     require_opencode()
     problem = "OpenCode v2 isn’t running locally."
     failure = RouteUnavailable
@@ -241,33 +277,87 @@ def accepted_message(response):
     message = value.get("id") if isinstance(value, dict) else None
     return message if isinstance(message, str) and MESSAGE_ID.fullmatch(message) else None
 
-async def list_sessions(client, record, query, limit):
-    results, seen, cursors = [], set(), set()
-    terms = query.casefold().split()
+async def session_rows(client, record, *, directory=None, pages=PAGE_COUNT):
+    cursors = set()
     params = {"parentID": "null", "limit": PAGE_SIZE}
-    for _ in range(PAGE_COUNT):
+    if directory:
+        params["directory"] = directory
+    for _ in range(pages):
         status, body = await request(client, record, "GET", "/api/session", seconds=2, params=params)
         check_status(status)
         data = decoded(body)
         rows = value_of(data)
         if not isinstance(rows, list):
             raise RoutingError("OpenCode returned an unreadable session list.")
-        for value in rows:
-            item = session(value)
-            if not item or item["id"] in seen:
-                continue
-            seen.add(item["id"])
-            if all(term in " ".join(item.values()).casefold() for term in terms):
-                results.append(item)
-                if len(results) == limit:
-                    return results
+        for value in rows[:PAGE_SIZE]:
+            yield value
         cursor = data.get("cursor") if isinstance(data, dict) else None
         next_cursor = cursor.get("next") if isinstance(cursor, dict) else None
         if not rows or not isinstance(next_cursor, str) or not next_cursor or len(next_cursor) > 4096 or next_cursor in cursors:
             break
         cursors.add(next_cursor)
         params = {"cursor": next_cursor, "limit": PAGE_SIZE}
+
+
+async def list_sessions(client, record, query, limit):
+    results, seen = [], set()
+    terms = query.casefold().split()
+    async for value in session_rows(client, record):
+        item = session(value)
+        if not item or item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        if all(term in " ".join(item.values()).casefold() for term in terms):
+            results.append(item)
+            if len(results) == limit:
+                return results
     return results
+
+
+async def matching_project_paths(record, target, directories):
+    if record.wsl:
+        from opencode_wsl import match_project
+
+        return await match_project(record, target, directories)
+    return await asyncio.to_thread(match_project_paths, target, directories)
+
+
+async def project_sessions(client, record, target, *, scoped=False):
+    candidates = {}
+    async for value in session_rows(client, record, directory=target if scoped else None, pages=1 if scoped else PAGE_COUNT):
+        item = session(value)
+        if not item or not item["directory"] or value.get("revert") is not None:
+            continue
+        timing = value.get("time")
+        updated = timing.get("updated") if isinstance(timing, dict) else None
+        candidates.setdefault(item["id"], (max(0, updated) if type(updated) is int else 0, item))
+    ordered = sorted(candidates.values(), key=lambda pair: -pair[0])
+    matches = await matching_project_paths(record, target, [item["directory"] for _, item in ordered])
+    return [ordered[index][1] for index in matches]
+
+
+async def rule_session(client, record, target):
+    if SESSION_ID.fullmatch(target):
+        return await current_session(client, record, f"/api/session/{target}", target)
+    folder = target.removeprefix(PROJECT_TARGET)
+    if folder == target or not project_path(folder, windows=sys.platform == "win32" and not record.wsl):
+        raise RoutingError("The saved OpenCode destination is invalid.")
+    try:
+        async with asyncio.timeout(8):
+            for scoped in (False, True):
+                for candidate in await project_sessions(client, record, folder, scoped=scoped):
+                    try:
+                        chosen = await current_session(client, record, f"/api/session/{candidate['id']}", candidate["id"])
+                    except RouteUnavailable:
+                        raise
+                    except RoutingError:
+                        continue
+                    # A session may move after the list was read. Verify its current directory.
+                    if chosen["directory"] == candidate["directory"] or await matching_project_paths(record, folder, [chosen["directory"]]):
+                        return chosen
+    except (TimeoutError, httpx.HTTPError) as error:
+        raise RouteUnavailable("Could not find the newest OpenCode chat in the saved project.") from error
+    raise RouteUnavailable("The saved OpenCode project has no open chat.")
 
 
 def make_client():
@@ -290,10 +380,26 @@ def route_scopes(detail):
     if not (origin := detail.get("origin")):
         return []
     if origin["app"] in TERMINAL_APPS:
-        project = terminal_path(origin.get("terminal", {}).get("project"))
-        return [{"kind": "terminal", "key": str(project), "label": project.name}] if project else []
+        terminal = origin.get("terminal", {})
+        project = terminal_path(terminal.get("project"))
+        if not project:
+            return []
+        scope = terminal_scope(project)
+        if origin["app"].startswith(("linux.", "windows.")) and (folder := terminal_path(terminal.get("folder"))):
+            if folder != project and folder.is_relative_to(project):
+                scope["location"] = str(folder)
+        return [scope]
     site = origin.get("site")
-    scopes = [{"kind": "site", "key": site, "label": site}] if site else []
+    location = site_scope(origin.get("siteUrl"), observed=True)
+    if location:
+        keys = list(site_choices(location))
+        scopes = [{"kind": "site", "key": key, "label": key} for key in keys]
+        if scopes:
+            scopes[0]["location"] = location.key()
+    else:
+        scopes = [{"kind": "site", "key": site, "label": site}] if site and site not in SHARED_SITES else []
+    if site and (site in SHARED_SITES or origin["app"].startswith(("windows.", "linux."))):
+        return scopes
     scopes.append({"kind": "app", "key": origin["app"], "label": origin["name"]})
     return scopes
 
@@ -357,6 +463,7 @@ async def destinations(query="", *, directory=None, root=None, capture=None):
     detail = await asyncio.to_thread(capture_for_routing, root, capture) if capture is not None else None
     scopes = route_scopes(detail) if detail else []
     rule = await asyncio.to_thread(AnnotationDeliveries(root).preferred_rule, scopes) if scopes else None
+    scopes = [{key: scope[key] for key in ("kind", "key", "label")} for scope in scopes]
     directory = directory or state_directory()
     async with make_client() as client:
         record = None
@@ -380,9 +487,9 @@ async def destinations(query="", *, directory=None, root=None, capture=None):
         suggestion = None
         if rule:
             saved = None
-            if rule["channel"] == record.channel and SESSION_ID.fullmatch(rule["target"]):
+            if rule["channel"] == record.channel:
                 try:
-                    saved = await current_session(client, record, "/api/session/" + rule["target"], rule["target"])
+                    saved = await rule_session(client, record, rule["target"])
                 except RoutingError:
                     pass
             rule = {**rule, "available": bool(saved)}
@@ -390,7 +497,7 @@ async def destinations(query="", *, directory=None, root=None, capture=None):
                 rows = [saved, *(row for row in rows if row["id"] != saved["id"])][:25]
             if saved and any(row["id"] == saved["id"] for row in rows):
                 suggestion = {"sessionId": saved["id"], "reason": f"Saved for {rule['scope']['label']}"}
-        if not suggestion:
+        if not suggestion and (not rule or not rule["target"].startswith(PROJECT_TARGET)):
             terminal = detail.get("origin", {}).get("terminal", {})
             target = terminal.get("session")
             if not query.strip() and target and not any(row["id"] == target for row in rows):
@@ -405,32 +512,93 @@ async def destinations(query="", *, directory=None, root=None, capture=None):
         return {"service": record.key, "sessions": rows, "rule": rule, "scopes": scopes, "suggestion": suggestion}
 
 
-async def set_destination_rule(root, capture, scope_kind, target, service, automatic=False, *, directory=None):
+def captured_rule_scope(detail, kind, key=None):
+    scope = next((item for item in route_scopes(detail) if item["kind"] == kind and (key is None or key == item["key"])), None)
+    return {name: scope[name] for name in ("kind", "key", "label")} if scope else None
+
+
+async def set_destination_rule(root, capture, scope_kind, target, service, automatic=False, *, directory=None, scope_key=None):
     require_opencode()
     if type(automatic) is not bool:
         raise RoutingError("Choose whether this destination sends automatically.")
+    detail = await asyncio.to_thread(capture_for_routing, root, capture)
+    scope = captured_rule_scope(detail, scope_kind, scope_key)
+    if scope is None:
+        raise RoutingError("This annotation does not have that captured app or site.")
+    record, chosen = await verify_rule_destination(target, service, directory=directory)
+    return await asyncio.to_thread(AnnotationDeliveries(root).remember_rule, scope, chosen["title"], target, record.channel, automatic)
+
+
+def annotation_rule_scope(kind, source, platform):
+    if not isinstance(source, str) or not source.strip() or len(source) > 4096:
+        raise RoutingError("Enter the source this rule should match.")
+    source = source.strip()
+    if kind == "terminal":
+        folder = str(Path.home() / source[2:]) if source.startswith(("~/", "~\\")) else source
+        path = terminal_path(folder)
+        if path and (isinstance(path, PureWindowsPath) == (platform == "win32")):
+            return terminal_scope(path)
+        raise RoutingError("Enter an absolute project folder inside your terminal workspace.")
+    if kind == "site":
+        site = site_scope(source, strip_www=platform != "darwin")
+        if site and allowed_scope(site):
+            key = site.key()
+            return {"kind": kind, "key": key, "label": key}
+        raise RoutingError("Enter a website domain or project path, such as github.com/org/repo.")
+    if kind == "app":
+        if platform != "darwin":
+            from portable_annotation_origin import portable_application
+
+            prefix = "windows" if platform == "win32" else "linux"
+            application = portable_application(prefix, source.casefold().removeprefix(prefix + "."))
+            source = f"{prefix}.{application}" if application else ""
+        if (app := annotation_origin({"app": source})) and app["app"] not in TERMINAL_APPS:
+            return {"kind": kind, "key": app["app"], "label": app["name"]}
+        raise RoutingError("Enter the application’s identifier. Choose Website for a site in a browser.")
+    raise RoutingError("Choose an available source type.")
+
+
+async def verify_rule_destination(target, service, *, directory=None):
     if not isinstance(target, str) or not SESSION_ID.fullmatch(target):
         raise RoutingError("Choose a valid OpenCode session ID.")
     if not isinstance(service, str) or not SERVICE_ID.fullmatch(service):
         raise RoutingError("Refresh the OpenCode destinations and choose again.")
-    detail = await asyncio.to_thread(capture_for_routing, root, capture)
-    scope = next((item for item in route_scopes(detail) if item["kind"] == scope_kind), None)
-    if scope is None:
-        raise RoutingError("This annotation does not have that captured app or site.")
     async with make_client() as client:
         record = await discover(client, service, directory or state_directory())
         chosen = await current_session(client, record, f"/api/session/{target}", target)
-    return await asyncio.to_thread(AnnotationDeliveries(root).remember_rule, scope, chosen["title"], target, record.channel, automatic)
+    return record, chosen
+
+
+async def verify_settings_destination(target, service, project):
+    if type(project) is not bool:
+        raise RoutingError("Choose a chat or a project folder.")
+    if not project:
+        record, chosen = await verify_rule_destination(target, service)
+        return record, chosen["title"], chosen["id"]
+    if not isinstance(service, str) or not SERVICE_ID.fullmatch(service):
+        raise RoutingError("Refresh the OpenCode destinations and choose again.")
+    async with make_client() as client:
+        record = await discover(client, service, state_directory())
+    path = project_path(target.strip(), windows=sys.platform == "win32" and not record.wsl) if isinstance(target, str) else None
+    if path is None or (not record.wsl and path == Path.home()):
+        raise RoutingError("Enter an absolute OpenCode project folder.")
+    return record, str(path), PROJECT_TARGET + str(path)
+
+
+async def save_rule_destination(root, target, service, *, project=False, scope=None, identifier=None):
+    record, title, destination = await verify_settings_destination(target, service, project)
+    store = AnnotationDeliveries(root)
+    if scope is not None:
+        await asyncio.to_thread(store.remember_rule, scope, title, destination, record.channel, create_only=True)
+    else:
+        await asyncio.to_thread(store.retarget_rule, identifier, title, destination, record.channel)
 
 
 async def resolve_automatic_rule(rule):
     require_opencode()
     async with make_client() as client:
         record = await discover(client, None, state_directory(), channel=rule["channel"])
-        target = rule["target"]
-        if not SESSION_ID.fullmatch(target):
-            raise RoutingError("The automatic OpenCode destination is invalid.")
-        chosen = await current_session(client, record, f"/api/session/{target}", target)
+        chosen = await rule_session(client, record, rule["target"])
         return record.key, chosen
 
 

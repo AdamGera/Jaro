@@ -1,9 +1,19 @@
+import AVFoundation
 import Foundation
 import Darwin
 
 @main enum CaptureCLI {
     static func main() async {
         let args = Array(CommandLine.arguments.dropFirst())
+        if args.first == "trim-annotation" {
+            do {
+                try await trimAnnotation(args)
+            } catch {
+                FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
+                exit(1)
+            }
+            return
+        }
         if args == ["devices"] {
             let inputs = InputDevice.available()
             let systemDefault = InputDevice.current()
@@ -129,5 +139,32 @@ import Darwin
             exit(1)
         }
         signals.forEach { $0.cancel() }
+    }
+
+    private static func trimAnnotation(_ args: [String]) async throws {
+        guard args.count == 5, args[1].hasPrefix("/"), args[2].hasPrefix("/"),
+              let start = Int64(args[3]), let end = Int64(args[4]), start >= 0, end > start, end - start >= 500 else {
+            throw CaptureError("Select at least half a second to export.")
+        }
+        let input = URL(fileURLWithPath: args[1])
+        let output = URL(fileURLWithPath: args[2])
+        guard !FileManager.default.fileExists(atPath: output.path) else {
+            throw CaptureError("The export file already exists.")
+        }
+        let asset = AVURLAsset(url: input)
+        let duration = try await asset.load(.duration)
+        let video = try await asset.loadTracks(withMediaType: .video)
+        let from = CMTime(value: start, timescale: 1000)
+        // The player reports container duration in seconds, rounded to milliseconds by the workspace.
+        let requestedEnd = CMTime(value: end, timescale: 1000)
+        guard duration.isNumeric, requestedEnd <= duration + CMTime(value: 1, timescale: 1000),
+              from < duration, !video.isEmpty else {
+            throw CaptureError("The selection is outside the recording.")
+        }
+        guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
+            throw CaptureError("Could not open the video for export.")
+        }
+        exporter.timeRange = CMTimeRange(start: from, end: min(requestedEnd, duration))
+        try await exporter.export(to: output, as: .mp4)
     }
 }

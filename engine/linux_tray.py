@@ -15,11 +15,20 @@ WATCHER_PATH = "/StatusNotifierWatcher"
 ITEM = "/StatusNotifierItem"
 MENU = "/MenuBar"
 ICON = "local.jardaudio.desktop"
+UPDATES = {
+    "check": 20, "download": 21, "restart": 22, "wait": 23, "checking": 24,
+    "downloading": 25, "staging": 26, "restarting": 27, "managed": 28,
+}
 PHASE = {"idle": 10, "recording": 11, "starting": 12, "saving": 13, "unavailable": 14}
 ENTRIES = {
     1: ("Open Jaro", "open"), 2: ("Copy last meeting transcript", "copy"), 3: ("Quit Jaro", "quit"),
     10: ("Record Meeting", "record"), 11: ("Stop & Save", "stop"), 12: ("Starting…", ""),
     13: ("Saving…", ""), 14: ("Record Meeting", ""),
+    20: ("Check for Updates…", "check"), 21: ("Download Update…", "download"),
+    22: ("Restart to Update", "restart"), 23: ("Restart to Update", ""),
+    24: ("Looking for new versions…", ""), 25: ("Downloading update…", ""),
+    26: ("Verifying update…", ""), 27: ("Restarting…", ""),
+    28: ("Updates managed by your organization", ""),
 }
 
 
@@ -64,7 +73,7 @@ class StatusItem(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def ToolTip(self) -> "(sa(iiay)ss)":
-        return [ICON, [], "Jaro", "Meeting controls"]
+        return [ICON, [], "Jaro", "Desktop controls"]
 
     @method()
     def Activate(self, x: "i", y: "i"):
@@ -79,8 +88,11 @@ class TrayMenu(ServiceInterface):
         self.version = 0
 
     def refresh(self):
-        phase, can_copy, _ = self.tray.view()
-        buttons = (1, PHASE[phase], 2, 3)
+        phase, can_copy, _, update = self.tray.view()
+        buttons = (1, PHASE[phase], 2) if phase in PHASE else (1,)
+        if update in UPDATES:
+            buttons += (UPDATES[update],)
+        buttons += (3,)
         items = {}
         for key in buttons:
             title, action = ENTRIES[key]

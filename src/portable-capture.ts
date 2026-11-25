@@ -137,8 +137,10 @@ export async function finishPortableRecording(
   return (await request(`/${id}/finish?${params}`, { method: "POST" })).json()
 }
 
-export async function portableRecordingDrafts(signal?: AbortSignal): Promise<RecordingDraft[]> {
-  return (await request("/drafts", { signal })).json()
+export async function portableRecordingDrafts(signal?: AbortSignal) {
+  const response = await request("/drafts", { signal })
+  const drafts: RecordingDraft[] = await response.json()
+  return { drafts, recovering: response.headers.get("X-Jard-Meeting-Recovery") === "pending" }
 }
 
 export async function discardPortableRecording(id: string) {

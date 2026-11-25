@@ -1,4 +1,4 @@
-"""Connect desktop key bindings to the running Wayland dictation workspace."""
+"""Connect local CLI commands and desktop key bindings to the Linux workspace."""
 import asyncio
 from contextlib import suppress
 import json
@@ -7,14 +7,21 @@ import shlex
 import socket
 import struct
 import sys
+from uuid import UUID
 
 from engine_lifecycle import library_id
 from engine_paths import ENGINE_ROOT, library_path
 
 
 ACTIONS = frozenset({"start", "stop", "toggle", "cancel", "paste-last"})
-GNOME_ACTIONS = {"gnome-toggle": "toggle", "gnome-paste-last": "paste-last", "gnome-cancel": "cancel"}
+PRINT_ACTION = "stop-print"
+RAW_ACTIONS = {"start-raw": "start", "toggle-raw": "toggle"}
+GNOME_ACTIONS = {"gnome-toggle": "toggle", "gnome-paste-last": "paste-last", "gnome-cancel": "cancel",
+                 "gnome-annotate": "annotate"}
 PEER_CREDENTIALS = struct.Struct("3i")
+TRASH_MEETING = "trash-meeting "
+MEETING_COMMAND = "meeting "
+ANNOTATION_COMMAND = "annotation "
 
 
 def address(root):
@@ -43,7 +50,7 @@ def same_user(connection):
     return uid == os.geteuid()
 
 
-async def listen(root, perform):
+async def listen(root, perform, *, trash_meeting=None, meeting_command=None, annotation_command=None):
     from linux_capture import CaptureError
 
     async def request(reader, writer):
@@ -55,10 +62,23 @@ async def listen(root, perform):
             if not command.endswith("\n"):
                 return
             action = command[:-1]
-            if action not in ACTIONS and action not in GNOME_ACTIONS:
-                return
             try:
-                result = {"status": await perform(action)}
+                if action.startswith(TRASH_MEETING) and trash_meeting is not None:
+                    identifier = action.removeprefix(TRASH_MEETING)
+                    if str(UUID(identifier)) != identifier:
+                        return
+                    result = await trash_meeting(identifier)
+                elif action.startswith(MEETING_COMMAND) and meeting_command is not None:
+                    result = await meeting_command(json.loads(action.removeprefix(MEETING_COMMAND)))
+                elif action.startswith(ANNOTATION_COMMAND) and annotation_command is not None:
+                    result = {"annotation": await annotation_command(json.loads(action.removeprefix(ANNOTATION_COMMAND)))}
+                elif action == PRINT_ACTION or action in ACTIONS or action in GNOME_ACTIONS or action in RAW_ACTIONS:
+                    if perform is None:
+                        raise CaptureError("System dictation is unavailable on this desktop.")
+                    value = await perform(action)
+                    result = value if action == PRINT_ACTION else {"status": value}
+                else:
+                    return
             except CaptureError as failure:
                 result = {"error": str(failure)}
             writer.write(json.dumps(result).encode() + b"\n")
@@ -70,25 +90,62 @@ async def listen(root, perform):
             with suppress(OSError):
                 await writer.wait_closed()
 
-    return await asyncio.start_unix_server(request, address(root), limit=32)
+    # A full Unicode terminal path can expand to almost 48 KiB when JSON-escaped.
+    return await asyncio.start_unix_server(request, address(root), limit=64 * 1024)
 
 
-def dispatch(root, action, *, gnome=False):
-    if action not in ACTIONS:
-        raise ValueError("Choose a Jaro dictation command.")
-    if gnome and action in GNOME_ACTIONS.values():
+def dispatch(root, action, *, gnome=False, raw=False, printed=False):
+    if printed:
+        if raw or gnome or action != "stop":
+            raise ValueError("Use print with stop.")
+        action = PRINT_ACTION
+    elif raw:
+        if gnome or action + "-raw" not in RAW_ACTIONS:
+            raise ValueError("Choose start or toggle for a raw dictation.")
+        action += "-raw"
+    elif gnome and "gnome-" + action in GNOME_ACTIONS:
         action = "gnome-" + action
+    elif action not in ACTIONS:
+        raise ValueError("Choose a Jaro desktop shortcut command.")
+    return request_command(root, action, timeout=70 if printed else 5,
+                           limit=1024 * 1024 if printed else 2048, purpose="use desktop dictation commands")
+
+
+def dispatch_meeting_trash(root, identifier):
+    return request_command(root, TRASH_MEETING + str(UUID(str(identifier))), timeout=125, limit=2048,
+                           purpose="move a meeting to Trash")
+
+
+def dispatch_meeting(root, action, *, title=""):
+    command = MEETING_COMMAND + json.dumps({"action": action, "title": title})
+    return request_command(root, command, timeout=2 if action == "live" else 60, limit=8192, purpose="use meeting commands")
+
+
+def dispatch_annotation(root, action, **options):
+    command = ANNOTATION_COMMAND + json.dumps({"action": action, **options})
+    limit = 2 * 1024 * 1024 if action == "destinations" else 64 * 1024
+    reply = request_command(root, command, timeout=180 if action in ("stop", "toggle") else 20, limit=limit,
+                            purpose="use annotation commands")
+    if not isinstance(reply.get("annotation"), dict):
+        raise RuntimeError("Jaro returned an invalid annotation reply.")
+    return reply["annotation"]
+
+
+def request_command(root, action, *, timeout, limit, purpose):
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(5)
+            connection.settimeout(3)
             connection.connect(address(root))
             if not same_user(connection):
                 raise ValueError("Unexpected socket owner")
+            connection.settimeout(timeout)
             connection.sendall(action.encode("ascii") + b"\n")
             with connection.makefile("rb") as reply:
-                result = json.loads(reply.readline(2048))
+                result = json.loads(reply.readline(limit))
+            if not isinstance(result, dict):
+                raise ValueError("Invalid dictation reply.")
     except (OSError, ValueError) as failure:
-        raise RuntimeError("Open Jaro for this library to use desktop dictation commands.") from failure
+        raise RuntimeError(f"Open Jaro for this library to {purpose}.") from failure
     if "error" in result:
         raise RuntimeError(result["error"])
     return result
@@ -96,7 +153,7 @@ def dispatch(root, action, *, gnome=False):
 
 def main():
     if len(sys.argv) != 2 or sys.argv[1] not in GNOME_ACTIONS.values():
-        print("Choose a GNOME dictation shortcut.", file=sys.stderr)
+        print("Choose a GNOME shortcut.", file=sys.stderr)
         return 2
     try:
         dispatch(library_path(), sys.argv[1], gnome=True)

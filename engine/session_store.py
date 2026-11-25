@@ -13,12 +13,14 @@ from uuid import UUID, uuid4
 import annotation_retention
 import annotation_storage
 import meeting_brief
+import meeting_edits
 import meeting_exports
 import meeting_retention
 import personal_notes
 import session_images
 import session_notes
 import writing_cache
+import workspace_drafts
 from annotation_assets import ASSETS as ANNOTATION_ASSETS, staged_annotation_paths
 from managed_preferences import meetings_managed
 from meeting_rolling import MIXED_SPEAKERS, RATE as RECORDING_RATE, SOURCE_LABELS, mixed_speaker_timeline, timeline_chunks
@@ -27,6 +29,9 @@ from native_recordings import normalize_meeting_title
 SHUTDOWN_INTERRUPTION = "Processing stopped when Jaro closed."
 LEGACY_SHUTDOWN_INTERRUPTION = "Processing stopped when Jard Soundfolio Local closed."
 RECOVERY_LIMIT = 2
+INTERRUPTED_FINALIZATIONS = """FROM meeting_finalization f JOIN sessions s ON s.id=f.session_id
+    WHERE s.status='interrupted' AND
+    (? OR NOT coalesce(json_extract(s.options,'$.meeting'),json_extract(s.options,'$.sourceSpeakerTurns'),0))"""
 
 
 def encode(value):
@@ -153,10 +158,12 @@ class SessionStore:
             """)
             db.executescript(session_notes.SCHEMA)
             db.executescript(session_images.SCHEMA)
+            db.execute(meeting_edits.SCHEMA)
             meeting_brief.migrate(db)
             meeting_exports.migrate(db)
             writing_cache.migrate(db)
             personal_notes.migrate(db)
+            workspace_drafts.migrate(db)
             db.executescript(meeting_retention.SCHEMA)
             db.executescript(annotation_retention.SCHEMA)
             db.executescript(annotation_storage.SCHEMA)
@@ -195,16 +202,20 @@ class SessionStore:
         self.recover_annotation_files()
 
     @contextmanager
-    def connection(self):
-        path = self.path.absolute().as_uri() + "?mode=ro" if self.read_only else self.path
+    def connection(self, *, write_lock=False):
+        path = self.path
+        if self.read_only:
+            path = self.path.absolute().as_uri() + ("?mode=rw" if write_lock else "?mode=ro")
         with closing(sqlite3.connect(path, timeout=15, uri=self.read_only)) as db:
             db.row_factory = sqlite3.Row
-            if self.read_only:
-                db.execute("PRAGMA query_only=ON")
-            else:
+            if not self.read_only:
                 db.execute("PRAGMA foreign_keys=ON")
                 db.execute("PRAGMA secure_delete=ON")
             with db:
+                if write_lock:
+                    db.execute("BEGIN IMMEDIATE")
+                if self.read_only:
+                    db.execute("PRAGMA query_only=ON")
                 yield db
 
     def recover_annotation_files(self, key=None):
@@ -294,7 +305,7 @@ class SessionStore:
                                (key, name, created, filename, mime, encode(options), duration, status, processed))
                     db.executemany("INSERT INTO meeting_rolling VALUES(?,?,?,?)",
                                    ((key, start, end, encode(result)) for start, end, result in rolling))
-                    if options.get("meeting", options.get("sourceSpeakerTurns")):
+                    if not video_only and (options["recording"] or options.get("meeting", options.get("sourceSpeakerTurns"))):
                         db.execute("INSERT INTO meeting_finalization(session_id) VALUES(?)", (key,))
                     personal_notes.attach(db, key, notes_draft)
                     if video_only:
@@ -315,27 +326,27 @@ class SessionStore:
             if next_frame is not None:
                 db.execute("UPDATE meeting_finalization SET next_frame=? WHERE session_id=?", (next_frame, key))
 
-    def claim_meeting_finalization(self):
+    def claim_recording_finalization(self, *, include_meetings=True):
+        # Keep the original table name so existing meeting checkpoints remain usable.
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            exhausted = """SELECT f.session_id FROM meeting_finalization f JOIN sessions s ON s.id=f.session_id
-                            WHERE s.status='interrupted' AND f.attempts>=?"""
+            exhausted = f"SELECT f.session_id {INTERRUPTED_FINALIZATIONS} AND f.attempts>=?"
             db.execute(f"UPDATE sessions SET error=?,transcript=NULL WHERE id IN ({exhausted})",
-                       ("Meeting recovery did not finish after two attempts. Recorded audio and available text are saved.",
-                        RECOVERY_LIMIT))
-            db.execute(f"DELETE FROM meeting_finalization WHERE session_id IN ({exhausted})", (RECOVERY_LIMIT,))
-            row = db.execute("""SELECT s.id,s.filename,s.duration,s.options,f.next_frame FROM meeting_finalization f
-                JOIN sessions s ON s.id=f.session_id WHERE s.status='interrupted' ORDER BY s.created,s.id LIMIT 1""").fetchone()
+                       ("Recording recovery did not finish after two attempts. Recorded audio and available text are saved.",
+                        include_meetings, RECOVERY_LIMIT))
+            db.execute(f"DELETE FROM meeting_finalization WHERE session_id IN ({exhausted})",
+                       (include_meetings, RECOVERY_LIMIT))
+            row = db.execute(f"""SELECT s.id,s.filename,s.duration,s.options,f.next_frame
+                {INTERRUPTED_FINALIZATIONS} ORDER BY s.created,s.id LIMIT 1""", (include_meetings,)).fetchone()
             if row:
                 db.execute("UPDATE meeting_finalization SET attempts=attempts+1 WHERE session_id=?", (row["id"],))
                 db.execute("UPDATE sessions SET status='processing',error=NULL,transcript=NULL WHERE id=?", (row["id"],))
                 return {**dict(row), "options": json.loads(row["options"])}
             return None
 
-    def has_pending_meetings(self):
+    def has_pending_recordings(self, *, include_meetings=True):
         with self.connection() as db:
-            return bool(db.execute("""SELECT 1 FROM meeting_finalization f JOIN sessions s ON s.id=f.session_id
-                                      WHERE s.status='interrupted' LIMIT 1""").fetchone())
+            return db.execute(f"SELECT 1 {INTERRUPTED_FINALIZATIONS} LIMIT 1", (include_meetings,)).fetchone() is not None
 
     def _result(self, db, row, *, rebuild=False, include_turns=False):
         options = json.loads(row["options"])
@@ -420,7 +431,8 @@ class SessionStore:
                 json_extract(s.options,'$.meetingEndedAt') AS meetingEndedAt,
                 json_extract(s.options,'$.audioRemovedAt') AS audioRemovedAt,
                 json_type(s.options,'$.annotation')='object' AS annotation,
-                CASE WHEN {meeting} THEN NULLIF({retention},0) END AS meetingRetentionDays,
+                CASE WHEN {meeting} AND coalesce(json_extract(s.options,'$.retentionApplies'),1)<>0
+                    THEN NULLIF({retention},0) END AS meetingRetentionDays,
                 {pending} AS finalizationPending, {title} AS summaryTitle, {provisional} AS provisionalTitle,
                 (SELECT count(*) FROM overviews v WHERE v.id=s.id AND v.status='queued')+{pending_brief} AS pendingOverview
                 FROM {source} s LEFT JOIN notes n ON n.id=s.id LEFT JOIN overviews o ON o.id=s.id AND o.lang=n.displayed {join}
@@ -441,8 +453,18 @@ class SessionStore:
                         and db.execute("SELECT 1 FROM meeting_trash WHERE id=?", (key,)).fetchone())
 
     def get(self, key, *, include_turns=False):
-        with self.connection() as db:
-            db.execute("BEGIN" if self.read_only else "BEGIN IMMEDIATE")
+        for write_lock in (False, True):
+            try:
+                return self._get(key, include_turns=include_turns, write_lock=write_lock)
+            except sqlite3.OperationalError as error:
+                busy = (getattr(error, "sqlite_errorcode", None) or 0) & 0xFF == sqlite3.SQLITE_BUSY
+                if write_lock or self.read_only or not (busy or "locked" in str(error).lower()):
+                    raise
+
+    def _get(self, key, *, include_turns=False, write_lock=False):
+        with self.connection(write_lock=write_lock) as db:
+            if not write_lock:
+                db.execute("BEGIN")
             source = meeting_retention.readable_source(db)
             row = db.execute(f"SELECT * FROM {source} WHERE id=?", (key,)).fetchone()
             if not row:
@@ -452,6 +474,10 @@ class SessionStore:
             result["transcript"], turns = self._result(db, row, include_turns=include_turns)
             if include_turns:
                 result["meetingTurns"] = turns
+                if (turns and not self.read_only and result["status"] == "complete" and not result.get("meetingsManaged")
+                        and meeting_edits.enabled(db) and not db.execute(
+                            "SELECT 1 FROM meeting_rolling WHERE session_id=?", (key,)).fetchone()):
+                    result["transcriptEditRevision"] = meeting_edits.revision(turns)
             return result
 
     def _metadata(self, db, row, *, initialize_notes=True):
@@ -471,10 +497,11 @@ class SessionStore:
         managed = is_meeting and meetings_managed()
         overview = session_notes.selection(db, key, initialize_missing=initialize_notes and not self.read_only and not managed)
         brief = meeting_brief.read(db, key) if is_meeting else None
-        pending = bool(options.get("meeting", options.get("sourceSpeakerTurns")) and self.has_finalization_table(db)
+        pending = bool(self.has_finalization_table(db)
                        and db.execute("SELECT 1 FROM meeting_finalization WHERE session_id=?", (key,)).fetchone())
+        retained_as_meeting = is_meeting and options.get("retentionApplies") != 0
         configured = (db.execute("SELECT days FROM meeting_retention WHERE id=1").fetchone()
-                      if is_meeting and meeting_retention.readable_source(db) == "readable_sessions" else None)
+                      if retained_as_meeting and meeting_retention.readable_source(db) == "readable_sessions" else None)
         return {**{k: row[k] for k in ("id", "name", "created", "duration", "processed", "status")},
                 **options, "meeting": is_meeting,
                 **({"meetingsManaged": True} if managed else {}),
@@ -613,6 +640,9 @@ class SessionStore:
                     staged.parent.mkdir(mode=0o700, exist_ok=True)
                     if staged.exists():
                         raise OSError("A previous audio transfer is still staged.")
+                    # The gallery's originals live in SQLite. Keep temporary handoff
+                    # copies out of the audio archive so deleting an image removes its copy.
+                    session_images.clear_handoff_files(folder)
                     folder.rename(staged)
                     moved = True
                     meeting_retention.sync_directory(self.audio)
@@ -750,7 +780,7 @@ class SessionStore:
         with self.connection() as db:
             db.execute("UPDATE meeting_trash SET sent=1 WHERE id=?", (key,))
 
-    def delete(self, key, *, trash=meeting_retention.trash_path):
+    def delete(self, key, *, meeting_only=False, trash=meeting_retention.trash_path):
         """Delete a session and return whether a committed meeting archive is still waiting for Trash."""
         with self.retention_lock:
             with self.export_lock, self.connection() as db:
@@ -762,6 +792,8 @@ class SessionStore:
                 else:
                     options = json.loads(row["options"])
                     if not options.get("meeting", options.get("sourceSpeakerTurns")):
+                        if meeting_only:
+                            raise MissingSession(key)
                         self._delete_session(db, key, row["status"], options)
                         return False
                     if not db.execute("SELECT 1 FROM archivable_meetings WHERE id=?", (key,)).fetchone():

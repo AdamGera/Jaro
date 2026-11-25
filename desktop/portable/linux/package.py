@@ -58,6 +58,9 @@ def stage_host(target, host):
     install(host.with_name("jaro-pen"), target / "bin/jaro-pen", 0o755)
     install(host.with_name("jaro-indicator"), target / "bin/jaro-indicator", 0o755)
     install(host.with_name("jaro-call-surface"), target / "bin/jaro-call-surface", 0o755)
+    install(host.with_name("jaro-focused-window"), target / "bin/jaro-focused-window", 0o755)
+    install(host.with_name("jaro-wayland-clipboard"), target / "bin/jaro-wayland-clipboard", 0o755)
+    install(host.with_name("jaro-save-video"), target / "bin/jaro-save-video", 0o755)
 
 
 def build(host, dist, output, revision, wheelhouse, sdk):
@@ -80,7 +83,13 @@ def build(host, dist, output, revision, wheelhouse, sdk):
         target = stage / PACKAGE_ROOT.removeprefix("/")
         stage_host(target, host)
         stage_workspace(target, dist)
-        release_metadata(target, "debian", version.rsplit("-", 1)[0], revision)
+        kind = target_os[0]
+        layer_shell_dependency = ", libgtk4-layer-shell0" if kind == "debian" else ""
+        if kind == "ubuntu":
+            library = host.parent.parent / "lib"
+            install(library / "libgtk4-layer-shell.so.0", target / "lib/libgtk4-layer-shell.so.0")
+            install(library / "gtk4-layer-shell-LICENSE", stage / "usr/share/doc/jaro/gtk4-layer-shell-LICENSE")
+        release_metadata(target, kind, version.rsplit("-", 1)[0], revision)
         stage_runtime(target, wheelhouse)
         install(HERE / "launch", target / "bin/launch", 0o755)
         (target / "in-use").touch()
@@ -95,6 +104,8 @@ def build(host, dist, output, revision, wheelhouse, sdk):
         for name in ("LICENSE", "NOTICE"):
             install(ROOT / name, stage / "usr/share/doc/jaro" / name)
         shutil.copytree(ROOT / "licenses", stage / "usr/share/doc/jaro/licenses")
+        for protocol in (HERE / "protocols").glob("*.xml"):
+            install(protocol, stage / "usr/share/doc/jaro/licenses/wayland" / protocol.name)
         shutil.copytree(ROOT / "engine/stupase_model/licenses", stage / "usr/share/doc/jaro/licenses/stupase")
         install(ROOT / "engine/stupase_model/NOTICE.md", stage / "usr/share/doc/jaro/licenses/stupase/NOTICE.md")
         install(ROOT / "desktop/build-tools/MODEL-NOTICES.txt", stage / "usr/share/doc/jaro/MODEL-NOTICES.txt")
@@ -113,16 +124,18 @@ Section: sound
 Priority: optional
 Installed-Size: {installed_kib}
 Depends: python{PYTHON_VERSION}, ffmpeg, pulseaudio-utils, libgtk-4-1, libwebkitgtk-6.0-4, libglib2.0-bin,
- gstreamer1.0-tools, gstreamer1.0-pipewire, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad,
- libgcc-s1, libstdc++6, libgomp1, libgtk4-layer-shell0, libx11-6, libxext6, ca-certificates, curl, openssl, util-linux,
+ python3-gi, gir1.2-gstreamer-1.0, gstreamer1.0-tools, gstreamer1.0-pipewire, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad,
+ libgcc-s1, libstdc++6, libgomp1{layer_shell_dependency}, libx11-6, libxext6, libwayland-client0, libxkbcommon0,
+ ca-certificates, curl, openssl, util-linux,
  xclip, wl-clipboard
-Recommends: xdg-desktop-portal, at-spi2-core
+Recommends: xdg-desktop-portal, at-spi2-core, wtype
 Homepage: https://www.jard.ai/
 Description: Local audio recording, transcription, and dictation
  Jaro records audio and transcribes it on this computer with local models.
 """
         )
-        name = f"jaro_{version}_amd64.deb"
+        target_suffix = "_ubuntu24.04" if kind == "ubuntu" else ""
+        name = f"jaro_{version}{target_suffix}_amd64.deb"
         artifact = Path(work) / name
         subprocess.run(["dpkg-deb", "--root-owner-group", "-Zzstd", "-z9", "--build", stage, artifact], check=True)
         result = output / name

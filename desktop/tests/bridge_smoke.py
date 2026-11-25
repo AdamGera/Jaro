@@ -300,6 +300,9 @@ else:
                 sidecar.write_bytes(source.read(44 + 4 * 48000 * 2))
         shutil.copyfile(os.environ["MEETING_MIX"], output)
     opened = {"event":"started","microphone":"Fixture microphone","openedAt":123.34}
+    if "Fixture workspace input" in sys.argv:
+        assert "--avoid-bluetooth" in sys.argv
+        opened["microphone"] = "Fixture workspace input"
     if "FixtureFallback" in sys.argv:
         assert "--cold-recovery" in sys.argv and "--avoid-bluetooth" in sys.argv
         opened.update(microphone="System fixture input", usingDefaultMicrophone=True)
@@ -401,10 +404,14 @@ else:
 
     async with httpx.AsyncClient(base_url=base,timeout=120,trust_env=False) as web:
         try:
-            assert (await rpc("prepare"))["ready"] and {"navigate":"app"} in seen
+            assert (await rpc("prepare"))["ready"]
+            key = next(row["workspaceKey"] for row in seen if row.get("navigate") == "app")
+            assert (await web.get("/api/sessions")).status_code == 403
+            assert (await web.post("/_desktop/connect", headers={"Origin": base, "X-Jaro-Workspace-Key": key})).status_code == 204
             await rpc("diagnosticPhase", phase="inserted", text="Private sample sentence", target="Secret destination")
             await rpc("diagnosticPhase", phase="unknown user-provided phase")
             await rpc("diagnosticTiming", inferenceMs=12, outputWaitMs=0, totalMs=24,
+                      speechQueueMs=3, audioPriorityMs=0, audioReadMs=4, voiceCleanupMs="Private sample sentence",
                       captureFinalizeMs=True, deliveryMs="Secret destination", other="Private sample sentence")
             events = (root / "logs" / "live.ndjson").read_text().splitlines()
             assert [(row["kind"], row["phase"]) for row in map(json.loads, events)] == [
@@ -412,7 +419,7 @@ else:
             ]
             timing = json.loads(events[-1])
             assert {key: value for key, value in timing.items() if key not in ("time", "kind", "phase")} == {
-                "inferenceMs": 12, "outputWaitMs": 0, "totalMs": 24,
+                "inferenceMs": 12, "outputWaitMs": 0, "totalMs": 24, "speechQueueMs": 3, "audioPriorityMs": 0, "audioReadMs": 4,
             }
             assert all("Private sample sentence" not in row and "Secret destination" not in row for row in events)
             assert (root / "logs" / "live.ndjson").stat().st_mode & 0o777 == 0o600
@@ -523,6 +530,8 @@ assert.equal(status.phase, "cancelled")
             dictated = await rpc("dictation", action="transcribe", id=recorded["id"], languages=["en"])
             assert "history books" in dictated["text"].lower()
             assert dictated["speechRequestMs"] >= dictated["inferenceMs"] > 0
+            assert set(dictated["speechTiming"]) == {"audioReadMs", "speechQueueMs", "audioPriorityMs"}, dictated["speechTiming"]
+            assert all(type(value) is int and value >= 0 for value in dictated["speechTiming"].values())
             assert not (await web.get("/api/sessions")).raise_for_status().json()
             assert not list((root/"library"/"staging").glob("*.dictation"))
             cancelled = str(uuid4())
@@ -962,6 +971,9 @@ assert.equal(status.phase, "cancelled")
             await desktop_command(["dictation", "start", "--raw"], "dictation-start-raw", {}, {"phase": "starting"})
             await desktop_command(["dictation", "toggle", "--raw"], "dictation-toggle-raw", {}, {"phase": "starting"})
             printed = {"status": "transcript", "text": "This dictation goes to the command."}
+            await desktop_command(["dictation", "start", "--print"], "dictation-start-print", {}, printed, json_output=False)
+            await desktop_command(["dictation", "start", "--raw", "--print"], "dictation-start-raw-print", {}, printed)
+            await desktop_command(["dictation", "start", "--print"], "dictation-start-print", {}, {"status": "no-speech"}, exit_code=4)
             await desktop_command(["dictation", "stop", "--print"], "dictation-stop-print", {}, printed, json_output=False)
             await desktop_command(["dictation", "stop", "--print"], "dictation-stop-print", {}, printed)
             await desktop_command(["dictation", "stop", "--print"], "dictation-stop-print", {}, {"status": "no-speech"}, exit_code=4)
@@ -982,6 +994,8 @@ assert.equal(status.phase, "cancelled")
             await desktop_command(["annotate", "status"], "annotation-status", {},
                                   {"phase": "recording", "capture": annotation_request, "elapsedSeconds": 2.5})
             await desktop_command(["annotate", "stop"], "annotation-stop", {},
+                                  {"phase": "saving", "capture": annotation_request, "changed": True})
+            await desktop_command(["capture", "toggle"], "annotation-toggle", {},
                                   {"phase": "saving", "capture": annotation_request, "changed": True})
             await desktop_command(["annotate", "cancel"], "annotation-cancel", {},
                                   {"phase": "saving", "capture": annotation_request, "changed": False})
@@ -1033,8 +1047,8 @@ assert.equal(status.phase, "cancelled")
             finally:
                 deny_recording.unlink()
             print("Typed microphone and system audio denials reach the UI and remove empty staging files.", flush=True)
-            await rpc("record",mode="both",live=True,**opts)
-            await wait_event("started")
+            await rpc("record", mode="both", live=True, inputDevice="Fixture workspace input", avoidBluetooth=True, **opts)
+            assert (await wait_event("started"))["microphone"] == "Fixture workspace input"
             assert "meetingRms" not in await wait_event("levels")
             await rpc("live",enabled=False)
             await rpc("stop")
@@ -1275,6 +1289,7 @@ assert.equal(status.phase, "cancelled")
             assert (await web.get(images_path)).raise_for_status().json() == [asset]
             response = (await web.get(asset["url"])).raise_for_status()
             assert response.content == image and response.headers["content-type"] == "image/jpeg"
+            assert response.headers["Cross-Origin-Resource-Policy"] == "same-origin"
             for provider, target in agent_targets.items():
                 result = await rpc("sendSessionToAgent", id=key, agent=provider, target=target)
                 wire = json.loads((root / f"{provider}-annotation.json").read_text())
@@ -1282,7 +1297,9 @@ assert.equal(status.phase, "cancelled")
                 assert brief["summary"] in context and "## My Notes" in context and "Ask about paperback pricing." in context
                 assert "## Transcript" in context and "**00:" in context
                 if provider == "t3":
-                    assert result == {"images": "references", "opened": False} and base + asset["url"] in context
+                    assert result == {"images": "references", "opened": False}
+                    local_image = Path(json.loads(context.splitlines()[-1].removeprefix("- ")))
+                    assert local_image.is_relative_to(root.resolve()) and local_image.read_bytes() == image
                 else:
                     assert result == {"images": "attached", "opened": False}
                     encoded = wire[1]["url"].split(",", 1)[1] if provider == "codex" else wire[1]["source"]["data"]
@@ -1296,6 +1313,7 @@ assert.equal(status.phase, "cancelled")
                 assert base64.b64decode(body["files"][0]["uri"].split(",", 1)[1]) == image
             (await web.delete(asset["url"], headers={"Origin": base})).raise_for_status()
             assert (await web.get(asset["url"])).status_code == 404
+            assert not local_image.exists()
             print("Overview sharing preserved a saved meeting brief, timed transcript, My Notes, and image attachments across all four agent transports.", flush=True)
             for kind, expected in (("notes", "Ask about paperback pricing."), ("md", "**"), ("srt", " --> "), ("vtt", "WEBVTT")):
                 result = (await web.get(f"/api/sessions/{key}/export", params={"kind": kind})).raise_for_status()
@@ -1307,7 +1325,7 @@ assert.equal(status.phase, "cancelled")
             assert (await web.put("/api/meetings/retention", params={"days": 0},
                                   headers={"Origin": base})).raise_for_status().json() == {"days": 0}
             assert (await web.put("/api/meetings/audio-retention?days=7")).raise_for_status().json() == {"days": 7}
-            removed = (await web.delete(f"/api/sessions/{key}/audio")).raise_for_status().json()["audioRemovedAt"]
+            removed = (await web.delete(f"/api/sessions/{key}/audio", headers={"Origin": base})).raise_for_status().json()["audioRemovedAt"]
             trashed_audio = root / "Trash" / f"Jaro Meeting Audio {key}"
             assert (trashed_audio / "mic.wav").read_bytes() == mic
             assert (trashed_audio / "system.wav").read_bytes() == system_audio
@@ -1522,7 +1540,8 @@ assert.equal(status.phase, "cancelled")
                 manifest_file.write_text(json.dumps({"version": 1, "source": "display", "coordinateSpace": "normalized-bottom-left",
                     "events": [{"time": .3, "stroke": 1, "from": [.2, .3], "to": [.7, .5], "liftedAt": .45},
                                {"time": 1.2, "clear": True}],
-                    "frames": [.25, 1.3], "origin": {"app": "com.fixture.Browser", "name": "Jard", "site": "example.test"}}))
+                    "frames": [.25, 1.3], "origin": {"app": "com.fixture.Browser", "name": "Jard", "site": "example.test",
+                        "siteUrl": "https://example.test/project/notes?fixture=private#anchor"}}))
                 sheet.write_bytes(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jL1sAAAAASUVORK5CYII="))
             manifest_bytes = manifest_file.read_bytes()
             invalid = json.loads(manifest_bytes)
@@ -1641,7 +1660,7 @@ assert.equal(status.phase, "cancelled")
             assert voice_detail["videoPath"] is None and Path(voice_detail["audioPath"]).is_file()
             voice_handoff = await rpc("annotationHandoff", id=no_picture)
             assert voice_handoff["imagePath"] is None and "produced no video frames" in voice_handoff["markdown"]
-            (await web.delete(f"/api/sessions/{no_picture}")).raise_for_status()
+            (await web.delete(f"/api/sessions/{no_picture}", headers={"Origin": base})).raise_for_status()
             print("Annotation without video saved its narration WAV and strokes, transcribed with Rumble2 Flash, and shared context without images.", flush=True)
             seen.clear()
             await rpc("record", mode="mic", live=True, **opts)
@@ -1657,7 +1676,7 @@ assert.equal(status.phase, "cancelled")
             assert "history books" in mic_session["transcript"]["text"].lower()
             assert mic_session["transcript"]["speakerActivity"]
             assert (await web.get(mic_session["audioUrl"])).raise_for_status().content == audio.read_bytes()
-            (await web.delete(f"/api/sessions/{mic_session['id']}")).raise_for_status()
+            (await web.delete(f"/api/sessions/{mic_session['id']}", headers={"Origin": base})).raise_for_status()
             print("A microphone-only session after the shared meeting captured, transcribed, and diarized its original audio.", flush=True)
             state = Path(env["XDG_STATE_HOME"]) / "opencode"
             assert "running locally" in await rpc("annotationDestinations", expect_error=True, query="")
@@ -1676,7 +1695,8 @@ assert.equal(status.phase, "cancelled")
                     {"id": "ses_later", "title": "Roadmap", "directory": "/fixture/Planning"}]
                 service = destinations["service"]
                 if not phone_fixture:
-                    assert detail["origin"] == {"app": "com.fixture.browser", "name": "Jard", "site": "example.test"}
+                    assert detail["origin"] == {"app": "com.fixture.browser", "name": "Jard", "site": "example.test",
+                                                "siteUrl": "https://example.test/project/notes"}
                     assert "example.test" not in handoff["markdown"]
                     initial = await agent("annotate", "destinations", "--capture", "latest")
                     assert initial["rule"] is None and initial["suggestion"] == {
@@ -1685,11 +1705,47 @@ assert.equal(status.phase, "cancelled")
                     app_pick = await rpc("annotationDestinations", id=annotation)
                     assert app_pick["sessions"][0]["id"] == "ses_later" and app_pick["rule"]["id"] == app_rule["id"]
                     assert app_pick["suggestion"]["reason"] == "Saved for Jard"
-                    site_rule = await rpc("rememberAnnotationDestination", id=annotation, scope="site", target="ses_project", service=service)
+                    new_rule = dict(action="add", kind="site", source="Example.Test.", target="ses_later", service=service)
+                    listing = await rpc("annotationRules", **new_rule)
+                    site_rule, = [rule for rule in listing["rules"] if rule["kind"] == "site"]
+                    assert site_rule["source"] == "example.test" and not site_rule["automatic"] and not posted
+                    assert "already has a rule" in await rpc("annotationRules", **new_rule, expect_error=True)
+                    changed = await rpc("annotationRules", action="retarget", id=site_rule["id"], target="ses_project", service=service)
+                    site_rule, = [rule for rule in changed["rules"] if rule["kind"] == "site"]
+                    assert not posted
                     rule_pick = await agent("annotate", "destinations", "--capture", annotation)
                     assert rule_pick["rule"]["id"] == site_rule["id"] and rule_pick["rule"]["available"]
                     assert rule_pick["suggestion"] == {"sessionId": "ses_project", "reason": "Saved for example.test"}
+                    invalid_scope = await rpc("rememberAnnotationDestination", id=annotation, scope="site",
+                                              scopeKey="example.test/unrelated", target="ses_later", service=service, expect_error=True)
+                    assert "does not have" in invalid_scope
+                    path_rule = await agent("annotate", "remember", "latest", "--scope", "site", "--scope-key", "example.test/project",
+                                            "--to", "ses_later", "--service", service)
+                    path_pick = await rpc("annotationDestinations", id=annotation)
+                    assert path_pick["rule"]["id"] == path_rule["id"]
+                    assert path_pick["suggestion"] == {"sessionId": "ses_later", "reason": "Saved for example.test/project"}
+                    assert not posted and (await agent("annotate", "forget", annotation, "--rule", path_rule["id"]))["forgotten"]
+                    print("The captured website path outranked a host rule, with private URL fields excluded.", flush=True)
                     assert (await agent("annotate", "forget", annotation, "--rule", site_rule["id"]))["forgotten"]
+                    print("Rules added in macOS Settings matched their normalized website and could be edited without sending.", flush=True)
+                    project_rule = await rpc("annotationRules", **{**new_rule, "project": True, "target": "/fixture/Jard"})
+                    folder_rule, = [rule for rule in project_rule["rules"] if rule["kind"] == "site"]
+                    assert (await rpc("annotationDestinations", id=annotation))["suggestion"]["sessionId"] == "ses_project"
+                    older = {"id": "ses_project", "title": "Original", "directory": "/fixture/Jard", "time": {"updated": 12}}
+                    outside = {"id": "ses_outside", "title": "Elsewhere", "directory": "/fixture/Jard2", "time": {"updated": 99}}
+                    newest = {"id": "ses_new_project", "title": "New chat", "directory": "/fixture/Jard/subdir", "time": {"updated": 20}}
+                    outcome["project_rows"] = [older, outside, newest]
+                    outcome["project_details"] = {item["id"]: item for item in outcome["project_rows"]}
+                    assert (await rpc("annotationDestinations", id=annotation))["suggestion"]["sessionId"] == "ses_new_project"
+                    outcome["project_details"]["ses_new_project"] = {**newest, "directory": "/fixture/Jard2"}
+                    assert (await rpc("annotationDestinations", id=annotation))["suggestion"]["sessionId"] == "ses_project"
+                    outcome["project_rows"] = [outside]
+                    no_match = await rpc("annotationDestinations", id=annotation)
+                    assert no_match["suggestion"] is None and not no_match["rule"]["available"] and not posted
+                    del outcome["project_rows"]
+                    del outcome["project_details"]
+                    await rpc("annotationRules", action="remove", id=folder_rule["id"])
+                    print("A project rule followed the newest matching chat, rejected a moved chat, and stayed unavailable when the project emptied.", flush=True)
                     outcome["retired_session"] = True
                     offline_rule = await rpc("annotationDestinations", id=annotation)
                     assert offline_rule["rule"]["id"] == app_rule["id"] and not offline_rule["rule"]["available"]
@@ -1895,8 +1951,8 @@ assert.equal(status.phase, "cancelled")
                         ("DELETE", "/api/session/ses_project/inbox/" + receipt["message"])]
                     assert (await agent("annotate", "deliveries", capture))["deliveries"][0]["status"] == "withdrawn"
                     assert (await agent("annotate", "forget", annotation, "--rule", rule["id"]))["forgotten"]
-                    (await web.delete(f"/api/sessions/{cancelled}")).raise_for_status()
-                    (await web.delete(f"/api/sessions/{capture}")).raise_for_status()
+                    (await web.delete(f"/api/sessions/{cancelled}", headers={"Origin": base})).raise_for_status()
+                    (await web.delete(f"/api/sessions/{capture}", headers={"Origin": base})).raise_for_status()
                     print("Automatic routing sent once after recovery, and panel Undo withdrew only the matching inbox item without reposting.", flush=True)
                     terminal_origin = {"app": "com.mitchellh.ghostty", "name": "Ghostty", "terminal": {
                         "folder": "/fixture/Jard/src", "project": "/fixture/Jard",
@@ -1933,7 +1989,7 @@ assert.equal(status.phase, "cancelled")
                     await route_phase(next_capture, "offer")
                     assert (await rpc("annotationRoute", id=next_capture, action="cancel"))["phase"] == "cancelled"
                     assert len(posted) == manual + 2
-                    (await web.delete(f"/api/sessions/{next_capture}")).raise_for_status()
+                    (await web.delete(f"/api/sessions/{next_capture}", headers={"Origin": base})).raise_for_status()
                     assert "already attempted" in await rpc("annotationPanelSend", id=terminal_capture, target="ses_project", service=service, expect_error=True)
                     assert "does not belong" in await rpc("annotationPanelUndo", id=cancelled, deliveryId=result["deliveryId"], expect_error=True)
                     back = await rpc("annotationPanelUndo", id=terminal_capture, deliveryId=result["deliveryId"])
@@ -1950,11 +2006,11 @@ assert.equal(status.phase, "cancelled")
                     assert "already attempted" in await rpc("annotationPanelSend", id=terminal_capture, target="ses_later", service=service, expect_error=True)
                     assert len(posted) == manual + 3
                     outcome["status"] = 200
-                    (await web.delete(f"/api/sessions/{terminal_capture}")).raise_for_status()
+                    (await web.delete(f"/api/sessions/{terminal_capture}", headers={"Origin": base})).raise_for_status()
                     print("Terminal provenance resolved the visible OpenCode conversation and scoped rules to its project.", flush=True)
                     print("The preview sent and remembered the exact OpenCode destination, restored the prior rule on Undo, and kept it after an uncertain send.", flush=True)
             print("OpenCode search, receipts, exact-item withdrawal, targeted corrections, races, and unknown outcomes passed through the workspace and CLI.", flush=True)
-            (await web.delete(f"/api/sessions/{picked['id']}")).raise_for_status()
+            (await web.delete(f"/api/sessions/{picked['id']}", headers={"Origin": base})).raise_for_status()
             assert (await web.get(assets["manifestUrl"])).status_code == (await web.get(assets["contactSheetUrl"])).status_code == 404
             assert not (await agent("annotate", "list"))["annotations"]
             assert not (await rpc("annotationLease", id=annotation, active=False))["active"]
@@ -2003,7 +2059,7 @@ assert.equal(status.phase, "cancelled")
                         tail = mixed[-24_000:]
                         peak = np.argmax(abs(np.fft.rfft(tail * np.hanning(len(tail)))))
                         assert abs(peak * 2 - 997) < 5 and np.max(np.abs(tail)) > .002
-                (await web.delete(f"/api/sessions/{capture}")).raise_for_status()
+                (await web.delete(f"/api/sessions/{capture}", headers={"Origin": base})).raise_for_status()
             print("Annotations saved video-only, Mac audio only, and both audio sources, with local speech and a verified mix.", flush=True)
             seen.clear()
             forced_meeting = str(uuid4())
@@ -2032,13 +2088,13 @@ assert.equal(status.phase, "cancelled")
             for row in events:
                 fields = transformation_fields[row["phase"]] if row["kind"] == "transformation" else {"inferenceMs"}
                 if row["phase"] == "timing":
-                    fields = {"inferenceMs", "outputWaitMs", "totalMs"}
+                    fields = {"inferenceMs", "outputWaitMs", "totalMs", "speechQueueMs", "audioPriorityMs", "audioReadMs"}
                 assert set(row) <= envelope | fields, row
                 if row["kind"] == "transformation" and row["phase"] == "console":
                     assert row["message"] == "Fixture transformation finished", row
             outside = str(uuid4())
             assert (await web.post("/api/clients/" + outside)).status_code == 204
-            assert "Close other Jard" in await rpc("updateQuiesce", expect_error=True)
+            assert "Close other Jaro" in await rpc("updateQuiesce", expect_error=True)
             assert (await web.delete("/api/clients/" + outside)).status_code == 204
             browser = "/api/clients/" + outside + "/stream"
             async with web.stream("GET", browser) as first_tab:
@@ -2047,8 +2103,8 @@ assert.equal(status.phase, "cancelled")
                 async with web.stream("GET", browser) as second_tab:
                     second_lines = second_tab.aiter_lines()
                     assert await anext(second_lines) == ": Jaro connected"
-                    assert "Close other Jard" in await rpc("updateQuiesce", expect_error=True)
-                assert "Close other Jard" in await rpc("updateQuiesce", expect_error=True)
+                    assert "Close other Jaro" in await rpc("updateQuiesce", expect_error=True)
+                assert "Close other Jaro" in await rpc("updateQuiesce", expect_error=True)
             # Disconnect without a DELETE, as when the browser closes without running pagehide.
             closed_at = time.monotonic()
             assert (await web.get("/api/status")).json()["status"]=="ready"
@@ -2059,7 +2115,7 @@ assert.equal(status.phase, "cancelled")
                         assert update["result"]["ready"]
                         break
                     message = update["error"]["message"]
-                    if "Close other Jard" in message:
+                    if "Close other Jaro" in message:
                         assert time.monotonic() - closed_at < 2, update
                     else:
                         assert "finish its current work" in message, update

@@ -337,7 +337,7 @@ def write_edit(store, directory, key, kind, filename, data, previous=None):
 def notes_markdown(detail, transcript, use_24_hour):
     from saved_meetings import render_export
 
-    summary = {"summary": detail["notes"]["summary"], "personalNotes": None, "overview": None}
+    summary = {"summary": detail["notes"].get("summary"), "personalNotes": None, "overview": None}
     heading, body = render_export({**detail, "notes": summary}, "notes", use_24_hour=use_24_hour).split("\n\n", 1)
     return f"{heading}\n\n[Open transcript]({quote(transcript)})\n\n{body}".encode("utf8")
 
@@ -485,7 +485,7 @@ def refresh(store, row, directory, create_notes, descriptive):
                 row = db.execute("SELECT * FROM meeting_exports WHERE id=?", (row["id"],)).fetchone()
         write_edit(store, directory, row["id"], "transcript", row["filename"],
                    render_export(detail, "md", use_24_hour=use_24_hour).encode("utf8"), (current, info))
-    if current and detail["notes"]["summary"]:
+    if current and (row["notes_filename"] or detail["notes"].get("summary")):
         refresh_notes(store, row, detail, directory, create_notes, use_24_hour)
 
 

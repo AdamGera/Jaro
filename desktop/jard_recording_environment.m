@@ -315,12 +315,24 @@ static JardPlaybackEffects playbackEffects(NSString *mode, double percent) {
 
 - (void)finish:(dispatch_block_t)completion {
     dispatch_async(self.queue, ^{
-        if (!self.active) return;
+        if (!self.active) {
+            if (completion) dispatch_async(dispatch_get_main_queue(), completion);
+            return;
+        }
         JardPlaybackEffects previous = [self combinedEffects];
         self.active = NO;
         [self releaseSleepAssertion];
         self.dictationEffects = playbackEffects(nil, 0);
         [self applyEffectsAfter:previous completion:completion];
+    });
+}
+
+- (void)setDictationMode:(NSString *)mode percent:(double)percent {
+    dispatch_async(self.queue, ^{
+        if (!self.active) return;
+        JardPlaybackEffects previous = [self combinedEffects];
+        self.dictationEffects = playbackEffects(mode, percent);
+        [self applyEffectsAfter:previous completion:nil];
     });
 }
 

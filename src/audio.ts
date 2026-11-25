@@ -251,6 +251,7 @@ export type SavedSession = {
   annotationCustomStorage?: boolean
   annotationStorageUnavailable?: boolean
   meetingTurns?: SpeakerSegment[]
+  transcriptEditRevision?: string
   meetingsManaged?: boolean
   finalizationPending?: boolean
   meetingRetentionDays?: number | null

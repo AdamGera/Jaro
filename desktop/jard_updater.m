@@ -16,9 +16,11 @@ extern NSInteger JardVerifyRolloutFeed(const void *bytes, NSInteger length, cons
 
 static NSString *const pendingKey = @"JardPendingUpdate";
 static NSString *const cleanupKey = @"JardInstalledUpdateBackup";
+static NSString *const rejectedKey = @"JardRejectedUpdate";
 static NSString *const channelKey = @"JardUpdateChannel";
 static NSString *const rolloutBucketKey = @"JardUpdateRolloutBucket";
 static NSString *const stagePrefix = @".jard-update-";
+static const char startupReceipt[] = ".startup-ready";
 static const int64_t feedLimit = 64 * 1024;
 static const int64_t rolloutFeedLimit = 128 * 1024;
 static const uint64_t archiveLimit = 4ULL * 1024 * 1024 * 1024;
@@ -112,7 +114,7 @@ static NSString *feedTagValue(NSString *tag) {
 }
 
 static BOOL archiveDigest(NSString *digest) {
-    return digest.length == 64 &&
+    return [digest isKindOfClass:NSString.class] && digest.length == 64 &&
         [digest rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"].invertedSet].location == NSNotFound;
 }
 
@@ -378,8 +380,8 @@ static BOOL realDirectory(NSURL *url) {
 
 static BOOL isSiblingStage(NSURL *current, NSURL *stage) {
     if (!realDirectory(stage) || ![stage.lastPathComponent hasPrefix:stagePrefix] ||
-        ![stage.URLByDeletingLastPathComponent.URLByStandardizingPath.path
-            isEqual:current.URLByDeletingLastPathComponent.URLByStandardizingPath.path]) return NO;
+        ![stage.URLByDeletingLastPathComponent.URLByResolvingSymlinksInPath.path
+            isEqual:current.URLByDeletingLastPathComponent.URLByResolvingSymlinksInPath.path]) return NO;
     struct stat info;
     return lstat(stage.fileSystemRepresentation, &info) == 0 && info.st_uid == getuid() && (info.st_mode & 077) == 0;
 }
@@ -391,6 +393,12 @@ static BOOL matchesInstalledPath(id path, NSURL *installed) {
 
 static BOOL receiptMatchesStage(NSDictionary *receipt, NSURL *installed, NSURL *stage) {
     return matchesInstalledPath(receipt[@"installed"], installed) && matchesInstalledPath(receipt[@"stage"], stage);
+}
+
+static BOOL rejectedArchive(NSURL *installed, NSString *digest) {
+    if (!archiveDigest(digest)) return NO;
+    NSDictionary *receipt = [NSUserDefaults.standardUserDefaults dictionaryForKey:rejectedKey];
+    return matchesInstalledPath(receipt[@"installed"], installed) && [digest isEqual:receipt[@"sha256"]];
 }
 
 static NSURL *receiptCandidate(NSDictionary *receipt, NSURL *stage) {
@@ -426,6 +434,14 @@ static BOOL directoryMatchesIdentity(NSURL *url, const struct stat *identity) {
     struct stat current;
     return lstat(url.fileSystemRepresentation, &current) == 0 && S_ISDIR(current.st_mode) &&
         current.st_dev == identity->st_dev && current.st_ino == identity->st_ino;
+}
+
+static void clearUpdateReceipts(NSURL *installed, NSURL *stage) {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    for (NSString *key in @[cleanupKey, pendingKey]) {
+        if (receiptMatchesStage([defaults dictionaryForKey:key], installed, stage))
+            [defaults removeObjectForKey:key];
+    }
 }
 
 static dispatch_queue_t stageMaintenanceQueue(void) {
@@ -474,6 +490,13 @@ BOOL JardSwapUpdateBundles(NSURL *current, NSURL *candidate, NSString **reason) 
     return NO;
 }
 
+static void appendRelaunchEnvironment(NSMutableArray<NSString *> *arguments) {
+    NSDictionary *environment = NSProcessInfo.processInfo.environment;
+    for (NSString *key in @[@"RUMBLE_DATA_DIR", @"RUMBLE_PORT", @"RUMBLE_LOG_DIR"]) {
+        if (environment[key]) [arguments addObjectsFromArray:@[@"--env", [key stringByAppendingFormat:@"=%@", environment[key]]]];
+    }
+}
+
 NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     NSTask *task = NSTask.new;
     task.executableURL = [NSURL fileURLWithPath:@"/bin/sh"];
@@ -481,16 +504,162 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     NSMutableArray *arguments = [@[@"-c",
         @"count=0; while /bin/kill -0 \"$1\" 2>/dev/null; do count=$((count+1)); [ \"$count\" -lt 300 ] || exit 1; /bin/sleep 0.2; done; shift; exec /usr/bin/open \"$@\"",
         @"jard-restart", @(process.processIdentifier).stringValue] mutableCopy];
-    NSDictionary *environment = process.environment;
-    for (NSString *key in @[@"RUMBLE_DATA_DIR", @"RUMBLE_PORT", @"RUMBLE_LOG_DIR"]) {
-        if (environment[key]) [arguments addObjectsFromArray:@[@"--env", [key stringByAppendingFormat:@"=%@", environment[key]]]];
-    }
+    appendRelaunchEnvironment(arguments);
     [arguments addObject:bundle.path];
     task.arguments = arguments;
     NSError *error = nil;
     if ([task launchAndReturnError:&error]) return task;
     if (reason) *reason = error.localizedDescription;
     return nil;
+}
+
+static NSTask *scheduleUpdateRelaunch(NSURL *installed, NSURL *candidate, NSString *version, NSString *digest,
+                                    NSString **reason) {
+    struct stat previous, incoming;
+    if (lstat(installed.fileSystemRepresentation, &previous) < 0 ||
+        lstat(candidate.fileSystemRepresentation, &incoming) < 0 || previous.st_dev != incoming.st_dev) {
+        if (reason) *reason = @"The update bundles could not be identified.";
+        return nil;
+    }
+    NSTask *task = NSTask.new;
+    task.executableURL = NSBundle.mainBundle.executableURL;
+    task.arguments = @[@"--jaro-relaunch-update", @(getpid()).stringValue, installed.path, candidate.path,
+        @(previous.st_dev).stringValue, @(previous.st_ino).stringValue, @(incoming.st_ino).stringValue, version,
+        archiveDigest(digest) ? digest : @""];
+    task.standardInput = NSFileHandle.fileHandleWithNullDevice;
+    task.standardOutput = NSFileHandle.fileHandleWithNullDevice;
+    NSError *error = nil;
+    if ([task launchAndReturnError:&error]) return task;
+    if (reason) *reason = error.localizedDescription;
+    return nil;
+}
+
+typedef NS_ENUM(NSInteger, JardUpdateStartup) {
+    JardUpdateStartupFailed, JardUpdateStartupReady, JardUpdateStartupPending,
+};
+
+static NSURL *updateStartupStage(void) {
+    const char *path = getenv("JARD_UPDATE_STARTUP_STAGE");
+    if (!path || path[0] != '/') return nil;
+    NSURL *stage = [NSURL fileURLWithPath:@(path) isDirectory:YES].URLByStandardizingPath;
+    return isSiblingStage(NSBundle.mainBundle.bundleURL, stage) ? stage : nil;
+}
+
+BOOL JardIsUpdateStartupProbe(void) {
+    return updateStartupStage() != nil;
+}
+
+void JardConfirmUpdateStartup(void) {
+    NSURL *stage = updateStartupStage();
+    if (!stage) return;
+    int directory = open(stage.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (directory < 0) return;
+    int receipt = openat(directory, startupReceipt, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (receipt >= 0) {
+        pid_t process = getpid();
+        if (write(receipt, &process, sizeof(process)) != sizeof(process)) unlinkat(directory, startupReceipt, 0);
+        close(receipt);
+    }
+    close(directory);
+}
+
+static BOOL updateStartupConfirmed(int directory) {
+    int receipt = openat(directory, startupReceipt, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (receipt < 0) return NO;
+    pid_t confirmed = 0;
+    BOOL ready = read(receipt, &confirmed, sizeof(confirmed)) == sizeof(confirmed) && confirmed > 1;
+    close(receipt);
+    return ready;
+}
+
+static JardUpdateStartup reopenUpdate(NSURL *installed, NSURL *stage, int lease) {
+    BOOL rolledBack = stage == nil;
+    NSInteger confirmation = rolledBack ? 0 : [updateBundleInfo(installed)[@"JardUpdateStartupConfirmation"] integerValue];
+    BOOL canConfirm = confirmation > 0;
+    NSMutableArray *arguments = NSMutableArray.array;
+    if (!rolledBack) [arguments addObject:@"-W"];
+    appendRelaunchEnvironment(arguments);
+    if (rolledBack) [arguments addObjectsFromArray:@[@"--env", @"JARD_UPDATE_ROLLED_BACK=1"]];
+    if (canConfirm) [arguments addObjectsFromArray:@[@"--env", [@"JARD_UPDATE_STARTUP_STAGE=" stringByAppendingString:stage.path]]];
+    [arguments addObject:installed.path];
+    NSTask *task = NSTask.new;
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/bin/open"];
+    task.arguments = arguments;
+    NSError *error = nil;
+    if (![task launchAndReturnError:&error]) {
+        NSLog(@"Jaro could not open the update bundle: %@", error.localizedDescription);
+        return JardUpdateStartupFailed;
+    }
+    // Allow older launchers their original grace periods. Workspace confirmation
+    // can include a cold engine startup, window load and a graceful shutdown.
+    NSTimeInterval grace = confirmation >= 2 ? 105 : canConfirm ? 60 : rolledBack ? 15 : 5;
+    NSTimeInterval until = NSProcessInfo.processInfo.systemUptime + grace;
+    @try {
+        do {
+            if (canConfirm && updateStartupConfirmed(lease)) return JardUpdateStartupReady;
+            if (!task.running)
+                return rolledBack && task.terminationStatus == 0 ? JardUpdateStartupReady : JardUpdateStartupFailed;
+            usleep(50 * 1000);
+        } while (NSProcessInfo.processInfo.systemUptime < until);
+        return canConfirm || rolledBack ? JardUpdateStartupPending : JardUpdateStartupReady;
+    } @finally {
+        // End the wait in Launch Services. The app it opened has its own lifetime.
+        if (task.running) [task terminate];
+    }
+}
+
+int JardRunUpdateRelaunch(int argc, const char *argv[]) {
+    if (argc != 10) return 1;
+    pid_t parent = (pid_t)strtol(argv[2], NULL, 10);
+    if (parent <= 1) return 1;
+    NSURL *installed = [NSURL fileURLWithPath:@(argv[3]) isDirectory:YES].URLByStandardizingPath;
+    NSURL *candidate = [NSURL fileURLWithPath:@(argv[4]) isDirectory:YES].URLByStandardizingPath;
+    NSURL *stage = candidate.URLByDeletingLastPathComponent;
+    struct stat previous = {.st_dev = (dev_t)strtol(argv[5], NULL, 10), .st_ino = strtoull(argv[6], NULL, 10)};
+    struct stat incoming = {.st_dev = previous.st_dev, .st_ino = strtoull(argv[7], NULL, 10)};
+    if (![installed.pathExtension.lowercaseString isEqual:@"app"] ||
+        ![candidate.pathExtension.lowercaseString isEqual:@"app"] || !isSiblingStage(installed, stage)) return 1;
+    NSTimeInterval until = NSProcessInfo.processInfo.systemUptime + 60;
+    while (getppid() == parent && NSProcessInfo.processInfo.systemUptime < until) usleep(50 * 1000);
+    if (getppid() == parent) return 1;
+
+    int lease = lockStage(stage);
+    if (lease < 0) return 1;
+    @try {
+        struct stat stageIdentity;
+        if (fstat(lease, &stageIdentity) < 0) return 1;
+        // The parent may have failed or aborted before the exchange.
+        if (!directoryMatchesIdentity(installed, &incoming) || !directoryMatchesIdentity(candidate, &previous)) return 1;
+        unlinkat(lease, startupReceipt, 0);
+        JardUpdateStartup startup = reopenUpdate(installed, stage, lease);
+        if (startup == JardUpdateStartupPending) return 1;
+        if (startup == JardUpdateStartupFailed) {
+            NSString *reason = nil;
+            if (!JardVerifyUpdateBundle(installed, candidate, @(argv[8]), &reason) ||
+                !directoryMatchesIdentity(stage, &stageIdentity) ||
+                !directoryMatchesIdentity(installed, &incoming) || !directoryMatchesIdentity(candidate, &previous) ||
+                !JardSwapUpdateBundles(installed, candidate, &reason)) {
+                NSLog(@"Jaro could not restore the previous version: %@", reason ?: @"The installation changed.");
+                return 1;
+            }
+            NSString *digest = @(argv[9]);
+            if (archiveDigest(digest)) {
+                NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+                [defaults setObject:@{@"installed": installed.path, @"sha256": digest} forKey:rejectedKey];
+                [defaults synchronize]; // The restored version is a separate process.
+            }
+            if (reopenUpdate(installed, nil, -1) != JardUpdateStartupReady)
+                NSLog(@"Jaro’s previous version was restored but could not be opened.");
+        }
+        if (directoryMatchesIdentity(stage, &stageIdentity) && isSiblingStage(installed, stage)) {
+            // Retire this stage's receipt before another update can reuse its path.
+            clearUpdateReceipts(installed, stage);
+            [NSFileManager.defaultManager removeItemAtURL:stage error:nil];
+        }
+        return 0;
+    } @finally {
+        close(lease);
+    }
 }
 
 @interface JardUpdater () <NSURLSessionDownloadDelegate>
@@ -543,8 +712,9 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     _phase = @"idle";
     _message = @"";
     _changed = [changed copy];
+    BOOL confirmsWorkspace = [[bundle objectForInfoDictionaryKey:@"JardUpdateStartupConfirmation"] integerValue] >= 2;
     dispatch_async(stageMaintenanceQueue(), ^{
-        [self cleanPreviousUpdate];
+        if (!confirmsWorkspace) [self cleanPreviousUpdate];
         [self pruneAbandonedStages];
     });
     return self;
@@ -737,6 +907,11 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
         [defaults removeObjectForKey:pendingKey];
 }
 
+- (void)confirmStartup {
+    JardConfirmUpdateStartup();
+    dispatch_async(stageMaintenanceQueue(), ^{ [self cleanPreviousUpdate]; });
+}
+
 - (BOOL)hasLiveReceiptForStage:(NSURL *)stage {
     NSDictionary *installed = updateBundleInfo(self.installed);
     id installedVersion = installed[@"CFBundleVersion"];
@@ -813,6 +988,7 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
     NSString *channel = saved[@"channel"] ?: @"stable";
     NSString *selected = self.selectedChannel;
     BOOL eligible = [channel isEqual:self.buildChannel] &&
+        !rejectedArchive(self.installed, saved[@"sha256"]) &&
         [version compare:self.version options:NSNumericSearch] == NSOrderedDescending;
     self.restoringStage = YES;
     NSUInteger generation = self.generation;
@@ -1077,6 +1253,11 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
         [self completeCheck:[self canInstallStagedUpdate] ? @"ready" : @"current" message:@"" failed:NO];
         return;
     }
+    if (rejectedArchive(self.installed, digest)) {
+        if ([self.stageDigest isEqual:digest]) [self discardStage];
+        [self error:@"This update failed to start. Jaro will check again for a different build."];
+        return;
+    }
     self.transferVersion = next;
     self.transferNotes = [[NSString alloc] initWithBytes:notes length:result.release_notes_len encoding:NSUTF8StringEncoding] ?: @"";
     self.transferChannel = self.selectedChannel;
@@ -1313,7 +1494,7 @@ NSTask *JardScheduleRelaunch(NSURL *bundle, NSString **reason) {
 - (BOOL)swapVerifiedUpdateAndRelaunch:(BOOL)relaunch reason:(NSString **)reason {
     NSTask *reopen = nil;
     if (relaunch) {
-        reopen = JardScheduleRelaunch(self.installed, reason);
+        reopen = scheduleUpdateRelaunch(self.installed, self.candidate, self.version, self.stageDigest, reason);
         if (!reopen) return NO;
     }
     if (!JardSwapUpdateBundles(self.installed, self.candidate, reason)) {

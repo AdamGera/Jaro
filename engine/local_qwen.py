@@ -124,6 +124,10 @@ def runtime_installed():
         return False
 
 
+def writing_model_installed():
+    return runtime_installed() and WEIGHTS.is_file()
+
+
 class LocalQwen:
     def __init__(self):
         self.socket_dir = None
@@ -166,7 +170,7 @@ class LocalQwen:
         await self.available.wait()
         if self.process and self.process.returncode is None and self.healthy:
             return
-        if not runtime_installed() or not WEIGHTS.is_file():
+        if not writing_model_installed():
             if sys.platform in PORTABLE_BIN_SHA:
                 raise RuntimeError("Run `jardctl model install --all` to install the local writing model.")
             raise RuntimeError("Run Setup Jaro to install the local writing model.")

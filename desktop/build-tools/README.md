@@ -18,6 +18,8 @@ python3 desktop/build-tools/package.py --dmg \
 
 The build verifies CPython and llama.cpp archives, installs hash-locked wheels into a portable Python runtime, and compiles the required FFmpeg decoders from upstream source. PyTorch, FFmpeg, FFprobe, the language catalogs, and the Metal-enabled writer executable are included inside the app. The model weights are installed separately at first use. Setup can download the pinned files or copy them from an existing `model/` directory. Progress and checksums apply to either source.
 
+Before signing or replacing the build output, the packager checks the staged workspace and uses its bundled Python to load the engine, desktop bridge, and CLI. This check uses a temporary library and runs without models or permission prompts.
+
 For an isolated test, set `RUMBLE_DATA_DIR` to a fresh private temporary directory, `RUMBLE_LOG_DIR` inside that directory, and `RUMBLE_PORT` to an unused local port. These variables work with the bundle's executable and helpers. This keeps fixtures separate from the everyday session library. A packaging smoke test can use `Contents/Helpers/jard-engine model-status`, followed by `Contents/Helpers/jard-engine models --from /path/to/model` and `Contents/Helpers/jard-engine start`.
 
 ## Local iteration
@@ -57,11 +59,16 @@ jard='/Applications/Jaro.app/Contents/Helpers/jardctl'
 "$jard" meetings watch
 ```
 
+With Jaro running, pass the full UUID from `meetings list --json` to
+`jardctl meetings delete <id>` to move a saved meeting and its files to Trash.
+The command accepts settled interrupted meetings and refuses meetings with work
+still pending. Add `--json` to check whether Trash delivery is pending.
+
 Use the same executable with the `mcp` argument for a local stdio MCP client. It exposes meeting discovery, transcript and notes search, timed transcript reads, saved notes, and `jard-meeting://{meeting_id}` Markdown resources. The CLI and MCP label the rolling transcript while Jard records and finalizes it. Interrupted meetings retain readable provisional text when it was saved. They use the same meeting ID after recovery. Use `--no-in-progress` or `include_in_progress: false` to exclude current recordings and finalizations. Date filters match the meeting's full time span, and a date in `--until` includes that entire local day.
 
 Markdown meeting reads include the saved Quick Brief, Overview, and My Notes when available. Use `--from` and `--to` to excerpt the transcript without cutting speaker turns. JSON returns the requested bounds in milliseconds, and Markdown identifies the range above the transcript. The MCP transcript tool accepts `start` and `end` or `from` and `to` using the same offsets. Subtitle exports retain each selected turn's position from the beginning of the recording.
 
-When Jard reopens, it resumes pending meetings from their last committed audio checkpoint once the model is ready and the recorder is idle. Interrupted sessions show `finalizationPending` while waiting. Two unexpected stops during recovery leave the recording and available transcript in Sessions under the original ID.
+When Jaro reopens, saved Sessions and Meetings resume transcription from their last committed audio checkpoint once the model is ready and the recorder is idle. The workspace shows that it's waiting to resume, and the session API reports `finalizationPending`. Two unexpected stops during recovery leave the recording and available transcript in Sessions under the original ID. See the [shared recording workflow](../../docs/recording-workspace.md).
 
 Meetings Settings controls whole-meeting retention. The 24-hour default covers new meetings, while an explicit setting applies to existing completed meetings too. Expired meetings disappear from Sessions and companion reads. Their audio, transcript, and notes are available together in the macOS Trash. A separate audio window or the confirmed Move meeting audio to Trash action moves only the recording and its source tracks. The transcript and notes stay in Sessions for the lifetime of the meeting.
 

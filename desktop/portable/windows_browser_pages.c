@@ -4,6 +4,7 @@
 #include <initguid.h>
 #include <uiautomationclient.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <wchar.h>
 
 enum { WINDOWS_PER_BROWSER = 6, MAX_BROWSERS = 48, MAX_URL = 4096 };
@@ -56,7 +57,16 @@ static void emit(char kind, int browser, int window, const wchar_t *value) {
     fflush(stdout); // Keep earlier windows' results if a later provider hangs.
 }
 
-static void read_document(IUIAutomation *automation, IUIAutomationCondition *condition, HWND window, int browser, int index) {
+static BOOL still_foreground(HWND window, DWORD pid, const wchar_t *title) {
+    DWORD actual = 0;
+    wchar_t current[512];
+    return GetForegroundWindow() == window && GetWindowThreadProcessId(window, &actual) && actual == pid &&
+           GetWindowTextLengthW(window) < (int)ARRAYSIZE(current) && GetWindowTextW(window, current, ARRAYSIZE(current)) &&
+           !wcscmp(current, title);
+}
+
+static void read_document(IUIAutomation *automation, IUIAutomationCondition *condition, HWND window, int browser, int index,
+                          DWORD foreground_pid, const wchar_t *foreground_title) {
     IUIAutomationElement *root = NULL, *document = NULL;
     if (FAILED(IUIAutomation_ElementFromHandle(automation, (UIA_HWND)window, &root)) || !root) return;
     HRESULT result = IUIAutomationElement_FindFirst(root, TreeScope_Descendants, condition, &document);
@@ -71,8 +81,44 @@ static void read_document(IUIAutomation *automation, IUIAutomationCondition *con
     result = IUIAutomationValuePattern_get_CurrentValue(pattern, &address);
     IUIAutomationValuePattern_Release(pattern);
     if (SUCCEEDED(result) && address && SysStringLen(address) <= MAX_URL && wcslen(address) == SysStringLen(address) &&
+        (!foreground_pid || still_foreground(window, foreground_pid, foreground_title)) &&
         (!wcsncmp(address, L"https://", 8) || !wcsncmp(address, L"http://", 7))) emit('U', browser, index, address);
     SysFreeString(address);
+}
+
+static int read_windows(Search *search, DWORD foreground_pid, const wchar_t *foreground_title) {
+    if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return 2;
+    IUIAutomation *automation = NULL;
+    HRESULT result = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER,
+                                      &IID_IUIAutomation, (void **)&automation);
+    if (SUCCEEDED(result)) {
+        VARIANT type = {.vt = VT_I4, .lVal = UIA_DocumentControlTypeId};
+        IUIAutomationCondition *condition = NULL;
+        result = IUIAutomation_CreatePropertyCondition(automation, UIA_ControlTypePropertyId, type, &condition);
+        if (SUCCEEDED(result)) {
+            for (int i = 0; i < search->count; i++) {
+                Browser *browser = &search->browsers[i];
+                for (int index = 0; index < browser->count; index++)
+                    read_document(automation, condition, browser->windows[index], i, index, foreground_pid, foreground_title);
+            }
+            IUIAutomationCondition_Release(condition);
+        }
+        IUIAutomation_Release(automation);
+    }
+    CoUninitialize();
+    return result == S_OK ? 0 : 2;
+}
+
+int jaro_foreground_page(const wchar_t *window_text, const wchar_t *pid_text) {
+    wchar_t *end;
+    HWND window = (HWND)(UINT_PTR)wcstoull(window_text, &end, 10);
+    if (*end || !window) return 2;
+    DWORD pid = wcstoul(pid_text, &end, 10);
+    if (*end || !pid) return 2;
+    wchar_t title[512];
+    if (!GetWindowTextW(window, title, ARRAYSIZE(title)) || !still_foreground(window, pid, title)) return 0;
+    Search search = {.count = 1, .browsers = {{.windows = {window}, .count = 1}}};
+    return read_windows(&search, pid, title);
 }
 
 int jaro_browser_pages(int count, wchar_t **binaries) {
@@ -89,25 +135,7 @@ int jaro_browser_pages(int count, wchar_t **binaries) {
         }
     }
     if (!any) return 0;
-    if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return 2;
-    IUIAutomation *automation = NULL;
-    HRESULT result = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER,
-                                      &IID_IUIAutomation, (void **)&automation);
-    if (SUCCEEDED(result)) {
-        VARIANT type = {.vt = VT_I4, .lVal = UIA_DocumentControlTypeId};
-        IUIAutomationCondition *condition = NULL;
-        result = IUIAutomation_CreatePropertyCondition(automation, UIA_ControlTypePropertyId, type, &condition);
-        if (SUCCEEDED(result)) {
-            for (int i = 0; i < count; i++) {
-                Browser *browser = &search.browsers[i];
-                for (int index = 0; index < browser->count; index++)
-                    read_document(automation, condition, browser->windows[index], i, index);
-            }
-            IUIAutomationCondition_Release(condition);
-            puts("done");
-        }
-        IUIAutomation_Release(automation);
-    }
-    CoUninitialize();
-    return result == S_OK ? 0 : 2;
+    int result = read_windows(&search, 0, NULL);
+    if (result == 0) puts("done");
+    return result;
 }

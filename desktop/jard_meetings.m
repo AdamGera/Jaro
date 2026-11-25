@@ -10,6 +10,8 @@
 static NSString *const managedMessage = @"Meetings are managed by your organization.";
 static NSString *const detectionKey = @"JardDetectMeetings";
 static NSString *const policyKey = @"JardMeetingProviderPolicies";
+static NSString *const defaultPolicyKey = @"JardMeetingDefaultPolicy";
+static NSString *const recentSourcesKey = @"JardMeetingRecentCallSources";
 static NSString *const lastSessionKey = @"JardLastMeetingSession";
 static NSString *const autoStopKey = @"JardMeetingAutoStop";
 static NSString *const noiseCleanupKey = @"JardMeetingNoiseCleanup";
@@ -26,6 +28,11 @@ static const NSTimeInterval callSwitchObservationGap = 10;
 static const NSTimeInterval callStopGrace = 30;
 static const NSTimeInterval meetingOfferLifetime = 20;
 static const NSTimeInterval offerStartingDelay = .18;
+static const NSUInteger recentSourceLimit = 64;
+
+static BOOL validCallPolicy(id policy) {
+    return [@[@"ask", @"auto", @"never"] containsObject:policy ?: NSNull.null];
+}
 
 static NSString *meetingClock(NSTimeInterval seconds) {
     long elapsed = (long)MAX(0, seconds);
@@ -54,6 +61,7 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic, strong) JardCall *offered, *activeCall;
 @property(nonatomic) BOOL offerChoicesOpen;
+@property(nonatomic) BOOL offerAllowsAutomaticRecording;
 @property(nonatomic) NSTimeInterval offerDepartureAt;
 @property(nonatomic) NSSize offerDepartureSize;
 @property(nonatomic) BOOL offerStartingVisible;
@@ -83,6 +91,7 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
 @property(nonatomic) BOOL microphoneSilent;
 @property(nonatomic) BOOL microphoneUnavailable;
 @property(nonatomic) BOOL systemAudioUnavailable;
+@property(nonatomic) BOOL systemAudioPermissionDenied;
 @property(nonatomic) BOOL captureUsesSharedMicrophone;
 @property(nonatomic, copy) NSString *microphoneName;
 @property(nonatomic, copy) NSString *completionSession;
@@ -90,6 +99,8 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
 @property(nonatomic, copy) NSString *recoveryDraft, *permissionSource, *panelCorner;
 @property(nonatomic, strong) NSNumber *panelDisplay;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *policies;
+@property(nonatomic, copy) NSString *defaultPolicy;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *recentSources;
 @property(nonatomic, strong) NSMutableArray<NSDictionary *> *liveTurns;
 @property(nonatomic, strong) JardMeetingDelta *delta;
 @property(nonatomic, copy) NSString *textMeetingID, *exhaustedMeetingID, *emptyMeetingID;
@@ -129,14 +140,25 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
     NSString *corner = [defaults stringForKey:cornerKey];
     _panelCorner = JardValidMeetingCorner(corner) ? corner : @"topRight";
     _panelDisplay = [defaults objectForKey:displayKey];
+    NSString *savedDefault = [defaults stringForKey:defaultPolicyKey];
+    _defaultPolicy = validCallPolicy(savedDefault) ? savedDefault : @"ask";
+    _recentSources = NSMutableDictionary.dictionary;
+    if (!managed) {
+        for (id entry in [defaults arrayForKey:recentSourcesKey]) {
+            if (_recentSources.count >= recentSourceLimit) break;
+            if (![entry isKindOfClass:NSDictionary.class] || ![entry[@"provider"] isKindOfClass:NSString.class] ||
+                ![entry[@"label"] isKindOfClass:NSString.class] || ![entry[@"lastSeen"] isKindOfClass:NSNumber.class]) continue;
+            _recentSources[entry[@"provider"]] = entry;
+        }
+    }
     _policies = NSMutableDictionary.dictionary;
     NSDictionary *savedPolicies = [NSUserDefaults.standardUserDefaults dictionaryForKey:policyKey];
     for (NSString *key in savedPolicies) {
         id entry = savedPolicies[key];
         if (![entry isKindOfClass:NSDictionary.class] || ![entry[@"label"] isKindOfClass:NSString.class] ||
-            ![@[@"ask", @"auto", @"never"] containsObject:entry[@"policy"] ?: NSNull.null]) continue;
+            !validCallPolicy(entry[@"policy"])) continue;
         if ([key hasPrefix:@"browser:"] && [entry[@"policy"] isEqual:@"auto"]) continue;
-        _policies[key] = entry;
+        _policies[key] = @{@"provider": key, @"label": entry[@"label"], @"policy": entry[@"policy"]};
     }
     _lastSavedSessionID = [NSUserDefaults.standardUserDefaults stringForKey:lastSessionKey];
     _reminded = NSMutableDictionary.dictionary;
@@ -171,10 +193,11 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
         @"session": self.sessionID ?: @"", @"hasText": @(self.hasExcerpt),
         @"hasSavedMeeting": @(self.lastSavedSessionID != nil),
         @"hasNewText": @(self.hasNewExcerpt), @"copying": @(self.copying), @"policies": self.policies.allValues,
-        @"providerPolicies": [self providerPolicies],
+        @"providerPolicies": [self providerPolicies], @"defaultPolicy": self.defaultPolicy,
         @"microphoneSilent": @(self.recording && self.microphoneSilent && !self.microphoneUnavailable),
         @"microphoneUnavailable": @(self.recording && self.microphoneUnavailable),
         @"systemAudioUnavailable": @(self.recording && self.systemAudioUnavailable),
+        @"systemAudioPermissionDenied": @(self.recording && self.systemAudioPermissionDenied),
         @"microphone": self.recording && !self.microphoneUnavailable ? self.microphoneName ?: @"" : @"",
         @"autoStop": @(self.autoStop), @"autoStopSeconds": @(self.autoStopAt > 0 ? ceil(MAX(0, self.autoStopAt - NSProcessInfo.processInfo.systemUptime)) : 0),
         @"noiseCleanup": @([NSUserDefaults.standardUserDefaults boolForKey:noiseCleanupKey]),
@@ -331,9 +354,18 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
     });
 }
 
+static BOOL verifiedCall(JardCall *target, NSArray<JardCall *> *observations) {
+    for (JardCall *call in observations) {
+        if (call.inputActive && !call.unnamedBrowser && !call.unverifiedPage && [target matchesObservation:call]) return YES;
+    }
+    return NO;
+}
+
 - (void)observeCalls:(NSArray<JardCall *> *)observations now:(NSTimeInterval)now date:(NSDate *)date {
+    if (self.managed) return;
     NSArray<JardCall *> *calls = [self.presence callsResolvingSwitch:observations now:now];
     JardCall *candidate = [self.presence offerFromCalls:calls now:now];
+    if (candidate) [self noteCallSource:candidate at:date];
     if (self.busy) {
         if ([self.phase isEqual:@"saving"]) {
             for (JardCall *call in observations) {
@@ -358,6 +390,11 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
                 self.offered = call;
             break;
         }
+        BOOL verified = verifiedCall(self.offered, observations);
+        if (self.offerAllowsAutomaticRecording != verified) {
+            self.offerAllowsAutomaticRecording = verified;
+            if (self.offerChoicesOpen) [self renderPanel];
+        }
         BOOL timedOut = !self.offerChoicesOpen && now - self.offeredAt >= meetingOfferLifetime;
         BOOL replaced = candidate && !present && ![self.offered matchesOfferObservation:candidate];
         if (!replaced && !timedOut && now - self.lastPresent < 3) return;
@@ -377,18 +414,21 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
         [self.presence deferOfferForCall:candidate now:now];
         return;
     }
+    BOOL verified = verifiedCall(candidate, observations);
+    BOOL automatic = verified && [policy isEqual:@"auto"];
     if (self.calendarOffer) {
-        if (![policy isEqual:@"auto"] || !JardCalendarMatchesCall(self.calendarOffer, candidate)) return;
+        if (!automatic || !JardCalendarMatchesCall(self.calendarOffer, candidate)) return;
         [self closeCalendarOffer];
     }
     self.offered = candidate;
+    self.offerAllowsAutomaticRecording = verified;
     self.offeredAt = self.lastPresent = now;
     self.providerLabel = nil;
     self.meetingTitle = nil;
     self.provisionalTitle = nil;
     NSString *title = candidate.unnamedBrowser ? [NSString stringWithFormat:@"Call in %@", candidate.label] :
         [NSString stringWithFormat:@"%@ call detected", candidate.label];
-    if ([policy isEqual:@"auto"] && !candidate.unnamedBrowser) [self begin:NO automatic:YES languages:@[] reply:nil];
+    if (automatic) [self begin:NO automatic:YES languages:@[] reply:nil];
     else [self state:@"offered" message:title];
 }
 
@@ -405,10 +445,10 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
         if (!call.inputActive && !automatic) continue;
         if ([self.activeCall matchesObservation:call]) {
             present = YES;
-            if ([self.activeCall.identity isEqual:call.identity] || call.googleMeetCode) confirmedCurrent = YES;
-            if (!self.activeCall.googleMeetCode && call.googleMeetCode) self.activeCall = call;
+            if (!call.unverifiedPage && ([self.activeCall.identity isEqual:call.identity] || call.googleMeetCode)) confirmedCurrent = YES;
+            if (!call.unverifiedPage && !self.activeCall.googleMeetCode && call.googleMeetCode) self.activeCall = call;
         } else if ([call.application isEqual:self.activeCall.application]) {
-            if (call.unnamedBrowser) present = YES;
+            if (call.unnamedBrowser || call.unverifiedPage) present = YES;
             else if ([self.keptSwitch isEqual:call.identity]) present = confirmedCurrent = YES;
             else if (automatic && self.activeCall.googleMeetCode && call.googleMeetCode) other = call;
         }
@@ -452,14 +492,20 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
 }
 
 - (NSString *)policyForCall:(JardCall *)call {
-    return self.policies[call.provider][@"policy"] ?:
+    return [self policyForCall:call defaultPolicy:self.defaultPolicy];
+}
+
+- (NSString *)policyForCall:(JardCall *)call defaultPolicy:(NSString *)defaultPolicy {
+    NSString *policy = self.policies[call.provider][@"policy"] ?:
         self.policies[[@"browser:" stringByAppendingString:call.application]][@"policy"] ?:
-        (call.unnamedBrowser ? nil : [self policyForLabel:call.label]);
+        (call.unnamedBrowser ? nil : [self policyForLabel:call.label]) ?: defaultPolicy;
+    return (call.unnamedBrowser || call.unverifiedPage) && [policy isEqual:@"auto"] ? @"ask" : policy;
 }
 
 - (NSString *)policyForCalendar:(JardCalendarMeeting *)event {
     JardCall *linked = event.link ? JardMeetingBrowserCall(event.link, @"calendar") : nil;
-    return linked ? [self policyForCall:linked] : [self policyForLabel:event.provider];
+    NSString *fallback = self.detection && event.provider ? self.defaultPolicy : @"ask";
+    return linked ? [self policyForCall:linked defaultPolicy:fallback] : [self policyForLabel:event.provider] ?: fallback;
 }
 
 - (NSString *)policyForLabel:(NSString *)label {
@@ -479,22 +525,48 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
     return nil;
 }
 
+- (NSArray<NSDictionary *> *)orderedCallSources {
+    return [self.recentSources.allValues sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+        NSComparisonResult order = [right[@"lastSeen"] compare:left[@"lastSeen"]];
+        return order == NSOrderedSame ? [left[@"provider"] compare:right[@"provider"]] : order;
+    }];
+}
+
+- (void)noteCallSource:(JardCall *)call at:(NSDate *)date {
+    NSNumber *time = @(date.timeIntervalSince1970);
+    NSDictionary *previous = self.recentSources[call.provider];
+    if ([previous[@"label"] isEqual:call.label] && time.doubleValue - [previous[@"lastSeen"] doubleValue] < 3600) return;
+    self.recentSources[call.provider] = @{@"provider": call.provider, @"label": call.label, @"lastSeen": time};
+    NSArray<NSDictionary *> *ordered = [self orderedCallSources];
+    if (ordered.count > recentSourceLimit) {
+        [self.recentSources removeObjectForKey:ordered.lastObject[@"provider"]];
+        ordered = [ordered subarrayWithRange:NSMakeRange(0, recentSourceLimit)];
+    }
+    [NSUserDefaults.standardUserDefaults setObject:ordered forKey:recentSourcesKey];
+    if (self.changed) self.changed([self status]);
+}
+
 - (NSArray<NSDictionary *> *)providerPolicies {
     NSMutableArray<NSDictionary *> *rows = NSMutableArray.array;
-    NSMutableSet<NSString *> *builtIn = NSMutableSet.set;
-    for (NSDictionary *provider in JardMeetingProviderCatalog()) {
-        NSString *key = provider[@"provider"];
-        [builtIn addObject:key];
-        [rows addObject:@{@"provider": key, @"label": provider[@"label"],
-            @"policy": [self policyForLabel:provider[@"label"]] ?: @"ask", @"canAlwaysRecord": @YES}];
+    NSMutableSet<NSString *> *included = NSMutableSet.set;
+    NSMutableArray<NSDictionary *> *sources = [[self orderedCallSources] mutableCopy];
+    for (NSString *key in [self.policies.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        [sources addObject:@{@"provider": key, @"label": self.policies[key][@"label"]}];
     }
-    for (NSString *key in [self.policies.allKeys sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)]) {
-        if ([builtIn containsObject:key]) continue;
-        NSDictionary *entry = self.policies[key];
+    [sources addObjectsFromArray:JardMeetingProviderCatalog()];
+    for (NSDictionary *entry in sources) {
+        NSString *key = entry[@"provider"], *label = entry[@"label"];
+        if ([included containsObject:key]) continue;
+        [included addObject:key];
         BOOL browser = [key hasPrefix:@"browser:"];
+        NSString *explicitPolicy = self.policies[key][@"policy"];
+        NSString *policy = explicitPolicy ?: (browser ? nil : [self policyForLabel:label]) ?: self.defaultPolicy;
+        if (browser && [policy isEqual:@"auto"]) policy = @"ask";
         NSString *scope = [key hasPrefix:@"site:"] ? [key substringFromIndex:5] : @"";
-        [rows addObject:@{@"provider": key, @"label": entry[@"label"], @"scope": scope,
-            @"policy": entry[@"policy"], @"canAlwaysRecord": @(!browser)}];
+        // Catalog labels already identify these providers without a redundant host.
+        if ([self builtInLabelForProvider:key]) scope = @"";
+        [rows addObject:@{@"provider": key, @"label": label, @"scope": scope, @"policy": policy,
+            @"canAlwaysRecord": @(!browser), @"inheritsPolicy": @(explicitPolicy == nil), @"lastSeen": entry[@"lastSeen"] ?: @0}];
     }
     return rows;
 }
@@ -581,10 +653,17 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
 }
 
 - (void)setPolicy:(NSString *)policy provider:(NSString *)provider label:(NSString *)label {
-    if (self.policies[provider] || self.policies.count < 80 || [self builtInLabelForProvider:provider]) {
-        self.policies[provider] = @{@"provider": provider, @"label": label, @"policy": policy};
-    }
+    if ([policy isEqual:@"inherit"]) [self.policies removeObjectForKey:provider];
+    else self.policies[provider] = @{@"provider": provider, @"label": label, @"policy": policy};
     [NSUserDefaults.standardUserDefaults setObject:self.policies forKey:policyKey];
+}
+
+- (void)callPoliciesChanged {
+    if (self.offered && [[self policyForCall:self.offered] isEqual:@"never"]) [self dismissOffer];
+    else {
+        if (self.calendarOffer) [self renderPanel];
+        if (self.changed) self.changed([self status]);
+    }
 }
 
 - (NSString *)builtInLabelForProvider:(NSString *)key {
@@ -633,6 +712,7 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
     self.microphoneSilent = NO;
     self.microphoneUnavailable = NO;
     self.systemAudioUnavailable = NO;
+    self.systemAudioPermissionDenied = NO;
     self.microphoneName = nil;
     self.automaticRecording = automatic;
     self.autoStopAt = self.differentSince = 0;
@@ -736,10 +816,13 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
         if (self.changed) self.changed([self status]);
     } else if ([event isEqual:@"meetingSystemAudio"] && self.recording) {
         BOOL unavailable = ![capture[@"available"] boolValue];
-        if (unavailable == self.systemAudioUnavailable) return;
+        BOOL denied = unavailable && [capture[@"permissionDenied"] isEqual:@YES];
+        if (unavailable == self.systemAudioUnavailable && denied == self.systemAudioPermissionDenied) return;
         self.systemAudioUnavailable = unavailable;
+        self.systemAudioPermissionDenied = denied;
         [self updateCaption];
-        [self announceMeetingStatus:JardLocalized(unavailable ? @"Mac audio reconnecting." : @"Mac audio reconnected.")];
+        [self announceMeetingStatus:JardLocalized(denied ? @"Mac audio access was denied." :
+            unavailable ? @"Mac audio reconnecting." : @"Mac audio reconnected.")];
         if (self.changed) self.changed([self status]);
     } else if ([event isEqual:@"sourceChanged"] && self.recording) {
         NSString *name = [capture[@"microphone"] isKindOfClass:NSString.class] ? capture[@"microphone"] : nil;
@@ -1119,21 +1202,23 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
     } else if ([action isEqual:@"copyAll"] || [action isEqual:@"copyNew"]) {
         [self copyNew:[action isEqual:@"copyNew"] to:NSPasteboard.generalPasteboard reply:reply];
         return;
+    } else if ([action isEqual:@"setDefaultPolicy"]) {
+        NSString *policy = request[@"policy"];
+        if (!validCallPolicy(policy)) { reply(nil, @"Choose a default recording preference."); return; }
+        self.defaultPolicy = policy;
+        [NSUserDefaults.standardUserDefaults setObject:policy forKey:defaultPolicyKey];
+        [self callPoliciesChanged];
     } else if ([action isEqual:@"setPolicy"]) {
         NSString *provider = request[@"provider"];
         NSString *policy = request[@"policy"];
         NSString *label = [provider isKindOfClass:NSString.class] ?
-            [self builtInLabelForProvider:provider] ?: self.policies[provider][@"label"] : nil;
-        if (!label.length || ![@[@"ask", @"auto", @"never"] containsObject:policy ?: NSNull.null] ||
+            [self builtInLabelForProvider:provider] ?: self.policies[provider][@"label"] ?: self.recentSources[provider][@"label"] : nil;
+        if (!label.length || (!validCallPolicy(policy) && ![policy isEqual:@"inherit"]) ||
             ([policy isEqual:@"auto"] && [provider hasPrefix:@"browser:"])) {
             reply(nil, @"Choose an available recording preference for this provider."); return;
         }
         [self setPolicy:policy provider:provider label:label];
-        if (self.offered && [[self policyForCall:self.offered] isEqual:@"never"]) [self dismissOffer];
-        else {
-            if (self.calendarOffer) [self renderPanel];
-            if (self.changed) self.changed([self status]);
-        }
+        [self callPoliciesChanged];
     } else if (![action isEqual:@"status"]) {
         reply(nil, @"Unknown meeting action."); return;
     }
@@ -1320,7 +1405,7 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
 - (void)calendarJoinRecord:(id)sender { [self answerCalendar:self.calendarOffer.identifier choice:@"joinRecord" reply:nil]; }
 - (void)calendarDismiss:(id)sender { [self answerCalendar:self.calendarOffer.identifier choice:@"dismiss" reply:nil]; }
 - (void)alwaysButton:(id)sender {
-    if (![self currentOfferButton:sender choices:YES] || self.offered.unnamedBrowser) return;
+    if (![self currentOfferButton:sender choices:YES] || !self.offerAllowsAutomaticRecording) return;
     JardCall *call = self.offered;
     [self setPolicy:@"auto" provider:call.provider label:call.label];
     [self startFromOffer];
@@ -1341,12 +1426,13 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
 }
 
 - (void)openRecordingPrivacy {
-    if (!self.permissionSource) return;
-    if ([self.permissionSource isEqual:@"system"] && self.showSystemAudioSettings) {
+    NSString *source = self.permissionSource ?: (self.recording && self.systemAudioPermissionDenied ? @"system" : nil);
+    if (!source) return;
+    if ([source isEqual:@"system"] && self.showSystemAudioSettings) {
         self.showSystemAudioSettings();
         return;
     }
-    NSString *pane = [self.permissionSource isEqual:@"mic"] ? @"Privacy_Microphone" : @"Privacy_ScreenCapture";
+    NSString *pane = [source isEqual:@"mic"] ? @"Privacy_Microphone" : @"Privacy_ScreenCapture";
     [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:[@"x-apple.systempreferences:com.apple.preference.security?" stringByAppendingString:pane]]];
 }
 
@@ -1390,7 +1476,8 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
     BOOL ended = [self.phase isEqual:@"callEnded"];
     self.caption.maximumNumberOfLines = ended ? 2 : 1;
     self.caption.lineBreakMode = ended ? NSLineBreakByWordWrapping : NSLineBreakByTruncatingTail;
-    NSString *notice = self.microphoneUnavailable && self.systemAudioUnavailable ? @"Audio inputs reconnecting" :
+    NSString *notice = self.systemAudioPermissionDenied ? JardLocalized(@"Mac audio access needed") :
+        self.microphoneUnavailable && self.systemAudioUnavailable ? @"Audio inputs reconnecting" :
         self.microphoneUnavailable ? @"Microphone reconnecting" : self.systemAudioUnavailable ? @"Mac audio reconnecting" :
         self.microphoneSilent ? @"Microphone silent" :
         NSProcessInfo.processInfo.systemUptime < self.automaticUntil ? @"Started automatically" : nil;
@@ -1794,7 +1881,7 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
     BOOL appearing = !self.panel;
     NSSize size = compact ? NSMakeSize(recordingInitialWidth, recordingHeaderHeight) : completed ? NSMakeSize(388, 142) : NSMakeSize(360, 94);
     if (compact && self.offerDepartureAt && self.panel) size = self.panel.frame.size;
-    if (offer) size = self.offerChoicesOpen ? NSMakeSize(self.offered.unnamedBrowser ? 330 : 448, 96) : NSMakeSize(330, 73);
+    if (offer) size = self.offerChoicesOpen ? NSMakeSize(self.offerAllowsAutomaticRecording ? 448 : 330, 96) : NSMakeSize(330, 73);
     BOOL changingOfferLayout = offer && [self.panel.contentView.identifier isEqual:@"meeting-offer"] &&
         !NSEqualSizes(self.panel.frame.size, size);
     if (appearing) {
@@ -1886,7 +1973,7 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
             detail.frame = NSMakeRect(14, 43, size.width - 28, 18);
             [surface addSubview:detail];
             CGFloat edge = size.width - 12;
-            if (!self.offered.unnamedBrowser) {
+            if (self.offerAllowsAutomaticRecording) {
                 edge -= 142;
                 [self button:JardLocalized(@"Always record") action:@selector(alwaysButton:) area:NSMakeRect(edge, 9, 142, 28) into:surface];
                 edge -= 6;

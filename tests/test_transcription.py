@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import contextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from pathlib import Path
 import os
 import plistlib
@@ -20,9 +20,9 @@ from rumble_model import MAX_SAMPLES, SAMPLE_RATE
 from transcription_pieces import wav_piece
 
 
-def write_mic_fixture(path, samples):
+def write_mic_fixture(path, samples, rate=48_000):
     with wave.open(str(path), "wb") as stream:
-        stream.setparams((1, 2, 48_000, 0, "NONE", "not compressed"))
+        stream.setparams((1, 2, rate, 0, "NONE", "not compressed"))
         stream.writeframes(np.asarray(samples, dtype="<i2").tobytes())
 
 
@@ -175,7 +175,7 @@ class TranscriptionTests(unittest.TestCase):
         engine.model.get_audio_features.assert_not_called()
 
     def test_dictation_signal_gate_preserves_sustained_quiet_audio(self):
-        window = 1440
+        window = 480
         noise = np.tile([4, -4], window // 2)
         quiet = np.tile([45, -45], window // 2)
         audible = np.tile([150, -150], window // 2)
@@ -192,10 +192,11 @@ class TranscriptionTests(unittest.TestCase):
         )
         with TemporaryDirectory() as directory:
             path = Path(directory) / "mic.wav"
-            for name, audio, expected in samples:
-                with self.subTest(name=name):
-                    write_mic_fixture(path, audio)
-                    self.assertEqual(dictation_has_signal(path), expected)
+            for rate in (16_000, 48_000):
+                for name, audio, expected in samples:
+                    with self.subTest(name=name, rate=rate):
+                        write_mic_fixture(path, np.repeat(audio, rate // 16_000), rate)
+                        self.assertEqual(dictation_has_signal(path), expected)
 
     def test_multilingual_pause_preserves_every_sample(self):
         phrase = np.full(4 * SAMPLE_RATE, 0.15, dtype="<f4")
@@ -221,6 +222,27 @@ class TranscriptionTests(unittest.TestCase):
 
 
 class DecoderCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_portable_silence_bypasses_decoding_cleanup_and_inference(self):
+        from server import transcribe_dictation, transcribe_portable_dictation
+
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "silent.wav"
+            write_mic_fixture(path, np.zeros(4800), 16_000)
+            state = SimpleNamespace(sdk_embedded=True)
+            cleanup = SimpleNamespace(clean=AsyncMock())
+            with (patch("server.stupase_cleanup", return_value=cleanup),
+                  patch("server.audio_blocks") as decode_file,
+                  patch("server.decode_pcm", new_callable=AsyncMock) as recognize,
+                  patch("server.speech_vocabulary", new_callable=AsyncMock) as vocabulary):
+                self.assertEqual(await transcribe_portable_dictation(state, path, noise_cleanup=True, boost=True),
+                                 {"text": "", "inferenceMs": 0})
+                self.assertEqual(await transcribe_dictation(state, path, (), sdk=True, screen_recording=True),
+                                 {"text": "", "durationMs": 300})
+                decode_file.assert_not_called()
+                recognize.assert_not_awaited()
+                cleanup.clean.assert_not_awaited()
+                vocabulary.assert_not_awaited()
+
 
     async def test_saved_jobs_reuse_terms_for_all_blocks_and_meeting_tracks(self):
         from server import process_saved_audio
@@ -319,40 +341,67 @@ class DecoderCacheTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(b"".join(parts), expected[:count * 4])
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "Requires the local FFmpeg decoder")
-    async def test_mixed_meeting_resumes_its_persisted_chunking_policy(self):
-        from server import process_mixed_audio
+    async def test_session_and_mixed_meeting_resume_their_persisted_chunking_policy(self):
+        from server import process_mixed_audio, recover_pending_recording
         from session_store import SessionStore
+
+        @asynccontextmanager
+        async def audio_priority(**_options):
+            yield
 
         samples = np.full(MAX_SAMPLES + SAMPLE_RATE, 8192, dtype="<i2")
         pause = MAX_SAMPLES - 2 * SAMPLE_RATE
         samples[pause:pause + SAMPLE_RATE // 10] = 0
-        for chunking, checkpoint in ((None, MAX_SAMPLES), (PAUSE_AWARE_CHUNKING, pause + SAMPLE_RATE // 20)):
-            with self.subTest(chunking=chunking), TemporaryDirectory() as directory:
+        pause_boundary = pause + SAMPLE_RATE // 20
+        for meeting, chunking, checkpoint in ((False, None, pause_boundary), (True, None, MAX_SAMPLES),
+                                               (True, PAUSE_AWARE_CHUNKING, pause_boundary)):
+            with self.subTest(meeting=meeting, chunking=chunking), TemporaryDirectory() as directory:
                 root = Path(directory)
                 audio = root / "input.wav"
                 audio.write_bytes(wav_piece(samples.tobytes()))
-                options = {"meeting": True, "recording": True, "diarization": False, "languageHints": ["en"]}
+                options = {"meeting": meeting, "recording": True, "diarization": False, "languageHints": ["en"]}
                 if chunking:
                     options["audioChunking"] = chunking
                 duration = len(samples) / SAMPLE_RATE
                 store = SessionStore(root)
-                key, source = store.create(audio, "Mixed meeting", "audio/wav", options, duration)
-                store.append(key, {"text": "Before restart.", "segments": [], "words": []},
-                             checkpoint / SAMPLE_RATE, next_frame=checkpoint * 3)
-                reopened = SessionStore(root)
-                saved = reopened.claim_meeting_finalization()
-                self.assertEqual(saved["id"], key)
-                self.assertEqual(saved["next_frame"], checkpoint * 3)
-                state = SimpleNamespace(library=reopened, diarizer=None)
+                key, source = store.create(audio, "Recording", "audio/wav", options, duration)
+
+                def interrupt_after_committed_audio(*, seconds, duration):
+                    if seconds:
+                        raise InterruptedError("Simulated engine exit after the first committed block.")
+
+                state = SimpleNamespace(library=store, diarizer=None)
                 with patch("server.decode_pcm", new_callable=AsyncMock,
-                           return_value={"text": "After restart.", "segments": [], "words": []}) as decode:
-                    actual = await process_mixed_audio(state, key, source, saved["options"], duration,
-                                                       checkpoint=saved["next_frame"], progress_only=True,
-                                                       emit=lambda **kwargs: None, vocabulary=())
+                           return_value={"text": "Before restart.", "segments": [], "words": []}) as decode:
+                    with self.assertRaises(InterruptedError):
+                        await process_mixed_audio(state, key, source, options, duration, checkpoint=0,
+                                                  progress_only=True, emit=interrupt_after_committed_audio, vocabulary=())
+                    decode.assert_awaited_once()
+                reopened = SessionStore(root)
+                waiting = reopened.get(key)
+                self.assertEqual((waiting["status"], waiting["meeting"]), ("interrupted", meeting))
+                self.assertTrue(waiting["finalizationPending"])
+                self.assertEqual(waiting["transcript"]["text"], "Before restart.")
+                self.assertEqual(reopened.has_pending_recordings(include_meetings=False), not meeting)
+                self.assertTrue(reopened.list("")[0]["finalizationPending"])
+                if meeting:
+                    self.assertIsNone(reopened.claim_recording_finalization(include_meetings=False))
+                insights = SimpleNamespace(model=SimpleNamespace(audio_priority=audio_priority), wake=asyncio.Event())
+                state = SimpleNamespace(library=reopened, diarizer=None, insights=insights, meeting_subscriber=None)
+                with (patch("server.meetings_managed", return_value=not meeting),
+                      patch("server.speech_vocabulary", new_callable=AsyncMock, return_value=()),
+                      patch("server.decode_pcm", new_callable=AsyncMock,
+                            return_value={"text": "After restart.", "segments": [], "words": []}) as decode):
+                    self.assertTrue(await recover_pending_recording(state, set()))
+                    self.assertFalse(await recover_pending_recording(state, set()))
                     decode.assert_awaited_once()
                 self.assertEqual(decode.await_args.args[-1], checkpoint)
-                self.assertEqual(actual, len(samples))
-                self.assertEqual(reopened.get(key)["transcript"]["text"], "Before restart. After restart.")
+                finished = reopened.get(key)
+                self.assertEqual((finished["status"], finished["meeting"]), ("complete", meeting))
+                self.assertEqual(finished["duration"], duration)
+                self.assertFalse(finished["finalizationPending"])
+                self.assertEqual(finished["transcript"]["text"], "Before restart. After restart.")
+                self.assertEqual(reopened.media(key)[0], source)
 
     async def test_near_silent_native_take_never_calls_model(self):
         from starlette.datastructures import QueryParams
@@ -368,7 +417,8 @@ class DecoderCacheTests(unittest.IsolatedAsyncioTestCase):
             TemporaryDirectory() as directory,
             patch("server.shared_vocabulary", return_value=("Shared name",)) as preferences,
             patch("server.audio_blocks", side_effect=blocks) as decode,
-            patch("server.decode_pcm", new_callable=AsyncMock, return_value={"text": "One take", "inferenceNs": 12_000_000}) as transcribe,
+            patch("server.decode_pcm", new_callable=AsyncMock,
+                  return_value={"text": "One take", "inferenceNs": 12_000_000, "speechQueueNs": 3_000_000}) as transcribe,
         ):
             path = Path(directory) / str(key)
             write_mic_fixture(path, np.full(4800, 1000))
@@ -383,7 +433,9 @@ class DecoderCacheTests(unittest.IsolatedAsyncioTestCase):
             decode.assert_not_called()
             transcribe.assert_not_awaited()
             write_mic_fixture(path, np.tile([200, -200], 2400))
-            self.assertEqual(await native_dictation(request, key), {"text": "One take", "inferenceMs": 12})
+            result = await native_dictation(request, key)
+            self.assertEqual((result["text"], result["inferenceMs"], result["speechTiming"]["speechQueueMs"]),
+                             ("One take", 12, 3))
             transcribe.assert_awaited_once_with(request.app.state, pcm, ("en",),
                                                live=True, vocabulary=(), dictation=True, measure_inference=True,
                                                screen_nonspeech=True)
@@ -394,7 +446,9 @@ class DecoderCacheTests(unittest.IsolatedAsyncioTestCase):
             decode.assert_not_called()
             transcribe.assert_not_awaited()
             write_mic_fixture(path, np.tile([200, -200], 2400))
-            self.assertEqual(await native_dictation(request, key, release_frame=2400), {"text": "One take", "inferenceMs": 12})
+            result = await native_dictation(request, key, release_frame=2400)
+            self.assertEqual((result["text"], result["inferenceMs"], result["speechTiming"]["speechQueueMs"]),
+                             ("One take", 12, 3))
             transcribe.assert_awaited_once_with(request.app.state, pcm, ("en",),
                                                live=True, vocabulary=(), dictation=True, measure_inference=True,
                                                screen_nonspeech=True, speech_prefix_samples=800)
@@ -477,13 +531,54 @@ class DecoderCacheTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(asyncio.gather(meeting, spoken), 1)
         self.assertEqual(entered, ["dictation", "meeting"])
 
+    async def test_dictation_timing_measures_speech_queue_and_cleanup_separately(self):
+        from dictation_input import CleanupFailed
+        from server import SpeechInference, transcribe_dictation
+
+        pcm = bytes(1600 * 4)
+        gate = SpeechInference()
+
+        @asynccontextmanager
+        async def audio_priority():
+            await asyncio.sleep(.04)
+            yield
+
+        async def blocks(*args, **kwargs):
+            await asyncio.sleep(.04)
+            yield pcm
+
+        async def clean(original, *, wait):
+            self.assertEqual(original, pcm)
+            self.assertFalse(wait)
+            await asyncio.sleep(.04)
+            raise CleanupFailed()
+
+        state = SimpleNamespace(model=SimpleNamespace(transcribe=Mock(return_value=("Kept the speech.", "en", []))),
+                                inference=gate, insights=SimpleNamespace(model=SimpleNamespace(audio_priority=audio_priority)))
+        with patch("server.audio_blocks", blocks):
+            async with asyncio.TaskGroup() as group:
+                async with gate.turn():
+                    job = group.create_task(transcribe_dictation(state, Path("fixture.wav"), ("en",), vocabulary=(),
+                                                                   cleanup=SimpleNamespace(clean=clean), measure_inference=True))
+                    async with asyncio.timeout(2):
+                        while not gate.waiting_dictation:
+                            await asyncio.sleep(.001)
+                    await asyncio.sleep(.04)
+        state.model.transcribe.assert_called_once()
+        result = job.result()
+        self.assertEqual(result["text"], "Kept the speech.")
+        self.assertGreaterEqual(result["inferenceMs"], 0)
+        self.assertEqual(set(result["speechTiming"]), {"audioReadMs", "speechQueueMs", "audioPriorityMs", "voiceCleanupMs"})
+        self.assertTrue(all(value >= 35 for value in result["speechTiming"].values()), result)
+
     async def test_meeting_recovery_job_arbitrates_restart_to_update(self):
         from fastapi import HTTPException
+        from engine_lifecycle import ClientLeases
         from server import quiesce_update, start_job
 
         state = SimpleNamespace(jobs=set(), native_token="fixture", draining=False, submitting=set(), status="ready",
                                 insights=SimpleNamespace(active_job=False, chat_count=0, model=SimpleNamespace(audio_users=0)),
-                                leases=SimpleNamespace(streams=set(), deadlines={}), request_shutdown=Mock())
+                                leases=ClientLeases(), request_shutdown=Mock())
         request = SimpleNamespace(app=SimpleNamespace(state=state), headers={"x-jard-token": "fixture"})
         gate = asyncio.Event()
         job = start_job(state, gate.wait())

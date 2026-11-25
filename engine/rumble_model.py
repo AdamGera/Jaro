@@ -170,7 +170,18 @@ class RumbleModel:
         ).to(self.device).eval()
         self.aligner = None
         self.reported_screen_failure = False
-        self._decode(np.zeros(SAMPLE_RATE * 2, dtype=np.float32), max_new_tokens=1)
+        warmup = np.zeros(SAMPLE_RATE * 2, dtype=np.float32)
+        try:
+            self._decode(warmup, max_new_tokens=4, cache_implementation="static")
+        except RuntimeError as error:
+            if "out of memory" not in str(error).lower():
+                raise
+            warmup_oom = True
+        else:
+            warmup_oom = False
+        if warmup_oom:
+            self.release_device_cache()
+            self._decode(warmup, max_new_tokens=4)
 
     def release_device_cache(self):
         if self.device == "mps":
@@ -249,6 +260,10 @@ class RumbleModel:
         with self.torch.inference_mode():
             screen = screen_nonspeech and self.aligner is not None
             screen_prefix = screen and speech_prefix_samples is not None
+            if screen_prefix:
+                tail = audio[speech_prefix_samples:]
+                if len(tail) == 0 or abs(tail).max() < 0.001:
+                    screen_prefix = False
             # A confidently blank prefix makes the full take unnecessary.
             inputs = None if screen_prefix else self._transcription_inputs(audio, prompt)
             if screen:

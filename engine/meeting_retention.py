@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS meeting_voice_input (
 CREATE TABLE IF NOT EXISTS portable_call_preferences (
     id INTEGER PRIMARY KEY CHECK(id=1), preferences TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS portable_call_preferences_recovery (
+    digest TEXT PRIMARY KEY, preferences TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS meeting_audio_trash (
     id TEXT PRIMARY KEY
 );
@@ -46,7 +49,8 @@ CREATE VIEW archivable_meetings AS
       AND NOT EXISTS(SELECT 1 FROM chat_turns c WHERE c.id=s.id AND c.status='streaming');
 CREATE VIEW expired_meetings AS
     SELECT s.id FROM archivable_meetings a JOIN sessions s ON s.id=a.id LEFT JOIN meeting_retention r ON r.id=1
-    WHERE s.status='complete' AND coalesce(r.days,json_extract(s.options,'$.retentionApplies'),0)>0
+    WHERE s.status='complete' AND coalesce(json_extract(s.options,'$.retentionApplies'),1)<>0
+      AND coalesce(r.days,json_extract(s.options,'$.retentionApplies'),0)>0
       AND julianday('now') > coalesce(julianday(json_extract(s.options,'$.meetingEndedAt')),julianday(s.created))
                                + coalesce(r.days,json_extract(s.options,'$.retentionApplies'),0);
 CREATE VIEW readable_sessions AS
@@ -55,6 +59,7 @@ CREATE VIEW expired_meeting_audio AS
     SELECT s.id FROM readable_sessions s JOIN meeting_audio_policy p ON p.id=1
     WHERE p.days>0 AND s.status='complete'
       AND coalesce(json_extract(s.options,'$.meeting'),json_extract(s.options,'$.sourceSpeakerTurns'),0)
+      AND coalesce(json_extract(s.options,'$.retentionApplies'),1)<>0
       AND json_extract(s.options,'$.audioRemovedAt') IS NULL
       AND julianday('now') > coalesce(julianday(json_extract(s.options,'$.meetingEndedAt')),julianday(s.created)) + p.days
       AND NOT EXISTS(SELECT 1 FROM meeting_finalization f WHERE f.session_id=s.id)
@@ -158,34 +163,54 @@ def recycle_windows(path):
         ole.CoUninitialize()
 
 
+def snapshot_images(db, key):
+    return [tuple(row) for row in db.execute(
+        "SELECT id, image FROM session_images WHERE session_id=? ORDER BY rowid", (key,)
+    )]
+
+
+def add_archive_images(files, tables, key, images):
+    if not images:
+        return
+    tables["session_images"] = []
+    for index, (identifier, image) in enumerate(images, 1):
+        name = f"Images/{index:02d}.jpg"
+        files[name] = image
+        tables["session_images"].append({"id": identifier, "session_id": key, "file": name})
+
+
 def write_snapshot(db, identifier, directory, source_audio, transcript, notes):
     tables = {
         table: [dict(row) for row in db.execute(f"SELECT * FROM {table} WHERE {column}=?", (identifier,))]
         for table, column in OWNED_TABLES.items()
     }
-    files = {
-        "Meeting.json": json.dumps({"version": 1, "id": identifier, "tables": tables}, ensure_ascii=False) + "\n",
-        "Transcript.md": transcript,
-        "Notes.md": notes,
-    }
+    files = {"Transcript.md": transcript, "Notes.md": notes}
+    add_archive_images(files, tables, identifier, snapshot_images(db, identifier))
+    files["Meeting.json"] = json.dumps({"version": 1, "id": identifier, "tables": tables}, ensure_ascii=False) + "\n"
     write_archive(directory, files, source_audio, media_folder="Audio")
 
 
 def write_archive(directory, files, source_media, *, media_folder):
     directory.mkdir(mode=0o700)
-    for name, text in files.items():
-        descriptor = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf8") as output:
-            output.write(text)
+    for name, content in files.items():
+        target = directory / name
+        target.parent.mkdir(mode=0o700, exist_ok=True)
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content.encode("utf8") if isinstance(content, str) else content)
             output.flush()
             os.fsync(output.fileno())
+    if (directory / "Images").is_dir():
+        sync_directory(directory / "Images")
 
     if source_media.is_dir() and not source_media.is_symlink():
+        import annotation_storage
+
         audio = directory / media_folder
         audio.mkdir(mode=0o700)
         for file in source_media.iterdir():
             if file.is_file() and not file.is_symlink():
-                os.link(file, audio / file.name, follow_symlinks=False)
+                annotation_storage.duplicate(file, audio / file.name)
         sync_directory(audio)
     sync_directory(directory)
     sync_directory(directory.parent)

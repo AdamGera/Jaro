@@ -17,6 +17,7 @@
 #include "capture_timeline.h"
 
 int jaro_browser_pages(int count, wchar_t **binaries);
+int jaro_foreground_page(const wchar_t *window, const wchar_t *process);
 
 enum { OUTPUT_BLOCK = CAPTURE_RATE / 50, CAPTURE_LAG = CAPTURE_RATE / 5, MAX_SECONDS = 3 * 3600,
        MAX_MEETING_OUTPUTS = 32 };
@@ -87,15 +88,8 @@ static HRESULT microphone_device(IMMDeviceEnumerator *enumerator, const wchar_t 
     return result;
 }
 
-static HRESULT open_input(IMMDeviceEnumerator *enumerator, Input *input, bool loopback, const wchar_t *id) {
-    IMMDevice *device = NULL;
-    HRESULT result = id ? (loopback ? IMMDeviceEnumerator_GetDevice(enumerator, id, &device)
-                                   : microphone_device(enumerator, id, &device))
-                        : IMMDeviceEnumerator_GetDefaultAudioEndpoint(
-                            enumerator, loopback ? eRender : eCapture, eMultimedia, &device);
-    if (FAILED(result)) return result;
-    result = IMMDevice_Activate(device, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&input->client);
-    IMMDevice_Release(device);
+static HRESULT open_device_input(IMMDevice *device, Input *input, bool loopback) {
+    HRESULT result = IMMDevice_Activate(device, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&input->client);
     if (FAILED(result)) return result;
 
     WAVEFORMATEX format = {
@@ -108,6 +102,18 @@ static HRESULT open_input(IMMDeviceEnumerator *enumerator, Input *input, bool lo
     result = IAudioClient_Initialize(input->client, AUDCLNT_SHAREMODE_SHARED, flags, 500000, 0, &format, NULL);
     if (FAILED(result)) return result;
     return IAudioClient_GetService(input->client, &IID_IAudioCaptureClient, (void **)&input->capture);
+}
+
+static HRESULT open_input(IMMDeviceEnumerator *enumerator, Input *input, bool loopback, const wchar_t *id) {
+    IMMDevice *device = NULL;
+    HRESULT result = id ? (loopback ? IMMDeviceEnumerator_GetDevice(enumerator, id, &device)
+                                   : microphone_device(enumerator, id, &device))
+                        : IMMDeviceEnumerator_GetDefaultAudioEndpoint(
+                            enumerator, loopback ? eRender : eCapture, eMultimedia, &device);
+    if (FAILED(result)) return result;
+    result = open_device_input(device, input, loopback);
+    IMMDevice_Release(device);
+    return result;
 }
 
 static void close_input(Input *input) {
@@ -130,6 +136,34 @@ static bool reopen_input(IMMDeviceEnumerator *enumerator, Input *input, bool loo
     if (SUCCEEDED(open_input(enumerator, input, loopback, id)) && SUCCEEDED(start_input(input))) return true;
     close_input(input);
     return false;
+}
+
+static bool refresh_meeting_microphone(IMMDeviceEnumerator *enumerator, Input *mic, wchar_t **current) {
+    IMMDevice *device = NULL;
+    if (FAILED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, eCapture, eMultimedia, &device))) return false;
+    wchar_t *id = NULL;
+    if (FAILED(IMMDevice_GetId(device, &id)) || !id || (mic->started && *current && !wcscmp(id, *current))) {
+        IMMDevice_Release(device);
+        CoTaskMemFree(id);
+        return false;
+    }
+    Input replacement = {0};
+    HRESULT result = open_device_input(device, &replacement, false);
+    IMMDevice_Release(device);
+    if (FAILED(result) || FAILED(start_input(&replacement))) {
+        close_input(&replacement);
+        CoTaskMemFree(id);
+        return false;
+    }
+    // Keep already buffered audio. Only the device positions reset at handoff.
+    close_input(mic);
+    mic->client = replacement.client;
+    mic->capture = replacement.capture;
+    mic->started = true;
+    mic->timeline.has_packet = false;
+    CoTaskMemFree(*current);
+    *current = id;
+    return true;
 }
 
 static void free_output(Output *output) {
@@ -243,6 +277,45 @@ static HRESULT read_input(Input *input, int64_t written, int64_t first_tick, int
                        (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0);
         result = IAudioCaptureClient_ReleaseBuffer(input->capture, frames);
         if (FAILED(result)) return result;
+    }
+}
+
+typedef struct {
+    Input *input;
+    const wchar_t *id;
+    bool loopback;
+    int64_t retry_at;
+} ScreenInput;
+
+static void screen_audio_status(const ScreenInput *source, bool available) {
+    fprintf(stderr, "jaro-screen-audio %s %s\n", source->loopback ? "system" : "mic",
+            available ? "ready" : "unavailable");
+    fflush(stderr);
+}
+
+static HRESULT open_screen_input(IMMDeviceEnumerator *enumerator, ScreenInput *source) {
+    Input *input = source->input;
+    HRESULT result = open_input(enumerator, input, source->loopback, source->id);
+    if (SUCCEEDED(result)) result = start_input(input);
+    if (FAILED(result)) close_input(input);
+    // A new endpoint clock must not extend the last packet from the old stream.
+    else input->timeline.has_packet = false;
+    return result;
+}
+
+static void read_screen_input(IMMDeviceEnumerator *enumerator, ScreenInput *source, int64_t written,
+                              int64_t start, int64_t elapsed, bool stopping) {
+    Input *input = source->input;
+    if (!input->started) {
+        if (stopping || elapsed < source->retry_at) return;
+        source->retry_at = elapsed + CAPTURE_RATE;
+        if (FAILED(open_screen_input(enumerator, source))) return;
+        screen_audio_status(source, true);
+    }
+    if (FAILED(read_input(input, written, start, elapsed))) {
+        close_input(input);
+        source->retry_at = elapsed + CAPTURE_RATE;
+        screen_audio_status(source, false);
     }
 }
 
@@ -553,24 +626,37 @@ static void refresh_meeting_outputs(IMMDeviceEnumerator *enumerator, Output **ou
 static HRESULT capture(IMMDeviceEnumerator *enumerator, bool loopback, bool dual, int64_t limit, HANDLE control,
                        bool write_clock, const wchar_t *microphone, bool meeting, RouteProbe *probe, bool dictation) {
     Input mic = {0}, system = {0};
+    bool screen = write_clock && !dictation && !meeting;
+    ScreenInput screen_mic = {.input = &mic, .id = microphone, .retry_at = CAPTURE_RATE};
+    ScreenInput screen_system = {.input = &system, .loopback = true, .retry_at = CAPTURE_RATE};
     Output *outputs = NULL;
     OutputTail tail = {0};
     RouteScope route_scope = ALL_OUTPUTS;
-    HRESULT result = loopback ? S_OK : open_input(enumerator, &mic, false, microphone);
-    if (SUCCEEDED(result) && !meeting && (dual || loopback)) result = open_input(enumerator, &system, true, NULL);
+    wchar_t *meeting_mic_id = NULL;
+    int64_t mic_first_frame = 0;
+    HRESULT result = screen || loopback || meeting ? S_OK : open_input(enumerator, &mic, false, microphone);
+    if (SUCCEEDED(result) && !screen && !meeting && (dual || loopback)) result = open_input(enumerator, &system, true, NULL);
 
     LARGE_INTEGER frequency;
     if (!QueryPerformanceFrequency(&frequency)) result = E_FAIL;
     int64_t start = 0;
     if (SUCCEEDED(result)) {
         start = tick_time(frequency.QuadPart);
-        if (mic.client) result = start_input(&mic);
-        if (SUCCEEDED(result) && system.client) result = start_input(&system);
-        if (SUCCEEDED(result) && meeting) {
+        if (meeting) {
+            refresh_meeting_microphone(enumerator, &mic, &meeting_mic_id);
             refresh_meeting_outputs(enumerator, &outputs, probe, &route_scope, &tail, 0, 0);
             Output *ready = outputs;
             while (ready && !ready->input.started) ready = ready->next;
             if (!ready && !mic.started) result = AUDCLNT_E_DEVICE_INVALIDATED;
+        } else if (screen) {
+            HRESULT mic_result = loopback ? S_OK : open_screen_input(enumerator, &screen_mic);
+            HRESULT system_result = dual || loopback ? open_screen_input(enumerator, &screen_system) : S_OK;
+            if (FAILED(mic_result)) screen_audio_status(&screen_mic, false);
+            if (FAILED(system_result)) screen_audio_status(&screen_system, false);
+            if (!mic.started && !system.started) result = FAILED(mic_result) ? mic_result : system_result;
+        } else {
+            if (mic.client) result = start_input(&mic);
+            if (SUCCEEDED(result) && system.client) result = start_input(&system);
         }
     }
     if (SUCCEEDED(result) && write_clock && (fwrite(&start, sizeof(start), 1, stdout) != 1 || fflush(stdout)))
@@ -582,8 +668,12 @@ static HRESULT capture(IMMDeviceEnumerator *enumerator, bool loopback, bool dual
         int64_t elapsed = capture_frame(tick_time(frequency.QuadPart) - start);
         bool stopping = WaitForSingleObject(control, 0) == WAIT_OBJECT_0;
         if (stopping && elapsed < limit) limit = elapsed;
-        result = read_input(&mic, written, start, elapsed);
-        if (meeting) {
+        if (screen) {
+            if (!loopback) read_screen_input(enumerator, &screen_mic, written, start, elapsed, stopping);
+            if (loopback || dual) read_screen_input(enumerator, &screen_system, written, start, elapsed, stopping);
+        } else if (meeting) {
+            int64_t first = mic_first_frame > written ? mic_first_frame : written;
+            result = read_input(&mic, first, start, elapsed);
             if (FAILED(result)) close_input(&mic);
             result = S_OK;
             for (Output *out = outputs; out; out = out->next) {
@@ -591,12 +681,13 @@ static HRESULT capture(IMMDeviceEnumerator *enumerator, bool loopback, bool dual
                 if (FAILED(read_input(&out->input, first, start, elapsed))) close_input(&out->input);
             }
             if (elapsed >= refresh_at && elapsed < limit) {
-                if (!mic.started) reopen_input(enumerator, &mic, false, NULL);
+                if (refresh_meeting_microphone(enumerator, &mic, &meeting_mic_id)) mic_first_frame = elapsed;
                 refresh_meeting_outputs(enumerator, &outputs, probe, &route_scope, &tail, written, elapsed);
                 refresh_at = elapsed + CAPTURE_RATE;
             }
-        } else if (SUCCEEDED(result)) {
-            result = read_input(&system, written, start, elapsed);
+        } else {
+            result = read_input(&mic, written, start, elapsed);
+            if (SUCCEEDED(result)) result = read_input(&system, written, start, elapsed);
         }
         if (FAILED(result)) break;
         // Let both devices deliver packets before filling gaps with silence.
@@ -613,6 +704,7 @@ static HRESULT capture(IMMDeviceEnumerator *enumerator, bool loopback, bool dual
     }
     close_input(&system);
     close_input(&mic);
+    CoTaskMemFree(meeting_mic_id);
     while (outputs) {
         Output *next = outputs->next;
         free_output(outputs);
@@ -659,21 +751,27 @@ int wmain(int argc, wchar_t **argv) {
         if (_setmode(_fileno(stdout), _O_BINARY) < 0) return 2;
         return jaro_browser_pages(argc - 2, argv + 2);
     }
+    if (argc == 4 && !wcscmp(argv[1], L"foreground-page")) {
+        if (_setmode(_fileno(stdout), _O_BINARY) < 0) return 2;
+        return jaro_foreground_page(argv[2], argv[3]);
+    }
     bool list = argc == 2 && wcscmp(argv[1], L"microphones") == 0;
     bool users = argc == 2 && wcscmp(argv[1], L"microphone-users") == 0;
     bool playback = argc == 2 && wcscmp(argv[1], L"playback-users") == 0;
     bool dictation = wcscmp(argv[1], L"dictation") == 0;
-    bool write_clock = dictation || (argc == 4 && wcscmp(argv[3], L"clock") == 0);
     bool mic = dictation || wcscmp(argv[1], L"mic") == 0;
     bool loopback = wcscmp(argv[1], L"system") == 0;
     bool meeting = wcscmp(argv[1], L"meeting") == 0;
     bool dual = meeting || wcscmp(argv[1], L"both") == 0;
     bool call = meeting && argc >= 5 && argc <= 16 && wcscmp(argv[3], L"call") == 0;
-    const wchar_t *microphone = argc == 5 && mic && wcscmp(argv[3], L"device") == 0 && argv[4][0] ? argv[4] : NULL;
+    bool clock = !dictation && !meeting && argc >= 4 && wcscmp(argv[3], L"clock") == 0;
+    int device_arg = clock ? 4 : 3;
+    const wchar_t *microphone = !meeting && (mic || dual) && argc == device_arg + 2 &&
+        wcscmp(argv[device_arg], L"device") == 0 && argv[device_arg + 1][0] ? argv[device_arg + 1] : NULL;
     long seconds = 0;
     if (!list && !users && !playback) {
         if ((!mic && !loopback && !dual) ||
-            (argc != 3 && !(meeting ? call : microphone || (!dictation && write_clock)))) return 2;
+            (argc != 3 && !(meeting ? call : microphone || (clock && argc == 4)))) return 2;
         wchar_t *end;
         seconds = wcstol(argv[2], &end, 10);
         if (*end || seconds < 1 || seconds > MAX_SECONDS) return 2;
@@ -696,7 +794,7 @@ int wmain(int argc, wchar_t **argv) {
                     HANDLE route_worker = NULL;
                     RouteProbe *probe = call ? start_route_probe(argc - 4, argv + 4, &route_worker) : NULL;
                     result = capture(enumerator, loopback, dual, (int64_t)seconds * CAPTURE_RATE, control,
-                                     write_clock, microphone, meeting, probe, dictation);
+                                     dictation || clock, microphone, meeting, probe, dictation);
                     close_route_probe(probe, route_worker);
                     CancelSynchronousIo(control);
                     CloseHandle(control);

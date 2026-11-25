@@ -1,0 +1,7 @@
+/JaroMobile.xcodeproj/
+/.build/
+/DerivedData/
+/build/
+!/Fixtures/fixture-silence.wav
+/JaroKeyboard/CleanupTagger/.model.*/
+/JaroKeyboard/CleanupTagger/JaroCleanupTagger.mlpackage/

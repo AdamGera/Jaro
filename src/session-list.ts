@@ -44,19 +44,23 @@ export function useSessionList(open: boolean, query: string, refreshKey: string 
     }
     timer = window.setTimeout(load, query.trim() ? 100 : 0)
     window.addEventListener("focus", refresh)
+    window.addEventListener("jaro-sessions-changed", refresh)
     window.addEventListener("jard-meeting-retention", refresh)
     window.addEventListener("jard-annotation-retention", refresh)
     window.addEventListener("jard-meeting-brief", refresh)
     window.addEventListener("jaro-portable-meeting-saved", refresh)
+    if (!meetingsOnly) window.addEventListener("jaro-portable-annotation-saved", refresh)
     window.addEventListener("native-sdk:jard-annotation", annotationSaved)
     return () => {
       abort.abort()
       window.clearTimeout(timer)
       window.removeEventListener("focus", refresh)
+      window.removeEventListener("jaro-sessions-changed", refresh)
       window.removeEventListener("jard-meeting-retention", refresh)
       window.removeEventListener("jard-annotation-retention", refresh)
       window.removeEventListener("jard-meeting-brief", refresh)
       window.removeEventListener("jaro-portable-meeting-saved", refresh)
+      window.removeEventListener("jaro-portable-annotation-saved", refresh)
       window.removeEventListener("native-sdk:jard-annotation", annotationSaved)
     }
   }, [open, query, refreshKey, refresh, version, meetingsOnly])

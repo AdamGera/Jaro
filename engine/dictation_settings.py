@@ -8,8 +8,8 @@ SETTINGS_LIMIT = 56_000
 
 
 def validate_changes(changes):
-    if not isinstance(changes, dict) or not changes or len(changes) > 24:
-        raise ValueError("Provide a nonempty settings object with up to 24 keys.")
+    if not isinstance(changes, dict) or not changes or len(changes) > 64:
+        raise ValueError("Provide a nonempty settings object with up to 64 keys.")
     encoded = json.dumps(changes, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
     if len(encoded) > SETTINGS_LIMIT:
         raise ValueError("The settings document exceeds 56,000 bytes.")

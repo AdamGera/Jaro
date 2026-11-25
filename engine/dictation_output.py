@@ -267,8 +267,8 @@ def valid_target(target):
 def parse_portable_profiles(definition):
     profiles = parse_profiles(definition)
     for profile in profiles:
-        if profile.target.casefold().startswith("site:") or any(map(is_script_step, profile.steps)):
-            raise ValueError("Use default or application profiles with built-in steps on this desktop.")
+        if any(map(is_script_step, profile.steps)):
+            raise ValueError("Use built-in steps on this desktop.")
         if profile.steps.count("rewrite") > 1:
             raise ValueError("Add at most one local Qwen step per profile.")
         if "rewrite" in profile.steps and not profile.instruction:

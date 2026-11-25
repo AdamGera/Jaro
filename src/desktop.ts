@@ -1,5 +1,5 @@
 import type { SpeakerSegment } from "./audio"
-import type { DictationAction, DictationHistory, DictationOutputPreview, DictationOutputProfiles, DictationScriptReview, DictationStatus } from "./system-dictation"
+import type { DictationAction, ProfileApplication, DictationHistoryStats, DictationHistory, DictationOutputPreview, DictationOutputProfiles, DictationScriptReview, DictationStatus } from "./system-dictation"
 
 export type RecordingMode = "both" | "mic" | "system"
 export type CaptureSource = Exclude<RecordingMode, "both">
@@ -47,6 +47,14 @@ export type AnnotationRouteScope = { kind: "app" | "site" | "terminal"; key: str
 export type AnnotationDestinationRule = {
   id: string; scope: AnnotationRouteScope; title: string; target: string; channel: string; automatic?: boolean
 }
+export type SavedAnnotationRule = {
+  id: string; kind: AnnotationRouteScope["kind"]; source: string; title: string; target: string; channel: string; automatic: boolean
+}
+export type AnnotationRuleDestinationChange =
+  ({ action: "add"; kind: AnnotationRouteScope["kind"]; source: string } | { action: "retarget"; id: string })
+  & { target: string; service: string; project?: true }
+export type AnnotationRulesAction = { action: "list" } | { action: "remove"; id: string }
+  | { action: "setAutomatic"; id: string; enabled: boolean } | AnnotationRuleDestinationChange
 export type AnnotationDestinations = {
   service: string | null
   sessions: AnnotationAgentSession[]
@@ -61,6 +69,7 @@ export type AnnotationRouteStatus = {
   title?: string
   message?: string
   seconds?: number
+  receiptStatus?: AnnotationDelivery["status"]
 }
 export type AnnotationDelivery = {
   deliveryId: string
@@ -101,6 +110,7 @@ export type DesktopUpdate = {
   channelManaged?: boolean
   updatesDisabled?: boolean
   restartBlocked?: boolean
+  restartBlockReason?: string
   restartInProgress?: boolean
   restartError?: string
   staged?: boolean
@@ -110,6 +120,7 @@ export type DesktopUpdate = {
   offerVersion?: string
   manualCheck?: boolean
   openUpdateSettings?: string
+  trayRestart?: string
 }
 
 export type DesktopMeetingCalendar = {
@@ -153,23 +164,33 @@ export type DesktopMeeting = {
   microphoneSilent?: boolean
   microphoneUnavailable?: boolean
   systemAudioUnavailable?: boolean
+  systemAudioPermissionDenied?: boolean
   microphone?: string
-  providerPolicies: { provider: string; label: string; scope?: string; policy: MeetingRecordingPolicy; canAlwaysRecord: boolean }[]
+  defaultPolicy?: MeetingRecordingPolicy
+  providerPolicies: {
+    provider: string; label: string; scope?: string; policy: MeetingRecordingPolicy
+    canAlwaysRecord: boolean; inheritsPolicy?: boolean; lastSeen?: number; website?: boolean
+  }[]
 }
 
 export type MeetingIndicatorCorner = "topLeft" | "topRight" | "bottomLeft" | "bottomRight"
 
+export type MeetingCallAction =
+  | { action: "detection"; enabled: boolean }
+  | { action: "autoStop"; enabled: boolean }
+  | { action: "setDefaultPolicy"; policy: MeetingRecordingPolicy }
+  | { action: "setPolicy"; provider: string; policy: MeetingRecordingPolicy | "inherit" }
+
 export type DesktopMeetingAction =
+  | MeetingCallAction
   | { action: "status" | "stop" | "copyNew" | "copyAll" }
   | { action: "start"; languages: string[] }
-  | { action: "detection"; enabled: boolean }
   | { action: "indicator"; enabled: boolean }
   | { action: "indicatorCorner"; corner: MeetingIndicatorCorner }
   | { action: "retryPermission" | "recordingPrivacy" | "dismissPermission" | "recoverMeeting" | "dismissRecovery" | "refreshRecovery" }
   | { action: "showLiveTranscript" }
-  | { action: "setPolicy"; provider: string; policy: MeetingRecordingPolicy }
   | { action: "keepRecording" | "calendarConnect" | "calendarDisconnect" | "calendarSettings" }
-  | { action: "autoStop" | "calendarReminders"; enabled: boolean }
+  | { action: "calendarReminders"; enabled: boolean }
   | { action: "noiseCleanup" | "boostMicrophone"; enabled: boolean }
   | { action: "calendarLead"; minutes: number }
   | { action: "calendarInclude"; enabled: boolean; id: string }
@@ -185,15 +206,16 @@ function applyWindowChrome(chrome: WindowChrome) {
 }
 
 type CaptureOptions = { diarization: boolean; languages: string[] }
-export type RecordingDraft = { id: string; seconds: number; meeting?: boolean; screen?: boolean }
+export type RecordingDraft = { id: string; seconds: number; meeting?: boolean; screen?: boolean; videoOnly?: boolean }
 type ActiveCapture = { dictation?: string; meeting?: string; warm?: boolean; mode: RecordingMode; live: boolean; seconds?: number; text?: string; segments?: SpeakerSegment[] }
 export type DictationDestination = "dictation" | "history" | "output"
 export type WindowNavigation = {
   id: string
-  pane: DictationDestination | "settings" | "general" | "meetings" | "annotate" | "home" | "live-meeting" | "meeting-library"
+  pane: DictationDestination | "settings" | "general" | "meetings" | "annotate" | "home" | "live-meeting" | "meeting-library" | "vocabulary" | "add-term"
 }
 
 type Requests = {
+  workspaceReady: undefined
   microphoneLevel: undefined
   windowNavigation: undefined
   workspaceToolbar: { inset: number }
@@ -204,11 +226,12 @@ type Requests = {
   copyAnnotation: { id: string }
   pasteAnnotation: { id: string }
   annotationRoutingPolicy: undefined
+  annotationRules: AnnotationRulesAction
   annotationDestinations: { query: string; id?: string }
   annotationAgentDestinations: { agent: Exclude<AnnotationAgent, "opencode">; query: string }
   sendSessionToAgent: { agent: AnnotationAgent; target: string; id: string; service?: string; open?: boolean }
   sendAnnotationToAgent: { agent: Exclude<AnnotationAgent, "opencode">; target: string; id: string }
-  rememberAnnotationDestination: { id: string; service: string; target: string; scope: AnnotationRouteScope["kind"]; automatic: boolean }
+  rememberAnnotationDestination: { id: string; service: string; target: string; scope: AnnotationRouteScope["kind"]; scopeKey?: string; automatic: boolean }
   forgetAnnotationDestination: { id: string; ruleId: string }
   sendAnnotation: { id: string; target: string; service: string }
   annotationDeliveries: { id: string }
@@ -239,11 +262,13 @@ type Requests = {
   recover: CaptureOptions & { id: string }
   discard: { id: string }
   export: { id: string; kind: "audio" | "json" | "md" | "notes" | "srt" | "vtt" | "annotation-manifest" | "annotation-contact-sheet" }
+    | { id: string; kind: "annotation-clip"; startMs: number; endMs: number }
   meetingExports: { action: "status" | "choose" | "disable" } | { action: "reveal"; id?: string }
     | { action: "revealFiles"; id: string }
     | { action: "separateNotes" | "descriptiveNames"; enabled: boolean }
 }
 type Responses = {
+  workspaceReady: null
   microphoneLevel: { peak: number | null }
   windowNavigation: { navigation?: WindowNavigation }
   workspaceToolbar: null
@@ -254,6 +279,7 @@ type Responses = {
   copyAnnotation: { includedImage: boolean }
   pasteAnnotation: { destination: string; includedSheet: boolean }
   annotationRoutingPolicy: { managed: boolean }
+  annotationRules: { managed: boolean; rules: SavedAnnotationRule[] }
   annotationDestinations: AnnotationDestinations
   annotationAgentDestinations: { sessions: AnnotationAgentSession[] }
   sendSessionToAgent: { images: "attached" | "references" | "none"; opened: boolean }
@@ -273,7 +299,7 @@ type Responses = {
   loginItem: DesktopLoginItem
   interfaceLanguage: DesktopInterfaceLanguage
   update: DesktopUpdate
-  systemDictation: DictationStatus | DictationHistory | DictationOutputPreview | DictationOutputProfiles | DictationScriptReview
+  systemDictation: { stats: DictationHistoryStats | null } | { application: ProfileApplication | null } | { applications: ProfileApplication[] } | DictationStatus | DictationHistory | DictationOutputPreview | DictationOutputProfiles | DictationScriptReview
   dictationCleanup: { status: "notInstalled" | "downloading" | "ready" | "error" }
   permission: { status: PermissionStatus }
   openPrivacy: unknown

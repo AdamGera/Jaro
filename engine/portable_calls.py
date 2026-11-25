@@ -2,14 +2,15 @@
 
 import asyncio
 from dataclasses import dataclass, replace
+from hashlib import sha256
 import json
 import sqlite3
-from time import monotonic
+from time import monotonic, time
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 from portable_capture import CaptureError, SAMPLE_RATE
-from portable_call_pages import Call, SITE_NAMES
+from portable_call_pages import Call, CONFIRMATION_ONLY_SITES, SITE_NAMES
 
 
 @dataclass(frozen=True)
@@ -22,10 +23,10 @@ class App:
 
 
 APPS = (
-    App("zoom", "Zoom", ("zoom", "zoom.real")),
+    App("zoom", "Zoom", ("zoom", "zoom.real", "cpthost")),
     App("teams", "Microsoft Teams", ("ms-teams", "msteams", "teams", "teams-for-linux")),
     App("slack", "Slack", ("slack",)),
-    App("discord", "Discord", ("discord", "discordcanary", "discordptb"), 20),
+    App("discord", "Discord", ("discord", "discordcanary", "discordptb", "discord-canary", "discord-ptb", "com.discordapp.discord"), 20),
     App("webex", "Webex", ("webex", "ciscocollabhost")),
     App("whatsapp", "WhatsApp", ("whatsapp", "whatsapp.root"), 20),
     App("signal", "Signal", ("signal", "signal-desktop"), 20),
@@ -37,7 +38,7 @@ APPS = (
     App("chrome", "Chrome", ("chrome", "google-chrome", "google-chrome-stable"), 20, True),
     App("chromium", "Chromium", ("chromium", "chromium-browser"), 20, True),
     App("edge", "Microsoft Edge", ("msedge", "microsoft-edge", "microsoft-edge-stable"), 20, True),
-    App("firefox", "Firefox", ("firefox", "firefox-bin"), 20, True),
+    App("firefox", "Firefox", ("firefox", "firefox-bin", "firefox-esr"), 20, True),
     App("brave", "Brave", ("brave", "brave-browser"), 20, True),
     App("vivaldi", "Vivaldi", ("vivaldi", "vivaldi-bin", "vivaldi-stable", "vivaldi-snapshot"), 20, True),
     App("helium", "Helium", ("helium", "helium-browser"), 20, True),
@@ -45,11 +46,17 @@ APPS = (
     App("arc", "Arc", ("arc",), 20, True),
     App("ardia", "Ardia", ("ardia",), 20, True),
 )
-WEB_PROVIDERS = tuple(App(site, name, (), 20 if site in ("google-voice", "messenger", "groupme") else 2)
+WEB_PROVIDERS = tuple(App(site, name, (), 20 if site in ("discord-web", "google-voice", "messenger", "groupme") else 2)
                       for site, name in SITE_NAMES.items())
 PROVIDERS = {app.key: app for app in (*APPS, *WEB_PROVIDERS)}
 BY_BINARY = {binary: app.key for app in APPS for binary in app.binaries}
-DEFAULT = {"enabled": False, "autoStop": False, "policies": {}}
+BROWSER_CONTEXT_BINARIES = frozenset(
+    binary for app in APPS if app.browser for binary in app.binaries
+) | {"librewolf", "opera", "opera_gx", "thorium"}
+DEFAULT = {"enabled": False, "autoStop": False, "stopRequestedCalls": False, "defaultPolicy": "ask", "policies": {}}
+POLICIES = ("ask", "never", "auto")
+RECENT_SOURCE_LIMIT = 64
+RECENT_SOURCE_REFRESH = 3600
 POLL_INTERVAL = 1
 OBSERVATION_GAP = 5
 CALL_DROPOUT = 3
@@ -103,6 +110,8 @@ class DetectedRecording:
     automatic: bool
     started: float
     languages: tuple[str, ...]
+    watched_source: str = ""
+    microphone_seen: bool = False
     missing: float | None = None
     stop_at: float | None = None
     keep: bool = False
@@ -111,6 +120,11 @@ class DetectedRecording:
     changed_since: float = 0
     kept_room: str = ""
     ending_reason: str = ""
+    title: str = ""
+
+    @property
+    def name(self):
+        return self.title or recording_label(self.call)
 
 
 class CallWatcher:
@@ -124,9 +138,10 @@ class CallWatcher:
         self.finish = finish
         self.available = available
         self.clock = clock
-        with state.library.connection() as db:
-            row = db.execute("SELECT preferences FROM portable_call_preferences WHERE id=1").fetchone()
-        self.preferences = json.loads(row[0]) if row else DEFAULT
+        self.settings_read_error = False
+        self.preferences_backup = None
+        self.saved_document = {}
+        self.preferences, self.recent_sources = self.load_preferences()
         self.seen = {}
         self.pages = {}
         self.offer = None
@@ -136,28 +151,140 @@ class CallWatcher:
         self.last_observation = None
         self.transition = asyncio.Lock()
 
+    def load_preferences(self):
+        try:
+            with self.state.library.connection() as db:
+                row = db.execute("SELECT preferences FROM portable_call_preferences WHERE id=1").fetchone()
+        except (OSError, sqlite3.Error):
+            self.settings_read_error = True
+            return DEFAULT.copy(), {}
+        if not row:
+            return DEFAULT.copy(), {}
+        raw = row[0]
+        try:
+            saved = json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
+            saved = None
+        if not isinstance(saved, dict):
+            self.preferences_backup = raw
+            return DEFAULT.copy(), {}
+
+        self.saved_document = saved
+        enabled = saved.get("enabled", False)
+        auto_stop = saved.get("autoStop", False)
+        requested_stop = saved.get("stopRequestedCalls", False)
+        default = saved.get("defaultPolicy", "ask")
+        policies = saved.get("policies", {})
+        recent = saved.get("recentSources", {})
+        preferences = DEFAULT.copy()
+        if type(enabled) is bool:
+            preferences["enabled"] = enabled
+        if type(auto_stop) is bool:
+            preferences["autoStop"] = auto_stop
+        if type(requested_stop) is bool:
+            preferences["stopRequestedCalls"] = requested_stop
+        if default in POLICIES and (isinstance(policies, dict) or default != "auto"):
+            preferences["defaultPolicy"] = default
+
+        invalid = (
+            type(enabled) is not bool or type(auto_stop) is not bool or type(requested_stop) is not bool
+            or default not in POLICIES
+            or not isinstance(policies, dict) or not isinstance(recent, dict)
+        )
+        if isinstance(policies, dict):
+            rules = {}
+            for key, value in policies.items():
+                if (app := PROVIDERS.get(key)) is None:
+                    continue
+                valid = value in POLICIES and not (app.browser and value == "auto")
+                rules[key] = value if valid else "ask"
+                invalid |= not valid
+            preferences["policies"] = rules
+
+        recent_sources = {}
+        if isinstance(recent, dict):
+            for key, stamp in recent.items():
+                if key in PROVIDERS:
+                    if type(stamp) is int and 0 < stamp <= 253402300799:
+                        recent_sources[key] = stamp
+                    else:
+                        invalid = True
+        if invalid:
+            self.preferences_backup = raw
+        return preferences, recent_sources
+
+    def settings_warning(self):
+        if self.settings_read_error:
+            return "Could not read saved call settings. Reopen Jaro before changing them."
+        if self.preferences_backup is not None:
+            return "Some saved call settings were invalid. Jaro will preserve the original settings when you save a change."
+        return ""
+
     def settings(self, preferences):
         for key, policy in preferences["policies"].items():
             app = PROVIDERS.get(key)
             if app is None or (app.browser and policy == "auto"):
                 raise HTTPException(400, "Choose a supported call app and recording policy.")
-        self.save_preferences(preferences)
-        self.offer = None
+        self.save_preferences({**self.preferences, **preferences})
+        if self.offer and (not preferences["enabled"] or self.policy_for(self.offer.call) == "never"):
+            self.offer = None
         if not preferences["enabled"]:
             self.seen = {key: item for key, item in self.seen.items() if item.snooze}
             self.pages.clear()
         self.message = ""
-        if not (preferences["enabled"] and preferences["autoStop"]) and self.active:
+        if self.active and not self.stop_enabled(self.active):
             self.active.stop_at = self.active.missing = None
             self.active.ending_reason = self.active.changed_room = ""
 
     def save_preferences(self, preferences):
+        if self.settings_read_error:
+            raise HTTPException(409, self.settings_warning())
+        previous_rules = self.saved_document.get("policies")
+        unknown = {}
+        if isinstance(previous_rules, dict):
+            unknown = {key: value for key, value in previous_rules.items() if key not in PROVIDERS}
+        document = {**self.saved_document, **preferences, "recentSources": self.recent_sources,
+                    "policies": {**unknown, **preferences["policies"]}}
+        text = json.dumps(document)
+        original = self.preferences_backup
         try:
             with self.state.library.connection() as db:
-                db.execute("INSERT OR REPLACE INTO portable_call_preferences VALUES(1,?)", (json.dumps(preferences),))
+                if original is None:
+                    db.execute("INSERT OR REPLACE INTO portable_call_preferences VALUES(1,?)", (text,))
+                else:
+                    updated = db.execute("UPDATE portable_call_preferences SET preferences=? WHERE id=1 AND preferences=?",
+                                         (text, original))
+                    if not updated.rowcount:
+                        raise HTTPException(409, "Saved call settings changed. Reopen Jaro before changing them.")
+                    data = original if isinstance(original, bytes) else original.encode("utf-8")
+                    db.execute("INSERT OR IGNORE INTO portable_call_preferences_recovery VALUES(?,?)",
+                               (sha256(data).hexdigest(), original))
         except (OSError, sqlite3.Error):
             raise HTTPException(503, "Could not save the call recording policy.") from None
+        self.saved_document = document
+        self.preferences_backup = None
         self.preferences = preferences
+
+    def policy_for(self, call):
+        policies = self.preferences["policies"]
+        return policies.get(call.provider, policies.get(call.source, self.preferences["defaultPolicy"]))
+
+    def remember_sources(self, calls):
+        observed_at = int(time())
+        updates = {
+            call.provider: observed_at for call in calls
+            if observed_at - self.recent_sources.get(call.provider, 0) >= RECENT_SOURCE_REFRESH
+        }
+        if not updates:
+            return
+        sources = {**self.recent_sources, **updates}
+        self.recent_sources = dict(sorted(sources.items(), key=lambda item: (-item[1], item[0]))[:RECENT_SOURCE_LIMIT])
+        if self.preferences_backup is None:
+            try:
+                self.save_preferences(self.preferences)
+            except HTTPException:
+                # The current list remains useful if the library cannot write it.
+                pass
 
     def visible_offer(self):
         offer = self.offer
@@ -170,20 +297,25 @@ class CallWatcher:
         active = None
         if recording:
             active = {
-                "id": str(recording.id), "name": recording_label(recording.call), "automatic": recording.automatic,
+                "id": str(recording.id), "name": recording.name, "automatic": recording.automatic,
                 "elapsed": max(0, int(self.clock() - recording.started)), "saving": recording.finishing,
                 "stopSeconds": max(1, round(recording.stop_at - self.clock())) if recording.stop_at is not None else None,
                 "roomChanged": recording.ending_reason == "page",
                 "sampleRate": SAMPLE_RATE, "languages": recording.languages,
             }
         offer = self.visible_offer()
+        sources = [app for app in (*APPS, *WEB_PROVIDERS)
+                   if app.binaries or self.browser_pages or app.key in self.recent_sources or app.key in self.preferences["policies"]]
+        sources.sort(key=lambda app: (-self.recent_sources.get(app.key, 0), app.key not in self.preferences["policies"]))
         return {
             **self.preferences, "offer": offer and {
                 "token": offer.token, "name": PROVIDERS[offer.call.provider].name,
                 "choosing": offer.choosing, "canAlways": offer.call.verified,
             }, "active": active, "completed": self.completed, "message": self.message,
-            "providers": [{"id": app.key, "name": app.name, "browser": app.browser}
-                          for app in (*APPS, *WEB_PROVIDERS) if app.binaries or self.browser_pages],
+            "settingsWarning": self.settings_warning(),
+            "providers": [{"id": app.key, "name": app.name, "browser": app.browser, "website": not app.binaries,
+                           "canAlwaysRecord": not app.browser and app.key not in CONFIRMATION_ONLY_SITES,
+                           "lastSeen": self.recent_sources.get(app.key)} for app in sources],
         }
 
     async def answer(self, token, action, languages):
@@ -222,34 +354,66 @@ class CallWatcher:
                 except OSError:
                     raise HTTPException(503, "Could not start recording the detected call.") from None
 
-    async def begin(self, call, languages, *, automatic=False):
+    def stop_enabled(self, active):
+        if active.automatic:
+            return self.preferences["enabled"] and self.preferences["autoStop"]
+        return bool(active.watched_source) and self.preferences["stopRequestedCalls"]
+
+    async def begin(self, call, languages, *, automatic=False, show_unmatched=True, title=""):
         self.message = ""
-        key = await self.start(languages, call)
-        self.active = DetectedRecording(key, call, automatic, self.clock(), languages)
+        watched = call.source
+        if not watched and self.preferences["stopRequestedCalls"]:
+            microphones = await sample_apps(self.microphone_users)
+            native = [app for app in recognized_providers(microphones) if not PROVIDERS[app].browser]
+            if len(native) == 1:
+                watched = native[0]
+        key = await self.start(languages, call, title=title) if title else await self.start(languages, call)
+        if watched or show_unmatched:
+            self.active = DetectedRecording(key, call, automatic, self.clock(), languages, watched_source=watched, title=title)
+        else:
+            self.active = None
+        self.offer = None
+        return key
 
     async def stop(self, key, *, monitoring=False):
         async with self.transition:
-            current = self.active
-            if not current or current.id != key:
-                raise HTTPException(409, "This call is no longer recording.")
+            await self._finish_active(key, monitoring=monitoring)
+
+    async def stop_requested(self):
+        async with self.transition:
             capture = self.state.portable_recording
-            call_ended = monitoring and current.stop_at is not None and self.clock() >= current.stop_at
-            if monitoring and capture and not capture.worker.done() and not call_ended:
-                return
-            current.finishing = True
-            try:
-                await self.finish(key)
-            except (HTTPException, OSError):
-                self.message = "Could not save the meeting. Open Home to recover the recorded audio."
-                raise
+            if not capture or not capture.meeting:
+                return None
+            key = capture.key
+            if self.active and self.active.id == key:
+                await self._finish_active(key)
             else:
+                await self.finish(key)
                 self.completed = str(key)
-            finally:
-                if call_ended:
-                    self.seen.pop(current.call, None)
-                elif current.call in self.seen:
-                    self.seen[current.call].snooze = REOFFER_AFTER
-                self.active = None
+            return key
+
+    async def _finish_active(self, key, *, monitoring=False):
+        current = self.active
+        if not current or current.id != key:
+            raise HTTPException(409, "This call is no longer recording.")
+        capture = self.state.portable_recording
+        call_ended = monitoring and current.stop_at is not None and self.clock() >= current.stop_at
+        if monitoring and capture and not capture.worker.done() and not call_ended:
+            return
+        current.finishing = True
+        try:
+            await self.finish(key)
+        except (HTTPException, OSError):
+            self.message = "Could not save the meeting. Open Home to recover the recorded audio."
+            raise
+        else:
+            self.completed = str(key)
+        finally:
+            if call_ended:
+                self.seen.pop(current.call, None)
+            elif current.call in self.seen:
+                self.seen[current.call].snooze = REOFFER_AFTER
+            self.active = None
 
     def keep_recording(self, key):
         if self.active and self.active.id == key:
@@ -263,25 +427,25 @@ class CallWatcher:
     async def run(self):
         while True:
             if self.preferences["enabled"] or self.active:
-                microphones = await sample_apps(self.microphone_users) if self.preferences["enabled"] else None
-                present = recognized_providers(microphones)
+                detect = self.preferences["enabled"]
                 recording = self.active
+                watch = recording and self.stop_enabled(recording)
+                microphones = await sample_apps(self.microphone_users) if detect or watch else None
+                present = recognized_providers(microphones)
                 browsers = {key: PROVIDERS[key].binaries for key in sorted(present) if PROVIDERS[key].browser
                             and (recording is None or (recording.automatic and self.preferences["autoStop"]
                                  and recording.call.room and key == recording.call.source))}
                 pages = {}
                 if browsers and self.browser_pages:
                     try:
-                        pages = await self.browser_pages(browsers)
+                        pages = await self.browser_pages(browsers, microphones)
                     except CaptureError:
                         pass
-                active = self.active
                 playback = None
-                if (microphones is not None and active and active.automatic and self.preferences["autoStop"]
-                        and active.call.source not in present):
+                if (microphones is not None and watch and recording.watched_source not in present):
                     playback = await sample_apps(self.playback_users)
                 async with self.transition:
-                    stop = await self.observe(microphones, playback if self.active is active else None, pages)
+                    stop = await self.observe(microphones, playback, pages) if self.active is recording else None
                 if stop:
                     try:
                         await self.stop(stop, monitoring=True)
@@ -307,22 +471,23 @@ class CallWatcher:
         return calls
 
     def update_end(self, active, present, playback, page, now):
-        playing = active.call.source in recognized_providers(playback)
-        audible = active.call.source in present or playing
+        on_microphone = active.watched_source in present
+        active.microphone_seen |= on_microphone
+        audible = on_microphone or active.watched_source in recognized_providers(playback)
         if audible:
             active.keep = False
             if observation := self.seen.get(active.call):
                 observation.last = now
-        monitoring = active.automatic and self.preferences["enabled"] and self.preferences["autoStop"]
+        monitoring = self.stop_enabled(active) and (active.automatic or active.microphone_seen)
         if not monitoring or playback is None or audible or active.keep:
             active.missing = None
         elif active.missing is None:
             active.missing = now
         different = ""
-        if (monitoring and active.call.room and page and page.verified and page.room
-                and page.provider == active.call.provider):
-            if page.room != active.call.room:
-                different = page.room
+        if monitoring and active.automatic and active.call.room and page and page.provider == active.call.provider:
+            room = page.room if page.verified else page.room_hint
+            if room and room != active.call.room:
+                different = room
             if different != active.kept_room:
                 active.kept_room = ""
         if different != active.changed_room:
@@ -341,7 +506,8 @@ class CallWatcher:
 
     async def observe(self, binaries, playback, pages=None):
         now = self.clock()
-        if not self.preferences["enabled"]:
+        detecting = self.preferences["enabled"]
+        if not detecting and not (self.active and self.stop_enabled(self.active)):
             binaries = None
         present = recognized_providers(binaries)
         elapsed = now - self.last_observation if self.last_observation is not None else 0
@@ -353,7 +519,7 @@ class CallWatcher:
                 self.active.stop_at = self.active.missing = None
                 self.active.changed_room = ""
         pages = pages if binaries is not None and pages else {}
-        calls = self.identify(present, pages, now)
+        calls = self.identify(present, pages, now) if detecting else []
 
         if binaries is None:
             self.offer = None
@@ -384,19 +550,26 @@ class CallWatcher:
                 return active.id
             return self.update_end(active, present, playback if binaries is not None else None, pages.get(active.call.source), now)
 
+        eligible = [call for call in calls if now - self.seen[call].first >= PROVIDERS[call.provider].delay]
+        if eligible:
+            self.remember_sources(eligible)
         if self.offer:
             offered = self.offer.call
             replaced = any(call.source == offered.source and call != offered for call in calls)
             if not self.offer.visible(now) or offered not in self.seen or replaced or not self.available():
                 self.offer = None
+            else:
+                current = next((call for call in calls if call == offered), None)
+                if offered.verified != bool(current and current.verified):
+                    # An open offer cannot retain authority from a stale page sample.
+                    self.offer = replace(self.offer, call=replace(offered, verified=bool(current and current.verified)))
             return None
         if not self.available():
             return None
-        policies = self.preferences["policies"]
-        for call in calls:
+        for call in eligible:
             seen = self.seen[call]
-            policy = policies.get(call.provider, policies.get(call.source, "ask"))
-            if seen.snooze or policy == "never" or now - seen.first < PROVIDERS[call.provider].delay:
+            policy = self.policy_for(call)
+            if seen.snooze or policy == "never":
                 continue
             if policy == "auto" and call.verified:
                 seen.snooze = REOFFER_AFTER

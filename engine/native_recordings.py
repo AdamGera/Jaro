@@ -1,10 +1,15 @@
-"""Private draft WAV files produced by the Mac capture helper."""
+"""Private draft WAV files and recording markers."""
 import json
 import os
+import stat
 import struct
 import tempfile
+import wave
 from uuid import UUID
 from contextlib import suppress
+
+
+PORTABLE_RECORDING_RATE = 16_000
 
 
 def recording_marker(path):
@@ -81,6 +86,70 @@ def recording_metadata(claim):
     return {}
 
 
+def open_portable_recording_marker(marker, *, create=False):
+    if marker.is_symlink():
+        raise OSError("Invalid recording marker.")
+    writable = create or os.name == "nt"
+    flags = (os.O_RDWR if writable else os.O_RDONLY) | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if create:
+        flags |= os.O_CREAT | os.O_EXCL
+    claim = os.fdopen(os.open(marker, flags, 0o600), "r+b" if writable else "rb")
+    try:
+        if not stat.S_ISREG(os.fstat(claim.fileno()).st_mode):
+            raise OSError("Invalid recording marker.")
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(claim.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(claim, (fcntl.LOCK_EX if create else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+    except BaseException:
+        claim.close()
+        if create:
+            with suppress(OSError):
+                marker.unlink()
+        raise
+    return claim
+
+
+def portable_draft_frames(path):
+    if path.is_symlink() or not path.is_file():
+        return 0
+    try:
+        with wave.open(str(path), "rb") as audio:
+            if (audio.getframerate(), audio.getnchannels(), audio.getsampwidth()) != (PORTABLE_RECORDING_RATE, 1, 2):
+                return 0
+            return min(audio.getnframes(), max(0, path.stat().st_size - 44) // 2)
+    except (EOFError, OSError, wave.Error):
+        return 0
+
+
+def portable_meeting_drafts(folder):
+    for marker in folder.glob("*.recording"):
+        try:
+            key = str(UUID(marker.stem))
+            if key != marker.stem:
+                continue
+            path = folder / f"{key}.wav"
+            # The recorder creates audio only after it owns the marker.
+            if not path.is_file():
+                continue
+            with open_portable_recording_marker(marker) as claim:
+                metadata = recording_metadata(claim)
+                provider = metadata.get("meetingProvider")
+                if not isinstance(provider, str) or not provider or not (frames := portable_draft_frames(path)):
+                    continue
+                modified = path.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        yield dict(id=key, path=str(path), duration=frames / PORTABLE_RECORDING_RATE, modified=modified,
+                   meeting=True, provider=provider, started=metadata.get("meetingStartedAt"), calendar=None,
+                   meetingTitle=metadata.get("meetingTitle"))
+
+
 def is_meeting_stage(path, metadata=None):
     if metadata is None:
         metadata = {}
@@ -93,6 +162,9 @@ def is_meeting_stage(path, metadata=None):
 
 
 def list_drafts(folder):
+    # Windows portable takes live in microphone-drafts and do not use the Mac helper's locks.
+    if os.name == "nt":
+        return []
     import fcntl
 
     drafts = []

@@ -133,7 +133,10 @@ int main(void) {
         [environment finish:nil];
         waitFor(^BOOL{ return !preventsIdleSleep(); });
 
-        [environment beginWithMode:@"mute" percent:20];
+        [environment beginWithMode:nil percent:20];
+        waitFor(^{ return preventsIdleSleep(); });
+        assert(volumesMatch(builtIn, .8, .5));
+        [environment setDictationMode:@"mute" percent:20];
         waitFor(^{ return volumesMatch(builtIn, 0, 0); });
         route = switched;
         __block BOOL restored = NO;

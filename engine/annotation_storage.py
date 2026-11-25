@@ -164,14 +164,30 @@ def allocate(root, key):
     return folder
 
 
+LINK_FALLBACK_ERRNOS = frozenset(
+    code for name in ("EXDEV", "EPERM", "EOPNOTSUPP", "ENOTSUP", "ENOSYS", "EINVAL")
+    if (code := getattr(errno, name, None)) is not None
+)
+CHMOD_UNSUPPORTED_ERRNOS = frozenset(
+    code for name in ("EPERM", "EOPNOTSUPP", "ENOTSUP")
+    if (code := getattr(errno, name, None)) is not None
+)
+
+
 def duplicate(source, destination):
+    source, destination = Path(source), Path(destination)
     try:
         os.link(source, destination, follow_symlinks=False)
     except OSError as error:
-        if error.errno != errno.EXDEV:
+        if error.errno not in LINK_FALLBACK_ERRNOS:
             raise
         with source.open("rb") as reader, destination.open("xb") as output:
-            os.fchmod(output.fileno(), 0o600)
+            if hasattr(os, "fchmod"):
+                try:
+                    os.fchmod(output.fileno(), 0o600)
+                except OSError as chmod_error:
+                    if chmod_error.errno not in CHMOD_UNSUPPORTED_ERRNOS:
+                        raise
             shutil.copyfileobj(reader, output, 1024 * 1024)
             output.flush()
             os.fsync(output.fileno())

@@ -17,13 +17,15 @@ from fastapi.testclient import TestClient
 from fastapi import HTTPException
 
 from annotation_assets import staged_annotation_paths
+from audio_file import audio_blocks, open_audio_pcm
 from dictation_input import CleanupFailed, MIC_GAIN, boost_microphone, replace_mixed_microphone
-from engine_lifecycle import ClientLeases, engine_proof, library_id
+from engine_lifecycle import ClientLeases, engine_proof, library_id, workspace_key
 from managed_preferences import ANNOTATION_MANAGED, MEETINGS_MANAGED, annotate_managed, meetings_managed
 import meeting_brief
 from meeting_rolling import append_rolling, read_rolling
 from native_recordings import recording_marker, source_tracks
 from personal_notes import NoteEdit, save
+from portable_workspace import BOOTSTRAP, WorkspaceAccess
 from server import URL, app, connect_browser, process_mixed_audio, quiesce_update, renew_client
 from session_store import RECOVERY_LIMIT, SHUTDOWN_INTERRUPTION, SessionStore
 
@@ -74,7 +76,8 @@ class NativeEngineTests(unittest.TestCase):
         with (patch("server.audio_blocks", blocks),
               patch("server.dictation_has_signal", return_value=True) as signal,
               patch("server.stupase_cleanup", return_value=cleanup) as processor,
-              patch("server.decode_pcm", new_callable=AsyncMock, return_value={"text": "Quiet words", "inferenceNs": 1000}) as decode):
+              patch("server.decode_pcm", new_callable=AsyncMock,
+                    return_value={"text": "Quiet words", "inferenceNs": 1000, "speechQueueNs": 0}) as decode):
             result = self.client.post(endpoint, headers=self.header)
             self.assertEqual(result.raise_for_status().json()["text"], "Quiet words")
             self.assertEqual(decode.call_args.args[1], original)
@@ -95,7 +98,7 @@ class NativeEngineTests(unittest.TestCase):
             self.assertLessEqual(max(boosted), 0.98 + 1e-6)
             self.assertAlmostEqual(boosted[0], 0.01 * MIC_GAIN * 0.98 / (0.9 * MIC_GAIN), places=6)
             decode.reset_mock()
-            decode.side_effect = [{"text": "", "inferenceNs": 1000}, {"text": "Quiet words", "inferenceNs": 1000}]
+            decode.side_effect = [{"text": text, "inferenceNs": 1000, "speechQueueNs": 0} for text in ("", "Quiet words")]
             enabled = {"noise_cleanup": True, "boost_microphone_input": True}
             self.assertEqual(self.client.post(endpoint, headers=self.header, params=enabled).json()["text"], "Quiet words")
             self.assertEqual([call.args[1] for call in decode.call_args_list], [boost_microphone(enhanced), boost_microphone(original)])
@@ -105,14 +108,43 @@ class NativeEngineTests(unittest.TestCase):
             self.assertEqual(self.client.post(endpoint, headers=self.header, params=enabled).json()["text"], "Quiet words")
             self.assertEqual([call.args[1] for call in decode.call_args_list], [boost_microphone(original)])
 
-    def test_meeting_voice_input_changes_only_asr_and_falls_back(self):
+    def test_dictation_keeps_each_cleaned_window_and_retries_missing_speech_once(self):
+        stage = self.client.post("/api/native/staging?dictation=true", headers=self.header).raise_for_status().json()
+        endpoint = f"/api/native/staging/{stage['id']}/dictate"
+        original = [struct.pack("<80f", *([level] * 80)) for level in (.1, .2, .3, .4)]
+        cleaned = [struct.pack("<80f", *([level] * 80)) for level in (.01, .02)]
+
+        async def blocks(*_args, **_kwargs):
+            for pcm in original:
+                yield pcm
+
+        cleanup = SimpleNamespace(clean=AsyncMock(side_effect=[*cleaned, CleanupFailed()]))
+        decoded = [{"text": text, "inferenceNs": 1_000_000, "speechQueueNs": 3_000_000}
+                   for text in ("First", "", "Second", "Third", "Fourth")]
+        with (patch("server.audio_blocks", blocks),
+              patch("server.dictation_has_signal", return_value=True),
+              patch("server.stupase_cleanup", return_value=cleanup),
+              patch("server.decode_pcm", new_callable=AsyncMock, side_effect=decoded) as decode):
+            result = self.client.post(endpoint, headers=self.header,
+                                      params={"noise_cleanup": True, "boost_microphone_input": True}).raise_for_status().json()
+        self.assertEqual((result["text"], result["inferenceMs"], result["speechTiming"]["speechQueueMs"]),
+                         ("First Second Third Fourth", 5, 15))
+        self.assertGreaterEqual(result["speechTiming"]["voiceCleanupMs"], 0)
+        self.assertEqual([call.args[0] for call in cleanup.clean.await_args_list], original[:3])
+        self.assertEqual([call.args[1] for call in decode.await_args_list],
+                         [boost_microphone(block) for block in (*cleaned, *original[1:])])
+
+    def test_meeting_voice_input_reaches_both_models_and_preserves_source(self):
         source = self.root / "source.wav"
         path = source.with_name("mic.wav")
         with wave.open(str(path), "wb") as capture:
             capture.setparams((1, 2, 48_000, 0, "NONE", ""))
             capture.writeframes(struct.pack("<h", 840) * 240)
         original = path.read_bytes()
-        mic = struct.pack("<80f", *([0.02] * 80))
+        async def decode_mic():
+            return b"".join([block async for block in audio_blocks(path)])
+
+        mic = asyncio.run(decode_mic())
         mixed = struct.pack("<80f", *([0.15] * 80))
         cleaned = struct.pack("<80f", *([0.03] * 80))
         boosted = replace_mixed_microphone(mixed, mic, boost_microphone(mic))
@@ -124,28 +156,31 @@ class NativeEngineTests(unittest.TestCase):
         async def blocks(*_args, **_kwargs):
             yield mixed
 
-        def run(voice, expected, transcripts=("Meeting words",), *, rate=48_000):
+        def run(voice, expected, transcripts=("Meeting words",), *, meeting=True, mic_used=True):
             with (patch("server.audio_blocks", blocks),
-                  patch("server.resample_capture", AsyncMock(return_value=mic)) as resample,
+                  patch("server.open_audio_pcm", wraps=open_audio_pcm) as open_mic,
                   patch("server.stupase_cleanup", return_value=cleanup),
                   patch("server.run_inference", new_callable=AsyncMock) as diarization,
                   patch("server.decode_pcm", AsyncMock(side_effect=[
                       {"text": text, "segments": []} for text in transcripts
                   ])) as recognize):
                 asyncio.run(process_mixed_audio(
-                    state, "fixture", source, {"languageHints": ["en"], "meeting": True, "recording": True,
+                    state, "fixture", source, {"languageHints": ["en"], "meeting": meeting, "recording": True,
                         "diarization": True, "meetingVoiceInput": voice}, 1,
                     checkpoint=0, progress_only=True, emit=lambda **_: None, vocabulary=(),
                 ))
                 self.assertEqual([call.args[1] for call in recognize.call_args_list], expected)
-                self.assertEqual(diarization.call_args.args[2], mixed)
-                self.assertEqual(resample.called, bool(voice))
-                if voice:
-                    resample.assert_awaited_once_with(struct.pack("<h", 840) * (80 * (rate // 16_000)), rate)
+                diarization.assert_awaited_once_with(state, speakers.push, expected[0])
+                if mic_used:
+                    open_mic.assert_called_once_with(path)
+                else:
+                    open_mic.assert_not_called()
                 self.assertEqual(state.library.append.call_args.args[1]["text"], "Meeting words")
                 self.assertEqual(path.read_bytes(), original)
 
-        run({}, [mixed])
+        run({}, [mixed], mic_used=False)
+        run({"noiseCleanup": False, "boostMicrophone": False}, [mixed], mic_used=False)
+        run({"boostMicrophone": True}, [mixed], meeting=False, mic_used=False)
         run({"boostMicrophone": True}, [boosted])
         run({"noiseCleanup": True}, [replace_mixed_microphone(mixed, mic, cleaned)])
         both = {"noiseCleanup": True, "boostMicrophone": True}
@@ -159,13 +194,30 @@ class NativeEngineTests(unittest.TestCase):
             capture.setparams((1, 2, 16_000, 0, "NONE", ""))
             capture.writeframes(struct.pack("<h", 840) * 80)
         original = path.read_bytes()
-        run({"boostMicrophone": True}, [boosted], rate=16_000)
+        mic = asyncio.run(decode_mic())
+        run({"boostMicrophone": True}, [replace_mixed_microphone(mixed, mic, boost_microphone(mic))])
 
-    def test_meeting_voice_settings_are_pinned_in_the_meeting_stage(self):
+        # A 48 kHz take can end between output sample boundaries.
+        with wave.open(str(path), "wb") as capture:
+            capture.setparams((1, 2, 48_000, 0, "NONE", ""))
+            capture.writeframes(struct.pack("<h", 840) * 242)
+        original = path.read_bytes()
+        mic = asyncio.run(decode_mic())
+        mixed += struct.pack("<f", 0.15)
+        self.assertEqual(len(mic), len(mixed))
+        run({"boostMicrophone": True}, [replace_mixed_microphone(mixed, mic, boost_microphone(mic))])
+
+        path.write_bytes(b"invalid audio")
+        original = path.read_bytes()
+        run({"boostMicrophone": True}, [mixed])
+
+    @patch("server.stupase_cleanup")
+    def test_meeting_voice_settings_are_pinned_in_the_meeting_stage(self, cleanup):
         stage = self.client.post("/api/native/staging", headers=self.header, params={
             "recording": "true", "meeting": "true",
         }).raise_for_status().json()
         self.assertNotIn("meetingVoiceInput", json.loads(recording_marker(Path(stage["path"])).read_text()))
+        cleanup.assert_not_called()
 
         flags = {"noise_cleanup": "true", "boost_microphone_input": "true"}
         stage = self.client.post("/api/native/staging", headers=self.header, params={
@@ -178,6 +230,7 @@ class NativeEngineTests(unittest.TestCase):
             "recording": "true", **flags,
         }).raise_for_status().json()
         self.assertEqual(recording_marker(Path(stage["path"])).read_bytes(), b"")
+        cleanup.return_value.prepare.assert_called_once_with()
 
     def test_annotation_retention_requires_local_changes_and_keeps_a_valid_policy(self):
         endpoint = "/api/annotations/retention"
@@ -214,8 +267,9 @@ class NativeEngineTests(unittest.TestCase):
             self.assertTrue(reset["available"] and not reset["custom"])
 
     def test_engine_proves_library_and_native_operations_require_local_token(self):
-        info = self.client.get("/api/status?challenge=012345").json()
-        self.assertEqual(info["proof"], engine_proof(self.secret, "012345"))
+        challenge = "01" * 16
+        info = self.client.get("/api/status", params={"challenge": challenge}).json()
+        self.assertEqual(info["proof"], engine_proof(self.secret, challenge))
         self.assertEqual(info["libraryId"], library_id(self.root.resolve()))
         self.assertEqual((self.root / ".native-token").stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.client.post("/api/native/staging").status_code, 403)
@@ -240,6 +294,35 @@ class NativeEngineTests(unittest.TestCase):
                 self.assertIn("workspace is unavailable", response.text)
             self.assertEqual(self.client.get("/api/status").json()["status"], "ready")
 
+    def test_shared_workspace_requires_authentication_and_keeps_native_credentials_separate(self):
+        wrapped = WorkspaceAccess(app, origin=URL, port=int(URL.rsplit(":", 1)[1]), shared_state=app.state)
+        client = TestClient(wrapped, base_url=URL)
+        self.addCleanup(client.close)
+        self.assertEqual(client.get("/api/sessions").status_code, 403)
+        self.assertEqual(client.get("/").status_code, 403)
+        self.assertEqual(client.get("/api/sessions", headers=self.header).status_code, 200)
+        challenge = "a" * 32
+        identity = client.get("/api/status", params={"challenge": challenge}).raise_for_status().json()
+        self.assertEqual(identity["proof"], engine_proof(self.secret, challenge))
+        self.assertIsNone(client.get("/api/status", params={"challenge": "jaro:workspace:v1"}).json()["proof"])
+
+        shell = client.get(BOOTSTRAP).raise_for_status()
+        self.assertEqual(shell.headers["Cache-Control"], "no-store")
+        self.assertIn("frame-ancestors 'none'", shell.headers["Content-Security-Policy"])
+        key_header = {"X-Jaro-Workspace-Key": workspace_key(self.secret)}
+        self.assertEqual(client.post(BOOTSTRAP, headers=key_header).status_code, 403)
+        self.assertEqual(client.post(BOOTSTRAP, headers={**key_header, "Origin": "http://127.0.0.1:9"}).status_code, 403)
+        invalid = client.post(BOOTSTRAP, headers={"Origin": URL, "X-Jaro-Workspace-Key": self.secret})
+        self.assertEqual(invalid.status_code, 403)
+        response = client.post(BOOTSTRAP, headers={**key_header, "Origin": URL})
+        self.assertEqual(response.status_code, 204)
+        self.assertIn("HttpOnly", response.headers["set-cookie"])
+        self.assertIn("SameSite=strict", response.headers["set-cookie"])
+        self.assertEqual(client.get("/api/sessions").status_code, 200)
+        self.assertEqual(client.get("/api/sessions", headers={"Host": "subdomain.example"}).status_code, 403)
+        self.assertEqual(client.get("/api/sessions", headers={"Origin": "https://example.com"}).status_code, 403)
+        self.assertEqual(client.post("/api/native/staging", headers={"Origin": URL}).status_code, 403)
+
     def test_live_preview_uses_written_range_and_submit_is_idempotent(self):
         ep, key = self.new_stage()
         self.assertEqual(self.client.post(ep + "/preview?start=48000&frames=240", headers=self.header).status_code, 409)
@@ -255,8 +338,10 @@ class NativeEngineTests(unittest.TestCase):
         saved = self.client.get(f"/api/sessions/{key}").raise_for_status().json()
         self.assertEqual(saved["status"], "complete")
         self.assertEqual(saved["transcript"]["text"], "Hello Jard")
-        self.assertTrue(self.client.get(saved["audioUrl"]).content.startswith(b"RIFF"))
-        self.assertEqual(self.client.delete(f"/api/sessions/{key}").status_code, 204)
+        audio = self.client.get(saved["audioUrl"], headers={"Range": "bytes=0-3"})
+        self.assertEqual((audio.status_code, audio.content), (206, b"RIFF"))
+        self.assertEqual(audio.headers["Cross-Origin-Resource-Policy"], "same-origin")
+        self.assertEqual(self.client.delete(f"/api/sessions/{key}", headers={"Origin": URL}).status_code, 204)
         self.assertEqual(self.client.get(f"/api/sessions/{key}").status_code, 404)
 
     def test_ordinary_session_preview_persists_rolling_transcript_through_finalization(self):
@@ -397,17 +482,80 @@ class NativeEngineTests(unittest.TestCase):
         library.finish(key)
         url = f"/api/sessions/{key}"
         self.assertEqual(self.client.delete(url, headers={"Origin": "https://example.net"}).status_code, 403)
+        self.assertEqual(self.client.delete(url).status_code, 403)
+        self.assertEqual(self.client.delete(url + "/audio").status_code, 403)
         with patch.object(library, "_deliver_meeting_archive", side_effect=OSError("Trash unavailable")):
-            response = self.client.delete(url)
+            response = self.client.delete(url, headers={"Origin": URL})
         self.assertEqual(response.status_code, 202, response.text)
         self.assertEqual(response.json(), {"trashPending": True})
         self.assertEqual(self.client.get(url).status_code, 404)
 
         deliver = library._deliver_meeting_archive
         with patch.object(library, "_deliver_meeting_archive", side_effect=lambda key, _: deliver(key, lambda path: path.rename(self.root / "Fixture Trash"))):
-            self.assertEqual(self.client.delete(url).status_code, 204)
-        self.assertEqual(self.client.delete(url).status_code, 404)
+            self.assertEqual(self.client.delete(url, headers={"Origin": URL}).status_code, 204)
+        self.assertEqual(self.client.delete(url, headers={"Origin": URL}).status_code, 404)
         self.assertTrue((self.root / "Fixture Trash" / "Meeting.json").is_file())
+
+    def test_native_meeting_trash_refuses_other_sessions_and_pending_work(self):
+        library = app.state.library
+        source = self.root / "native-trash.wav"
+        source.write_bytes(b"ordinary recording")
+        options = {"recording": True, "diarization": False}
+        ordinary, _ = library.create(source, "Ordinary recording", "audio/wav", options, 1)
+        library.finish(ordinary)
+        source.write_bytes(b"meeting recording")
+        meeting, _ = library.create(source, "Meeting fixture", "audio/wav", dict(options, meeting=True), 1)
+        route = f"/api/native/meetings/{meeting}"
+        headers = {**self.header, "Origin": URL}
+        revision = "/api/sessions/revision"
+        before = self.client.get(revision).raise_for_status().json()["revision"]
+        self.assertEqual(self.client.get(revision, headers={"Origin": "https://example.net"}).status_code, 403)
+        self.assertEqual(self.client.delete(route, headers={"Origin": URL}).status_code, 403)
+        self.assertEqual(self.client.delete(route, headers={**headers, "Origin": "https://example.net"}).status_code, 403)
+        self.assertEqual(self.client.delete(f"/api/native/meetings/{ordinary}", headers=headers).status_code, 404)
+        self.assertEqual(self.client.get(f"/api/sessions/{ordinary}").status_code, 200)
+        self.assertEqual(self.client.delete(route, headers=headers).status_code, 409)
+        self.assertEqual(self.client.get(revision).json()["revision"], before)
+        library.finish(meeting)
+        deliver = library._deliver_meeting_archive
+        with patch.object(library, "_deliver_meeting_archive", side_effect=OSError("Trash unavailable")):
+            response = self.client.delete(route, headers=headers)
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(response.json(), {"trashPending": True})
+        self.assertNotEqual(self.client.get(revision).json()["revision"], before)
+        with patch.object(library, "_deliver_meeting_archive",
+                          side_effect=lambda key, _: deliver(key, lambda path: path.rename(self.root / "Native Trash"))):
+            self.assertEqual(self.client.delete(route, headers=headers).status_code, 204)
+        self.assertTrue((self.root / "Native Trash" / "Meeting.json").is_file())
+        self.assertEqual(self.client.delete(route, headers=headers).status_code, 404)
+
+    def test_meeting_transcript_edit_requires_opt_in_origin_and_current_revision(self):
+        path = "/api/meeting-transcript-edits"
+        self.assertEqual(self.client.get(path).json(), {"enabled": False})
+        self.assertEqual(self.client.put(path, json={"enabled": True}).status_code, 403)
+        origin = {"Origin": URL}
+        self.assertEqual(self.client.put(path, headers=origin, json={"enabled": True}).json(), {"enabled": True})
+        source = self.root / "edit.wav"
+        source.write_bytes(b"original recording")
+        store = app.state.library
+        key, _ = store.create(source, "Meeting.wav", "audio/wav",
+                              {"meeting": True, "recording": True, "diarization": True, "languageHints": ["en"]}, 2)
+        turns = [{"text": "first", "speaker": 1, "start": 0, "end": 1},
+                 {"text": "second", "speaker": 2, "start": 1, "end": 2}]
+        store.append(key, {"text": "first second", "segments": turns, "words": []}, 2)
+        store.finish(key)
+        with store.connection() as db:
+            db.execute("UPDATE overviews SET status='error' WHERE id=?", (key,))
+            db.execute("UPDATE meeting_briefs SET status='error' WHERE id=?", (key,))
+        url = f"/api/sessions/{key}"
+        payload = {"revision": self.client.get(url).json()["transcriptEditRevision"], "lines": [1]}
+        self.assertEqual(self.client.post(url + "/delete-transcript-lines", json=payload).status_code, 403)
+        response = self.client.post(url + "/delete-transcript-lines", headers=origin, json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["transcript"]["text"], "first")
+        self.assertEqual(self.client.get(url).json()["meetingTurns"], turns[:1])
+        self.assertEqual(self.client.put(path, headers=origin, json={"enabled": False}).json(), {"enabled": False})
+        self.assertEqual(self.client.post(url + "/delete-transcript-lines", headers=origin, json=payload).status_code, 409)
 
     def test_settled_meeting_draft_can_be_copied_revealed_and_archived(self):
         library = app.state.library
@@ -427,13 +575,13 @@ class NativeEngineTests(unittest.TestCase):
         reveal = f"/api/native/meetings/{key}/recording-files"
         self.assertEqual(self.client.get(copy).status_code, 409)
         self.assertEqual(self.client.get(reveal, headers=self.header).status_code, 404)
-        self.assertEqual(self.client.delete(url).status_code, 409)
+        self.assertEqual(self.client.delete(url, headers={"Origin": URL}).status_code, 409)
 
         with library.connection() as db:
             db.execute("UPDATE meeting_finalization SET attempts=? WHERE session_id=?", (RECOVERY_LIMIT, key))
             save(db, key, NoteEdit(revision=0, document={"type": "doc", "content": [
                 {"type": "paragraph", "content": [{"type": "text", "text": "Draft notes to keep."}]}]}))
-        self.assertIsNone(library.claim_meeting_finalization())
+        self.assertIsNone(library.claim_recording_finalization())
         self.assertEqual(library.expire_meetings(), [])
         self.assertEqual([row["id"] for row in library.list("", meetings_only=True)], [key])
         self.assertEqual(self.client.get(copy).raise_for_status().text, f"**00:04 · You**  \n{text}")
@@ -444,7 +592,7 @@ class NativeEngineTests(unittest.TestCase):
         archive = self.root / "Recovered meeting in Trash"
         deliver = library._deliver_meeting_archive
         with patch.object(library, "_deliver_meeting_archive", side_effect=lambda key, _: deliver(key, lambda path: path.rename(archive))):
-            self.assertEqual(self.client.delete(url).status_code, 204)
+            self.assertEqual(self.client.delete(url, headers={"Origin": URL}).status_code, 204)
         self.assertEqual(self.client.get(copy).status_code, 404)
         self.assertEqual(self.client.get(reveal, headers=self.header).status_code, 404)
         self.assertEqual(library.list("", meetings_only=True), [])
@@ -570,7 +718,9 @@ class NativeEngineTests(unittest.TestCase):
             saved = self.client.get(f"/api/sessions/{key}").raise_for_status().json()
             self.assertEqual(saved["annotation"]["source"], "display")
             self.assertEqual(self.client.get(saved["audioUrl"]).content, b"saved video")
-            self.assertEqual(self.client.get(saved["annotation"]["manifestUrl"]).json(), {})
+            manifest = self.client.get(saved["annotation"]["manifestUrl"])
+            self.assertEqual(manifest.json(), {})
+            self.assertEqual(manifest.headers["Cross-Origin-Resource-Policy"], "same-origin")
 
         annotate_managed.cache_clear()
         allowed = self.client.post(endpoint, headers=self.header, params=params)
@@ -663,12 +813,12 @@ class ManagedMeetingsEngineTests(unittest.TestCase):
         claims = []
 
         async def observe_recovery(state, stranded):
-            claims.append(state.library.claim_meeting_finalization())
+            claims.append(state.library.claim_recording_finalization())
             resumed.set()
             return False
 
         with (patch("insights.Insights.run", new_callable=AsyncMock),
-              patch("server.recover_pending_meeting", side_effect=observe_recovery),
+              patch("server.recover_pending_recording", side_effect=observe_recovery),
               TestClient(app, base_url=URL) as client):
             self.assertTrue(app.state.startup_recovery)
             self.assertEqual(client.get("/api/meetings/automatic-notes").json(), {"enabled": True})

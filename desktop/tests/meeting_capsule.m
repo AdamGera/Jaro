@@ -119,8 +119,8 @@ static void testOfferChoices(void) {
     } send:nil changed:nil];
     [meeting.policies removeAllObjects];
     NSString *chrome = @"com.google.chrome";
-    JardCall *first = JardMeetingBrowserTitleCall(@"Meet - abc-defg-hij", chrome);
-    JardCall *second = JardMeetingBrowserTitleCall(@"Meet - xyz-wxyz-xyz", chrome);
+    JardCall *first = JardMeetingBrowserCall([NSURL URLWithString:@"https://meet.google.com/abc-defg-hij"], chrome);
+    JardCall *second = JardMeetingBrowserCall([NSURL URLWithString:@"https://meet.google.com/xyz-wxyz-xyz"], chrome);
     NSDate *date = NSDate.date;
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
     [meeting observeCalls:@[first] now:now - 2 date:date];
@@ -195,6 +195,40 @@ static void testOfferChoices(void) {
 }
 
 typedef NS_ENUM(NSUInteger, OfferStartFixture) { QuickOfferStart, SlowOfferStart, RefusedOfferStart, HiddenOfferStart };
+
+static void testOfferVerification(void) {
+    NSString *chrome = @"com.google.chrome";
+    JardCall *named = JardMeetingBrowserTitleCall(@"Meet - abc-defg-hij", chrome);
+    JardCall *verified = JardMeetingBrowserCall([NSURL URLWithString:@"https://meet.google.com/abc-defg-hij"], chrome);
+    __block NSUInteger starts = 0;
+    JardMeetings *meeting = [[JardMeetings alloc] initWithManaged:NO start:^(NSDictionary *options, BOOL prompt, JardDictationReply reply) {
+        assert(prompt && [options[@"meetingLabel"] isEqual:@"Google Meet"]);
+        starts++;
+        reply(@{}, nil);
+    } send:nil changed:nil];
+    [meeting.policies removeAllObjects];
+    meeting.policies[named.provider] = @{@"label": named.label, @"policy": @"auto"};
+    NSDate *date = NSDate.date;
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    [meeting observeCalls:@[named] now:now date:date];
+    [meeting observeCalls:@[named] now:now + 2 date:date];
+    assert(!starts && button(meeting.panel, JardLocalized(@"Record")));
+    [button(meeting.panel, @"…") performClick:nil];
+    assert(button(meeting.panel, JardLocalized(@"Never offer")) && !button(meeting.panel, JardLocalized(@"Always record")));
+
+    [meeting observeCalls:@[verified] now:now + 3 date:date];
+    NSButton *formerlyVerified = button(meeting.panel, JardLocalized(@"Always record"));
+    assert(formerlyVerified && !starts);
+    [meeting observeCalls:@[named] now:now + 4 date:date];
+    assert(!button(meeting.panel, JardLocalized(@"Always record")));
+    [NSApp sendAction:formerlyVerified.action to:meeting from:formerlyVerified];
+    assert(!starts);
+    [button(meeting.panel, JardLocalized(@"Cancel")) performClick:nil];
+    [button(meeting.panel, JardLocalized(@"Record")) performClick:nil];
+    assert(starts == 1);
+    [meeting shutdown];
+    puts("Title-only offers require confirmation and lose Always record when address evidence disappears.");
+}
 
 static void testOfferToRecording(OfferStartFixture scenario) {
     BOOL reduced = scenario == SlowOfferStart;
@@ -329,8 +363,14 @@ static void testMeetingWindow(void) {
     [meeting handleCapture:@{@"meeting": take, @"event": @"meetingSystemAudio", @"available": @NO}];
     assert([[meeting status][@"systemAudioUnavailable"] boolValue] && meeting.recording);
     assert([meeting.caption.accessibilityLabel containsString:@"Mac audio reconnecting"]);
+    [meeting handleCapture:@{@"meeting": take, @"event": @"meetingSystemAudio", @"available": @NO, @"permissionDenied": @YES}];
+    assert([[meeting status][@"systemAudioPermissionDenied"] boolValue] && meeting.recording);
+    assert([meeting.caption.accessibilityLabel containsString:@"Mac audio access needed"]);
+    [meeting request:@{@"action": @"recordingPrivacy"} reply:accept];
+    assert(audioSettingsOpened == 3);
     [meeting handleCapture:@{@"meeting": take, @"event": @"meetingSystemAudio", @"available": @YES}];
-    assert(![[meeting status][@"systemAudioUnavailable"] boolValue] && meeting.recording);
+    assert(![[meeting status][@"systemAudioUnavailable"] boolValue] &&
+           ![[meeting status][@"systemAudioPermissionDenied"] boolValue] && meeting.recording);
     [meeting handleCapture:@{@"meeting": take, @"event": @"levels", @"seconds": @8, @"meetingRms": @0.45}];
     assert([meeting.caption.accessibilityLabel containsString:@"0:08"]);
     assert(meeting.recordingMeter.embedded && [meeting.panel.appearance.name isEqual:NSAppearanceNameDarkAqua]);
@@ -768,6 +808,7 @@ int main(void) {
         }
         testPlacement(screen);
         testOfferChoices();
+        testOfferVerification();
         for (OfferStartFixture mode = QuickOfferStart; mode <= HiddenOfferStart; mode++) testOfferToRecording(mode);
         puts("Record requested capture immediately, preserved the offer panel, and delayed Starting until a slow open.");
         testMeetingWindow();

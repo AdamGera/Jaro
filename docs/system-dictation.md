@@ -38,7 +38,9 @@ With dictation enabled, you can also choose **Paste Last Dictation** from Jaro�
 
 To record a modifier-only shortcut, hold the combination in the shortcut recorder and then release the keys. A chord such as Option–Command works with either hand. A chord recorded with two keys of the same modifier, such as both Option keys, needs those two presses within 80 ms. Dictation and Dictate raw text both accept these chords.
 
-Dictation works while the Jard window is closed and the app is running. It uses Rumble2 Flash on the Mac. Settings include the shortcut, input device, language, vocabulary, output, and text-only history. The default history retention is seven days.
+Dictation works while the Jard window is closed and the app is running. It uses Rumble2 Flash on the Mac. Settings include the shortcut, input device, language, vocabulary, output, and History. Dictation transcripts are kept for seven days by default. Original microphone clips are available for up to 24 hours.
+
+Under **Dictation → General → Labs**, enable **Show History stats** to see word and dictation counts, estimated typing time saved, words per minute, your current streak, and your busiest local hour. These figures use the entries still in History. Search leaves the totals in place. Time saved uses a typing speed of 40 words per minute and includes only entries with a recorded duration.
 
 In **Dictation → General → Vocabulary**, add up to 32 preferred names or terms. Add comma-separated alternate spellings in **Sounds like**. Jaro saves after you pause typing and when you close the editor.
 
@@ -209,11 +211,19 @@ You can start a meeting while Annotate is recording or start Annotate during a m
 
 **Paste into Last App** returns to the previous app and pastes the contact sheet followed by the written context. Supported terminal apps receive the sheet's file path. Jard restores the original clipboard after the paste and leaves the field ready for review.
 
+In a saved annotation’s **Overview**, open **Images** and choose **Trim video** below the player. Set **Clip start** and **Clip end**, choose **Preview clip**, then use **Save clip…** to export that range as a separate MP4 with its saved sound and drawings.
+
 Scroll below the Overview to expand **Images** and open individual annotation frames. Add reference images to a saved recording with the image-plus button. The buttons beside Images send the saved overview, quick brief, My Notes, timestamped transcript, and available images to a selected Codex, Claude Code, OpenCode, or T3 Code chat. Hover or focus a button to see its name, then choose an existing chat and select **Send context**. Jaro opens the installed agent after the send. Codex, Claude Code, and OpenCode get inline images. T3 Code gets local image links that work while Jaro’s engine is running. Claude Code needs its CLI installed and signed in. T3 Code needs its CLI and the desktop app or local server running.
 
 **Send to OpenCode** lists open sessions from a running local OpenCode v2 service. Search by title, project path, or session ID, select one, and choose **Send annotation**. The prompt queues the narration and contact sheet together. The saved annotation stays available in Jard. Under **OpenCode deliveries**, choose **Undo send** within ten minutes. Jard withdraws an inbox item or rolls back the turn it started if the inbox and timeline show no newer input. **Restore files and undo** requires confirmation because OpenCode can restore files changed during that turn, including edits made outside OpenCode. If the turn contains other work, **Send correction** asks OpenCode to disregard that specific message. The receipt stays visible after you reopen Jard. For an unconfirmed rollback, **Check rollback status** reads the session again.
 
 The destination picker can suggest a session mentioned in the narration or one whose project matches the captured app. Select **Remember destination** to prefer a session for this app, a verified browser site, or a terminal project on later annotations. Terminal rules cover project subfolders, and the closest matching project wins. Jard can also suggest the OpenCode conversation shown in the terminal. **Forget** removes the preference. To enable automatic sending for future matching captures, select the automatic option before saving the destination. Jard shows the chosen session when narration is ready. Hover over the three-second countdown to pause it or choose **Cancel**. If OpenCode is unavailable before a send, Jard keeps the capture queued for up to a day and checks again when Jard is open. A resumed send gets a fresh countdown. A send without confirmation appears as **Delivery unconfirmed** for review. If the saved session is unavailable, the picker still shows other open sessions.
+
+Open **Settings → Annotate → Manage rules → Add rule** to set up a destination before recording. Enter a website domain or project path such as `github.com/org/repo`, a macOS bundle identifier, or an absolute terminal project folder. Choose an existing OpenCode chat and save. New rules and rules with an updated destination use **Suggest**. Enable **Send automatically** separately for a saved rule.
+
+Website rules use the most specific matching path. A rule for `github.com/org/repo` covers `github.com/org/repo/issues`. It does not cover `github.com/org/repo-tools`. Shared services such as GitHub require a project path. Existing rules for an entire shared domain stay visible in Settings for removal. Jaro keeps the verified host and path in local routing metadata and drops credentials, query strings, and fragments. The CLI accepts `annotate remember --scope site --scope-key` with one of the keys returned by `annotate destinations --capture`.
+
+Choose **Project’s newest chat** as the destination to follow a folder. Select a listed OpenCode project or enter its absolute path. Jaro finds the most recently updated open chat in that project each time a capture matches, including chats in Git worktrees for the same repository. If automatic sending is enabled, review the exact chat in the countdown.
 
 Mac administrators can force the Boolean `DisableOpenCodeProcessing` in the `local.jardaudio.desktop` preference domain. Relaunch Jaro to apply or remove the restriction. The restriction turns off OpenCode session discovery, delivery, and changes to deliveries. Existing annotations, destination preferences, receipts, and pending sends stay on this Mac. You can still copy or export annotations and cancel a pending send. The CLI returns a `managed` error for restricted operations.
 
@@ -223,7 +233,7 @@ With Jard running, use `jardctl annotate destinations --query project-name` to f
 
 To annotate a wired iPhone or iPad, connect it over USB, unlock it, and trust the Mac when asked. Select **Wired iPhone or iPad** in **Settings → Screen Annotation**, or run `jardctl annotate start --source phone`. Allow Camera access to open the mirror and Microphone access for Mac narration. Draw on the mirrored picture and choose **Stop & Save** to add it to Sessions.
 
-With Jaro running, `jardctl annotate start` records the display under the pointer when Screen Recording is available. Pass `--source display`, `--source window`, or `--source area` to use the corresponding chooser, or `--source phone` to use a wired device. You can also pass `--language`. `jardctl annotate status` reports the capture ID and elapsed recording time. `jardctl annotate stop` starts saving in the background. Use the capture ID with `annotate show` once saving finishes. `jardctl annotate cancel` discards the unsaved take. If saving has already started, it returns that state with `changed: false`.
+With Jaro running, `jardctl annotate start` records the display under the pointer when Screen Recording is available. Pass `--source display`, `--source window`, or `--source area` to use the corresponding chooser, or `--source phone` to use a wired device. You can also pass `--language`. `jardctl annotate status` reports the capture ID and elapsed recording time. `jardctl annotate stop` starts saving in the background. Use the capture ID with `annotate show` once saving finishes. `jardctl annotate cancel` discards the unsaved take. If saving has already started, it returns that state with `changed: false`. Bind `jardctl annotate toggle` to one key to start the default display capture and press it again to save. A second press while the picker is open leaves the picker open.
 
 ## Read history with jardctl
 
@@ -235,11 +245,17 @@ jardctl history --search "paperback schedule" --limit 10 --json
 jardctl history --raw --oldest-first --json
 ```
 
+## Use the vocabulary menu on Mac
+
+Turn on **Vocabulary menu** under **Dictation → General → Labs**. Open Jaro’s menu bar icon and choose **Vocabulary → Add Term…** to add a word or phrase, or **Open Vocabulary…** to edit your list. The submenu also shows up to five recent terms.
+
 ## Control the Mac app with jardctl
 
 Open **Settings → General → CLI and MCP** to copy a CLI command or a prompt for your agent. Expand **Setup guide** and choose your MCP client to copy its connection command or configuration. MCP can read saved meetings, transcripts, notes, and screen annotations. The CLI also supports local recording controls and settings. [Claude Code MCP](https://code.claude.com/docs/en/mcp) · [OpenCode MCP](https://opencode.ai/docs/mcp-servers/)
 
 With Jard running and dictation enabled, `jardctl dictation start --raw` starts a take without output processing. `jardctl dictation stop --print` delivers the text only to stdout and accepts `--json` for structured output. Printed takes appear in History when retention is enabled. If Jard hears no speech, the command exits with code 4 and leaves stdout empty.
+
+On macOS, `jardctl dictation start --print` starts a print-only take and waits for the transcript. Finish with the regular dictation shortcut or run `jardctl dictation stop` from another terminal. Add `--raw` to skip output processing. The printed transcript stays out of the clipboard and Paste Last.
 
 With Jaro running, use `jardctl vocabulary list --json`, `jardctl vocabulary add "Mei Lin" --sounds-like "May Lean,May Linn"`, or `jardctl vocabulary remove "Mei Lin"`. Added terms appear in Dictation settings and provide context to Rumble2 Flash. Alternate spellings correct whole phrases during normal dictation and output previews. Add and remove match terms case-insensitively.
 
@@ -250,6 +266,8 @@ Live and saved meeting transcripts use Rumble2 Flash on the combined microphone 
 Run `jardctl transcribe "recording.m4a"` to transcribe a local audio or video file. Jaro uses Rumble2 Flash and processes long tracks in pieces. Pass `--language en` to supply a language hint or `--json` for structured output. The command can use an installed model with Jaro closed. If the speech model is missing, an interactive terminal offers to download the pinned assets. Scripts can check readiness with `jardctl model status --json` and explicitly prepare it with `jardctl model install`. Add `--from FOLDER` to verify and install an existing local copy. Silence exits with code 4 and leaves stdout empty.
 
 Run `jardctl logs -n 50` to read recent desktop and recording events, or `jardctl logs --process -f` to follow the engine log until interrupted. Both commands work with Jaro closed. The structured event log stores phases and timestamps without the spoken text or its destination. When either log reaches 10 MiB, the engine’s startup and hourly checks keep its newest complete lines within about 5 MiB.
+
+For a completed system dictation, the timing event separates time waiting for decoded audio, the speech worker, and output delivery from time spent in Rumble2 Flash. It also records the time spent obtaining priority over the local writing model and running noise cleanup when used. All durations are in milliseconds.
 
 The packaged CLI can start its own app bundle and request a normal quit or restart. Quit and restart return a busy error while Jard has an active capture. A restart reopens the same app bundle. A staged update can install during either action once the shared engine is idle.
 

@@ -1,6 +1,7 @@
 // Compiled only in the process-lifecycle tests. Never opens a capture device.
 import CoreMedia
 import Foundation
+import ScreenCaptureKit
 
 private struct SyntheticSystemFallback: MeetingSystemAudioConnection {
     let openedAt = hostSeconds()
@@ -37,6 +38,7 @@ func startSyntheticInput(_ recorder: Recorder, input: InputDevice? = nil, usingD
     let fail = ProcessInfo.processInfo.environment["JARD_TEST_INPUT_LOSS"] == "1"
     let handoff = ProcessInfo.processInfo.environment["JARD_TEST_MIC_HANDOFF"] == "1"
     let systemRestart = ProcessInfo.processInfo.environment["JARD_TEST_SYSTEM_RESTART"] == "1"
+    let latePackets = ProcessInfo.processInfo.environment["JARD_TEST_LATE_PACKETS"] == "1"
     let fallback = ProcessInfo.processInfo.environment["JARD_TEST_SYSTEM_FALLBACK"]
     let initialSystem = UUID(), restartedSystem = UUID()
     let interruption = ProcessInfo.processInfo.environment["JARD_TEST_INTERRUPTION"]
@@ -48,6 +50,10 @@ func startSyntheticInput(_ recorder: Recorder, input: InputDevice? = nil, usingD
     if let fallback {
         var firstTap = true
         recorder.startMeetingSystemAudio(open: { backend, _, forward in
+            if fallback == "denied" {
+                if backend == .tap { throw CaptureError("Fixture audio tap is unavailable.") }
+                throw NSError(domain: SCStreamErrorDomain, code: SCStreamError.Code.userDeclined.rawValue)
+            }
             if backend == .tap {
                 let recovering = fallback == "recover"
                 if fallback == "open" || (recovering && firstTap) {
@@ -82,6 +88,12 @@ func startSyntheticInput(_ recorder: Recorder, input: InputDevice? = nil, usingD
             if i == 20 && interruption == "stall" { return }
             let gap = i >= 20 && interruption == "gap" ? 0.28 : 0
             let timestamp = start + Double(i) * 0.02 + gap
+            if latePackets && i == 75 {
+                let source: Source = recorder.mode == .mic ? .mic : .system
+                for late in 0..<4 {
+                    recorder.enqueue(quiet, at: start + Double(late) * 0.02, from: source)
+                }
+            }
             if recorder.mode != .system && includeMicrophone {
                 let samples = speechEnd.map { (speechStart..<max(speechStart, $0)).contains(i) ? speech : quiet } ?? constant
                 if handoff {

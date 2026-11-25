@@ -83,7 +83,7 @@ struct Timeline {
                 }
             }
         }
-        lastEnd[source] = start + aligned.count
+        lastEnd[source] = max(lastEnd[source] ?? 0, start + aligned.count)
         lateFrames += max(0, min(aligned.count, cursor - max(0, start)))
         if start + aligned.count > cursor {
             blocks.append(Block(start: start, samples: aligned, source: source))

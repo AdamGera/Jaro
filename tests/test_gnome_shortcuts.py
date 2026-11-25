@@ -78,3 +78,30 @@ class GnomeShortcutsTests(unittest.TestCase):
         with self.assertRaises(CaptureError):
             self.shortcuts.install()
         self.calls.assert_called_once_with("get", SCHEMA, KEY)
+
+    def test_adding_annotate_preserves_other_keys_and_removes_only_its_own_entry(self):
+        self.shortcuts.install()
+        old_keys = list(self.listed)
+        self.values[self.other]["binding"] = "<Shift><Alt><Primary>S"
+        self.values[old_keys[1]]["binding"] = "F9"
+        with patch("wayland_dictation_commands.ENGINE_ROOT", Path("/usr/lib/jaro/engine")):
+            updated = GnomeShortcuts(self.root, annotation=True)
+        self.assertTrue(updated.install())  # The existing custom key owns the default.
+        entry = updated.annotation_entry
+        self.assertEqual(self.listed, [*old_keys, entry])
+        self.assertEqual(self.values[entry], {
+            "name": "Jaro · Annotate", "command": updated.prefix + " annotate", "binding": "",
+        })
+        self.values[entry]["binding"] = "F10"
+        self.assertFalse(updated.install())
+        self.assertEqual(self.values[entry]["binding"], "F10")
+        self.assertEqual(self.values[old_keys[1]]["binding"], "F9")
+        self.assertFalse(self.shortcuts.install())  # A desktop without screen capture can remove the obsolete entry.
+        self.assertEqual(self.listed, old_keys)
+        self.assertNotIn(entry, self.values)
+        self.assertEqual(self.values[self.other]["command"], "external-command")
+        self.values[self.other]["binding"] = "F11"
+        self.values[old_keys[1]]["binding"] = "<Shift><Alt><Primary>S"
+        self.assertTrue(updated.install())
+        self.assertEqual(self.values[entry]["binding"], "")
+        self.assertEqual(self.values[old_keys[1]]["binding"], "<Shift><Alt><Primary>S")

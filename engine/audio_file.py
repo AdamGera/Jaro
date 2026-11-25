@@ -1,15 +1,16 @@
 import asyncio
+from contextlib import asynccontextmanager
+from functools import lru_cache
 import json
 from pathlib import Path
 import sys
 import wave
 
-import numpy as np
-
 from rumble_model import MAX_SAMPLES, SAMPLE_RATE
 from engine_paths import WORKSPACE_ROOT
 
 MAX_AUDIO_SECONDS = 3 * 60 * 60
+FAST_WAV_MAX_SECONDS = 60
 FILE_ERROR = "This audio could not be opened. Try a WAV, MP3, or M4A file."
 DURATION_ERROR = "Choose audio up to 3 hours long."
 PAUSE_AWARE_CHUNKING = "quiet-window-v1"
@@ -60,6 +61,8 @@ async def audio_duration(path: Path) -> float | None:
 
 def split_at_pauses(pcm: bytes):
     """Keep all samples and give clearly separated utterances their own ASR context."""
+    import numpy as np
+
     audio = np.frombuffer(pcm, dtype="<f4")
     frame = SAMPLE_RATE // 50  # 20 ms
     frames = audio[:len(audio) // frame * frame].reshape(-1, frame)
@@ -78,6 +81,8 @@ def split_at_pauses(pcm: bytes):
 
 def quiet_sample_boundary(samples):
     """Cut at the midpoint of the quietest span near the end of a full model window."""
+    import numpy as np
+
     if len(samples) <= 1:
         return len(samples)
     search = min(QUIET_SEARCH, len(samples) // 2)
@@ -92,17 +97,86 @@ def quiet_sample_boundary(samples):
     return max(1, int(len(samples) - search + quiet_start + span // 2))
 
 
-async def audio_blocks(path: Path, *, multilingual=False, pause_aware=False):
+@asynccontextmanager
+async def open_audio_pcm(path: Path):
     process = await asyncio.create_subprocess_exec(
         codec_binary("ffmpeg"), "-v", "error", "-nostdin", *INPUT_OPTIONS, "-i", path,
         "-map", "0:a:0", "-t", str(MAX_AUDIO_SECONDS + 1), "-ac", "1",
         "-ar", str(SAMPLE_RATE), "-f", "f32le", "pipe:1",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
+    try:
+        yield process
+    finally:
+        await stop_process(process)
+
+
+@lru_cache(maxsize=1)
+def _decimate_48k_kernel():
+    import numpy as np
+
+    taps = 31
+    half = taps // 2
+    positions = np.arange(-half, half + 1, dtype=np.float64)
+    cutoff = 7_200.0 / 48_000.0
+    kernel = np.sinc(2.0 * cutoff * positions) * np.hamming(taps)
+    kernel /= kernel.sum()
+    return kernel.astype(np.float32)
+
+
+def _read_fast_wav_pcm(path: Path) -> bytes | None:
+    """Decode short mono 16-bit 16/48 kHz PCM WAVs in-process without spawning ffmpeg."""
+    import numpy as np
+
+    try:
+        with wave.open(str(path), "rb") as stream:
+            if (stream.getnchannels(), stream.getsampwidth(), stream.getcomptype()) != (1, 2, "NONE"):
+                return None
+            rate = stream.getframerate()
+            if rate not in (SAMPLE_RATE, 48_000):
+                return None
+            frames = stream.getnframes()
+            if frames <= 0 or frames > FAST_WAV_MAX_SECONDS * rate:
+                return None
+            raw = stream.readframes(frames)
+    except (wave.Error, OSError, EOFError):
+        return None
+    if len(raw) != frames * 2:
+        return None
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) * np.float32(1.0 / 32768.0)
+    if rate == 48_000:
+        kernel = _decimate_48k_kernel()
+        half = len(kernel) // 2
+        padded = np.pad(samples, half, mode="edge")
+        samples = np.convolve(padded, kernel, mode="valid")[::3]
+    return np.ascontiguousarray(samples, dtype="<f4").tobytes()
+
+
+async def audio_blocks(path: Path, *, multilingual=False, pause_aware=False, fast_wav=False):
+    import numpy as np
+
     limit = MAX_SAMPLES * 4
     read_size = limit + 4 if pause_aware else limit
+    fast_pcm = await asyncio.to_thread(_read_fast_wav_pcm, path) if fast_wav else None
+    if fast_pcm is not None:
+        offset = 0
+        total = len(fast_pcm)
+        while offset < total:
+            block = fast_pcm[offset:offset + read_size]
+            if len(block) > limit:
+                cut = quiet_sample_boundary(np.frombuffer(block, dtype="<f4", count=MAX_SAMPLES)) * 4
+                block = block[:cut]
+                offset += cut
+            else:
+                offset += len(block)
+            if multilingual:
+                for part in split_at_pauses(block):
+                    yield part
+            else:
+                yield block
+        return
     pending = b""
-    try:
+    async with open_audio_pcm(path) as process:
         while True:
             try:
                 block = pending + await process.stdout.readexactly(read_size - len(pending))
@@ -128,12 +202,12 @@ async def audio_blocks(path: Path, *, multilingual=False, pause_aware=False):
                 break
         if await process.wait():
             raise ValueError(FILE_ERROR)
-    finally:
-        await stop_process(process)
 
 
 def dictation_has_signal(path: Path, through_frames: int | None = None, gain: float = 1.0) -> bool:
     """Reject near-silent recorder output before decoding or speech recognition."""
+    import numpy as np
+
     full_scale = 32768 / gain
     fixed = full_scale * 10 ** (-50 / 20)
     level_floor = full_scale * 10 ** (-120 / 20)
@@ -141,10 +215,11 @@ def dictation_has_signal(path: Path, through_frames: int | None = None, gain: fl
     levels = []
     try:
         with wave.open(str(path), "rb") as stream:
-            if (stream.getnchannels(), stream.getsampwidth(), stream.getframerate()) != (1, 2, 48_000):
+            rate = stream.getframerate()
+            if (stream.getnchannels(), stream.getsampwidth()) != (1, 2) or rate not in (SAMPLE_RATE, 48_000):
                 return True  # Leave other audio layouts to the existing decoder.
-            window = 1440  # 30 ms of 48 kHz recorder audio.
-            remaining = min(stream.getnframes(), (MAX_AUDIO_SECONDS + 1) * 48_000)
+            window = rate * 30 // 1_000
+            remaining = min(stream.getnframes(), (MAX_AUDIO_SECONDS + 1) * rate)
             if through_frames is not None:
                 remaining = min(remaining, through_frames)
             while remaining > 0:

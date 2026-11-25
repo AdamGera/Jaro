@@ -15,6 +15,7 @@ private func checkMix() throws {
     try check(both.render(through: 7) == [32767, 12288, 0, 0], "peak, trailing channel, silence")
     both.add([1, 1, 1], at: 0, from: .system)
     try check(both.lateFrames == 3, "dropped late samples reported")
+    try check(both.systemEnd == 5, "stale samples cannot move the source's clock backwards")
     for (source, mode) in [(Source.mic, CaptureMode.mic), (.system, .system)] {
         var only = Timeline(mode: mode)
         only.add([1, -1], at: 0, from: source)
@@ -92,19 +93,43 @@ private struct FixtureSystemAudio: MeetingSystemAudioConnection {
 private func checkMeetingSystemAudioReadiness() throws {
     var tap = MeetingSystemAudioHealth(openedAt: 100)
     try check(tap.readiness(for: .tap, at: 102) == .waiting, "opening a tap does not establish audio delivery")
-    try check(!tap.receive(frames: 0, timestamp: 102, at: 102), "an empty buffer does not establish contact")
+    try check(!tap.receive([], timestamp: 102, at: 102), "an empty buffer does not establish contact")
     try check(tap.readiness(for: .tap, at: 103) == .failed, "empty callbacks do not extend the startup deadline")
 
     tap = MeetingSystemAudioHealth(openedAt: 100)
     let silence = [Float](repeating: 0, count: 512)
-    try check(tap.receive(frames: silence.count, timestamp: 102, at: 102), "silent PCM is valid")
+    try check(tap.receive(silence, timestamp: 102, at: 102), "silent PCM is valid")
     try check(tap.readiness(for: .tap, at: 104) == .ready, "a real buffer brings the tap online")
-    try check(!tap.receive(frames: 0, timestamp: 104, at: 104), "empty buffers do not confirm ongoing delivery")
+    try check(!tap.receive([], timestamp: 104, at: 104), "empty buffers do not confirm ongoing delivery")
     try check(tap.readiness(for: .tap, at: 105) == .failed, "the running tap detects stalled audio")
+
+    let fifteenSeconds = [Float](repeating: 0, count: 15 * Timeline.rate)
+    for backend in [MeetingSystemAudioMode.tap, .screen] {
+        var health = MeetingSystemAudioHealth(openedAt: 0)
+        _ = health.receive(fifteenSeconds, timestamp: 15, at: 15)
+        try check(health.readiness(for: backend, at: 15) == .ready, "idle audio must not cycle capture")
+        _ = health.receive([0.2], timestamp: 16, at: 16)
+        _ = health.receive(Array(fifteenSeconds.dropLast()), timestamp: 31, at: 31)
+        try check(health.readiness(for: backend, at: 31) == .ready, "less than 15 seconds is allowed")
+        _ = health.receive([0, 0.000001, 0], timestamp: 31, at: 31)
+        _ = health.receive(Array(fifteenSeconds.dropLast(2)), timestamp: 46, at: 46)
+        try check(health.readiness(for: backend, at: 46) == .ready, "quiet speech resets the zero count")
+        _ = health.receive([0], timestamp: 46, at: 46)
+        try check(health.readiness(for: backend, at: 46) == .failed, "continuous silent packets can mask a lost output")
+    }
+
+    var initiallyEmpty = MeetingOutputRoute(at: 10, uid: "")
+    try check(!initiallyEmpty.changed(at: 12) { "speakers" }, "empty output IDs are unavailable")
+    var route = MeetingOutputRoute(at: 10, uid: nil)
+    try check(!route.changed(at: 11) { fatalError("route checked too often") }, "route checks are bounded")
+    try check(!route.changed(at: 12) { "speakers" }, "adopt the first readable output")
+    try check(!route.changed(at: 14) { nil }, "temporary output lookup failure is not a route change")
+    try check(!route.changed(at: 16) { "speakers" }, "same output does not interrupt capture")
+    try check(route.changed(at: 18) { "headphones" }, "rebuild when the hardware output changes")
 
     var screen = MeetingSystemAudioHealth(openedAt: 100)
     try check(screen.readiness(for: .screen, at: 150) == .ready, "ScreenCaptureKit is allowed to remain quiet")
-    try check(!screen.receive(frames: 128, timestamp: .nan, at: 150), "invalid timing rejects the audio")
+    try check(!screen.receive(silence, timestamp: .nan, at: 150), "invalid timing rejects the audio")
     try check(screen.readiness(for: .screen, at: 150) == .failed, "invalid timing needs recovery on ScreenCaptureKit too")
 }
 
@@ -180,6 +205,35 @@ private func checkMeetingSystemAudioSupervisor() async throws {
     }, pause: { _ in false })
     try check(attempts == [.tap] && closed == 1 && availability.isEmpty,
               "stopping during the startup wait closes the tap without publishing readiness or opening ScreenCaptureKit")
+}
+
+private func checkMeetingSystemAudioPermissionDenial(_ denial: Error) async throws {
+    var attempts = [MeetingSystemAudioMode]()
+    var reports = 0
+    var waits = 0
+    await superviseMeetingSystemAudio(mode: .tapAndScreen, hostPID: nil, receive: { _, _, _ in },
+                                    change: { _, _ in }, permissionDenied: { reports += 1 },
+                                    open: { backend, _, _ in
+        attempts.append(backend)
+        if backend == .screen { throw denial }
+        throw CaptureError("The audio tap is unavailable.")
+    }, waitForRetry: { _, _ in waits += 1; return .cancelled })
+    try check(attempts == [.tap, .screen] && reports == 1 && waits == 0,
+              "explicit screen denial stops retrying after the transient tap failure")
+
+    let (retired, didRetire) = AsyncStream<Void>.makeStream()
+    var retires = retired.makeAsyncIterator()
+    var current = MeetingSystemAudioReadiness.ready
+    var availability = [Bool]()
+    await superviseMeetingSystemAudio(mode: .screen, hostPID: nil, receive: { _, _, _ in },
+                                    change: { available, _ in availability.append(available) },
+                                    permissionDenied: { reports += 1 },
+                                    open: { _, _, _ in FixtureSystemAudio(read: { current }) { didRetire.yield(()) } },
+                                    pause: { _ in current = .permissionDenied; return true },
+                                    waitForRetry: { _, _ in waits += 1; return .cancelled })
+    _ = await retires.next()
+    try check(availability == [true] && reports == 2 && waits == 0,
+              "permission lost during a meeting retires the stream without entering reconnect")
 }
 
 private func checkMeetingSystemAudioOpenTimeout() async throws {
@@ -700,6 +754,27 @@ private func checkDictationInputRoute() async throws {
     try check(route(nil, headset, [headset, internalMic], avoidBluetooth: true).primary == headset, "Bluetooth default remains usable as the last resort")
     try check(route(headset, headset, [headset, usb], avoidBluetooth: true).primary == headset, "an explicit headset stays selected")
 
+    var opened = [InputDevice]()
+    let system = try route(nil, internalMic, all, closed: false).openRecordingInput { opened.append($0) }
+    try check(system == internalMic && opened == [internalMic], "ordinary recording uses the built-in system input")
+    opened.removeAll()
+    let missing = try route(usb, internalMic, [internalMic], closed: false).openRecordingInput { opened.append($0) }
+    try check(missing == internalMic && opened == [internalMic], "a disconnected selection falls back to the internal microphone")
+    opened.removeAll()
+    let selected = route(usb, internalMic, all, closed: false)
+    let preferred = try selected.openRecordingInput { opened.append($0) }
+    try check(preferred == usb && opened == [usb], "ordinary recording uses an available saved input")
+    opened.removeAll()
+    let kept = try selected.openRecordingInput(keeping: internalMic) {
+        opened.append($0)
+        throw CaptureError("The saved input could not open.")
+    }
+    try check(kept == internalMic && opened == [usb], "a failed handoff keeps the working internal microphone")
+    opened.removeAll()
+    let avoided = try route(nil, headset, [internalMic, headset], closed: false, avoidBluetooth: true)
+        .openRecordingInput { opened.append($0) }
+    try check(avoided == internalMic && opened == [internalMic], "Bluetooth avoidance selects the built-in input")
+
     let blocked = route(internalMic, internalMic, [internalMic, virtual, aggregate, phone])
     var attempted = [InputDevice]()
     do {
@@ -775,6 +850,7 @@ private func checkWarmMicrophoneRetry() throws {
         try checkMeetingInputRoute()
         try checkMeetingSystemAudioReadiness()
         try await checkMeetingSystemAudioSupervisor()
+        try await checkMeetingSystemAudioPermissionDenial(multiple)
         try await checkMeetingSystemAudioOpenTimeout()
         try await checkMeetingSystemAudioConsoleRecovery()
         try checkMeetingMicrophoneSilence()
