@@ -317,12 +317,17 @@ export async function transcribeMedia(
   }
 }
 
+const PAUSE_SPLIT_SECONDS = 30
+
 function appendSpeakers(segments: SpeakerSegment[], next: SpeakerSegment[] = []) {
   for (const segment of next) {
     const last = segments.at(-1)
-    if (last?.speaker === segment.speaker) {
+    const gap = last?.end != null && Number.isFinite(segment.start) ? segment.start - last.end : 0
+    if (last && last.speaker === segment.speaker && gap < PAUSE_SPLIT_SECONDS) {
       segments[segments.length - 1] = {
-        ...last, end: segment.end ?? last.end, text: `${last.text} ${segment.text}`,
+        ...last,
+        end: segment.end == null ? last.end : last.end == null ? segment.end : Math.max(last.end, segment.end),
+        text: `${last.text.trimEnd()} ${segment.text.trimStart()}`.trim(),
       }
     } else {
       segments.push(segment)

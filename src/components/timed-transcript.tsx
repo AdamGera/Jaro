@@ -3,11 +3,10 @@ import type { Transcript } from "@/audio"
 import { useInterfaceLanguage } from "@/interface-language"
 import type { TranscriptMatch } from "@/transcript-search"
 import { clock, speakerColor, speakerLabel } from "@/speaker-activity"
-import { transcriptTurns } from "./transcript-turns"
+import { PAUSE_DIVIDER_SECONDS, transcriptTurns } from "./transcript-turns"
 
 type Props = {
   result: Transcript
-  meeting: boolean
   listening: boolean
   time: number
   citation?: { seconds: number } | null
@@ -31,7 +30,7 @@ function reveal(target: HTMLElement, always = false) {
 }
 
 export const TimedTranscript = memo(function TimedTranscript({
-  result, meeting, listening, time, ready, seek, citation, matches = noMatches, activeMatch = -1,
+  result, listening, time, ready, seek, citation, matches = noMatches, activeMatch = -1,
 }: Props) {
   const { t } = useInterfaceLanguage()
   const root = useRef<HTMLDivElement>(null)
@@ -91,6 +90,7 @@ export const TimedTranscript = memo(function TimedTranscript({
   const content = useMemo(() => {
     let mi = 0
     let endOfSpeech: number | null = null
+    const hasLabeledSpeakers = turns.some(turn => turn.speaker != null)
     return turns.map((turn, turnIndex) => {
       function highlight(start: number, end: number) {
         while (mi < matches.length && (matches[mi].turn < turnIndex ||
@@ -112,21 +112,18 @@ export const TimedTranscript = memo(function TimedTranscript({
         return pieces
       }
       let first = true
-      const name = turn.speaker ? speakerLabel(turn.speaker, result.speakerNames) : meeting ? "Speaker" : undefined
-      const label = name && meeting ? t(name) : name
-      const pause = meeting && endOfSpeech !== null && Number.isFinite(turn.start) ? turn.start - endOfSpeech : 0
-      if (meeting) {
-        endOfSpeech = turn.end !== null && Number.isFinite(turn.end)
-          ? Math.max(endOfSpeech ?? turn.end, turn.end) : null
-      }
+      const name = turn.speaker ? speakerLabel(turn.speaker, result.speakerNames) : hasLabeledSpeakers ? "Speaker" : undefined
+      const label = name ? t(name) : undefined
+      const pause = endOfSpeech !== null && Number.isFinite(turn.start) ? turn.start - endOfSpeech : 0
+      endOfSpeech = turn.end !== null && Number.isFinite(turn.end)
+        ? Math.max(endOfSpeech ?? turn.end, turn.end) : null
       return <Fragment key={turnIndex}>
-        {pause >= 30 && <p className="meeting-transcript-pause">{t("{time} pause", { time: clock(pause) })}</p>}
+        {pause >= PAUSE_DIVIDER_SECONDS && <p className="transcript-pause">{t("{time} pause", { time: clock(pause) })}</p>}
         <article className="speaker-turn" data-turn={turnIndex} tabIndex={-1}
           data-side={turn.speaker && turn.speaker % 2 === 0 ? "end" : "start"}
-          data-local={meeting && name === "You" ? true : undefined}
           style={turn.speaker ? { "--speaker-color": speakerColor(turn.speaker) } as CSSProperties : undefined}>
           {label && <header className="speaker-heading">
-            <span className="turn-badge">{!meeting && <i aria-hidden="true" />}{label}</span>
+            <span className="turn-badge">{turn.speaker != null && <i aria-hidden="true" />}{label}</span>
             <button type="button" disabled={!ready} aria-label={`Play ${label} at ${clock(turn.start)}`}
               onClick={() => seek(turn.start, true)}><time dir="ltr">{clock(turn.start)}</time></button>
           </header>}
@@ -153,10 +150,10 @@ export const TimedTranscript = memo(function TimedTranscript({
         </article>
       </Fragment>
     })
-  }, [turns, matches, ready, seek, words, result.speakerNames, meeting, t])
+  }, [turns, matches, ready, seek, words, result.speakerNames, t])
 
-  return <div ref={root} tabIndex={-1} className={`transcript-text speaker-transcript${meeting ? " meeting-transcript" : ""}`}>
+  return <div ref={root} tabIndex={-1} className="transcript-text speaker-transcript">
     {content}
-    {listening && <p className="meeting-transcript-listening" role="status">{t("Listening…")}</p>}
+    {listening && <p className="transcript-listening" role="status">{t("Listening…")}</p>}
   </div>
 })

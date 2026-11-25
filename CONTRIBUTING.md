@@ -16,6 +16,8 @@ Use [GitHub Issues](https://github.com/AdamGera/Jaro/issues) for bugs and featur
 
 ## Build and check
 
+Use the shared [Sessions and Meetings architecture](docs/recording-workspace.md) for new recording features and platform ports.
+
 Use Apple Silicon macOS 26 or later for native builds. For the Python and web workspace, install Python 3.13 through uv, Bun, and the FFmpeg tools. Run these commands from the repository root:
 
 ```sh

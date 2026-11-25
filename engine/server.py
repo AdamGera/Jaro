@@ -37,7 +37,7 @@ from managed_preferences import ManagedFeatureError, annotate_managed, meetings_
 from dictation_output import (MAX_PROFILE_CORRECTIONS, MAX_PROFILE_DOCUMENT, MAX_REWRITE_DEADLINE, MAX_VOCABULARY, correction_rules,
                               parse_portable_profiles, profile_for, rewrite_deadline, rewrite_locally, validate_dictation_vocabulary,
                               vocabulary_terms)
-from meeting_rolling import MIXED_SPEAKERS, SOURCE_LABELS, read_rolling, rolling_path
+from meeting_rolling import MIXED_SPEAKERS, SOURCE_LABELS, append_rolling, read_rolling, rolling_path
 from meeting_retention import readable_source
 from meeting_transcript import FRAME as MEETING_FRAME, RATE as MEETING_RATE, read_window, merge_sources
 from saved_dictations import shared_vocabulary
@@ -1613,8 +1613,11 @@ async def transcribe(request: Request, session: UUID | None = None, offset: int 
         state = request.app.state
         vocabulary = await speech_vocabulary(state)
         async with state.insights.model.audio_priority():
-            return await decode_pcm(state, bytes(pcm), languages, live_speakers(request, session), offset,
-                                    live=True, vocabulary=vocabulary)
+            result = await decode_pcm(state, bytes(pcm), languages, live_speakers(request, session), offset,
+                                      live=True, vocabulary=vocabulary)
+        start_time = offset / SAMPLE_RATE
+        ensure_meeting_turn(result, start_time, start_time + len(pcm) / (4 * SAMPLE_RATE))
+        return result
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
     except Exception as error:
@@ -1777,12 +1780,14 @@ def portable_capture_busy(state):
 
 
 @app.post("/api/portable/recording", status_code=201)
-async def start_portable_recording(request: Request, mode: Literal["mic", "system", "both"] = "mic", meeting: bool = False):
+async def start_portable_recording(request: Request, mode: Literal["mic", "system", "both"] = "mic", meeting: bool = False,
+                                   live: bool = False, diarization: bool = False):
     state = portable_capture_state(request)
-    return await begin_portable_recording(state, mode, meeting, transcription_languages(request))
+    return await begin_portable_recording(state, mode, meeting, transcription_languages(request), live=live, diarization=diarization)
 
 
-async def begin_portable_recording(state, mode, meeting, languages, *, provider="Meeting", call_binaries=()):
+async def begin_portable_recording(state, mode, meeting, languages, *, provider="Meeting", call_binaries=(),
+                                    live=False, diarization=False):
     from portable_capture import CaptureError, save_draft_metadata
     from recording_power import keep_awake_until
 
@@ -1817,8 +1822,99 @@ async def begin_portable_recording(state, mode, meeting, languages, *, provider=
                 with suppress(OSError):
                     recording_marker(path).unlink(missing_ok=True)
         state.portable_recording = capture
+        capture.preview_enabled = meeting or live
+        capture.preview_chunks = deque(maxlen=160)
+        capture.preview_processed = 0
+        capture.preview_task = start_job(state, preview_portable_recording(state, capture, languages, meeting or diarization))
         keep_awake_until(capture.worker, "Jaro is recording audio")
     return {"id": key, "sampleRate": SAMPLE_RATE}
+
+
+def portable_preview_pcm(path, start, frames):
+    import numpy as np
+    import wave
+
+    try:
+        with wave.open(str(path), "rb") as audio:
+            audio.setpos(start)
+            data = audio.readframes(frames)
+    except wave.Error as error:
+        raise ValueError("Could not read the live recording audio.") from error
+    if len(data) != frames * 2:
+        raise EOFError("The requested recording audio is still being written.")
+    return (np.frombuffer(data, dtype="<i2").astype("<f4") / 32768).tobytes()
+
+
+async def preview_portable_recording(state, capture, languages, diarization):
+    frames = 4 * SAMPLE_RATE
+    conversion = MEETING_RATE // SAMPLE_RATE
+    speakers = None
+    vocabulary = None
+    offset = 0
+    delayed = False
+    while state.portable_recording is capture and not capture.worker.done():
+        await asyncio.sleep(.35)
+        if state.portable_recording is not capture or capture.worker.done():
+            return
+        if (not capture.preview_enabled or state.draining or state.status != "ready" or capture.frames - offset < frames
+                or (state.portable_dictation and state.portable_dictation.busy)):
+            continue
+        try:
+            if vocabulary is None:
+                vocabulary = await speech_vocabulary(state)
+                speakers = state.diarizer.session(live=True) if diarization and state.diarizer else None
+            pcm = await run_in_threadpool(portable_preview_pcm, capture.path, offset, frames)
+            if state.portable_recording is not capture:
+                return
+            if not capture.preview_enabled or (state.portable_dictation and state.portable_dictation.busy):
+                continue
+            async with state.insights.model.audio_priority():
+                result = await decode_pcm(state, pcm, languages, speakers, offset, live=True, timed_output=True,
+                                          vocabulary=vocabulary)
+            if state.portable_recording is not capture:
+                return
+            end = offset + frames
+            ensure_meeting_turn(result, offset / SAMPLE_RATE, end / SAMPLE_RATE)
+            result.update(activity=[], meetingSpeakerMode=MIXED_SPEAKERS)
+            await run_in_threadpool(append_rolling, capture.path, offset * conversion, end * conversion, result)
+        except Exception as error:
+            if not delayed:
+                logger.warning("The live transcript is delayed (%s). Recording continues.", type(error).__name__)
+            delayed = True
+            continue
+        delayed = False
+        offset = end
+        capture.preview_processed = end
+        if result["text"]:
+            capture.preview_chunks.append(result)
+
+
+@app.get("/api/portable/recording/{key}/preview")
+async def portable_recording_preview(request: Request, key: UUID, after: int = Query(0, ge=0)):
+    state = portable_capture_state(request)
+    capture = state.portable_recording
+    if not capture or capture.key != key:
+        raise HTTPException(404, "This recording has ended.")
+    if capture.preview_processed == after:
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+    chunks = tuple(capture.preview_chunks)
+    return JSONResponse({"text": " ".join(chunk["text"] for chunk in chunks),
+                         "segments": [segment for chunk in chunks for segment in chunk["segments"]],
+                         "through": capture.preview_processed},
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.put("/api/portable/recording/{key}/preview", status_code=204)
+async def set_portable_recording_preview(request: Request, key: UUID, live: Annotated[bool, Body(embed=True, strict=True)]):
+    state = portable_capture_state(request)
+    async with state.portable_recording_lock:
+        capture = state.portable_recording
+        if not capture or capture.key != key or capture.worker.done():
+            raise HTTPException(404, "This recording has ended.")
+        # Meetings keep an excerpt available for Copy New and Copy All.
+        capture.preview_enabled = capture.meeting or live
+    return Response(status_code=204)
+
 
 
 def portable_call_watcher(request):
@@ -2496,12 +2592,15 @@ async def portable_recording_frames(request: Request, key: UUID, offset: int = Q
 
 
 async def stop_portable_recording(state, key):
-    if state.portable_recording and state.portable_recording.key == key:
+    capture = state.portable_recording
+    if capture and capture.key == key:
         try:
             with suppress(OSError):
-                await state.portable_recording.stop()
+                await capture.stop()
         finally:
             state.portable_recording = None
+            if preview := getattr(capture, "preview_task", None):
+                await asyncio.shield(preview)
 
 
 @app.post("/api/portable/recording/{key}/finish")
@@ -2533,6 +2632,7 @@ async def finish_portable_capture(state, key, languages, *, name="", diarization
             raise HTTPException(404, "No captured audio is available to save.")
         tracks = await run_in_threadpool(draft_tracks, path, frames)
         metadata = await run_in_threadpool(draft_metadata, path)
+        rolling = await run_in_threadpool(lambda: tuple(read_rolling(path, frames * (MEETING_RATE // SAMPLE_RATE))))
         provider = metadata.get("meetingProvider")
         explicit_meeting = isinstance(provider, str) and bool(provider)
         meeting = explicit_meeting or any(track.is_file() for track in source_tracks(path).values())
@@ -2554,7 +2654,7 @@ async def finish_portable_capture(state, key, languages, *, name="", diarization
             name = name or "Meeting"
         accepted = await accept_audio(state, path, name, "audio/wav", languages, True, diarization, live, True,
                                       stage_id=str(key), tracks=tracks, meeting_provider=(provider or "Meeting") if meeting else None,
-                                      meeting_started=started, meeting_voice_input=voice, applies_retention=explicit_meeting)
+                                      meeting_started=started, meeting_voice_input=voice, applies_retention=explicit_meeting, rolling=rolling)
         with suppress(OSError):
             clear_draft(path)
         return accepted
@@ -2682,8 +2782,7 @@ async def process_mixed_audio(state, key, source, options, duration, *, checkpoi
             result = await decode_pcm(state, fallback, languages, speakers, offset, vocabulary=vocabulary)
         end = offset + len(pcm) // 4
         seconds = end / SAMPLE_RATE
-        if meeting:
-            ensure_meeting_turn(result, offset / SAMPLE_RATE, seconds)
+        ensure_meeting_turn(result, offset / SAMPLE_RATE, seconds)
         await run_in_threadpool(state.library.append, key, result, seconds, next_frame=end * conversion if meeting else None)
         emit(**({} if progress_only else result), seconds=seconds, duration=duration)
 
@@ -3051,8 +3150,7 @@ async def submit_staged_audio(state, key, languages, *, recording, diarization, 
                     meeting_provider = "Meeting"
                 frames = await run_in_threadpool(recover_wav, source)
                 tracks = await run_in_threadpool(recover_tracks, source, frames)
-                if meeting_provider:
-                    rolling = read_rolling(source, frames)
+                rolling = read_rolling(source, frames)
             except ValueError as error:
                 raise HTTPException(400, str(error)) from error
         result = await accept_audio(state, source, name, mime, languages, recording, diarization, live, True, str(key),
@@ -3428,19 +3526,19 @@ async def preview_stage(request: Request, key: UUID, start: int = Query(ge=0, le
     data = await run_in_threadpool(read_pcm)
     if len(data) != frames * 2:
         raise HTTPException(409, "The requested audio has not been written yet.")
-    if meeting and frames < MEETING_FRAME:
+    dictation = path.with_suffix(".dictation").is_file()
+    if not dictation and frames < MEETING_FRAME:
         return {"text": "", "language": None, "segments": [], "words": [], "activity": [], "meetingSpeakerMode": MIXED_SPEAKERS}
     try:
         pcm = await resample_capture(data)
     except ValueError as error:
         raise HTTPException(400, "Could not decode live audio.") from error
-    dictation = path.with_suffix(".dictation").is_file()
     vocabulary = () if dictation else await speech_vocabulary(state)
     async with state.insights.model.audio_priority():
-        speakers = live_speakers(request, key) if diarization or meeting else None
+        speakers = live_speakers(request, key) if (not dictation and (diarization or meeting)) else None
         result = await decode_pcm(state, pcm, languages, speakers, start * SAMPLE_RATE // MEETING_RATE,
-                                  live=True, timed_output=meeting, dictation=dictation, vocabulary=vocabulary)
-    if meeting:
+                                  live=True, timed_output=not dictation, dictation=dictation, vocabulary=vocabulary)
+    if not dictation:
         ensure_meeting_turn(result, start / MEETING_RATE, (start + frames) / MEETING_RATE)
         result["words"] = [{"speaker": None, **word} for word in result["words"]]
         result.update(activity=[], meetingSpeakerMode=MIXED_SPEAKERS)

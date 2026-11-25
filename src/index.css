@@ -253,7 +253,7 @@ html:has(.workspace-settings)::-webkit-scrollbar,
   display: flex; align-items: center; gap: .48rem; padding-inline: .15rem; margin-bottom: .24rem;
   color: var(--quiet); font-size: .71rem; line-height: 1.35; font-variant-numeric: tabular-nums;
 }
-.turn-badge { display: inline-flex; align-items: center; gap: .32rem; color: color-mix(in srgb, var(--speaker-color) 60%, var(--foreground)); font-weight: 630; }
+.turn-badge { display: inline-flex; align-items: center; gap: .32rem; color: color-mix(in srgb, var(--speaker-color, var(--quiet)) 60%, var(--foreground)); font-weight: 630; }
 .turn-badge i { width: .43rem; height: .43rem; border-radius: 50%; background: var(--speaker-color); }
 .speaker-heading button { padding-inline: .1rem; }
 .speaker-heading button:hover:enabled { color: var(--foreground); text-decoration: underline; }
@@ -263,20 +263,13 @@ html:has(.workspace-settings)::-webkit-scrollbar,
 }
 .speaker-turn[data-side="end"] .turn-bubble { background: color-mix(in srgb, var(--speaker-color) 9%, var(--surface)); }
 .turn-bubble + .turn-bubble { margin-top: .16rem; }
-.meeting-transcript .speaker-turn { align-items: stretch; }
-.meeting-transcript .speaker-heading { padding-inline: 0; }
-.meeting-transcript .turn-badge { color: var(--quiet); }
-.meeting-transcript [data-local="true"] .turn-badge { color: var(--foreground); }
-.meeting-transcript .speaker-turn .turn-bubble {
-  max-width: 72ch; padding: 0; border-radius: 0; background: transparent;
-}
-.meeting-transcript-pause, .meeting-transcript-listening {
+.transcript-pause, .transcript-listening {
   margin: 0; color: var(--quiet); font-size: .75rem;
 }
-.meeting-transcript-pause {
+.transcript-pause {
   display: flex; align-items: center; gap: .6rem; font-variant-numeric: tabular-nums;
 }
-.meeting-transcript-pause::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+.transcript-pause::before, .transcript-pause::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
 .speaker-turn:focus-visible, .speaker-heading button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .transcript-text mark {
   color: inherit; background: color-mix(in srgb, #f2c267 51%, var(--surface));

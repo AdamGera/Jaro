@@ -2338,11 +2338,11 @@ async function run() {
       words: [{ speaker: 1, start: 0, end: .2, text: "Opening." }, { speaker: 1, start: .4, end: .55, text: "Continued." }],
     }
     await page.goto(`http://127.0.0.1:18997/?session=${meetingId}&tab=transcript`)
-    const stackedMeeting = page.locator(".meeting-transcript")
+    const stackedMeeting = page.locator(".speaker-transcript")
     await stackedMeeting.locator('[data-turn="3"]').waitFor()
     assert.equal(await stackedMeeting.locator(".speaker-turn").count(), 4)
-    assert.equal(await stackedMeeting.locator(".meeting-transcript-pause").allTextContents().then(rows => rows.join(" ")), "0:35 pause")
-    assert.equal(await stackedMeeting.locator(".turn-bubble").first().evaluate(p => getComputedStyle(p).backgroundColor), "rgba(0, 0, 0, 0)")
+    assert.equal(await stackedMeeting.locator(".transcript-pause").allTextContents().then(rows => rows.join(" ")), "0:35 pause")
+    assert.notEqual(await stackedMeeting.locator(".turn-bubble").first().evaluate(p => getComputedStyle(p).backgroundColor), "rgba(0, 0, 0, 0)")
     await button("Search transcript").click()
     const findTranscript = page.getByRole("textbox", { name: "Search transcript" })
     await findTranscript.fill("Opening. Continued.")

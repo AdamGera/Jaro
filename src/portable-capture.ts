@@ -1,4 +1,4 @@
-import { previewFrames, type AudioFrames } from "./audio"
+import { EMPTY_TRANSCRIPT, previewFrames, type AudioFrames, type Transcript } from "./audio"
 import type { RecordingDraft, RecordingMode } from "./desktop"
 
 const endpoint = "/api/portable/recording"
@@ -32,13 +32,13 @@ export async function openPortableRecording(
   mode: RecordingMode,
   onFrame: (audio: AudioFrames, samples: Float32Array, levels?: SourceLevels) => void,
   onEnded: () => void,
-  meetingLanguages?: readonly string[],
+  options: { meeting: boolean; live: boolean; diarization: boolean; languages: readonly string[] },
 ): Promise<PortableRecording> {
   const parameters = new URLSearchParams({ mode })
-  if (meetingLanguages) {
-    parameters.set("meeting", "true")
-    for (const code of meetingLanguages) parameters.append("language", code)
-  }
+  if (options.meeting) parameters.set("meeting", "true")
+  if (options.live) parameters.set("live", "true")
+  if (options.diarization) parameters.set("diarization", "true")
+  for (const code of options.languages) parameters.append("language", code)
   const { id, sampleRate }: { id: string; sampleRate: number } = await (await request(`?${parameters}`, { method: "POST" })).json()
   return followPortableRecording(id, sampleRate, mode, onFrame, onEnded)
 }
@@ -87,6 +87,41 @@ export function followPortableRecording(
       window.clearTimeout(timer)
       history.clear()
     },
+  }
+}
+
+export async function setPortableRecordingPreview(id: string, live: boolean) {
+  await request(`/${id}/preview`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ live }),
+  })
+}
+
+export function portableRecordingPreview(id: string, onText: (transcript: Transcript) => void, onSlow: () => void) {
+  const controller = new AbortController()
+  let nextCheck = 0
+  let pending = false
+  let failures = 0
+  let through = 0
+  return {
+    async update() {
+      if (controller.signal.aborted || pending || performance.now() < nextCheck) return
+      pending = true
+      nextCheck = performance.now() + 900
+      try {
+        const response = await request(`/${id}/preview?after=${through}`, { signal: controller.signal })
+        failures = 0
+        if (response.status === 204) return
+        const data: { through: number; text: string; segments: Transcript["segments"] } = await response.json()
+        if (controller.signal.aborted) return
+        through = data.through
+        onText({ ...EMPTY_TRANSCRIPT, text: data.text, segments: data.segments })
+      } catch {
+        if (!controller.signal.aborted && ++failures === 2) onSlow()
+      } finally {
+        pending = false
+      }
+    },
+    stop() { controller.abort() },
   }
 }
 

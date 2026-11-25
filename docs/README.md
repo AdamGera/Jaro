@@ -9,6 +9,7 @@
 ## Develop and release
 
 - [Repository layout and development checks](../CONTRIBUTING.md)
+- [Shared Sessions and Meetings architecture](recording-workspace.md)
 - [Build and test the signed Mac app](../desktop/build-tools/README.md)
 - [Security reporting](../SECURITY.md)
 - [Roadmap](../ROADMAP.md)

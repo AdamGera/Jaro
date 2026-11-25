@@ -346,22 +346,22 @@ class SessionStore:
         chunks = [json.loads(c[0]) for c in db.execute("SELECT payload FROM chunks WHERE session_id=? ORDER BY seconds", (key,))]
         source_turns = options.get("sourceSpeakerTurns", False)
         is_meeting = options.get("meeting", source_turns)
-        mixed_speakers = options.get("meetingSpeakerMode") == MIXED_SPEAKERS
+        mixed_speakers = (not is_meeting) or options.get("meetingSpeakerMode") == MIXED_SPEAKERS
         # Offline consumers may open an older library before it has been migrated.
         rolling = db.execute("SELECT end_frame,payload FROM meeting_rolling WHERE session_id=? ORDER BY start_frame", (key,)).fetchall() if (
-            is_meeting and db.execute("SELECT 1 FROM sqlite_master WHERE name='meeting_rolling'").fetchone()) else []
+            db.execute("SELECT 1 FROM sqlite_master WHERE name='meeting_rolling'").fetchone()) else []
         if rolling:
             provisional = [json.loads(draft["payload"]) for draft in rolling]
             chunks = (mixed_speaker_timeline(chunks, provisional, row["processed"]) if mixed_speakers else
                       timeline_chunks(chunks, provisional, mixed=not source_turns))
-        seconds = (row["duration"] or row["processed"]) if is_meeting else row["processed"]
+        seconds = (row["duration"] or row["processed"]) if (is_meeting or rolling) else row["processed"]
         if rolling:
             seconds = max(seconds, rolling[-1]["end_frame"] / RECORDING_RATE)
         result = json.loads(row["transcript"]) if cached else transcript_from_chunks(
             chunks, seconds, options["diarization"] or bool(rolling and not mixed_speakers), row["error"],
             meeting=source_turns or bool(rolling and not mixed_speakers),
             reconcile=bool(rolling))
-        if is_meeting and not cached:
+        if (is_meeting or rolling) and not cached:
             result["transcriptSource"] = ("final" if row["status"] == "complete" else
                                           "rolling" if rolling or row["status"] == "processing" else "draft")
         turns = [turn for chunk in chunks for turn in chunk["segments"]] if include_turns else []
@@ -377,7 +377,7 @@ class SessionStore:
                 return
             row = db.execute("SELECT * FROM sessions WHERE id=?", (key,)).fetchone()
             options = json.loads(row["options"])
-            if not error and (options.get("sourceSpeakerTurns") or options.get("meetingSpeakerMode") == MIXED_SPEAKERS):
+            if not error and (not options.get("meeting") or options.get("sourceSpeakerTurns") or options.get("meetingSpeakerMode") == MIXED_SPEAKERS):
                 db.execute("DELETE FROM meeting_rolling WHERE session_id=?", (key,))
             if not closing:
                 db.execute("DELETE FROM meeting_finalization WHERE session_id=?", (key,))

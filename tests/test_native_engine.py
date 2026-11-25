@@ -259,6 +259,48 @@ class NativeEngineTests(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/sessions/{key}").status_code, 204)
         self.assertEqual(self.client.get(f"/api/sessions/{key}").status_code, 404)
 
+    def test_ordinary_session_preview_persists_rolling_transcript_through_finalization(self):
+        stage = self.client.post("/api/native/staging?recording=true", headers=self.header).raise_for_status().json()
+        path = Path(stage["path"])
+        with wave.open(str(path), "wb") as wav:
+            wav.setparams((1, 2, 48_000, 0, "NONE", ""))
+            wav.writeframes(struct.pack("<h", 4096) * 48_000)
+        endpoint = f"/api/native/staging/{stage['id']}"
+        preview = self.client.post(f"{endpoint}/preview?start=0&frames=48000&language=en", headers=self.header).raise_for_status().json()
+        self.assertEqual(preview["text"], "Hello Jard")
+        self.assertEqual(preview["meetingSpeakerMode"], "mixed")
+        self.assertEqual(len(preview["segments"]), 1)
+        self.assertIsNone(preview["segments"][0]["speaker"])
+        append_rolling(path, 0, 48_000, preview)
+
+        gate = Event()
+        original_process = app.state.library.finish
+        def hold_finish(key, *args, **kwargs):
+            gate.wait(5)
+            return original_process(key, *args, **kwargs)
+
+        with patch.object(app.state.library, "finish", side_effect=hold_finish):
+            submitted = self.client.post(f"{endpoint}/submit", params={
+                "recording": "true", "recover": "true", "live": "true", "name": "Session", "language": "en",
+            }, headers=self.header).raise_for_status().json()
+            self.assertEqual(submitted["id"], stage["id"])
+            during = self.client.get(f"/api/sessions/{stage['id']}").raise_for_status().json()
+            self.assertEqual(during["status"], "processing")
+            self.assertFalse(during["meeting"])
+            self.assertEqual(during["transcript"]["text"], "Hello Jard")
+            self.assertEqual(during["transcript"]["transcriptSource"], "rolling")
+            self.assertNotIn("speakerNames", during["transcript"])
+            gate.set()
+            self.client.portal.call(self.wait_for_jobs)
+
+        finished = self.client.get(f"/api/sessions/{stage['id']}").raise_for_status().json()
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(finished["transcript"]["text"], "Hello Jard")
+        self.assertNotIn("speakerNames", finished["transcript"])
+        self.assertNotIn("transcriptSource", finished["transcript"])
+        with app.state.library.connection() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM meeting_rolling WHERE session_id=?", (stage["id"],)).fetchone()[0], 0)
+
     @staticmethod
     async def wait_for_jobs():
         await asyncio.wait_for(asyncio.gather(*app.state.jobs), timeout=10)

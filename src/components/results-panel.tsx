@@ -11,7 +11,7 @@ import { OverviewLanguage, languageName } from "./overview-language"
 import { transcriptMatches } from "@/transcript-search"
 import { TranscriptFind } from "./transcript-find"
 import { LiveTranscriptScroll } from "./live-transcript-scroll"
-import { meetingSegments } from "./transcript-turns"
+import { normalizeTranscriptSegments } from "./transcript-turns"
 import { desktopBridge } from "@/desktop"
 import { SessionImages } from "./session-images"
 import { Button } from "./ui/button"
@@ -30,7 +30,7 @@ type Props = {
   tab: string; onTab: (tab: string) => void
   jump?: number
   toolbar?: HTMLElement | null
-  working: boolean; recording: boolean; liveMeeting: boolean; followLive: boolean; emptyText: string; progress: ReactNode
+  working: boolean; recording: boolean; followLive: boolean; emptyText: string; progress: ReactNode
   copied: boolean; onCopy: () => void
   dictationEnabled: boolean; onDictationBusy: (busy: boolean) => void
   onMeetingRenamed: (id: string, title: string, exported: MeetingExport | null) => void
@@ -342,7 +342,7 @@ function ManagedMeetingExport({ id, initial, title }: { id: string; initial: Mee
   </>
 }
 
-export function ResultsPanel({ result, session, source, tab, onTab, jump, toolbar, working, recording, liveMeeting, followLive, emptyText, progress, copied, onCopy, dictationEnabled, onDictationBusy, onMeetingRenamed }: Props) {
+export function ResultsPanel({ result, session, source, tab, onTab, jump, toolbar, working, recording, followLive, emptyText, progress, copied, onCopy, dictationEnabled, onDictationBusy, onMeetingRenamed }: Props) {
   const { t } = useInterfaceLanguage()
   const complete = session?.status === "complete"
   const reviewable = complete || !!session?.annotation || isSettledMeeting(session)
@@ -380,11 +380,12 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
   const [findOpen, setFindOpen] = useState(false)
   const [query, setQuery] = useState("")
   const [matchIndex, setMatchIndex] = useState(0)
-  const meeting = !!session?.meeting || liveMeeting
   const originalTurns = session?.meetingTurns
-  const transcript = useMemo(() => meeting ? {
-    ...result, segments: meetingSegments(originalTurns?.length ? originalTurns : result.segments),
-  } : result, [meeting, originalTurns, result])
+  const transcript = useMemo(() => {
+    const sourceSegments = originalTurns?.length ? originalTurns : result.segments
+    if (!sourceSegments.length) return result
+    return { ...result, segments: normalizeTranscriptSegments(sourceSegments, result.words) }
+  }, [originalTurns, result])
   const search = useDeferredValue(findOpen && tab === "transcript" ? query : "")
   const matches = useMemo(() => transcriptMatches(transcript, search), [transcript, search])
   const currentMatch = Math.min(matches.length - 1, matchIndex)
@@ -466,7 +467,7 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
   </div> : null
   const transcriptContent = result.text ? (
     <Suspense fallback={null}>
-      <TimedTranscript result={transcript} meeting={meeting} listening={meeting && followLive}
+      <TimedTranscript result={transcript} listening={followLive}
         time={player.time} ready={ready} seek={player.seek}
         citation={citation ?? linkedPassage} matches={matches} activeMatch={currentMatch} />
     </Suspense>

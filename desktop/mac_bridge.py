@@ -1052,6 +1052,7 @@ class MacBridge:
         capture_id = capture.get("dictation")
         metadata = {"dictation": capture_id} if capture_id else {}
         meeting = capture.get("meeting")
+        record_rolling = not capture_id
         copy_state = take.copy_state
         if meeting:
             metadata["meeting"] = meeting
@@ -1060,7 +1061,7 @@ class MacBridge:
             await asyncio.sleep(0.35)
             if not take.started:
                 continue
-            if meeting and (self.capture_lock.locked() or "dictation" in self.captures or self.dictation_jobs):
+            if record_rolling and (self.capture_lock.locked() or "dictation" in self.captures or self.dictation_jobs):
                 # Capture continues to disk. Wait before queuing another background
                 # decode so the spoken shortcut does not compete for the same model.
                 continue
@@ -1073,7 +1074,7 @@ class MacBridge:
             size = min(block, cut - start) if cut is not None and cut > start else block
             if available - start < size:
                 continue
-            if not meeting and available - start > block * 3:
+            if not record_rolling and available - start > block * 3:
                 start = available - block
             try:
                 value = await self.api(
@@ -1081,7 +1082,7 @@ class MacBridge:
                     f"native/staging/{take.stage['id']}/preview",
                     params={**take.settings, "start": start, "frames": size, **({"meeting": "true"} if meeting else {})},
                 )
-                if meeting:
+                if record_rolling:
                     try:
                         append_rolling(path, start, start + size, value)
                         if take.title_plan:
@@ -1117,7 +1118,7 @@ class MacBridge:
                         message="Live preview is delayed. The recording is still being saved.",
                     )
                 warned = True
-                if meeting:
+                if record_rolling:
                     continue
             start += size
             if copy_state:
