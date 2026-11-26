@@ -99,7 +99,9 @@ def build(host, dist, output, revision, wheelhouse, sdk):
             (commands / name).symlink_to(f"{PACKAGE_ROOT}/bin/launch")
         application = stage / f"usr/share/applications/{APP_ID}.desktop"
         install(HERE / f"{APP_ID}.desktop", application)
-        subprocess.run(["desktop-file-validate", application], check=True)
+        kde_shortcuts_entry = application.with_name(APP_ID)
+        kde_shortcuts_entry.write_text(application.read_text(encoding="utf-8") + "NoDisplay=true\n", encoding="utf-8")
+        subprocess.run(["desktop-file-validate", application, kde_shortcuts_entry], check=True)
         install(ROOT / "desktop/assets/icon.png", stage / f"usr/share/icons/hicolor/512x512/apps/{APP_ID}.png")
         for name in ("LICENSE", "NOTICE"):
             install(ROOT / name, stage / "usr/share/doc/jaro" / name)

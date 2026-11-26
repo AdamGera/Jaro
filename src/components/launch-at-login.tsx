@@ -38,6 +38,10 @@ export function PortableApplicationSettings() {
   </SettingGroup>
 }
 
+export function PortableLaunchAtLogin() {
+  return <LoginSwitch request={requestPortableLogin} onboarding portable />
+}
+
 function LoginSwitch({ request, onboarding, description, portable }: {
   request: LoginRequest; onboarding?: boolean; description?: string; portable?: boolean
 }) {
@@ -101,7 +105,7 @@ function LoginSwitch({ request, onboarding, description, portable }: {
     }
   }
 
-  const title = t(onboarding ? "Launch Jard at login" : "Launch at login")
+  const title = t(onboarding ? (portable ? "Launch Jaro at login" : "Launch Jard at login") : "Launch at login")
   const error = actionError || (status?.state === "unknown" ? status.message : undefined)
   if (status?.state === "enabled" || status?.state === "disabled") {
     const input = (labels?: SettingControlLabels) => <input {...labels} type="checkbox" role={onboarding ? undefined : "switch"}

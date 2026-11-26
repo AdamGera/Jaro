@@ -87,23 +87,26 @@ function AnnotationPanel({ id, annotation, movie, movieName, videoExpired, unava
   const portableSave = document.documentElement.hasAttribute("data-jaro-portable-video-export")
   const canSaveVideo = !!native || portableSave
 
-  async function save(kind: "audio" | "annotation-manifest" | "annotation-contact-sheet" | "annotation-clip") {
+  async function save(kind: "audio" | "annotation-manifest" | "annotation-contact-sheet" | "annotation-clip" | "annotation-package") {
     if (kind === "annotation-clip" && !clip) return
     setShareStatus("")
     setError("")
     setBusy(true)
     try {
       if (native) {
-        if (kind !== "annotation-clip") await native.request("export", { id, kind })
-        else if (clip) await native.request("export", { id, kind, ...clip })
+        const result = kind === "annotation-clip" && clip
+          ? await native.request("export", { id, kind, ...clip })
+          : kind !== "annotation-clip" && await native.request("export", { id, kind })
+        if (result && result.saved && kind === "annotation-package") setShareStatus(t("Saved annotation package."))
       } else if (portableSave) {
+        const packageExport = kind === "annotation-package"
         const response = await fetch(`/api/portable/annotations/${id}/export`, {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ span: kind === "annotation-clip" ? clip : null }),
+          body: JSON.stringify({ kind: packageExport ? "package" : "video", span: kind === "annotation-clip" ? clip : null }),
         })
         const value = await response.json()
         if (!response.ok) throw new Error(typeof value.detail === "string" ? value.detail : t("Could not export the annotation."))
-        if (value.saved) setShareStatus(t(kind === "annotation-clip" ? "Saved video clip." : "Saved video."))
+        if (value.saved) setShareStatus(t(packageExport ? "Saved annotation package." : kind === "annotation-clip" ? "Saved video clip." : "Saved video."))
       }
     }
     catch (failure) { setError(failure instanceof Error ? failure.message : "Could not export the annotation.") }
@@ -214,6 +217,8 @@ function AnnotationPanel({ id, annotation, movie, movieName, videoExpired, unava
     </div>}
     <div className="annotation-review-tools">
       <p>{annotation.strokeCount} {annotation.strokeCount === 1 ? "stroke" : "strokes"}</p>
+      {canSaveVideo && annotation.manifestUrl && !unavailable && <Button variant="outline" size="sm" disabled={busy}
+        onClick={() => void save("annotation-package")}><Download />{t("Export annotation…")}</Button>}
       {native && <>
         <Button variant="outline" size="sm" disabled={busy} onClick={() => void shareAnnotation("copyAnnotation")}><Copy />Copy for Agent</Button>
         <Button variant="outline" size="sm" disabled={busy} onClick={() => void shareAnnotation("pasteAnnotation")}>Paste into Last App</Button>
@@ -546,7 +551,8 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
     </p>
     {showingPrevious && <small>Showing saved {languageName(version.language)} {tab === "timeline" ? "timeline" : "overview"}</small>}
   </div> : null
-  const transcriptContent = result.text ? (
+  const hasTranscriptText = Boolean(result.text || result.tentative)
+  const transcriptContent = hasTranscriptText ? (
     <Suspense fallback={null}>
       <TimedTranscript result={transcript} listening={followLive}
         time={player.time} ready={ready} seek={player.seek}
@@ -558,9 +564,9 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
       {working ? progress : <p>{emptyText}</p>}
     </div>
   )
-  const transcriptClass = result.text ? "transcript-body has-text" : "transcript-body"
+  const transcriptClass = hasTranscriptText ? "transcript-body has-text" : "transcript-body"
   if (!session || !reviewable) return <section className="transcript-panel capture-panel" aria-label={t("Transcript")}>
-    <LiveTranscriptScroll className={transcriptClass} following={followLive} hasText={!!result.text}>
+    <LiveTranscriptScroll className={transcriptClass} following={followLive} hasText={hasTranscriptText}>
       {transcriptContent}
     </LiveTranscriptScroll>
     {meetingsManaged && session?.finalizationPending && <p className="processing-footer" role="status">

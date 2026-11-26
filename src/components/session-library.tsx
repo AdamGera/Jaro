@@ -2,7 +2,7 @@ import { useInterfaceLanguage } from "@/interface-language"
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { AlertDialog, Dialog, Tooltip } from "radix-ui"
 import { ArrowLeft, ChevronDown, FileAudio2, House, Mic, PanelLeft, Search, Settings, Trash2, UsersRound } from "lucide-react"
-import type { DesktopBridge, DictationDestination, WindowNavigation } from "@/desktop"
+import type { DesktopBridge, WindowNavigation } from "@/desktop"
 import { readSession, type SavedSession } from "@/audio"
 import { useSessionList, type SessionSummary } from "@/session-list"
 import { readWorkspacePreference, writeWorkspacePreference } from "@/workspace-drafts"
@@ -64,12 +64,12 @@ type Props = {
   onHome: () => void
   onSelect: (session: SavedSession) => void
   onDelete: (id: string) => void
-  settings?: Partial<Record<Exclude<SettingsPage, "dictation">, ReactNode>> & { dictation?: (visible: boolean) => ReactNode }
+  settings?: Partial<Record<Exclude<SettingsPage, "dictation">, ReactNode>> & { dictation?: (visible: boolean, outputRequest?: string) => ReactNode }
   native?: DesktopBridge
   meetingOptions?: MeetingWorkspaceOptions
   portableMeeting?: PortableMeetingControls
   callBar?: PortableCallBarProps
-  dictation?: (destination: DictationDestination, navigationId?: string) => ReactNode
+  dictation?: (onSettings: () => void, navigationId?: string) => ReactNode
   update?: ReactNode
   openUpdateSettings?: string
   onUpdateSettingsOpened?: (token: string) => void
@@ -89,7 +89,9 @@ export function SessionLibrary({ busy, currentId, onOpenVocabulary, onHome, onSe
   const [meetingQuery, setMeetingQuery] = useState("")
   const [settingsPage, setSettingsPage] = useState("general")
   const [windowNavigation, setWindowNavigation] = useState<WindowNavigation>()
-  const [dictationRoute, setDictationRoute] = useState<{ pane: DictationDestination; id: string }>()
+  const [dictationNavigationId, setDictationNavigationId] = useState<string>()
+  const [settingsFromDictation, setSettingsFromDictation] = useState(false)
+  const [outputRequest, setOutputRequest] = useState<string>()
   const paneTitle = useRef<HTMLHeadingElement>(null)
   const settingsScope = useRef<HTMLDivElement>(null)
   const settingsButton = useRef<HTMLButtonElement>(null)
@@ -156,6 +158,8 @@ export function SessionLibrary({ busy, currentId, onOpenVocabulary, onHome, onSe
     request.current?.abort()
     setSelectionError("")
     setOverlay(false)
+    setSettingsFromDictation(false)
+    setOutputRequest(undefined)
     setPane(next)
   }, [setSelectionError, setOverlay, setPane])
   function openHighlight(destination: HighlightDestination) {
@@ -231,9 +235,13 @@ export function SessionLibrary({ busy, currentId, onOpenVocabulary, onHome, onSe
         if (destination === "live-meeting") requestAnimationFrame(() => {
           document.querySelector<HTMLElement>("[data-live-transcript]")?.focus({ preventScroll: true })
         })
-      } else if (destination === "dictation" || destination === "history" || destination === "output") {
-        setDictationRoute({ pane: destination, id })
+      } else if (destination === "dictation" || destination === "history") {
+        setDictationNavigationId(id)
         openPane("dictation")
+      } else if (destination === "output") {
+        setSettingsPage("dictation")
+        openPane("settings")
+        setOutputRequest(id)
       } else if (destination === "meeting-library") {
         openPane("meetings")
       } else {
@@ -332,7 +340,7 @@ export function SessionLibrary({ busy, currentId, onOpenVocabulary, onHome, onSe
     </button>
     {dictation && <button type="button" ref={dictationButton} className="sidebar-home" disabled={busy}
       aria-current={pane === "dictation" ? "page" : undefined} onClick={() => {
-        if (pane !== "dictation") setDictationRoute(undefined)
+        if (pane !== "dictation") setDictationNavigationId(undefined)
         openPane("dictation")
       }}>
       <Mic aria-hidden="true" />{t("Dictation")}
@@ -398,6 +406,10 @@ export function SessionLibrary({ busy, currentId, onOpenVocabulary, onHome, onSe
     {callBar && <PortableCallBar {...callBar} onView={call => { openPane(undefined); callBar.onView(call) }} />}
     {pane && <main className="workspace-settings" data-pane={pane}>
       <button type="button" className="settings-back" onClick={() => {
+        if (pane === "settings" && settingsFromDictation) {
+          openPane("dictation")
+          return
+        }
         setPane(undefined)
         const button = pane === "dictation" ? dictationButton : pane === "meetings" ? meetingsButton : settingsButton
         const target = expanded && !compact ? button.current : toggleButton.current
@@ -410,7 +422,11 @@ export function SessionLibrary({ busy, currentId, onOpenVocabulary, onHome, onSe
           if (page) setSettingsPage(page)
         }} />}
       </div>
-      {pane === "dictation" && dictation?.(dictationRoute?.pane ?? "dictation", dictationRoute?.id)}
+      {pane === "dictation" && dictation?.(() => {
+        setSettingsPage("dictation")
+        setSettingsFromDictation(true)
+        setPane("settings")
+      }, dictationNavigationId)}
       {pane === "meetings" && (meetingOptions || portableMeeting) &&
         <MeetingsWorkspace native={native} options={meetingOptions} portable={portableMeeting}
           onShowLive={() => { portableMeeting?.showLive(); openPane(undefined) }}
@@ -424,7 +440,7 @@ export function SessionLibrary({ busy, currentId, onOpenVocabulary, onHome, onSe
         <div ref={settingsScope}>
           {visibleSettings.map(({ id, label }) => <TabsContent key={id} value={id} forceMount hidden={settingsPage !== id}
             data-settings-page={id} data-setting-group={id === "general" ? t(label) : undefined}>
-            {id === "dictation" ? settings.dictation?.(settingsPage === id) : settings[id]}
+            {id === "dictation" ? settings.dictation?.(settingsPage === id, outputRequest) : settings[id]}
           </TabsContent>)}
           <TabsContent value="whats-new">
             <WhatsNewSettings version={installedVersion} onOpen={openHighlight} />

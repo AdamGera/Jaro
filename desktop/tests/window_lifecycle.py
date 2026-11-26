@@ -344,6 +344,12 @@ def run_case(executable, scenario, prepare):
                         assert shown["result"] == {"windowVisible": True, "requestedPane": "history"}, shown
                         assert shown["navigation"]["pane"] == "history" and shown["navigation"]["id"], shown
                         assert invoke("cli-show")["navigation"]["id"] != shown["navigation"]["id"]
+                        assert not invoke("cli-hide")["visible"]
+                        replayed = invoke("cli-replay")
+                        assert replayed == {"busyError": "Finish the current recording before replaying dictation setup.",
+                                            "updateError": "Jaro is preparing to close.", "blockedStep": "done",
+                                            "blockedWindowVisible": False, "step": "welcome", "unchanged": True,
+                                            "visible": True, "error": ""}, replayed
                         assert invoke("menu-open")["visible"]
                         assert invoke("preview-active")["soundPreview"]
                         closed = invoke("close")

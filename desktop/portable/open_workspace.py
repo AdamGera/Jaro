@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "engine"))
 
 from sdk_embedded import owned_service, verify_service
 from engine_paths import library_path
-from linux_direct import STARTUP_ENV, STARTUP_RECEIPT, WINDOW_STARTUP_SECONDS, WORKSPACE_CONNECTED
+from linux_direct import APP_ID, STARTUP_ENV, STARTUP_RECEIPT, WINDOW_STARTUP_SECONDS, WORKSPACE_CONNECTED
 from desktop_instance import STARTUP_VARIABLES, claim_desktop, replace_private, startup_environment
 
 
@@ -39,14 +39,19 @@ def ensure_wayland_desktop_entry(host):
     data = Path(os.environ.get("XDG_DATA_HOME", default))
     applications = (data if data.is_absolute() else default) / "applications"
     applications.mkdir(parents=True, exist_ok=True)
-    entry = applications / "local.jardaudio.desktop.desktop"
     command = " ".join(map(desktop_argument, (sys.executable, Path(__file__).resolve(), host)))
-    try:
-        with entry.open("x", encoding="utf-8") as file:
-            file.write("[Desktop Entry]\nType=Application\nName=Jaro\nComment=Local recordings and dictation\n"
-                       f"Exec={command}\nTerminal=false\nStartupNotify=true\nStartupWMClass=local.jardaudio.desktop\n")
-    except FileExistsError:
-        pass
+    entries = {f"{APP_ID}.desktop": ""}
+    if kde_desktop():
+        entries[APP_ID] = "NoDisplay=true\n"
+    for name, options in entries.items():
+        with suppress(FileExistsError):
+            with (applications / name).open("x", encoding="utf-8") as file:
+                file.write("[Desktop Entry]\nType=Application\nName=Jaro\nComment=Local recordings and dictation\n"
+                           f"Exec={command}\nTerminal=false\nStartupNotify=true\nStartupWMClass={APP_ID}\n{options}")
+
+
+def kde_desktop():
+    return "kde" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower().split(":")
 
 
 def open_workspace(host, *, installed=False, background=False):
@@ -79,10 +84,15 @@ def run_owned_workspace(instance, host, *, installed, background):
             if installed_launcher(ROOT):
                 staging = Path(tempfile.mkdtemp(prefix="jaro-update-"))
         elif sys.platform == "linux":
-            from linux_direct import managed_root
+            from linux_direct import ensure_kde_shortcuts_entry, managed_root
 
             direct = managed_root(ROOT)
             if direct:
+                if kde_desktop():
+                    try:
+                        ensure_kde_shortcuts_entry(direct)
+                    except (OSError, ValueError) as error:
+                        print(f"Could not register the KDE shortcut launcher: {error}", file=sys.stderr)
                 staging = Path(tempfile.mkdtemp(prefix="jaro-update-")).resolve()
         if staging:
             environment["JARO_UPDATE_STAGING"] = str(staging)

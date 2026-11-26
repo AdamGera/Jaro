@@ -1,6 +1,6 @@
 # Building the Mac app
 
-Use an Apple Silicon Mac on macOS 26 with Xcode command-line tools, Node 24+, Bun, uv, Rust 1.97 with Cargo, and Native SDK CLI 0.11.1. Install the CLI on the build machine with `npm install -g @native-sdk/cli@0.11.1`. The builder uses Zig 0.16.0 and downloads a checksum-verified copy when needed. The shell links the pinned Native SDK AppKit host and uses the system WKWebView to display the same built React application as the browser. The build uses Cargo’s locked dependencies for the isolated JavaScript transformation helper. Users installing the finished app need only macOS.
+Use an Apple Silicon Mac on macOS 26 with Xcode command-line tools, Node 24+, Bun, uv, CMake, Rust 1.97 with Cargo, and Native SDK CLI 0.11.1. Install the CLI on the build machine with `npm install -g @native-sdk/cli@0.11.1`. The builder uses Zig 0.16.0 and downloads a checksum-verified copy when needed. The shell links the pinned Native SDK AppKit host and uses the system WKWebView to display the same built React application as the browser. The build uses Cargo’s locked dependencies for the Rust speech helper and the isolated JavaScript transformation helper. Users installing the finished app need only macOS.
 
 Build the local disk image from the repository root.
 

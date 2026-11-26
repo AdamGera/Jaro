@@ -16,6 +16,7 @@ ROUTE = "/api/portable/dictation/command"
 MEETING_TRASH_ROUTE = "/api/portable/meetings/trash"
 MEETING_COMMAND_ROUTE = "/api/portable/meetings/command"
 ANNOTATION_COMMAND_ROUTE = "/api/portable/annotations/command"
+ONBOARDING_ROUTE = "/api/portable/onboarding/command"
 REGISTRY = r"Software\Jaro\Dictation"
 
 
@@ -85,6 +86,10 @@ def dispatch_annotation(root, action, **options):
     return request_command(root, ANNOTATION_COMMAND_ROUTE, {"action": action, **options},
                            timeout=180 if action in ("stop", "toggle") else 20,
                            limit=2 * 1024 * 1024 if action == "destinations" else 1024 * 1024)
+
+
+def dispatch_onboarding(root):
+    return request_command(root, ONBOARDING_ROUTE, {}, timeout=5)
 
 
 def request_command(root, route, payload, *, timeout, limit=1024 * 1024):

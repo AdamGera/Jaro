@@ -24,6 +24,7 @@
 - (void)completeWindowLaunch:(NSAppleEventDescriptor *)event;
 - (void)setShowDockIcon:(BOOL)enabled;
 @property(nonatomic, readonly) NSDictionary *windowNavigation;
+- (void)replayDictationSetupShowingWindow:(BOOL)show reply:(JardDictationReply)reply;
 - (void)controlWindowAction:(NSString *)action pane:(NSString *)pane reply:(void (^)(id result, NSString *error))reply;
 - (NSDictionary *)dockIconStatus;
 - (void)refreshInterfaceLanguage;
@@ -540,6 +541,28 @@ static void fixtureCopyLatestTranscript(JardMeetings *meeting, SEL selector, Jar
                 NSString *other = host.updater.status[@"phase"];
                 [center postNotificationName:NSWindowDidBecomeKeyNotification object:window];
                 report(@"reply.json", @{@"disabled": disabled, @"other": other, @"workspace": host.updater.status[@"phase"]});
+                return;
+            } else if ([command isEqual:@"cli-replay"]) {
+                NSDictionary *before = [host.systemDictation status];
+                __block NSString *busyError = nil, *updateError = nil;
+                [host setValue:@YES forKey:@"otherRecording"];
+                [host replayDictationSetupShowingWindow:YES reply:^(id result, NSString *error) { busyError = error; }];
+                [host setValue:@NO forKey:@"otherRecording"];
+                [host setValue:@YES forKey:@"updateRestartInProgress"];
+                [host replayDictationSetupShowingWindow:YES reply:^(id result, NSString *error) { updateError = error; }];
+                [host setValue:@NO forKey:@"updateRestartInProgress"];
+                NSDictionary *blocked = [host.systemDictation status];
+                BOOL blockedWindowVisible = window.visible;
+                [host replayDictationSetupShowingWindow:YES reply:^(id result, NSString *error) {
+                    NSDictionary *after = [host.systemDictation status];
+                    BOOL unchanged = YES;
+                    for (NSString *key in @[@"microphone", @"accessibility", @"shortcutLabel", @"enabled", @"retention"]) {
+                        if (![before[key] isEqual:after[key]]) unchanged = NO;
+                    }
+                    report(@"reply.json", @{@"busyError": busyError ?: @"", @"updateError": updateError ?: @"",
+                        @"blockedStep": blocked[@"onboarding"], @"blockedWindowVisible": @(blockedWindowVisible),
+                        @"step": after[@"onboarding"], @"unchanged": @(unchanged), @"visible": @(window.visible), @"error": error ?: @""});
+                }];
                 return;
             } else if ([command isEqual:@"cli-hide"] || [command isEqual:@"cli-show"]) {
                 BOOL hide = [command isEqual:@"cli-hide"];

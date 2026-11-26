@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import gc
 import json
 import hmac
 import socket
@@ -55,9 +56,13 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import ClientDisconnect
 
 from audio_file import (
-    DURATION_ERROR, FILE_ERROR, MAX_AUDIO_SECONDS, PAUSE_AWARE_CHUNKING, audio_blocks, audio_duration, dictation_has_signal,
-    codec_binary, make_playable, open_audio_pcm,
+    DURATION_ERROR, FILE_ERROR, MAX_AUDIO_SECONDS, PAUSE_AWARE_CHUNKING, audio_blocks, audio_duration,
+    codec_binary, decimate_pcm16_to_16k_f32, dictation_has_signal, make_playable, open_audio_pcm,
 )
+from live_preview import (
+    CommitAction, LiveWindowPlanner, SkipAction, TentativeAction, finish_live_preview, read_wav_i16_slice, trim_boundary_overlap,
+)
+from rust_speech import RustSpeechClient, start_bundled_speech, stop_speech_process
 from insights import Insights
 from local_qwen import writing_model_installed
 from dictation_input import CleanupFailed, MIC_GAIN, StuPASECleanup, boost_microphone, replace_mixed_microphone
@@ -67,7 +72,10 @@ from model_installation import install_workspace_models, model_status
 from writing_api import router as writing_routes
 import windows_dictation_commands
 import workspace_drafts
-from rumble_model import DIARIZATION_ID, DIARIZATION_REVISION, REVISION, LANGUAGES, MAX_SAMPLES, MODEL_ID, SAMPLE_RATE, RumbleModel, prepare_model
+from rumble_model import (
+    DIARIZATION_ID, DIARIZATION_REVISION, REVISION, LANGUAGES, MAX_SAMPLES, MODEL_ID, SAMPLE_RATE,
+    RumbleModel, diarization_installed, prepare_model,
+)
 
 from engine_lifecycle import (
     HOST, PORT, URL, API_VERSION, ClientLeases, begin_draining, desktop_control_path, engine_proof, install_token, library_id, library_path,
@@ -86,6 +94,8 @@ LANGUAGE_OPTIONS = [
     {"code": code, "name": name}
     for code, name in sorted(LANGUAGES.items(), key=lambda language: language[1])
 ]
+IDLE_CACHE_TRIM_SECONDS = 15.0
+IDLE_DIARIZER_UNLOAD_SECONDS = 300.0
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -97,8 +107,7 @@ class SpeechInference:
         self.active = False
         self.waiting_dictation = 0
 
-    @asynccontextmanager
-    async def turn(self, *, dictation=False):
+    async def acquire(self, *, dictation=False):
         async with self.condition:
             self.waiting_dictation += int(dictation)
             try:
@@ -110,12 +119,19 @@ class SpeechInference:
                 self.waiting_dictation -= int(dictation)
                 if dictation and not self.active:
                     self.condition.notify_all()
+
+    async def release(self):
+        async with self.condition:
+            self.active = False
+            self.condition.notify_all()
+
+    @asynccontextmanager
+    async def turn(self, *, dictation=False):
+        await self.acquire(dictation=dictation)
         try:
             yield
         finally:
-            async with self.condition:
-                self.active = False
-                self.condition.notify_all()
+            await self.release()
 
 
 async def load_model(app: FastAPI):
@@ -130,14 +146,42 @@ async def load_model(app: FastAPI):
         app.state.status = "ready"
 
 
-async def load_speaker_tools(state):
-    if state.diarizer is None:
+def diarization_ready(state):
+    return state.diarizer is not None or bool(getattr(state, "diarizer_lazy", False))
+
+
+async def ensure_diarizer(state):
+    if state.diarizer is not None:
+        state.diarizer_last_used = time.monotonic()
+        return state.diarizer
+    if not getattr(state, "diarizer_lazy", False) or getattr(state, "model", None) is None:
+        return None
+    lock = getattr(state, "diarizer_lock", None)
+    if lock is None:
+        lock = state.diarizer_lock = asyncio.Lock()
+    async with lock:
+        if state.diarizer is not None:
+            state.diarizer_last_used = time.monotonic()
+            return state.diarizer
+        if not getattr(state, "diarizer_lazy", False) or getattr(state, "model", None) is None:
+            return None
         try:
             from diarization import Diarizer
 
             state.diarizer = await run_in_threadpool(Diarizer, state.model.device)
         except Exception:
+            state.diarizer_lazy = False
             logger.exception("Speaker labeling could not start. Run Setup Jaro to install its models.")
+            return None
+        state.diarizer_last_used = time.monotonic()
+        return state.diarizer
+
+
+async def load_speaker_tools(state):
+    if state.diarizer is None:
+        state.diarizer_lazy = diarization_installed()
+        if not state.diarizer_lazy:
+            logger.info("Speaker labeling models are not installed yet.")
     if state.model.aligner is None:
         try:
             await run_in_threadpool(state.model.enable_alignment)
@@ -146,7 +190,130 @@ async def load_speaker_tools(state):
 
 
 def additional_models_ready(state):
-    return state.diarizer is not None and state.model.aligner is not None and writing_model_installed()
+    return diarization_ready(state) and state.model.aligner is not None and writing_model_installed()
+
+
+def _trim_device_cache(state):
+    state.cache_trim_handle = None
+    if getattr(state, "draining", False):
+        return
+    inference = getattr(state, "inference", None)
+    if inference is not None and (inference.active or inference.waiting_dictation):
+        return
+    model = getattr(state, "model", None)
+    release = getattr(model, "release_device_cache", None)
+    if callable(release):
+        try:
+            release()
+        except Exception:
+            logger.debug("Could not release idle device cache.", exc_info=True)
+
+
+def schedule_cache_trim(state):
+    if getattr(state, "draining", False):
+        return
+    model = getattr(state, "model", None)
+    if not callable(getattr(model, "release_device_cache", None)):
+        return
+    if handle := getattr(state, "cache_trim_handle", None):
+        handle.cancel()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    state.cache_trim_handle = loop.call_later(IDLE_CACHE_TRIM_SECONDS, _trim_device_cache, state)
+
+
+async def maybe_unload_idle_diarizer(state):
+    if state.diarizer is None or not getattr(state, "diarizer_lazy", False) or getattr(state, "draining", False):
+        return
+    if (getattr(state, "jobs", None) or getattr(state, "submitting", None) or getattr(state, "live_speakers", None)
+            or getattr(state, "portable_recording", None)):
+        return
+    inference = getattr(state, "inference", None)
+    if inference is not None and (inference.active or inference.waiting_dictation):
+        return
+    if time.monotonic() - getattr(state, "diarizer_last_used", 0.0) < IDLE_DIARIZER_UNLOAD_SECONDS:
+        return
+    lock = getattr(state, "diarizer_lock", None)
+    if lock is None or lock.locked():
+        return
+    async with lock:
+        if state.diarizer is None or getattr(state, "live_speakers", None) or getattr(state, "jobs", None):
+            return
+        state.diarizer = None
+        gc.collect()
+        release = getattr(getattr(state, "model", None), "release_device_cache", None)
+        if callable(release):
+            release()
+
+
+async def _run_prewarm(state):
+    try:
+        model = getattr(state, "model", None)
+        prewarm = getattr(model, "prewarm", None)
+        if not callable(prewarm):
+            return
+        is_warm = getattr(model, "is_warm", None)
+        if callable(is_warm) and is_warm():
+            return
+        async with state.inference.turn(dictation=False):
+            if getattr(state, "draining", False) or state.inference.waiting_dictation:
+                return
+            if callable(is_warm) and is_warm():
+                return
+            started = time.monotonic()
+            warmed = await run_in_threadpool(prewarm)
+            if warmed:
+                logger.info("Prewarmed speech model in %d ms.", round((time.monotonic() - started) * 1000))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug("Background speech model prewarm failed.", exc_info=True)
+    finally:
+        if getattr(state, "prewarm_task", None) is asyncio.current_task():
+            state.prewarm_task = None
+
+
+def rust_speech_client(state) -> RustSpeechClient | None:
+    client = getattr(state, "rust_speech", None)
+    if client is None and not getattr(state, "rust_speech_checked", False):
+        state.rust_speech_checked = True
+        client = RustSpeechClient.from_env()
+        state.rust_speech = client
+    return client
+
+
+def schedule_prewarm(state) -> bool:
+    if getattr(state, "draining", False):
+        return False
+    rust = rust_speech_client(state)
+    if rust is not None:
+        current = getattr(state, "prewarm_task", None)
+        if current is not None and not current.done():
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        state.prewarm_task = loop.create_task(rust.prewarm())
+        return True
+    if getattr(state, "status", None) != "ready":
+        return False
+    model = getattr(state, "model", None)
+    if not callable(getattr(model, "prewarm", None)):
+        return False
+    is_warm = getattr(model, "is_warm", None)
+    if callable(is_warm) and is_warm():
+        return False
+    inference = getattr(state, "inference", None)
+    if inference is None or inference.active or inference.waiting_dictation:
+        return False
+    current = getattr(state, "prewarm_task", None)
+    if current is not None and not current.done():
+        return True
+    state.prewarm_task = asyncio.create_task(_run_prewarm(state))
+    return True
 
 
 async def load_speech(app):
@@ -262,11 +429,29 @@ async def restore_portable_shortcut(state):
                 dictation.feedback = str(failure)
 
 
+async def load_bundled_speech(state):
+    if rust_speech_client(state) is not None:
+        return
+    try:
+        bundled = await start_bundled_speech(Path(__file__).resolve().parents[1])
+        if bundled:
+            state.rust_speech, state.rust_speech_process = bundled
+            logger.info("Bundled Rust dictation ready with Rumble2 Flash.")
+    except (OSError, ValueError, RuntimeError, TimeoutError):
+        logger.warning("Bundled Rust speech could not start. Dictation will use the local model.", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.status = "loading"
     app.state.inference = SpeechInference()
     app.state.diarizer = None
+    app.state.diarizer_lazy = False
+    app.state.diarizer_lock = asyncio.Lock()
+    app.state.diarizer_last_used = 0.0
+    app.state.prewarm_task = None
+    app.state.schedule_prewarm = lambda: schedule_prewarm(app.state)
+    app.state.cache_trim_handle = None
     app.state.stupase_cleanup = None
     app.state.portable_screencast = None
     app.state.portable_annotation_shortcut = None
@@ -313,6 +498,7 @@ async def lifespan(app: FastAPI):
         app.state.portable_meeting_recorder = meeting_recorder
         app.state.portable_recording = None
         app.state.portable_dictation = None
+        app.state.portable_onboarding = None
         app.state.portable_sdk_capture = None
         if portable:
             app.state.portable_recording_lock = asyncio.Lock()
@@ -322,6 +508,10 @@ async def lifespan(app: FastAPI):
             app.state.portable_recording_dir = root / "microphone-drafts"
             app.state.portable_recording_dir.mkdir(mode=0o700, exist_ok=True)
             app.state.portable_dictation = await open_portable_dictation(app.state, root)
+            if app.state.portable_dictation is not None:
+                from portable_onboarding import PortableOnboarding
+
+                app.state.portable_onboarding = PortableOnboarding(root)
             app.state.portable_sdk_capture = PortableSDKCapture(
                 root, recorder, lambda path, languages: transcribe_sdk_microphone(app.state, path, languages))
         app.state.native_token = os.urandom(32).hex() if portable else install_token(root)
@@ -455,6 +645,7 @@ async def lifespan(app: FastAPI):
                                           library.has_pending_recordings(include_meetings=not managed_meetings))
             background.append(asyncio.create_task(resume_recordings(state)))
         command_listener = None
+        speech_startup = None
         shortcut_restore = None
         sdk_discovery = None
         try:
@@ -479,13 +670,15 @@ async def lifespan(app: FastAPI):
                     command_listener = await listen(root, dictation.run_command if dictation else None,
                                                     trash_meeting=lambda key: trash_meeting_from_linux_command(state, key),
                                                     meeting_command=lambda payload: run_linux_meeting_command(state, payload),
-                                                    annotation_command=lambda payload: run_linux_annotation_command(state, payload))
+                                                    annotation_command=lambda payload: run_linux_annotation_command(state, payload),
+                                                    onboarding=lambda: run_linux_onboarding_command(state))
                     if dictation and dictation.platform == "wayland":
                         await dictation.restore_command_preference(command_prefix(root), root)
                 except OSError:
                     logger.warning("Could not start the Linux desktop command listener.", exc_info=True)
             if state.portable_dictation is not None:
                 shortcut_restore = asyncio.create_task(restore_portable_shortcut(state))
+            speech_startup = asyncio.create_task(load_bundled_speech(state))
             yield
         finally:
             if command_record := state.windows_dictation_control:
@@ -525,6 +718,13 @@ async def lifespan(app: FastAPI):
             if sdk_discovery is not None:
                 remove_sdk(root, sdk_discovery)
             state.sdk = None
+            if handle := getattr(state, "cache_trim_handle", None):
+                handle.cancel()
+                state.cache_trim_handle = None
+            if prewarm := getattr(state, "prewarm_task", None):
+                prewarm.cancel()
+                await asyncio.gather(prewarm, return_exceptions=True)
+                state.prewarm_task = None
             for task in background:
                 task.cancel()
             await asyncio.gather(*background, return_exceptions=True)
@@ -538,6 +738,14 @@ async def lifespan(app: FastAPI):
                 from annotation_agents import close
 
                 await close()
+            if speech_startup is not None:
+                if not speech_startup.done():
+                    speech_startup.cancel()
+                await asyncio.gather(speech_startup, return_exceptions=True)
+            if speech := getattr(state, "rust_speech", None):
+                await speech.close()
+            if process := getattr(state, "rust_speech_process", None):
+                await stop_speech_process(process)
             if cleanup := getattr(state, "stupase_cleanup", None):
                 await cleanup.close()
             await app.state.insights.close()
@@ -564,6 +772,7 @@ async def watch_retention(app):
                 and (state.annotation_expiry is None or state.annotation_expiry.done())):
             state.annotation_expiry_due = now + 3600
             state.annotation_expiry = start_job(state, sweep_annotation_retention(state))
+        await maybe_unload_idle_diarizer(state)
 
 
 async def watch_idle(app):
@@ -619,6 +828,8 @@ async def publish_meeting_exports(state, *, key=None):
 
 
 async def resume_recordings(state):
+    if not state.startup_recovery:
+        return
     portable = getattr(state, "portable_workspace", False)
 
     def available():
@@ -629,7 +840,7 @@ async def resume_recordings(state):
                 and not getattr(state, "is_shutting_down", lambda: False)())
 
     try:
-        while state.startup_recovery:
+        while True:
             await asyncio.sleep(2)
             if state.status == "error" and not portable:
                 return
@@ -639,7 +850,12 @@ async def resume_recordings(state):
                 if ((not portable and await run_in_threadpool(capture_active, state.staging))
                         or not available()):
                     continue
-                if not await asyncio.shield(start_job(state, recover_pending_recording(state, state.startup_stranded))):
+                if await asyncio.shield(start_job(state, recover_pending_recording(state, state.startup_stranded))):
+                    continue
+                # A disconnected drive may leave a deferred claim. Check for its
+                # return without holding the update guard open between checks.
+                state.startup_recovery = False
+                if not await run_in_threadpool(state.library.has_pending_recordings, include_meetings=not meetings_managed()):
                     return
             except (OSError, sqlite3.Error, RuntimeError):
                 logger.exception("Could not resume pending recording finalization.")
@@ -656,8 +872,9 @@ async def recover_pending_recording(state, stranded):
     pending = state.library.claim_recording_finalization(include_meetings=include_meetings)
     if pending is None:
         return include_meetings and await recover_stranded_meeting(state, stranded)
+    state.startup_recovery = True
     key, options = pending["id"], pending["options"]
-    source = state.library.audio / key / pending["filename"]
+    source = pending["source"]
     tracks = ({name: source.parent / f"{name}.wav" for name in ("mic", "system")}
               if options.get("sourceSpeakerTurns") else None)
     await process_saved_audio(state, key, source, options, pending["duration"], tracks=tracks,
@@ -720,7 +937,7 @@ async def status(request: Request, challenge: str = Query("", max_length=64)):
     return {
         "libraryId": library_id(request.app.state.library.root), "proof": proof,
         "status": request.app.state.status, "model": MODEL_ID, "languages": LANGUAGE_OPTIONS, "apiVersion": API_VERSION,
-        "diarization": request.app.state.diarizer is not None,
+        "diarization": diarization_ready(request.app.state),
         **({"modelSetup": setup} if (setup := getattr(request.app.state, "model_setup", None)) else {}),
     }
 
@@ -778,6 +995,8 @@ async def connect_browser(key: UUID, request: Request):
         previous = None
         next_ping = time.monotonic()
         desktop = getattr(getattr(request, "state", None), "portable_desktop", False)
+        onboarding = getattr(state, "portable_onboarding", None) if desktop else None
+        last_onboarding = object()
         with state.leases.browser_connection(str(key), desktop=desktop):
             while not state.draining:
                 updated = updater.changed if updater else state.leases.closing
@@ -786,6 +1005,10 @@ async def connect_browser(key: UUID, request: Request):
                     with suppress(OSError):
                         receipt.touch(mode=0o600)
                         state.workspace_startup_receipt = None
+                onboarding_changed = onboarding.changed if onboarding else None
+                if onboarding and onboarding.id != last_onboarding:
+                    last_onboarding = onboarding.id
+                    yield f"event: onboarding\ndata: {json.dumps({'id': last_onboarding})}\n\n"
                 now = time.monotonic()
                 if status != previous:
                     previous = status
@@ -797,8 +1020,17 @@ async def connect_browser(key: UUID, request: Request):
                 # While an update is ready, refresh the restart guard as the
                 # recording, model, and library jobs finish independently.
                 delay = min(.5 if status and status.get("staged") else 20, max(.01, next_ping - time.monotonic()))
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(updated.wait(), timeout=delay)
+                if onboarding_changed is None:
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(updated.wait(), timeout=delay)
+                else:
+                    events = [asyncio.create_task(event.wait()) for event in (updated, onboarding_changed)]
+                    try:
+                        await asyncio.wait(events, timeout=delay, return_when=asyncio.FIRST_COMPLETED)
+                    finally:
+                        for task in events:
+                            task.cancel()
+                        await asyncio.gather(*events, return_exceptions=True)
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
 
@@ -1197,12 +1429,20 @@ async def start_screen_take(state, source, microphone, computer_audio, target, *
             raise HTTPException(503, "The local model is unavailable.")
         if microphone_device and not any(device["id"] == microphone_device for device in await screen_microphone_inputs()):
             raise HTTPException(409, "The selected microphone is unavailable. Choose another microphone and try again.")
+        def resolve_location():
+            with state.library.connection() as db:
+                return annotation_storage.capture_location(db)
+
+        try:
+            location = await run_in_threadpool(resolve_location)
+        except annotation_storage.Unavailable as error:
+            raise HTTPException(503, str(error)) from error
         if sys.platform == "win32":
             from windows_screencast import WindowsScreenRecording
 
             await require_windows_target("display" if source == "area" else source, target)
             take = WindowsScreenRecording(state.screen_draft_dir, source, target, microphone, computer_audio,
-                                          microphone_device=microphone_device, notice=notice)
+                                          microphone_device=microphone_device, notice=notice, annotation_location=location)
         else:
             from linux_screencast import ScreenRecording, supported
             from linux_x11 import recording_target, x11_session
@@ -1222,7 +1462,8 @@ async def start_screen_take(state, source, microphone, computer_audio, target, *
                     raise HTTPException(503, str(error)) from error
             take = ScreenRecording(state.screen_draft_dir, source, microphone, computer_audio,
                                    microphone_device=microphone_device, native_x11=native_x11, notice=notice,
-                                   draw_on_start=draw_on_start, x11_area=area, show_area_picker=show_area_picker)
+                                   draw_on_start=draw_on_start, x11_area=area, show_area_picker=show_area_picker,
+                                   annotation_location=location)
         take.annotation_languages = annotation_languages
         take.observe_annotation_origin = observe_origin
         take.annotation_started_at = time.time()
@@ -1750,17 +1991,27 @@ async def save_screen_draft(state, draft, languages, *, origin=None):
             await run_in_threadpool(draft.discard)
         return JSONResponse({"id": draft.key}, status_code=202)
     try:
+        if draft.annotation_location is not None:
+            def check_location():
+                with state.library.connection() as db:
+                    annotation_storage.location_root(db, draft.annotation_location)
+
+            await run_in_threadpool(check_location)
         events = await run_in_threadpool(load_events, draft.ink)
         movie, duration = await draft.prepare_movie(events)
         assets = staged_annotation_paths(movie)
-        frames = await make_contact_sheet(movie, assets["contact-sheet"], duration, events)
+        frames, keyframes = await make_contact_sheet(movie, assets, duration, events)
         await run_in_threadpool(assets["manifest"].write_text, json.dumps({
             "version": 1, "source": draft.source, "coordinateSpace": "normalized-bottom-left", "events": events, "frames": frames,
+            **({"keyframes": keyframes} if keyframes else {}),
             **({"origin": origin} if origin else {}),
         }), encoding="utf-8")
         annotation = await run_in_threadpool(read_staged_annotation, movie)
         result = await accept_audio(state, movie, "Screen recording", "video/mp4", languages,
-                                    True, len(draft.audio_sources) == 2, False, True, stage_id=draft.key, annotation=annotation)
+                                    True, len(draft.audio_sources) == 2, False, True, stage_id=draft.key, annotation=annotation,
+                                    annotation_location=draft.annotation_location)
+    except annotation_storage.Unavailable as error:
+        raise HTTPException(503, str(error)) from error
     except (CaptureError, ValueError) as failure:
         raise HTTPException(422, str(failure)) from failure
     except OSError as failure:
@@ -1851,7 +2102,7 @@ def session_audio(request: Request, key: UUID, track: Literal["mic", "system"] |
 
 
 @app.get("/api/sessions/{key}/annotation/{kind}")
-def session_annotation_asset(request: Request, key: UUID, kind: Literal["manifest", "contact-sheet"]):
+def session_annotation_asset(request: Request, key: UUID, kind: str):
     path, mime = request.app.state.library.annotation_asset(str(key), kind)
     return FileResponse(path, media_type=mime, headers=PRIVATE_MEDIA_HEADERS)
 
@@ -1864,24 +2115,38 @@ class AnnotationVideoRange(BaseModel):
 
 @app.post("/api/portable/annotations/{key}/export")
 async def export_portable_annotation(request: Request, key: UUID,
-                                     span: Annotated[AnnotationVideoRange | None, Body(embed=True)] = None):
+                                     span: Annotated[AnnotationVideoRange | None, Body(embed=True)] = None,
+                                     kind: Annotated[Literal["video", "package"], Body(embed=True)] = "video"):
     if request.headers.get("origin") != URL or not getattr(request.state, "portable_desktop", False):
-        raise HTTPException(403, "Save the video from Jaro’s desktop workspace.")
+        raise HTTPException(403, "Export the annotation from Jaro’s desktop workspace.")
+    from annotation_package import write_package
     from portable_video_export import save_annotation_video
-    from desktop_file_dialog import file_dialog
+    from desktop_file_dialog import choose_file, file_dialog
 
     if not (dialog := file_dialog()):
-        raise HTTPException(404, "The desktop video save dialog is unavailable.")
+        raise HTTPException(404, "The desktop export dialog is unavailable.")
+    if kind == "package" and span is not None:
+        raise HTTPException(422, "A video range can only be used for a clip export.")
     if span and span.endMs - span.startMs < 500:
         raise HTTPException(422, "Select at least half a second within the recording to export.")
     state = request.app.state
-    pending = getattr(state, "portable_video_export", None)
+    pending = getattr(state, "portable_annotation_export", None)
     if state.draining or (pending and not pending.done()):
-        raise HTTPException(409, "Finish the current video export before saving another.")
+        raise HTTPException(409, "Finish the current annotation export before saving another.")
+
+    async def export_package():
+        folder = await choose_file(dialog, "--choose-annotation-export-folder")
+        if folder is None:
+            return {"saved": False}
+        return await asyncio.to_thread(write_package, state.library, str(key), folder)
+
     bounds = (span.startMs, span.endMs) if span else None
-    state.portable_video_export = start_job(state, save_annotation_video(state.library, dialog, str(key), bounds))
+    work = export_package() if kind == "package" else save_annotation_video(state.library, dialog, str(key), bounds)
+    state.portable_annotation_export = start_job(state, work)
     try:
-        return await state.portable_video_export
+        return await asyncio.shield(state.portable_annotation_export)
+    except annotation_storage.Unavailable:
+        raise
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
     except OSError as error:
@@ -2131,12 +2396,21 @@ class AnnotationFolder(BaseModel):
     folder: str | None
 
 
+def annotation_folder_status(library):
+    with library.connection() as db:
+        return annotation_storage.status(db, library.audio)
+
+
+def select_annotation_folder(library, folder):
+    with library.connection(write_lock=True) as db:
+        annotation_storage.select(db, folder, library.root)
+        return annotation_storage.status(db, library.audio)
+
+
 @app.get("/api/native/annotation-storage")
 def get_annotation_storage(request: Request):
     check_native(request)
-    library = request.app.state.library
-    with library.connection() as db:
-        return annotation_storage.status(db, library.audio)
+    return annotation_folder_status(request.app.state.library)
 
 
 @app.put("/api/native/annotation-storage")
@@ -2147,18 +2421,114 @@ async def put_annotation_storage(request: Request, setting: AnnotationFolder):
     if state.draining:
         raise HTTPException(409, "Jaro is preparing to restart.")
 
-    def save():
-        with state.library.connection() as db:
-            db.execute("BEGIN IMMEDIATE")
-            annotation_storage.select(db, setting.folder, state.library.root)
-            return annotation_storage.status(db, state.library.audio)
-
     try:
-        return await asyncio.shield(start_job(state, run_in_threadpool(save)))
+        return await asyncio.shield(start_job(state, run_in_threadpool(select_annotation_folder, state.library, setting.folder)))
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
     except OSError as error:
         raise HTTPException(409, "Jaro could not use that folder. Choose a writable location.") from error
+
+
+class PortableAnnotationStorageCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    action: Literal["storage"]
+    storageAction: Literal["status", "set", "reset", "reveal"]
+    folder: str | None = Field(default=None, max_length=4096)
+
+
+def require_annotation_folder_idle(state):
+    if state.draining:
+        raise HTTPException(409, "Jaro is preparing to restart.")
+    take = state.portable_screencast
+    if take and (take.saving or take.phase not in ("cancelled", "error")):
+        raise HTTPException(409, "Finish the active annotation before changing its folder.")
+
+
+async def change_portable_annotation_folder(state, folder):
+    async with state.portable_recording_lock:
+        require_annotation_folder_idle(state)
+        return await run_in_threadpool(select_annotation_folder, state.library, folder)
+
+
+async def run_portable_annotation_storage(state, action, folder=None):
+    from desktop_file_dialog import choose_file, file_dialog, reveal_folder
+
+    if not getattr(state, "screen_draft_dir", None):
+        raise HTTPException(404, "Annotation storage is unavailable.")
+    if (action == "set") != (folder is not None):
+        raise HTTPException(422, "Specify a folder only when setting annotation storage.")
+    if action == "status":
+        return await run_in_threadpool(annotation_folder_status, state.library)
+    require_annotation()
+
+    async def choose(dialog):
+        current = await run_in_threadpool(annotation_folder_status, state.library)
+        selected = await choose_file(dialog, "--choose-annotation-storage-folder",
+                                     *((current["folder"],) if current["available"] else ()))
+        if selected is None:
+            return await run_in_threadpool(annotation_folder_status, state.library)
+        return await change_portable_annotation_folder(state, str(selected))
+
+    try:
+        if action == "reveal":
+            location = await run_in_threadpool(annotation_folder_status, state.library)
+            if not location["available"]:
+                raise annotation_storage.Unavailable()
+            await reveal_folder(location["folder"])
+            return location
+        if action == "choose":
+            require_annotation_folder_idle(state)
+            pending = getattr(state, "annotation_folder_picker", None)
+            if pending and not pending.done():
+                raise HTTPException(409, "The Annotations folder picker is already open.")
+            if not (dialog := file_dialog()):
+                raise HTTPException(503, "The Annotations folder picker is unavailable.")
+            state.annotation_folder_picker = start_job(state, choose(dialog))
+            return await asyncio.shield(state.annotation_folder_picker)
+        return await asyncio.shield(start_job(state, change_portable_annotation_folder(state, folder)))
+    except annotation_storage.Unavailable as error:
+        raise HTTPException(503, str(error)) from error
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    except OSError as error:
+        detail = "Jaro could not open the Annotations folder." if action == "reveal" else "Jaro could not use that folder. Choose a writable location."
+        raise HTTPException(409, detail) from error
+
+
+@app.post("/api/portable/annotation-storage")
+async def portable_annotation_storage(request: Request, action: Annotated[Literal["status", "choose", "reveal", "reset"], Body(embed=True)]):
+    state = screencast_workspace(request)
+    if not getattr(request.state, "portable_desktop", False) or request.headers.get("origin") != URL:
+        raise HTTPException(403, "Open Jaro’s desktop workspace to access annotation storage.")
+    value = await run_portable_annotation_storage(state, action)
+    return JSONResponse(value, headers={"Cache-Control": "no-store"})
+
+
+class AnnotationAgentSkillCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    action: Literal["guide", "status", "install", "update"]
+    agent: Literal["claude", "codex", "opencode", "pi"] | None = None
+
+
+@app.post("/api/portable/annotation-agent-skill")
+async def portable_annotation_agent_skill(request: Request, command: AnnotationAgentSkillCommand):
+    from annotation_agent_skill import manage
+
+    state = screencast_workspace(request)
+    if not getattr(request.state, "portable_desktop", False) or request.headers.get("origin") != URL:
+        raise HTTPException(403, "Open Jaro’s desktop workspace to manage annotation guides.")
+    require_annotation()
+    writing = command.action in ("install", "update")
+    if writing and state.draining:
+        raise HTTPException(409, "Jaro is preparing to restart.")
+    try:
+        work = run_in_threadpool(manage, command.action, command.agent)
+        result = await asyncio.shield(start_job(state, work)) if writing else await work
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    except OSError as error:
+        raise HTTPException(409, "Jaro could not access the local agent guide.") from error
+    return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/annotations/retention")
@@ -2320,8 +2690,35 @@ def transcription_languages(request: Request, *, require_ready=True) -> tuple[st
 
 
 async def run_inference(state, function, *args, dictation=False, **kwargs):
-    async with state.inference.turn(dictation=dictation):
-        return await run_in_threadpool(function, *args, **kwargs)
+    await state.inference.acquire(dictation=dictation)
+    worker = asyncio.create_task(run_in_threadpool(function, *args, **kwargs))
+
+    async def release_when_done():
+        try:
+            with suppress(BaseException):
+                await worker
+        finally:
+            await state.inference.release()
+            schedule_cache_trim(state)
+
+    try:
+        result = await asyncio.shield(worker)
+    except BaseException:
+        if not worker.done():
+            # Caller was cancelled while the threadpool worker is still executing:
+            # keep `state.inference.active` held until the worker actually exits so
+            # no subsequent dictation or finalization runs concurrently on the model.
+            release_task = asyncio.create_task(release_when_done())
+            if hasattr(state, "jobs"):
+                state.jobs.add(release_task)
+                release_task.add_done_callback(state.jobs.discard)
+        else:
+            await state.inference.release()
+            schedule_cache_trim(state)
+        raise
+    await state.inference.release()
+    schedule_cache_trim(state)
+    return result
 
 
 async def speech_vocabulary(state):
@@ -2339,6 +2736,7 @@ async def decode_pcm(state, pcm: bytes, languages, speakers=None, offset=0, live
         queue_ns = time.monotonic_ns() - queued_at if queued_at is not None else None
         if live and speakers:
             speakers.push(pcm, offset)
+            state.diarizer_last_used = time.monotonic()
         model = state.model
         if (screen_nonspeech and getattr(state, "sdk_embedded", False)
                 and not getattr(state, "speech_screen_prepared", False)):
@@ -2360,12 +2758,11 @@ async def decode_pcm(state, pcm: bytes, languages, speakers=None, offset=0, live
             )
 
         started = time.monotonic_ns() if measure_inference else None
-        use_static = not live or dictation
         try:
-            # Fixed-size decoder storage avoids growing tensors on every final-pass or dictation token.
-            recognized = recognize("static" if use_static else None)
+            # Fixed-size decoder storage avoids growing tensors per token across live, dictation, and final passes.
+            recognized = recognize("static")
         except RuntimeError as error:
-            if not use_static or "out of memory" not in str(error).lower():
+            if "out of memory" not in str(error).lower():
                 raise
             recognized = None
         if recognized is None:
@@ -2379,6 +2776,8 @@ async def decode_pcm(state, pcm: bytes, languages, speakers=None, offset=0, live
         segments, word_times = speakers.label(
             text, words, offset, duration, include_word_times=not live or timed_output,
         ) if speakers else ([], [])
+        if speakers:
+            state.diarizer_last_used = time.monotonic()
         if not speakers and (not live or timed_output):
             from speaker_alignment import word_records
 
@@ -2395,6 +2794,9 @@ async def decode_pcm(state, pcm: bytes, languages, speakers=None, offset=0, live
 
 
 async def resample_capture(data, rate=MEETING_RATE):
+    fast = await run_in_threadpool(decimate_pcm16_to_16k_f32, data, rate)
+    if fast is not None:
+        return fast
     proc = await asyncio.create_subprocess_exec(
         codec_binary("ffmpeg"), "-v", "error", "-f", "s16le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
         "-ar", str(SAMPLE_RATE), "-f", "f32le", "pipe:1", stdin=asyncio.subprocess.PIPE,
@@ -2437,16 +2839,19 @@ def ensure_meeting_turn(result, start, end):
         result["segments"] = [{"speaker": None, "start": start, "end": end, "text": result["text"]}]
 
 
-def live_speakers(request, session_id):
+async def live_speakers(request, session_id):
     state = request.app.state
-    if not session_id or state.diarizer is None:
+    if not session_id:
+        return None
+    diarizer = await ensure_diarizer(state)
+    if diarizer is None:
         return None
     now = time.monotonic()
     for key, (used, _) in list(state.live_speakers.items()):
         if now - used > 120:
             del state.live_speakers[key]
     existing = state.live_speakers.get(session_id)
-    speakers = existing[1] if existing else state.diarizer.session(live=True)
+    speakers = existing[1] if existing else diarizer.session(live=True)
     state.live_speakers[session_id] = (now, speakers)
     return speakers
 
@@ -2469,8 +2874,8 @@ async def transcribe(request: Request, session: UUID | None = None, offset: int 
         state = request.app.state
         vocabulary = await speech_vocabulary(state)
         async with state.insights.model.audio_priority():
-            result = await decode_pcm(state, bytes(pcm), languages, live_speakers(request, session), offset,
-                                      live=True, vocabulary=vocabulary)
+            result = await decode_pcm(state, bytes(pcm), languages, await live_speakers(request, session), offset,
+                                      live=True, vocabulary=vocabulary, screen_nonspeech=True)
         start_time = offset / SAMPLE_RATE
         ensure_meeting_turn(result, start_time, start_time + len(pcm) / (4 * SAMPLE_RATE))
         return result
@@ -2549,7 +2954,7 @@ async def accept_audio(state, source, name, mime, languages, recording, diarizat
         if duration is not None and duration > limit:
             raise ValueError(DURATION_ERROR)
         meeting = bool(meeting_provider)
-        identify_speakers = not video_only and (diarization or meeting) and state.diarizer is not None
+        identify_speakers = not video_only and (diarization or meeting) and diarization_ready(state)
         options = dict(recording=recording, live=live, diarization=identify_speakers,
                        languageHints=list(languages), model=MODEL_ID, modelRevision=REVISION,
                        speakerModel=DIARIZATION_ID if identify_speakers else None,
@@ -2698,11 +3103,15 @@ async def begin_portable_recording(state, mode, meeting, languages, *, provider=
         if meeting:
             capture.meeting_claim = claim
             capture.meeting_metadata = metadata
+        capture.preview_live = live
         capture.preview_enabled = meeting or live
         capture.preview_chunks = deque(maxlen=160)
         capture.preview_processed = 0
+        capture.preview_tentative = ""
+        capture.preview_revision = 0
         capture.preview_task = start_job(state, preview_portable_recording(state, capture, languages, meeting or diarization))
         keep_awake_until(capture.worker, "Jaro is recording audio")
+        schedule_prewarm(state)
     return {"id": key, "sampleRate": SAMPLE_RATE}
 
 
@@ -2722,46 +3131,98 @@ def portable_preview_pcm(path, start, frames):
 
 
 async def preview_portable_recording(state, capture, languages, diarization):
-    frames = 4 * SAMPLE_RATE
     conversion = MEETING_RATE // SAMPLE_RATE
+    planner = LiveWindowPlanner(SAMPLE_RATE)
     speakers = None
     vocabulary = None
-    offset = 0
     delayed = False
+
+    def read_slice(start, count):
+        return read_wav_i16_slice(capture.path, start, count)
+
     while state.portable_recording is capture and not capture.worker.done():
-        await asyncio.sleep(.35)
+        await asyncio.sleep(.2)
         if state.portable_recording is not capture or capture.worker.done():
             return
-        if (not capture.preview_enabled or state.draining or state.status != "ready" or capture.frames - offset < frames
+        if not capture.preview_enabled:
+            if getattr(capture, "preview_tentative", ""):
+                capture.preview_tentative = ""
+                capture.preview_revision = getattr(capture, "preview_revision", 0) + 1
+            continue
+        if (state.draining or state.status != "ready"
                 or (state.portable_dictation and state.portable_dictation.busy)):
+            continue
+        inference = getattr(state, "inference", None)
+        under_load = bool(inference and (inference.active or inference.waiting_dictation))
+        show_live = bool(getattr(capture, "preview_live", capture.preview_enabled))
+        action = await run_in_threadpool(
+            planner.plan, capture.frames, read_slice, show_live=show_live, under_load=under_load,
+        )
+        if isinstance(action, SkipAction):
+            planner.jump_to(action.cursor)
+            if getattr(capture, "preview_tentative", ""):
+                capture.preview_tentative = ""
+                capture.preview_revision = getattr(capture, "preview_revision", 0) + 1
+            if not delayed:
+                logger.warning("The live transcript is delayed. Recording continues.")
+                delayed = True
+            continue
+        if not isinstance(action, (TentativeAction, CommitAction)):
             continue
         try:
             if vocabulary is None:
                 vocabulary = await speech_vocabulary(state)
-                speakers = state.diarizer.session(live=True) if diarization and state.diarizer else None
-            pcm = await run_in_threadpool(portable_preview_pcm, capture.path, offset, frames)
+                diarizer = await ensure_diarizer(state) if diarization else None
+                speakers = diarizer.session(live=True) if diarizer else None
+            pcm = await run_in_threadpool(portable_preview_pcm, capture.path, action.start, action.frames)
             if state.portable_recording is not capture:
                 return
             if not capture.preview_enabled or (state.portable_dictation and state.portable_dictation.busy):
                 continue
+            if isinstance(action, TentativeAction):
+                if not getattr(capture, "preview_live", capture.preview_enabled):
+                    continue
+                async with state.insights.model.audio_priority():
+                    result = await decode_pcm(state, pcm, languages, None, action.start, live=True, timed_output=False,
+                                              vocabulary=vocabulary, screen_nonspeech=True)
+                if state.portable_recording is not capture:
+                    return
+                planner.mark_tentative(action.start + action.frames)
+                tentative = (result.get("text") or "").strip() if getattr(capture, "preview_live", capture.preview_enabled) else ""
+                if tentative != getattr(capture, "preview_tentative", ""):
+                    capture.preview_tentative = tentative
+                    capture.preview_revision = getattr(capture, "preview_revision", 0) + 1
+                delayed = False
+                continue
+
             async with state.insights.model.audio_priority():
-                result = await decode_pcm(state, pcm, languages, speakers, offset, live=True, timed_output=True,
-                                          vocabulary=vocabulary)
+                decoded = await decode_pcm(state, pcm, languages, speakers, action.start, live=True, timed_output=True,
+                                           vocabulary=vocabulary, screen_nonspeech=True)
             if state.portable_recording is not capture:
                 return
-            end = offset + frames
-            ensure_meeting_turn(result, offset / SAMPLE_RATE, end / SAMPLE_RATE)
+            result = {**decoded, "segments": [dict(segment) for segment in decoded.get("segments", [])],
+                      "words": [dict(word) for word in decoded.get("words", [])]}
+            if action.forced and capture.preview_chunks and result.get("text"):
+                trimmed = trim_boundary_overlap(capture.preview_chunks[-1]["text"], result["text"])
+                if trimmed != result["text"]:
+                    result["text"] = trimmed
+                    if len(result["segments"]) == 1:
+                        result["segments"][0]["text"] = trimmed
+            end = action.start + action.frames
+            ensure_meeting_turn(result, action.start / SAMPLE_RATE, end / SAMPLE_RATE)
             result["words"] = [{"speaker": None, **word} for word in result["words"]]
             result.update(activity=[], meetingSpeakerMode=MIXED_SPEAKERS)
-            await run_in_threadpool(append_rolling, capture.path, offset * conversion, end * conversion, result)
+            await run_in_threadpool(append_rolling, capture.path, action.start * conversion, end * conversion, result)
         except Exception as error:
             if not delayed:
                 logger.warning("The live transcript is delayed (%s). Recording continues.", type(error).__name__)
             delayed = True
             continue
         delayed = False
-        offset = end
+        planner.mark_committed(end)
         capture.preview_processed = end
+        capture.preview_tentative = ""
+        capture.preview_revision = getattr(capture, "preview_revision", 0) + 1
         if result["text"]:
             capture.preview_chunks.append(result)
 
@@ -2786,17 +3247,21 @@ def portable_has_live_transcript(state):
 
 
 @app.get("/api/portable/recording/{key}/preview")
-async def portable_recording_preview(request: Request, key: UUID, after: int = Query(0, ge=0)):
+async def portable_recording_preview(request: Request, key: UUID, after: int = Query(0, ge=0),
+                                     rev: int | None = Query(None, ge=0)):
     state = portable_capture_state(request)
     capture = state.portable_recording
     if not capture or capture.key != key:
         raise HTTPException(404, "This recording has ended.")
-    if capture.preview_processed == after:
+    revision = getattr(capture, "preview_revision", 0)
+    if capture.preview_processed == after and (rev is None or revision == rev):
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
     chunks = tuple(capture.preview_chunks)
     return JSONResponse({"text": " ".join(chunk["text"] for chunk in chunks),
+                         "tentative": getattr(capture, "preview_tentative", ""),
                          "segments": [segment for chunk in chunks for segment in chunk["segments"]],
-                         "through": capture.preview_processed},
+                         "through": capture.preview_processed,
+                         "rev": revision},
                         headers={"Cache-Control": "no-store"})
 
 
@@ -2808,7 +3273,11 @@ async def set_portable_recording_preview(request: Request, key: UUID, live: Anno
         if not capture or capture.key != key or capture.worker.done():
             raise HTTPException(404, "This recording has ended.")
         # Meetings keep an excerpt available for Copy New and Copy All.
+        capture.preview_live = live
         capture.preview_enabled = bool(getattr(capture, "meeting_metadata", None)) or live
+        if not live and getattr(capture, "preview_tentative", ""):
+            capture.preview_tentative = ""
+            capture.preview_revision = getattr(capture, "preview_revision", 0) + 1
     return Response(status_code=204)
 
 
@@ -2942,7 +3411,64 @@ async def change_portable_meeting_voice_input(request: Request, change: MeetingV
 
 @app.get("/api/portable/dictation")
 def portable_dictation_status(request: Request):
-    return JSONResponse(portable_dictation(request).snapshot(), headers={"Cache-Control": "no-store"})
+    status = portable_dictation(request).snapshot()
+    if status["platform"] == "windows" and getattr(request.state, "portable_desktop", False):
+        from windows_capture import microphone_privacy_denied
+
+        status["microphoneDenied"] = microphone_privacy_denied()
+    return JSONResponse(status, headers={"Cache-Control": "no-store"})
+
+
+def portable_onboarding_state(state):
+    if (onboarding := getattr(state, "portable_onboarding", None)) is None:
+        raise HTTPException(404, "Dictation setup is unavailable on this desktop.")
+    if state.draining:
+        raise HTTPException(409, "Jaro is preparing to restart.")
+    if portable_capture_busy(state) or state.portable_dictation.authorizing or getattr(state.portable_dictation, "paste_authorizing", False):
+        raise HTTPException(409, "Finish the current recording or desktop approval before changing dictation setup.")
+    return onboarding
+
+
+def restart_portable_onboarding(state, *, foreground=False):
+    onboarding = portable_onboarding_state(state)
+    try:
+        if foreground:
+            tray = Path(os.environ.get("JARO_DESKTOP_TRAY", ""))
+            if not tray.is_absolute() or not tray.is_dir():
+                raise OSError("Native workspace unavailable")
+            (tray / "open").touch()
+        return {"id": onboarding.restart()}
+    except OSError as error:
+        raise HTTPException(503, "Could not replay dictation setup. Reopen Jaro and try again.") from error
+
+
+class OnboardingAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["restart", "finish", "microphone"]
+    id: UUID | None = None
+
+
+@app.post("/api/portable/onboarding")
+async def change_portable_onboarding(request: Request, operation: OnboardingAction):
+    if request.headers.get("origin") != URL or not getattr(request.state, "portable_desktop", False):
+        raise HTTPException(403, "Open Jaro’s desktop workspace to run dictation setup.")
+    state = request.app.state
+    if operation.action == "restart":
+        return restart_portable_onboarding(state)
+    onboarding = portable_onboarding_state(state)
+    if operation.id is None or onboarding.id != str(operation.id):
+        raise HTTPException(409, "This setup run has changed. Try again in the current window.")
+    try:
+        if operation.action == "microphone":
+            if sys.platform != "win32":
+                raise HTTPException(404, "Microphone privacy settings are available on Windows.")
+            os.startfile("ms-settings:privacy-microphone")
+            return {"id": onboarding.id}
+        onboarding.finish(str(operation.id))
+        return {"id": None}
+    except OSError as error:
+        raise HTTPException(503, "Could not finish the setup action. Try again.") from error
 
 
 def portable_dictation(request):
@@ -3005,6 +3531,20 @@ def windows_desktop_command_state(request):
     return state
 
 
+@app.post(windows_dictation_commands.ONBOARDING_ROUTE)
+async def windows_onboarding_command(request: Request):
+    return restart_portable_onboarding(windows_desktop_command_state(request), foreground=True)
+
+
+async def run_linux_onboarding_command(state):
+    from portable_capture import CaptureError
+
+    try:
+        return restart_portable_onboarding(state, foreground=True)
+    except HTTPException as error:
+        raise CaptureError(error.detail) from error
+
+
 @app.post(windows_dictation_commands.MEETING_TRASH_ROUTE)
 async def trash_meeting_from_windows_command(request: Request, command: MeetingTrashCommand):
     state = windows_desktop_command_state(request)
@@ -3026,8 +3566,10 @@ async def windows_meeting_command(request: Request, command: PortableMeetingComm
 
 
 @app.post(windows_dictation_commands.ANNOTATION_COMMAND_ROUTE)
-async def windows_annotation_command(request: Request, command: PortableAnnotationCommand | PortableAnnotationHandoff):
+async def windows_annotation_command(request: Request, command: PortableAnnotationCommand | PortableAnnotationHandoff | PortableAnnotationStorageCommand):
     state = windows_desktop_command_state(request)
+    if isinstance(command, PortableAnnotationStorageCommand):
+        return await run_portable_annotation_storage(state, command.storageAction, command.folder)
     if isinstance(command, PortableAnnotationHandoff):
         if command.action == "send-session":
             raise HTTPException(400, "Open the Jaro desktop window to perform this action.")
@@ -3039,6 +3581,9 @@ async def run_linux_annotation_command(state, payload):
     from portable_capture import CaptureError
 
     try:
+        if isinstance(payload, dict) and payload.get("action") == "storage":
+            storage = PortableAnnotationStorageCommand.model_validate(payload)
+            return await run_portable_annotation_storage(state, storage.storageAction, storage.folder)
         if isinstance(payload, dict) and payload.get("action") in ("destinations", "send", "undo", "correct", "remember", "forget", "route"):
             handoff = PortableAnnotationHandoff.model_validate(payload)
             return await run_portable_annotation_handoff(state, handoff)
@@ -3653,7 +4198,7 @@ def change_portable_history(request: Request, change: PortableHistoryChange):
 @app.post("/api/portable/dictation/{action}")
 async def change_portable_dictation(request: Request, action: Literal[
                                    "enable", "disable", "paste-shortcut", "configure", "toggle", "cancel", "allow-paste",
-                                   "disable-paste", "enable-commands", "add-gnome-shortcuts", "remove-gnome-shortcuts"],
+                                   "disable-paste", "cancel-approval", "enable-commands", "add-gnome-shortcuts", "remove-gnome-shortcuts"],
                                terminal: bool = False):
     from portable_capture import CaptureError
 
@@ -3689,11 +4234,13 @@ async def change_portable_dictation(request: Request, action: Literal[
             except (OSError, ValueError, sqlite3.Error) as failure:
                 raise HTTPException(503, "Could not save the paste shortcut.") from failure
             dictation.terminal = terminal
-        elif action in ("configure", "toggle", "allow-paste", "disable-paste", "enable-commands",
+        elif action in ("configure", "toggle", "allow-paste", "disable-paste", "cancel-approval", "enable-commands",
                         "add-gnome-shortcuts", "remove-gnome-shortcuts"):
             if dictation.platform != "wayland":
                 raise HTTPException(404, "This action uses the Wayland desktop.")
-            if action == "disable-paste":
+            if action == "cancel-approval":
+                await dictation.cancel_approval()
+            elif action == "disable-paste":
                 try:
                     await dictation.disable_paste()
                 except CaptureError as failure:
@@ -3838,8 +4385,11 @@ async def stopped_portable_recording(state, key):
                 await capture.stop()
         finally:
             state.portable_recording = None
-            if preview := getattr(capture, "preview_task", None):
-                await asyncio.shield(preview)
+            if hasattr(state, "live_speakers"):
+                state.live_speakers.pop(key, None)
+
+        if preview := getattr(capture, "preview_task", None):
+            await finish_live_preview(preview, 0.35, logger, key)
         yield capture
     finally:
         if claim := getattr(capture, "meeting_claim", None):
@@ -3999,7 +4549,7 @@ async def meeting_recognition_audio(state, pcm, microphone, voice):
 async def process_mixed_audio(state, key, source, options, duration, *, checkpoint, progress_only, emit, vocabulary):
     languages = options["languageHints"]
     meeting = options.get("meeting", options.get("sourceSpeakerTurns", False))
-    diarizer = state.diarizer
+    diarizer = await ensure_diarizer(state) if options["diarization"] else None
     speakers = diarizer.session() if options["diarization"] and diarizer else None
     pending = deque()
     samples = 0
@@ -4380,6 +4930,8 @@ async def new_stage(request: Request, recording: bool = False, dictation: bool =
         if annotation_id and isinstance(error, FileExistsError):
             raise HTTPException(409, "This annotation is already being staged.") from error
         raise
+    if dictation or recording:
+        schedule_prewarm(request.app.state)
     if meeting and noise_cleanup:
         stupase_cleanup(request.app.state).prepare()
     return {"id": key, "path": str(path)}
@@ -4410,6 +4962,7 @@ async def abandon_stage(request: Request, key: UUID, dictation: bool = False):
     path = stage_path(request.app.state, key)
     if dictation and not path.with_suffix(".dictation").is_file():
         raise HTTPException(404, "This dictation is unavailable.")
+    request.app.state.live_speakers.pop(key, None)
     path.unlink()
     path.with_suffix(".dictation").unlink(missing_ok=True)
     recording_marker(path).unlink(missing_ok=True)
@@ -4558,12 +5111,31 @@ async def transcribe_dictation(state, source, languages, vocabulary=None, *, sdk
     speech_queue_ns = 0
     audio_read_ns = 0
     cleanup_ns = None
+    used_rust = False
     before_release = None if release_frame is None else release_frame * SAMPLE_RATE // 48_000
 
     async def recognize(pcm, options):
-        nonlocal inference_ns, speech_queue_ns
+        nonlocal inference_ns, speech_queue_ns, used_rust
         if boost:
             pcm = boost_microphone(pcm)
+        rust = rust_speech_client(state) if len(languages) <= 1 else None
+        if rust is not None:
+            try:
+                started = time.monotonic_ns()
+                res = await rust.transcribe_pcm(
+                    pcm,
+                    sample_rate=SAMPLE_RATE,
+                    sample_format="f32le",
+                    languages=languages,
+                    vocabulary=vocabulary or (),
+                    screen_speech=screen_recording,
+                )
+                if measure_inference:
+                    inference_ns += int(res.get("inferenceMs", 0)) * 1_000_000 or (time.monotonic_ns() - started)
+                used_rust = True
+                return str(res.get("text", "")).strip()
+            except Exception:
+                logger.warning("Rust speech engine request failed; falling back to local PyTorch model.", exc_info=True)
         result = await decode_pcm(state, pcm, languages, live=True, vocabulary=vocabulary, dictation=not sdk,
                                   measure_inference=measure_inference, screen_nonspeech=screen_recording, **options)
         if measure_inference:
@@ -4644,6 +5216,8 @@ async def transcribe_dictation(state, source, languages, vocabulary=None, *, sdk
                                   "audioPriorityMs": round(priority_ns / 1_000_000)}
         if cleanup_ns is not None:
             result["speechTiming"]["voiceCleanupMs"] = round(cleanup_ns / 1_000_000)
+    if used_rust:
+        result["speechEngine"] = "rust"
     return result
 
 
@@ -4815,6 +5389,12 @@ def stupase_cleanup(state):
     return cleanup
 
 
+@app.post("/api/native/prewarm", status_code=202)
+async def native_prewarm(request: Request):
+    check_native(request)
+    return {"warming": schedule_prewarm(request.app.state)}
+
+
 @app.post("/api/native/dictation-cleanup")
 async def native_dictation_cleanup(request: Request, action: Literal["status", "prepare"] = "status"):
     check_native(request)
@@ -4920,7 +5500,8 @@ async def write_staged_meeting_title(request: Request, key: UUID, through: int =
 
 @app.post("/api/native/staging/{key}/preview")
 async def preview_stage(request: Request, key: UUID, start: int = Query(ge=0, le=MAX_AUDIO_SECONDS * 48000),
-                        frames: int = Query(gt=0, le=25 * 48000), diarization: bool = False, meeting: bool = False):
+                        frames: int = Query(gt=0, le=25 * 48000), diarization: bool = False, meeting: bool = False,
+                        tentative: bool = False):
     check_native(request)
     if meetings_managed() and (meeting or await run_in_threadpool(is_meeting_stage, request.app.state.staging / str(key))):
         require_meetings()
@@ -4950,9 +5531,22 @@ async def preview_stage(request: Request, key: UUID, start: int = Query(ge=0, le
         raise HTTPException(400, "Could not decode live audio.") from error
     vocabulary = () if dictation else await speech_vocabulary(state)
     async with state.insights.model.audio_priority():
-        speakers = live_speakers(request, key) if (not dictation and (diarization or meeting)) else None
+        if dictation and len(languages) <= 1 and (rust := rust_speech_client(state)) is not None:
+            try:
+                result = await rust.transcribe_pcm(pcm, languages=languages)
+                return {**result, "segments": [], "words": [], "activity": []}
+            except (httpx.HTTPError, ValueError):
+                logger.debug("Rust dictation preview unavailable.", exc_info=True)
+        if tentative and not dictation:
+            result = await decode_pcm(state, pcm, languages, None, start * SAMPLE_RATE // MEETING_RATE,
+                                      live=True, timed_output=False, dictation=False, vocabulary=vocabulary,
+                                      screen_nonspeech=True)
+            return {"text": result["text"], "language": result["language"], "segments": [], "words": [], "activity": [],
+                    "tentative": True}
+        speakers = await live_speakers(request, key) if (not dictation and (diarization or meeting)) else None
         result = await decode_pcm(state, pcm, languages, speakers, start * SAMPLE_RATE // MEETING_RATE,
-                                  live=True, timed_output=not dictation, dictation=dictation, vocabulary=vocabulary)
+                                  live=True, timed_output=not dictation, dictation=dictation, vocabulary=vocabulary,
+                                  screen_nonspeech=True)
     if not dictation:
         ensure_meeting_turn(result, start / MEETING_RATE, (start + frames) / MEETING_RATE)
         result["words"] = [{"speaker": None, **word} for word in result["words"]]
@@ -5028,6 +5622,8 @@ def workspace_page(request: Request):
             html = html.replace(b"<html ", b'<html data-jaro-portable-dictation ', 1)
         if getattr(request.app.state, "screen_draft_dir", None):
             html = html.replace(b"<html ", b"<html data-jaro-screen-recording ", 1)
+            if desktop and file_dialog() and not annotate_managed():
+                html = html.replace(b"<html ", b"<html data-jaro-annotation-storage ", 1)
             if (getattr(request.state, "portable_desktop", False)
                     and getattr(request.app.state, "portable_annotation_shortcut", None)):
                 html = html.replace(b"<html ", b"<html data-jaro-annotation-shortcut ", 1)
@@ -5035,7 +5631,7 @@ def workspace_page(request: Request):
                     html = html.replace(b"<html ", b"<html data-jaro-desktop-annotation ", 1)
         if sys.platform in ("linux", "win32") and desktop and not annotate_managed():
             handoff = b"managed" if opencode_managed() else b"available"
-            html = html.replace(b"<html ", b'<html data-jaro-opencode-handoff="' + handoff + b'" ', 1)
+            html = html.replace(b"<html ", b'<html data-jaro-annotation-agents data-jaro-opencode-handoff="' + handoff + b'" ', 1)
             if sys.platform == "win32" and handoff == b"available":
                 html = html.replace(b"<html ", b"<html data-jaro-opencode-wsl ", 1)
         if sys.platform == "linux":

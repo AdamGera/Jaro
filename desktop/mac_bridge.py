@@ -11,6 +11,7 @@ import datetime
 import fcntl
 import hmac
 import json
+import logging
 import math
 import mimetypes
 import os
@@ -31,9 +32,10 @@ workspace = Path(__file__).resolve().parents[1]
 engine = workspace / "engine" if (workspace / "pyproject.toml").is_file() else workspace
 sys.path[:0] = [str(engine), str(workspace)] if engine != workspace else [str(engine)]
 from engine_lifecycle import HOST, PORT, URL, library_path, open_browser_workspace, read_native_token, running_engine, workspace_key
-from annotation_assets import (ASSETS as ANNOTATION_ASSETS, MAX_TIMELINE_SECONDS, annotation_input, annotation_movie_info,
+from annotation_assets import (ASSETS as ANNOTATION_ASSETS, KEYFRAME_KINDS, MAX_TIMELINE_SECONDS, annotation_input, annotation_movie_info,
                                annotation_origin, staged_annotation_paths)
 from annotation_rollback import undo_annotation
+from annotation_package import write_package
 from annotation_routing import send_session_prompt
 from annotation_routing import (RouteUnavailable, annotation_rule_scope, capture_for_routing, captured_rule_scope, correct_annotation,
                                 destinations as annotation_destinations, forget_destination_rule, recent_deliveries,
@@ -47,6 +49,8 @@ from dictation_output import (MAX_REWRITE_DEADLINE, is_script_step, is_transform
                               process as process_output, profile_for, review_output_script, vocabulary_terms)
 from dictation_settings import validate_changes
 from local_qwen import MODEL_NAME as REWRITE_MODEL_NAME
+from live_preview import (CommitAction, LiveWindowPlanner, SkipAction, TentativeAction, finish_live_preview, read_wav_i16_slice,
+                          trim_boundary_overlap)
 from meeting_brief import LIVE_TITLE_INTERVAL, LiveTitlePlan
 from meeting_rolling import MIXED_SPEAKERS, append_rolling
 from native_recordings import normalize_meeting_title, recording_metadata, write_meeting_title, write_recording_metadata
@@ -57,6 +61,8 @@ from session_store import MissingSession, SessionStore
 import annotation_agents
 from annotation_automation import AnnotationAutomation, describe_delivery
 from desktop.sdk_capture import CaptureError, SDKCapture
+
+logger = logging.getLogger(__name__)
 
 
 def send(message):
@@ -907,7 +913,7 @@ class MacBridge:
             )
             if slot in self.captures or (self.captures and not compatible):
                 raise ValueError("A recording is already active.")
-            live = args.get("live") is True if global_dictation else bool(dictation or args.get("live"))
+            live = bool(args.get("live")) if global_dictation else bool(dictation or args.get("live"))
             settings = self.options({**args, "diarization": False, "live": live} if dictation else args)
             if (await self.api("GET", "status"))["status"] != "ready":
                 raise ValueError("Wait for the speech model to finish loading.")
@@ -1018,6 +1024,7 @@ class MacBridge:
                     "meetingTurns": [], **({"meetingTitle": title} if title else {})} if meeting else {}),
                 "seconds": 0,
                 "text": "",
+                "tentative": "",
                 "segments": [],
             }
             take = Capture(child, stage, marker, settings, state, global_dictation,
@@ -1052,13 +1059,13 @@ class MacBridge:
             emit("meetingTitle", meeting=take.state["meeting"], title=title)
 
     async def live_preview(self, take):
-        block = 4 * 48000
+        capture = take.state
+        capture_id = capture.get("dictation")
+        block = int(1.6 * 48000) if capture_id else 4 * 48000
         start = 0
         parts = []
         warned = False
         warned_storage = False
-        capture = take.state
-        capture_id = capture.get("dictation")
         metadata = {"dictation": capture_id} if capture_id else {}
         meeting = capture.get("meeting")
         record_rolling = not capture_id
@@ -1066,9 +1073,14 @@ class MacBridge:
         if meeting:
             metadata["meeting"] = meeting
         path = Path(take.stage["path"])
-        while True:
-            await asyncio.sleep(0.35)
-            if not take.started:
+        if capture_id and os.environ.get("JARD_SPEECH_URL", "").strip():
+            if await self._rust_live_preview(take, path, capture, metadata):
+                return
+        planner = LiveWindowPlanner(48_000) if record_rolling else None
+        read_slice = (lambda s, n: read_wav_i16_slice(path, s, n)) if record_rolling else None
+        while not take.finished:
+            await asyncio.sleep(0.15 if capture_id else 0.2)
+            if take.finished or not take.started:
                 continue
             if record_rolling and (self.capture_lock.locked() or "dictation" in self.captures or self.dictation_jobs):
                 # Capture continues to disk. Wait before queuing another background
@@ -1077,13 +1089,78 @@ class MacBridge:
             available = max(0, (path.stat().st_size - 44) // 2)
             cut = copy_state.get("cut") if copy_state else None
             if not capture["live"] and not copy_state:
-                start = available
+                if planner is not None:
+                    planner.jump_to(available)
+                    if capture.get("tentative"):
+                        capture["tentative"] = ""
+                else:
+                    start = available
                 continue
-            size = min(block, cut - start) if cut is not None and cut > start else block
-            if available - start < size:
-                continue
-            if not record_rolling and available - start > block * 3:
-                start = available - block
+            if planner is not None:
+                action = planner.plan(
+                    available,
+                    read_slice,
+                    show_live=bool(capture["live"]),
+                    cut_frame=cut,
+                    under_load=False,
+                )
+                if isinstance(action, SkipAction):
+                    planner.jump_to(action.cursor)
+                    if capture.get("tentative"):
+                        capture["tentative"] = ""
+                    if not warned:
+                        emit(
+                            "warning",
+                            **metadata,
+                            message="Live preview is delayed. The recording is still being saved.",
+                        )
+                        warned = True
+                    continue
+                if isinstance(action, TentativeAction):
+                    try:
+                        value = await self.api(
+                            "POST",
+                            f"native/staging/{take.stage['id']}/preview",
+                            params={
+                                **take.settings,
+                                "start": action.start,
+                                "frames": action.frames,
+                                "tentative": "true",
+                                **({"meeting": "true"} if meeting else {}),
+                            },
+                        )
+                        planner.mark_tentative(action.start + action.frames)
+                        if capture["live"]:
+                            tentative = (value.get("text") or "").strip()
+                            if tentative != capture.get("tentative", ""):
+                                capture["tentative"] = tentative
+                                emit(
+                                    "preview",
+                                    **metadata,
+                                    text=capture["text"],
+                                    tentative=tentative,
+                                    segments=capture["segments"],
+                                )
+                        warned = False
+                    except httpx.HTTPError:
+                        if not warned:
+                            emit(
+                                "warning",
+                                **metadata,
+                                message="Live preview is delayed. The recording is still being saved.",
+                            )
+                            warned = True
+                    continue
+                if not isinstance(action, CommitAction):
+                    continue
+                start, size, forced = action.start, action.frames, action.forced
+            else:
+                size = min(block, cut - start) if cut is not None and cut > start else block
+                if available - start < size:
+                    continue
+                if available - start > block * 3:
+                    start = available - block
+                forced = False
             try:
                 value = await self.api(
                     "POST",
@@ -1091,6 +1168,13 @@ class MacBridge:
                     params={**take.settings, "start": start, "frames": size, **({"meeting": "true"} if meeting else {})},
                 )
                 if record_rolling:
+                    if forced and parts and value.get("text"):
+                        trimmed = trim_boundary_overlap(parts[-1]["text"], value["text"])
+                        if trimmed != value["text"]:
+                            value = {**value, "text": trimmed,
+                                     "segments": [dict(seg) for seg in value.get("segments", [])]}
+                            if len(value["segments"]) == 1:
+                                value["segments"][0]["text"] = trimmed
                     try:
                         append_rolling(path, start, start + size, value)
                         if take.title_plan:
@@ -1099,22 +1183,28 @@ class MacBridge:
                         if not warned_storage:
                             emit("warning", **metadata, message="Live text could not be saved. Recording continues.")
                             warned_storage = True
-                if (capture["live"] or copy_state) and value.get("text"):
-                    if meeting:
-                        capture["meetingTurns"].extend(value["segments"])
-                    # Keep the provisional UI bounded. The final pass always uses the full take.
-                    parts = (parts + [value])[-160:]
-                    capture["text"] = " ".join(part["text"] for part in parts)
-                    capture["segments"] = [
-                        segment
-                        for part in parts
-                        for segment in part.get("segments", [])
-                    ]
+                had_tentative = bool(capture.get("tentative"))
+                if had_tentative:
+                    capture["tentative"] = ""
+                if (capture["live"] or copy_state) and (value.get("text") or had_tentative):
+                    if value.get("text"):
+                        if meeting:
+                            capture["meetingTurns"].extend(value["segments"])
+                        # Keep the provisional UI bounded. The final pass always uses the full take.
+                        parts = (parts + [value])[-160:]
+                        capture["text"] = " ".join(part["text"] for part in parts)
+                        capture["segments"] = [
+                            segment
+                            for part in parts
+                            for segment in part.get("segments", [])
+                        ]
                     emit(
                         "preview",
                         **metadata,
-                        **({"delta": value["text"], "deltaSegments": value["segments"], "through": start + size} if meeting else {}),
+                        **({"delta": value["text"], "deltaSegments": value["segments"], "through": start + size}
+                           if meeting and value.get("text") else {}),
                         text=capture["text"],
+                        tentative="",
                         segments=capture["segments"],
                     )
                 warned = False
@@ -1129,9 +1219,81 @@ class MacBridge:
                 if record_rolling:
                     continue
             start += size
+            if planner is not None:
+                planner.mark_committed(start)
             if copy_state:
                 copy_state["through"] = start
                 copy_state["changed"].set()
+
+    async def _rust_live_preview(self, take, path, capture, metadata):
+        from rust_speech import RustSpeechClient
+
+        client = RustSpeechClient.from_env(http=self.http)
+        if client is None:
+            return False
+        languages = tuple(take.settings.get("language") or ())
+        while not take.started and not take.finished:
+            await asyncio.sleep(0.05)
+        if take.finished or not capture.get("live"):
+            return True
+        try:
+            stream = await client.open_stream(
+                sample_rate=48_000,
+                sample_format="s16le",
+                languages=languages,
+                partials=True,
+                screen_speech=True,
+            )
+        except httpx.HTTPError:
+            return False
+
+        async def consume_events():
+            try:
+                async for event in stream.events():
+                    if event.get("type") != "partial":
+                        continue
+                    stable = str(event.get("stable") or "")
+                    tentative = str(event.get("tentative") or "")
+                    text = (stable + tentative).strip()
+                    if not text:
+                        continue
+                    capture["text"] = text
+                    emit("preview", **metadata, text=text, stable=stable, tentative=tentative, segments=[])
+            except (asyncio.CancelledError, httpx.HTTPError):
+                pass
+
+        consumer = asyncio.create_task(consume_events())
+        offset = 44
+        chunk_bytes = 48_000 * 2 // 5  # 200 ms chunks at 48 kHz s16le
+        try:
+            while not take.finished:
+                await asyncio.sleep(0.12)
+                if not capture.get("live"):
+                    continue
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+                available = (size - offset) // 2 * 2
+                if available < chunk_bytes:
+                    continue
+                try:
+                    with path.open("rb") as handle:
+                        handle.seek(offset)
+                        data = handle.read(min(available, chunk_bytes * 4))
+                except OSError:
+                    continue
+                if data:
+                    offset += len(data)
+                    await stream.feed(data)
+        except (asyncio.CancelledError, httpx.HTTPError):
+            pass
+        finally:
+            await stream.cancel()
+            consumer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await consumer
+        return True
 
     async def copy_meeting_through_now(self, args):
         expected = str(UUID(args["meeting"]))
@@ -1301,20 +1463,12 @@ class MacBridge:
             if take.title_job:
                 await asyncio.gather(take.title_job, return_exceptions=True)
             if copy_state:
-                # Allow a cut pressed before Stop to read the final committed samples.
-                if copy_state.get("cut") is not None:
-                    with contextlib.suppress(OSError):
-                        committed = (path.stat().st_size - 44) // 2
-                        copy_state["cut"] = min(copy_state["cut"], max(0, committed))
-                        copy_state["changed"].set()
-                        while copy_state.get("request"):
-                            copy_state["changed"].clear()
-                            await copy_state["changed"].wait()
+                # Stop saves immediately. Release any pending Copy New / Copy All
+                # request right away so it returns the transcript already available.
                 copy_state["closed"] = True
                 copy_state["changed"].set()
-            preview.cancel()
-            with contextlib.suppress(asyncio.CancelledError, OSError):
-                await preview
+            capture["tentative"] = ""
+            await finish_live_preview(preview, 0.3, logger, stage["id"])
             take.started = False
         try:
             if capture_id:
@@ -1399,6 +1553,11 @@ class MacBridge:
 
     async def export(self, args):
         key, kind = str(UUID(args["id"])), args["kind"]
+        if kind == "annotation-package":
+            choice = (await self.dialog("annotation-export-folder", "")).get("path")
+            if not choice:
+                return None
+            return await asyncio.to_thread(write_package, SessionStore(self.root, read_only=True), key, Path(choice))
         annotation_kind = kind.removeprefix("annotation-") if isinstance(kind, str) and kind.startswith("annotation-") else ""
         if kind not in ("audio", "json", "md", "notes", "srt", "vtt", "annotation-clip") and annotation_kind not in ANNOTATION_ASSETS:
             raise ValueError("Unsupported export format.")
@@ -1678,8 +1837,14 @@ class MacBridge:
                     for kind, destination in staged_annotation_paths(target).items():
                         original = source.with_name(ANNOTATION_ASSETS[kind][0])
                         if kind == "manifest" or (not narration_only and original.exists()):
-                            shutil.copyfile(annotation_input(original, kind), destination)
-                            destination.chmod(0o600)
+                            try:
+                                shutil.copyfile(annotation_input(original, kind), destination)
+                                destination.chmod(0o600)
+                            except (ValueError, OSError):
+                                if kind not in KEYFRAME_KINDS:
+                                    raise
+                                with suppress(OSError):
+                                    destination.unlink(missing_ok=True)
 
             if narration is not None:
                 packaged_ffmpeg = self.helpers / "ffmpeg"
@@ -2047,6 +2212,13 @@ class MacBridge:
             return {"managed": False, "rules": await asyncio.to_thread(store.list_rules)}
         if command == "jard.annotationStorage":
             return await self.annotation_storage(args)
+        if command == "jard.annotationAgentSkill":
+            from annotation_agent_skill import manage
+
+            require_annotation()
+            if self.updating:
+                raise RuntimeError("Jaro is preparing to restart.")
+            return await asyncio.to_thread(manage, args.get("action"), args.get("agent"))
         if command == "jard.annotationRoute":
             return await self.annotation_route(args)
         if command == "jard.annotationRouteUndo":

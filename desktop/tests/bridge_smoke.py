@@ -104,6 +104,8 @@ from pathlib import Path
 audio=Path(os.environ["FIXTURE_AUDIO"])
 if sys.argv[1]=="meeting-export-folder":
     print(json.dumps({"path":os.environ["FIXTURE_MEETING_EXPORT"]}))
+elif sys.argv[1]=="annotation-export-folder":
+    print(json.dumps({"path":None if (audio.parent/"cancel-export").exists() else str(audio.parent)}))
 elif sys.argv[1]=="trash":
     item=Path(sys.argv[2])
     trash=audio.parent/"Trash"
@@ -968,6 +970,9 @@ assert.equal(status.phase, "cancelled")
             await desktop_command(["window", "show", "history"], "window-show", {"pane": "history"},
                                   {"windowVisible": True, "requestedPane": "history"})
             await desktop_command(["window", "hide"], "window-hide", {}, {"windowVisible": False, "changed": True})
+            setup = {"onboarding": "welcome", "microphone": "granted", "accessibility": True, "shortcutLabel": "Right ⌥"}
+            await desktop_command(["setup"], "setup", {}, setup)
+            await desktop_command(["onboarding", "reset", "--json"], "setup", {}, setup)
             await desktop_command(["dictation", "start", "--raw"], "dictation-start-raw", {}, {"phase": "starting"})
             await desktop_command(["dictation", "toggle", "--raw"], "dictation-toggle-raw", {}, {"phase": "starting"})
             printed = {"status": "transcript", "text": "This dictation goes to the command."}
@@ -1576,6 +1581,20 @@ assert.equal(status.phase, "cancelled")
             assert (root / "export-Screen annotation-annotation.json").read_bytes() == manifest_bytes
             assert (await rpc("export", id=picked["id"], kind="annotation-contact-sheet"))["saved"]
             assert (root / "export-Screen annotation-contact-sheet.png").read_bytes() == sheet.read_bytes()
+            exported = await rpc("export", id=picked["id"], kind="annotation-package")
+            package = root / exported["name"]
+            capture = json.loads((package / "annotation.json").read_text())["annotation"]
+            assert exported["saved"] and package.suffix == ".jaroannotation" and capture["id"] == picked["id"]
+            assert capture["events"] == json.loads(manifest_bytes)["events"]
+            assert capture["transcript"] == screen_session["transcript"]
+            assert (package / capture["video"]).read_bytes() == saved_movie
+            assert (package / capture["contactSheet"]).read_bytes() == sheet.read_bytes()
+            if renderer:
+                assert assets["keyframes"] == capture["keyframes"] == json.loads(manifest_bytes)["keyframes"]
+                for index in assets["keyframes"]:
+                    kind = f"frame-{index:02d}"
+                    still = (await web.get(f"/api/sessions/{picked['id']}/annotation/{kind}")).raise_for_status().content
+                    assert still == (folder / f"{kind}.png").read_bytes() == (package / f"frames/{kind}.png").read_bytes()
             detail = await agent("annotate", "show", "latest")
             assert detail["id"] == picked["id"] and "history books" in detail["transcript"].lower()
             assert Path(detail["videoPath"]).parents[1] == annotation_storage

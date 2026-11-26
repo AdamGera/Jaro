@@ -2,13 +2,13 @@
 import base64
 import re
 
-from annotation_assets import MISSING_VIDEO_REASONS, annotation_origin
+from annotation_assets import KEYFRAME_KINDS, MISSING_VIDEO_REASONS, annotation_origin
 from session_store import MissingSession
 
 MAX_INLINE_SHEET = 9 * 1024 * 1024  # 12 MiB after base64 encoding.
 
 
-def annotation_detail(library, identifier):
+def annotation_detail(library, identifier, *, include_capture=False):
     identifier = identifier.lower()
     if identifier == "latest":
         matches = library.annotations(limit=1)
@@ -35,11 +35,16 @@ def annotation_detail(library, identifier):
     origin = annotation_origin(session["annotation"].get("origin"))
     missing_video = session["annotation"].get("missingVideo")
     media_path = path_for(library.media)
+    keyframes = [{"index": index, "time": row["frames"][index - 1], "path": path}
+                 for index in session["annotation"].get("keyframes", [])
+                 if (path := path_for(library.annotation_asset, KEYFRAME_KINDS[index - 1]))]
     return {"version": 1, **row, **({"origin": origin} if origin else {}),
             "status": session["status"], "durationSeconds": session["duration"],
             "route": f"/?session={key}&tab=overview",
             "transcript": transcript["text"], "interruption": transcript.get("interruption"),
+            **({"captureTitle": session["name"], "timedTranscript": transcript} if include_capture else {}),
             **({"missingVideo": missing_video, "audioPath": media_path} if missing_video else {}),
+            **({"keyframes": keyframes} if keyframes else {}),
             "videoPath": None if missing_video else media_path, "manifestPath": path_for(library.annotation_asset, "manifest"),
             "contactSheetPath": path_for(library.annotation_asset, "contact-sheet")}
 

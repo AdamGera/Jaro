@@ -266,6 +266,10 @@ html:has(.workspace-settings)::-webkit-scrollbar,
 .transcript-pause, .transcript-listening {
   margin: 0; color: var(--quiet); font-size: .75rem;
 }
+.transcript-tentative {
+  max-width: min(88%, 41rem); margin: 0; padding: .3rem .68rem; color: var(--quiet);
+  font-size: .92rem; line-height: 1.5; white-space: pre-wrap; text-align: start;
+}
 .transcript-pause {
   display: flex; align-items: center; gap: .6rem; font-variant-numeric: tabular-nums;
 }

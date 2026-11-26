@@ -207,12 +207,20 @@ function applyWindowChrome(chrome: WindowChrome) {
 
 type CaptureOptions = { diarization: boolean; languages: string[] }
 export type RecordingDraft = { id: string; seconds: number; meeting?: boolean; screen?: boolean; videoOnly?: boolean }
-type ActiveCapture = { dictation?: string; meeting?: string; warm?: boolean; mode: RecordingMode; live: boolean; seconds?: number; text?: string; segments?: SpeakerSegment[] }
+type ActiveCapture = { dictation?: string; meeting?: string; warm?: boolean; mode: RecordingMode; live: boolean; seconds?: number; text?: string; tentative?: string; segments?: SpeakerSegment[] }
 export type DictationDestination = "dictation" | "history" | "output"
 export type WindowNavigation = {
   id: string
   pane: DictationDestination | "settings" | "general" | "meetings" | "annotate" | "home" | "live-meeting" | "meeting-library" | "vocabulary" | "add-term"
 }
+
+export type AnnotationSkillAgent = "claude" | "codex" | "opencode" | "pi"
+export type AnnotationAgentSkillRequest = { action: "guide" | "status" }
+  | { action: "install" | "update"; agent: AnnotationSkillAgent }
+export type AnnotationSkillStatus = {
+  agent: AnnotationSkillAgent; path: string; found: boolean; state: "installed" | "missing" | "managed" | "different"
+}
+export type AnnotationAgentSkillResult = { agents: AnnotationSkillStatus[] } | { markdown: string }
 
 type Requests = {
   workspaceReady: undefined
@@ -223,6 +231,7 @@ type Requests = {
   sessionScreenshot: { source: DesktopScreenshotSource }
   annotationAccess: { action: "status" | "allow" | "repair" | "restart" }
   annotationStorage: { action: "status" | "choose" | "reveal" | "reset" }
+  annotationAgentSkill: AnnotationAgentSkillRequest
   copyAnnotation: { id: string }
   pasteAnnotation: { id: string }
   annotationRoutingPolicy: undefined
@@ -261,7 +270,7 @@ type Requests = {
   revealSessionMedia: { id: string }
   recover: CaptureOptions & { id: string }
   discard: { id: string }
-  export: { id: string; kind: "audio" | "json" | "md" | "notes" | "srt" | "vtt" | "annotation-manifest" | "annotation-contact-sheet" }
+  export: { id: string; kind: "audio" | "json" | "md" | "notes" | "srt" | "vtt" | "annotation-manifest" | "annotation-contact-sheet" | "annotation-package" }
     | { id: string; kind: "annotation-clip"; startMs: number; endMs: number }
   meetingExports: { action: "status" | "choose" | "disable" } | { action: "reveal"; id?: string }
     | { action: "revealFiles"; id: string }
@@ -276,6 +285,7 @@ type Responses = {
   sessionScreenshot: { jpeg?: string }
   annotationAccess: DesktopAnnotationAccess
   annotationStorage: { folder: string; custom: boolean; available: boolean }
+  annotationAgentSkill: AnnotationAgentSkillResult
   copyAnnotation: { includedImage: boolean }
   pasteAnnotation: { destination: string; includedSheet: boolean }
   annotationRoutingPolicy: { managed: boolean }
@@ -314,7 +324,7 @@ type Responses = {
   revealSessionMedia: null
   recover: { id: string }
   discard: unknown
-  export: unknown
+  export: { saved: boolean; name?: string } | null
   meetingExports: { folder: string | null; separateNotes?: boolean; descriptiveNames?: boolean }
 }
 export type DesktopInputDevices = {
@@ -334,7 +344,7 @@ export type DesktopCaptureEvent = { dictation?: string; meeting?: string } & (
   | { event: "started"; mode: RecordingMode; microphone: string; live?: boolean; warm?: boolean }
   | { event: "levels"; seconds: number; mic: number; system: number; microphone?: string }
   | { event: "sourceChanged"; microphone: string; message: string }
-  | { event: "preview"; text: string; segments?: SpeakerSegment[] }
+  | { event: "preview"; text: string; tentative?: string; segments?: SpeakerSegment[] }
   | { event: "finished"; reason?: string }
   | { event: "accepted" | "dictationReady"; id: string; interruption?: string }
   | { event: "warning"; message: string }

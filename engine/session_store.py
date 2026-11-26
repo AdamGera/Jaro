@@ -21,7 +21,7 @@ import session_images
 import session_notes
 import writing_cache
 import workspace_drafts
-from annotation_assets import ASSETS as ANNOTATION_ASSETS, staged_annotation_paths
+from annotation_assets import ASSETS as ANNOTATION_ASSETS, KEYFRAME_KINDS, staged_annotation_paths
 from managed_preferences import meetings_managed
 from meeting_rolling import MIXED_SPEAKERS, RATE as RECORDING_RATE, SOURCE_LABELS, mixed_speaker_timeline, timeline_chunks
 from native_recordings import normalize_meeting_title
@@ -280,6 +280,9 @@ class SessionStore:
                 files[paths["manifest"]] = folder / ANNOTATION_ASSETS["manifest"][0]
                 if annotation["frames"]:
                     files[paths["contact-sheet"]] = folder / ANNOTATION_ASSETS["contact-sheet"][0]
+                for index in annotation.get("keyframes", []):
+                    kind = KEYFRAME_KINDS[index - 1]
+                    files[paths[kind]] = folder / ANNOTATION_ASSETS[kind][0]
                 options = {**options, "annotationRetentionEligible": 1, "annotation": {**annotation, "manifestUrl": base + "manifest",
                            "contactSheetUrl": base + "contact-sheet" if annotation["frames"] else None}}
             if annotation_location is not None:
@@ -336,12 +339,18 @@ class SessionStore:
                         include_meetings, RECOVERY_LIMIT))
             db.execute(f"DELETE FROM meeting_finalization WHERE session_id IN ({exhausted})",
                        (include_meetings, RECOVERY_LIMIT))
-            row = db.execute(f"""SELECT s.id,s.filename,s.duration,s.options,f.next_frame
-                {INTERRUPTED_FINALIZATIONS} ORDER BY s.created,s.id LIMIT 1""", (include_meetings,)).fetchone()
-            if row:
+            rows = db.execute(f"""SELECT s.id,s.filename,s.duration,s.options,f.next_frame
+                {INTERRUPTED_FINALIZATIONS} ORDER BY s.created,s.id""", (include_meetings,)).fetchall()
+            for row in rows:
+                options = json.loads(row["options"])
+                try:
+                    source = self.media_folder(db, row["id"], options) / row["filename"]
+                except annotation_storage.Unavailable:
+                    # A disconnected recording can resume when its original folder returns.
+                    continue
                 db.execute("UPDATE meeting_finalization SET attempts=attempts+1 WHERE session_id=?", (row["id"],))
                 db.execute("UPDATE sessions SET status='processing',error=NULL,transcript=NULL WHERE id=?", (row["id"],))
-                return {**dict(row), "options": json.loads(row["options"])}
+                return {**dict(row), "options": options, "source": source}
             return None
 
     def has_pending_recordings(self, *, include_meetings=True):
@@ -492,7 +501,7 @@ class SessionStore:
             except annotation_storage.Unavailable:
                 has_audio = False
                 options["annotationStorageUnavailable"] = True
-                options["annotation"] = {**options["annotation"], "manifestUrl": None, "contactSheetUrl": None}
+                options["annotation"] = {**options["annotation"], "manifestUrl": None, "contactSheetUrl": None, "keyframes": []}
         is_meeting = bool(options.get("meeting", options.get("sourceSpeakerTurns")))
         managed = is_meeting and meetings_managed()
         overview = session_notes.selection(db, key, initialize_missing=initialize_notes and not self.read_only and not managed)
@@ -594,7 +603,10 @@ class SessionStore:
             source = meeting_retention.readable_source(db)
             row = db.execute(f"SELECT options FROM {source} WHERE id=?", (key,)).fetchone()
             options = json.loads(row["options"]) if row else {}
-            if not options.get("annotation") or kind not in ANNOTATION_ASSETS:
+            annotation = options.get("annotation")
+            if not annotation or kind not in ANNOTATION_ASSETS:
+                raise MissingSession(key)
+            if kind in KEYFRAME_KINDS and KEYFRAME_KINDS.index(kind) + 1 not in annotation.get("keyframes", []):
                 raise MissingSession(key)
             name, _, mime, _ = ANNOTATION_ASSETS[kind]
             path = self.media_folder(db, key, options) / name

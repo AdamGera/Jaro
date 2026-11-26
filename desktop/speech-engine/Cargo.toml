@@ -1,0 +1,40 @@
+[package]
+name = "jaro-speech"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Pin anomalyco/transcribe.cpp (0.4.1 + Metal idle residency heartbeat,
+# Parakeet vocabulary bias/sounds-like, Nemotron/Fluid pre-block & padding fixes,
+# and Qwen3-ASR / Rumble-2-Flash + Silero VAD support).
+[patch.crates-io]
+transcribe-cpp = { git = "https://github.com/anomalyco/transcribe.cpp", rev = "60bed89dab84f7c1fddc3a17ad7fa8a27ddfba19" }
+transcribe-cpp-sys = { git = "https://github.com/anomalyco/transcribe.cpp", rev = "60bed89dab84f7c1fddc3a17ad7fa8a27ddfba19" }
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+getrandom = "0.3"
+hound = "3.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+transcribe-cpp = "=0.4.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+transcribe-cpp = { version = "=0.4.1", features = ["vulkan"] }
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
+transcribe-cpp = { version = "=0.4.1", features = ["vulkan"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

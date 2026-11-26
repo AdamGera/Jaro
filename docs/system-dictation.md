@@ -10,7 +10,7 @@ The compact dictation indicator stays with you when you switch Spaces, including
 
 With **Keep microphone ready** on, Jaro gives ordinary keyboard chords 40 ms to complete before it plays the dictation start cue. With that setting off, the cue waits for the microphone and a committed take. In Hold mode, muting, lowering audio, or pausing media begins only after the 300 ms hold threshold.
 
-In **Dictation → General → Audio and feedback**, open **Sound style**. Use the play button next to a style to hear a sample, or select the style name to save it and hear it. Use the cue buttons to hear individual sounds from the style you last tried. The compact indicator follows the sample through its listening, processing, and result states. Previews play at half volume when dictation sounds are off or their volume is zero. Classic is the default. Styles with a Done cue play it after successful keyboard dictation when delivery takes at least two seconds after the stop cue.
+In **Settings → Dictation → Recording controls**, open **Sound style**. Use the play button next to a style to hear a sample, or select the style name to save it and hear it. Use the cue buttons to hear individual sounds from the style you last tried. The compact indicator follows the sample through its listening, processing, and result states. Previews play at half volume when dictation sounds are off or their volume is zero. Classic is the default. Styles with a Done cue play it after successful keyboard dictation when delivery takes at least two seconds after the stop cue.
 
 Finishing with the shortcut gives a trailing word 200 ms to finish. If you are still speaking, Jard keeps up to 600 ms and stops at the next brief pause. Speak before ending the gesture so the take is recognized. You can press the shortcut for the next take while the last word is still finishing. With **Keep microphone ready** enabled and **While dictating** set to **Do nothing**, Jard can recover the audio around the next press. In other modes, hold the shortcut until the microphone opens for the new take.
 
@@ -26,7 +26,7 @@ Jaro releases the dictation microphone when you lock your Mac, switch users, or 
 
 Releasing a hold before 300 ms discards the audio. To lock hands-free, complete the second tap within 300 ms of releasing the first. In **Hold or double-tap** mode, holding the second press still works as an ordinary hold.
 
-For a single Option, Command, Control, or Shift shortcut, **Dictation → General → Shortcut side** lets you choose Left, Either, or Right. With Either, you can start from either hand. If you hold both keys, releasing the last one ends the gesture.
+For a single Option, Command, Control, or Shift shortcut, **Settings → Dictation → Shortcut side** lets you choose Left, Either, or Right. With Either, you can start from either hand. If you hold both keys, releasing the last one ends the gesture.
 
 With Input Monitoring granted, Jard uses the physical key side when it can distinguish a modifier remapped from Caps Lock. Recording a remapped Control shortcut selects **Either**. Shortcut labels follow your keyboard layout, including dead keys such as **^** on a German keyboard.
 
@@ -40,9 +40,9 @@ To record a modifier-only shortcut, hold the combination in the shortcut recorde
 
 Dictation works while the Jard window is closed and the app is running. It uses Rumble2 Flash on the Mac. Settings include the shortcut, input device, language, vocabulary, output, and History. Dictation transcripts are kept for seven days by default. Original microphone clips are available for up to 24 hours.
 
-Under **Dictation → General → Labs**, enable **Show History stats** to see word and dictation counts, estimated typing time saved, words per minute, your current streak, and your busiest local hour. These figures use the entries still in History. Search leaves the totals in place. Time saved uses a typing speed of 40 words per minute and includes only entries with a recorded duration.
+Under **Settings → Dictation → Labs**, enable **Show History stats** to see word and dictation counts, estimated typing time saved, words per minute, your current streak, and your busiest local hour. These figures use the entries still in History. Search leaves the totals in place. Time saved uses a typing speed of 40 words per minute and includes only entries with a recorded duration.
 
-In **Dictation → General → Vocabulary**, add up to 32 preferred names or terms. Add comma-separated alternate spellings in **Sounds like**. Jaro saves after you pause typing and when you close the editor.
+In **Settings → Dictation → Vocabulary**, add up to 32 preferred names or terms. Add comma-separated alternate spellings in **Sounds like**. Jaro saves after you pause typing and when you close the editor.
 
 Rumble2 Flash also uses the preferred terms when transcribing meetings, annotations, audio files, and audio submitted through the local CLI or SDK. An embedded SDK helper picks up vocabulary changes on its next launch.
 
@@ -50,7 +50,7 @@ Fuzzy meeting search, MCP transcript search, and `jardctl history --search` can 
 
 `jardctl meetings search` shows how many passages matched in each meeting. Transcript hits include the recording offset, local timestamp, and nearby speech. The `--json` output remains a list of passages. MCP includes the counts alongside its passage list.
 
-For a profile with **Run local script**, choose an executable and approve its version in **Dictation → Output**. The executable receives the transcript on standard input and returns its result on standard output. Jaro runs a private copy of the approved contents and sets `JARO_OUTPUT_SCRIPT` to the original file path for scripts that need to find nearby files. Use a wrapper script if the executable needs to launch from its installed location. If the version changes, the transcript is kept and Output asks you to review the new version. Scripts run with your account’s access and are skipped in previews and raw dictation.
+For a profile with **Run local script**, choose an executable and approve its version in **Settings → Dictation → Output and vocabulary corrections**. The executable receives the transcript on standard input and returns its result on standard output. Jaro runs a private copy of the approved contents and sets `JARO_OUTPUT_SCRIPT` to the original file path for scripts that need to find nearby files. Use a wrapper script if the executable needs to launch from its installed location. If the version changes, the transcript is kept and Output asks you to review the new version. Scripts run with your account’s access and are skipped in previews and raw dictation.
 
 For several local steps, select a JSON catalog in the same picker. Each transformation has an ID, display name, executable entry, and optional dependency files and deadline in milliseconds. After reviewing the catalog in **Output**, choose its named steps in the ordered profile editor.
 
@@ -69,13 +69,13 @@ For several local steps, select a JSON catalog in the same picker. Each transfor
 
 The manifest, entry files, and declared dependencies are reviewed together. Paths are relative to the catalog and must stay within its directory. A named executable starts in a private copy of that directory’s declared files. It receives the text on stdin and writes text to stdout. `JARO_TRANSFORM_ID` names the step, and `JARO_TRANSFORM_CONTEXT` contains JSON with the source and any known application and browser host. Use `local:format-lines` to select the same step in a profile managed by `jardctl`.
 
-For local JavaScript or TypeScript steps, select **Create starter configuration** in **Dictation → Output**. Jaro creates an example config, editor types, and notes in `~/.config/jaro`, or in `$XDG_CONFIG_HOME/jaro` when configured. Existing files are preserved. Use **Reveal script** to find the file and open it in your editor.
+For local JavaScript or TypeScript steps, select **Create starter configuration** in **Settings → Dictation → Output and vocabulary corrections**. Jaro creates an example config, editor types, and notes in `~/.config/jaro`, or in `$XDG_CONFIG_HOME/jaro` when configured. Existing files are preserved. Use **Reveal script** to find the file and open it in your editor.
 
 `jardctl transforms init` creates the same files with the app closed. Output offers **Use configuration** when it finds one there. Run `jardctl transforms check` to validate the config and list its steps. Both commands accept `--directory` for a different folder and `--json` for structured output. Choose another config with **Choose a local script…**. Keep one `jaro.config.js`, `.mjs`, `.ts`, or `.mts` per folder.
 
 The config exports named transformations. Each receives the current text and available foreground metadata and returns a string or a promise of one.
 
-In **Dictation → Output**, enable **Share page and window details** for the reviewed version if a transformation needs `context.browserUrl` or `context.windowTitle`. The URL can include its path, query, and fragment. The fields are optional and describe the page and window active when you finish dictating. You can remove that permission without removing the transformation.
+In **Settings → Dictation → Output and vocabulary corrections**, enable **Share page and window details** for the reviewed version if a transformation needs `context.browserUrl` or `context.windowTitle`. The URL can include its path, query, and fragment. The fields are optional and describe the page and window active when you finish dictating. You can remove that permission without removing the transformation.
 
 ```ts
 import { defineJaroConfig } from "@jaro/commands"
@@ -93,7 +93,7 @@ export default defineJaroConfig({
 
 Static relative imports can load JavaScript, TypeScript and JSON files within the configuration directory. Jaro approves the exact entry and import versions together. A missing file, expired deadline, or changed configuration keeps the text from before the failed stage. While Output is open, edits refresh the review. A failed load displays the error and keeps the last valid definitions visible for reference.
 
-If the configuration uses `fetch` or imports `node:child_process`, **Dictation → Output** offers separate checkboxes for network requests and programs. Both start off for each version. Review the destinations shown, choose which capabilities the configuration may use, and select **Allow this version**. Change an existing grant with **Update permissions**. Requests can send the text and available app or site context. Programs run with your macOS account's access. Destinations and commands can also be computed at runtime.
+If the configuration uses `fetch` or imports `node:child_process`, **Settings → Dictation → Output and vocabulary corrections** offers separate checkboxes for network requests and programs. Both start off for each version. Review the destinations shown, choose which capabilities the configuration may use, and select **Allow this version**. Change an existing grant with **Update permissions**. Requests can send the text and available app or site context. Programs run with your macOS account's access. Destinations and commands can also be computed at runtime.
 
 `fetch` accepts absolute HTTP and HTTPS URLs, headers, and string bodies. It supports response text, JSON, and binary buffers, and accepts an `AbortSignal`. The program API provides callback-based `execFile` and `exec` and `promisify` from `node:util`. Use `execFile` with the `input` option to pass dictation on standard input. Pending requests and program groups end when the transformation returns, times out, or loses its approval.
 
@@ -103,15 +103,15 @@ Mac administrators can force Boolean keys in the `local.jardaudio.desktop` prefe
 
 Ordinary requests use `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` overrides and the Mac’s configured HTTP and HTTPS proxies and exceptions. On a network that provides only automatic proxy configuration, set an explicit environment proxy for the transformation requests.
 
-In **Dictation → History**, hover over a row to copy its final transcript. Drag across rows or Shift-click to select a range, or Command-click to add or remove individual rows. Copy from the detail pane to copy the selection.
+In **Dictation → Saved dictations**, hover over a row to copy its final transcript. Drag across rows or Shift-click to select a range, or Command-click to add or remove individual rows. Copy from the detail pane to copy the selection.
 
-Open **Dictation → General → Output and vocabulary corrections → Ordered output profiles** to add **Lowercase**, **SpongeBob case**, or **No trailing punctuation**. Arrange the steps in the order you want and try them with sample text. Website rules accept a hostname or a pasted URL. Application rules accept the running app name, its Finder name, or its bundle ID.
+Open **Settings → Dictation → Output and vocabulary corrections → Ordered output profiles** to add **Lowercase**, **SpongeBob case**, or **No trailing punctuation**. Arrange the steps in the order you want and try them with sample text. Website rules accept a hostname or a pasted URL. Application rules accept the running app name, its Finder name, or its bundle ID.
 
 A local rewrite formats spoken cues such as “point one” and “point two” as a numbered list by default. Set a different list style in the profile’s rewrite instructions. If a rewrite changes a numeric literal such as `1200` or `−12.5%`, Jaro keeps the text that entered that rewrite and continues with later steps. Dictating only numbers skips rewriting.
 
 Jard chooses the output profile from the app and page in front when you finish speaking. If the page is unavailable, it uses an app profile or the default. Automatic insertion still checks the field where you started. If you've moved away, use Paste Last to insert the result.
 
-If Jard cannot identify the page in Safari or a Chromium browser, switch to that browser and return to **Dictation → General → Output and vocabulary corrections → Browser tab access**. Choose **Allow** for that browser and respond to the macOS Automation prompt. Jard uses only the active tab’s hostname for website matching.
+If Jard cannot identify the page in Safari or a Chromium browser, switch to that browser and return to **Settings → Dictation → Output and vocabulary corrections → Browser tab access**. Choose **Allow** for that browser and respond to the macOS Automation prompt. Jard uses only the active tab’s hostname for website matching.
 
 Consecutive takes and **Paste Last** join at the same insertion point with spacing and capitalization that follow the previous text. Typing, clicking, moving the caret, switching apps, copying a dictation, or inserting a meeting excerpt starts a new sequence.
 
@@ -197,21 +197,35 @@ With Accessibility enabled, press and release **Option–Shift–S** to record t
 
 With Jaro running, `jardctl settings get capture.` shows whether Annotate is enabled, its shortcut, and whether floating controls appear in recordings. Use `jardctl settings set capture.enabled off` to disable Annotate, or `jardctl settings set capture.hotkey option+shift+s` to restore its default shortcut. Function keys such as `f9` work as well. The **Show in screen recordings** switch and `jardctl settings set capture.show_overlays_in_recordings on` can change the presentation during a display or area recording. Hiding floating controls from Jaro’s display and area recordings uses the existing Screen Recording grant. To set preferences while Jaro is closed, pass `{"capture.enabled":true,"capture.hotkey":"f9"}` to `jardctl settings apply -`.
 
-Use **Settings → Annotate → Storage** to keep videos for 7 days and annotation records for 30 days, extend those periods to 30 and 90 days, or keep both forever. After a video moves to the macOS Trash, its narration, notes, and contact sheet stay in Sessions until the record expires. Jaro archives the remaining files and text in the Trash at that point. Annotations saved before retention was added are excluded unless you turn on **Include older annotations**.
+Use **Settings → Annotate → Storage** to keep videos for 7 days and annotation records for 30 days, extend those periods to 30 and 90 days, or keep both forever. After a video moves to the macOS Trash, its narration, notes, contact sheet, and saved stills stay in Sessions until the record expires. Jaro archives the remaining files and text in the Trash at that point. Annotations saved before retention was added are excluded unless you turn on **Include older annotations**.
 
-In the same Storage card, use **Choose Folder** to save new annotations in another folder or on a connected drive. **Reveal** opens the current folder in Finder. **Use Default** returns new captures to the Jaro Session library. Earlier recordings keep their assigned folders. If a drive disconnects, reconnect it to play those videos or export their images. Their narration remains in Sessions. With Jaro running, the corresponding commands are `jardctl annotate storage`, `jardctl annotate storage --folder /path/to/captures`, `jardctl annotate storage --reveal`, and `jardctl annotate storage --default`.
+In **Settings → Annotate → Storage**, use **Choose Folder…** to save new annotations in another folder or on a connected drive. **Reveal** opens the current folder in your desktop file manager. **Use Default** returns new captures to the Jaro Session library. Earlier captures keep their assigned folders. Windows and Linux also remember the destination for interrupted captures. If a drive disconnects, reconnect it to recover those recordings, play existing videos, or export their images. Saved narration remains in Sessions. With Jaro running, use `jardctl annotate storage`, `jardctl annotate storage --folder <path>`, `jardctl annotate storage --reveal`, or `jardctl annotate storage --default` on macOS, Windows, or Linux.
 
 You can start Annotate during a system dictation or use dictation while Annotate is recording. Both use the selected microphone, including when you turn off **Keep microphone ready**. Ending a dictation keeps the screen recording running, and saving the screen recording leaves an active dictation running.
 
 You can start a meeting while Annotate is recording or start Annotate during a meeting. Both use the meeting microphone. The meeting keeps its separate Mac audio track, live transcript, and copy controls. You can stop the meeting and annotation independently. A microphone change for the shared capture takes effect after an active dictation ends.
 
-`jardctl annotate list` lists saved annotations newest first. `jardctl annotate show latest` returns the latest annotation's narration, frame times, and paths to the movie and available assets. You can give `show` a Session UUID or unique prefix instead of `latest`. Both commands emit JSON and work with Jard closed.
+`jardctl annotate list` lists saved annotations newest first. `jardctl annotate show latest` returns the latest annotation's narration, frame times, and paths to the movie and available assets. You can give `show` a Session UUID or unique prefix instead of `latest`. Both commands emit JSON and work with Jaro closed.
 
 **Copy for Agent** below the Overview copies the written context as Markdown. Apps that accept rich text also get the contact sheet above the context. To get the same Markdown from a terminal, run `jardctl annotate context latest`. An agent attached to `jardctl mcp` can call `list_annotations` and `get_annotation` with Jard closed. `get_annotation` includes the contact sheet as an inline image on its first page when one is available. Pass the returned annotation ID and `next_cursor` to read more narration.
 
 **Paste into Last App** returns to the previous app and pastes the contact sheet followed by the written context. Supported terminal apps receive the sheet's file path. Jard restores the original clipboard after the paste and leaves the field ready for review.
 
 In a saved annotation’s **Overview**, open **Images** and choose **Trim video** below the player. Set **Clip start** and **Clip end**, choose **Preview clip**, then use **Save clip…** to export that range as a separate MP4 with its saved sound and drawings.
+
+Choose **Export annotation…** in the same panel to save a separate `.jaroannotation` folder on macOS, Windows, or Linux. It includes the available recording or narration audio, contact sheet, saved stills, added images, and a Markdown summary. The versioned `annotation.json` contains the timestamped transcript and strokes and refers to media inside the folder. **Images** opens saved stills individually in the session, and uses the contact sheet for older captures.
+
+Give `jardctl annotate show` or `jardctl annotate context` the exported folder or its `annotation.json` path to read a capture outside the library. Use `jardctl annotate inspect <path> --json` for the full manifest, or add `--strokes` to list the recorded stroke ranges. Exported captures keep their original ID and recording date when moved. Reading a package works with Jaro closed and leaves its files and the Session library untouched.
+
+`jardctl annotate frames latest --from 0:05 --to 0:08 --fps 2` saves video stills as PNGs. Give both endpoints the same time to save one still, or choose a range for up to 240 stills per export. If the video has expired, Jaro returns the paths of any saved stills near that time range. The JSON result labels those frames as `"source": "saved"` and includes their actual timestamps.
+
+`jardctl annotate zoom latest --at "review this chart"` makes a contact sheet around a timestamp or a phrase in the timed narration. Use `--mark 4` in place of `--at` to review stroke 4, or add `--full` to include the whole picture around a stroke. The command reports the frame times and nearby narration. Use `--span` to set the window in seconds and `--frames` to request up to 48 frames.
+
+Both commands also accept a Session ID or an exported package path and work with Jaro closed. Add `--json` for machine-readable results or `--output <folder>` to save in a new subfolder of an existing folder. The default is a new folder in the system temporary directory.
+
+Open **Settings → Annotate → Agents → Capture review guides** to copy the guide or install it for a configured Claude Code, Codex, OpenCode, or Pi client. Open a new agent chat to use it. Jaro leaves guides managed through symbolic links in place.
+
+`jardctl annotate skill` prints the guide even with Jaro closed. Use `--status` to see each local location, `--install codex` to add the guide, or `--update codex` to replace an existing regular guide for that client. Use `claude`, `opencode`, or `pi` for the other clients.
 
 Scroll below the Overview to expand **Images** and open individual annotation frames. Add reference images to a saved recording with the image-plus button. The buttons beside Images send the saved overview, quick brief, My Notes, timestamped transcript, and available images to a selected Codex, Claude Code, OpenCode, or T3 Code chat. Hover or focus a button to see its name, then choose an existing chat and select **Send context**. Jaro opens the installed agent after the send. Codex, Claude Code, and OpenCode get inline images. T3 Code gets local image links that work while Jaro’s engine is running. Claude Code needs its CLI installed and signed in. T3 Code needs its CLI and the desktop app or local server running.
 
@@ -247,7 +261,7 @@ jardctl history --raw --oldest-first --json
 
 ## Use the vocabulary menu on Mac
 
-Turn on **Vocabulary menu** under **Dictation → General → Labs**. Open Jaro’s menu bar icon and choose **Vocabulary → Add Term…** to add a word or phrase, or **Open Vocabulary…** to edit your list. The submenu also shows up to five recent terms.
+Turn on **Vocabulary menu** under **Settings → Dictation → Labs**. Open Jaro’s menu bar icon and choose **Vocabulary → Add Term…** to add a word or phrase, or **Open Vocabulary…** to edit your list. The submenu also shows up to five recent terms.
 
 ## Control the Mac app with jardctl
 
@@ -284,6 +298,8 @@ jardctl quit
 `quit --force` and `restart --force` stop active captures first. Saved recordings and meetings continue processing locally. Jard finishes saving screen annotations and discards unfinished shortcut and SDK takes. Verified updates still wait for the shared engine to be idle.
 
 Use `jardctl window show [pane]` to bring the workspace forward. The default pane is General Settings. You can also choose `home`, `dictation`, `history`, `output`, `meetings`, or `annotate`. While the active session is busy, Jaro opens the requested pane when it can navigate. `jardctl window hide` hides the workspace and keeps the app and any active capture running.
+
+Run `jardctl onboarding reset` or choose **Replay setup** on the Dictation page to start the tour again. It checks the current microphone access, model, and shortcut. The macOS tour also checks Accessibility, and the Linux tour can guide you through keyboard and clipboard approval on Wayland. Finish any active recording before replaying. `jardctl setup` also opens the tour.
 
 With Jard running, `settings` shows the available dictation preferences and changes them immediately. `settings apply` also works when Jard is closed, and the changes take effect on the next launch. An `apply` document is a JSON object keyed by setting name. A bad key or value leaves the entire batch unapplied. Shortcut labels are read-only. Change the shortcut itself through Dictation settings. `launch-at-login` reads or sets macOS Launch at Login, and `check-for-updates` asks the desktop updater to check now.
 

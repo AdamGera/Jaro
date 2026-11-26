@@ -66,6 +66,7 @@ class ScreenDraft:
     folder: Path
     source: str
     audio_sources: tuple[str, ...]
+    annotation_location: str | None = None
 
     @property
     def key(self):
@@ -123,7 +124,8 @@ class ScreenDraft:
     def write_metadata(self):
         pending = self.folder / "draft.tmp"
         with pending.open("xb") as file:
-            file.write(json.dumps({"version": 1, "source": self.source, "audio": self.audio_sources}).encode())
+            file.write(json.dumps({"version": 1, "source": self.source, "audio": self.audio_sources,
+                                  "annotationLocation": self.annotation_location}).encode())
             file.flush()
             os.fsync(file.fileno())
         pending.replace(self.folder / "draft.json")
@@ -146,7 +148,10 @@ class ScreenDraft:
                 source, audio = metadata.get("source"), metadata.get("audio")
                 if source not in ("display", "window", "area") or audio not in ([], ["mic"], ["system"], ["mic", "system"]):
                     return None
-                draft = cls(folder, source, tuple(audio))
+                location = metadata.get("annotationLocation")
+                if location is not None and (not isinstance(location, str) or str(UUID(location)) != location):
+                    return None
+                draft = cls(folder, source, tuple(audio), location)
                 if draft.movie.is_file() and not draft.movie.is_symlink():
                     return draft
         except (OSError, ValueError):

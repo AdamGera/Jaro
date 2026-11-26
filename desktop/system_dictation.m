@@ -260,6 +260,97 @@ static NSScreen *activeScreen(void) {
 - (BOOL)canBecomeMainWindow { return NO; }
 @end
 
+static BOOL JardIsRTLLetter(unichar ch) {
+    return (ch >= 0x0590 && ch <= 0x08FF) || (ch >= 0xFB1D && ch <= 0xFDFF) || (ch >= 0xFE70 && ch <= 0xFEFF);
+}
+
+static BOOL JardTextStartsRTL(NSString *stable, NSString *tentative) {
+    NSString *combined = stable.length ? stable : tentative;
+    for (NSUInteger i = 0; i < combined.length; i++) {
+        unichar ch = [combined characterAtIndex:i];
+        if (JardIsRTLLetter(ch)) return YES;
+        if ([[NSCharacterSet letterCharacterSet] characterIsMember:ch]) return NO;
+    }
+    return NO;
+}
+
+@interface JardLiveTextView : NSView
+@property(nonatomic, copy) NSString *stableText;
+@property(nonatomic, copy) NSString *tentativeText;
+- (void)setStable:(NSString *)stable tentative:(NSString *)tentative;
+@end
+
+@implementation JardLiveTextView
+- (BOOL)isFlipped { return YES; }
+
+- (void)setStable:(NSString *)stable tentative:(NSString *)tentative {
+    NSString *nextStable = stable ?: @"";
+    NSString *nextTentative = tentative ?: @"";
+    if ([self.stableText isEqual:nextStable] && [self.tentativeText isEqual:nextTentative]) return;
+    self.stableText = nextStable;
+    self.tentativeText = nextTentative;
+    self.needsDisplay = YES;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    NSString *stable = [self.stableText stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    NSString *tentative = [self.tentativeText stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    if (!stable.length && !tentative.length) return;
+
+    BOOL rtl = JardTextStartsRTL(stable, tentative);
+    NSFont *font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightMedium];
+    NSMutableParagraphStyle *para = [NSMutableParagraphStyle new];
+    para.lineBreakMode = NSLineBreakByTruncatingHead;
+    para.alignment = rtl ? NSTextAlignmentRight : NSTextAlignmentLeft;
+    para.baseWritingDirection = rtl ? NSWritingDirectionRightToLeft : NSWritingDirectionLeftToRight;
+
+    NSMutableAttributedString *attr = [NSMutableAttributedString new];
+    NSDictionary *stableAttrs = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [NSColor colorWithSRGBRed:0.96 green:0.97 blue:0.99 alpha:0.96],
+        NSParagraphStyleAttributeName: para,
+    };
+    NSDictionary *tentativeAttrs = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [NSColor colorWithSRGBRed:0.78 green:0.81 blue:0.86 alpha:0.60],
+        NSParagraphStyleAttributeName: para,
+    };
+    if (stable.length) [attr appendAttributedString:[[NSAttributedString alloc] initWithString:stable attributes:stableAttrs]];
+    if (tentative.length) {
+        NSString *gap = stable.length ? @" " : @"";
+        [attr appendAttributedString:[[NSAttributedString alloc] initWithString:[gap stringByAppendingString:tentative] attributes:tentativeAttrs]];
+    }
+
+    CGFloat maxPlateWidth = NSWidth(self.bounds) - 12.0;
+    CGFloat textMaxWidth = maxPlateWidth - 28.0;
+    CGFloat measured = ceil([attr boundingRectWithSize:NSMakeSize(CGFLOAT_MAX, 24.0) options:0].size.width);
+    CGFloat plateWidth = MIN(maxPlateWidth, MAX(96.0, measured + 28.0));
+    CGFloat plateHeight = 32.0;
+    NSRect plateRect = NSMakeRect(floor((NSWidth(self.bounds) - plateWidth) * 0.5),
+                                  floor((NSHeight(self.bounds) - plateHeight) * 0.5),
+                                  plateWidth, plateHeight);
+    NSBezierPath *pill = [NSBezierPath bezierPathWithRoundedRect:plateRect xRadius:plateHeight * 0.5 yRadius:plateHeight * 0.5];
+
+    [NSGraphicsContext saveGraphicsState];
+    NSShadow *shadow = [NSShadow new];
+    shadow.shadowColor = [NSColor colorWithSRGBRed:0 green:0 blue:0 alpha:0.35];
+    shadow.shadowBlurRadius = 6.0;
+    shadow.shadowOffset = NSMakeSize(0, -2.0);
+    [shadow set];
+    [[NSColor colorWithSRGBRed:0.08 green:0.085 blue:0.095 alpha:0.92] setFill];
+    [pill fill];
+    [NSGraphicsContext restoreGraphicsState];
+
+    [[NSColor colorWithSRGBRed:1.0 green:1.0 blue:1.0 alpha:0.14] setStroke];
+    pill.lineWidth = 0.75;
+    [pill stroke];
+
+    CGFloat textWidth = MIN(textMaxWidth, plateWidth - 28.0);
+    NSRect textRect = NSMakeRect(NSMinX(plateRect) + 14.0, NSMinY(plateRect) + 7.0, textWidth, 20.0);
+    [attr drawWithRect:textRect options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingTruncatesLastVisibleLine];
+}
+@end
+
 @interface JardDictationStartCue : NSObject
 - (void)playURL:(NSURL *)url volume:(float)volume at:(NSTimeInterval)deadline;
 - (void)afterPlayback:(dispatch_block_t)completion;
@@ -588,13 +679,14 @@ static BOOL JardMaintainEventTap(JardEventTap *tap, CGEventTapLocation location,
 @property(nonatomic, strong) JardOutputContext *captureOutputContext;
 @property(nonatomic, strong) JardOutputContext *captureOutputCandidate;
 @property(nonatomic) BOOL dispatchingOutput, usingRawBinding, lastTapWasRaw;
-@property(nonatomic, copy) NSString *lastText, *captureID, *phase, *message, *lastHistoryID, *websiteHost, *preview;
+@property(nonatomic, copy) NSString *lastText, *captureID, *phase, *message, *lastHistoryID, *websiteHost, *preview, *previewStable, *previewTentative;
 @property(nonatomic, strong) NSRunningApplication *destination;
 @property(nonatomic) AXUIElementRef focusedElement;
 @property(nonatomic) BOOL focusedWindowOnly;
 @property(nonatomic, strong) NSValue *selectedRange;
-@property(nonatomic, strong) JardDictationPanel *hud, *guide;
+@property(nonatomic, strong) JardDictationPanel *hud, *guide, *liveTextPanel;
 @property(nonatomic, strong) JardDictationMeter *meter;
+@property(nonatomic, strong) JardLiveTextView *liveTextView;
 @property(nonatomic) NSUInteger hudRehomeAttempts;
 @property(nonatomic) NSTimeInterval hudRehomeDeadline, nextHUDPlacementAt;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSSound *> *cues;
@@ -2022,8 +2114,8 @@ static NSString *annotationTerminalDirectory(AXUIElementRef element) {
     visible[@"mediaAccessMessage"] = self.mediaAccessMessage ?: @"";
     visible[@"browserAccessMessage"] = self.browserAccessMessage ?: @"";
     if (!self.lastWebsiteBrowser.terminated) visible[@"browserAccessTarget"] = self.lastWebsiteBrowser.localizedName;
-    // Provisional words are visible in the practice field only.
-    visible[@"preview"] = self.practice ? (self.preview ?: @"") : @"";
+    BOOL liveVisible = self.practice || [self.settings[@"livePreview"] boolValue];
+    visible[@"preview"] = liveVisible ? (self.preview ?: @"") : @"";
     [visible removeObjectForKey:@"onboardingEnabledBefore"];
     visible[@"outputScriptName"] = [self.settings[@"outputScript"] lastPathComponent] ?: @"";
     [visible removeObjectForKey:@"outputScript"];
@@ -2218,7 +2310,10 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     NSString *placement = self.settings[@"placement"];
     if ([placement isEqual:@"cursor"] || [placement isEqual:@"off"]) return;
     NSPoint origin = [self hudEdgeOrigin:placement];
-    if (!NSEqualPoints(self.hud.frame.origin, origin)) [self.hud setFrameOrigin:origin];
+    if (!NSEqualPoints(self.hud.frame.origin, origin)) {
+        [self.hud setFrameOrigin:origin];
+        [self positionLiveTextPlate];
+    }
 }
 
 - (void)showHUD:(NSString *)label stage:(JardIndicatorStage)stage {
@@ -2297,12 +2392,70 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     }
 }
 
+- (void)hideLiveTextPlate {
+    self.previewStable = nil;
+    self.previewTentative = nil;
+    [self.liveTextView setStable:@"" tentative:@""];
+    [self.liveTextPanel orderOut:nil];
+}
+
+- (void)positionLiveTextPlate {
+    if (!self.liveTextPanel || !self.hud || !self.hud.visible) return;
+    NSRect hudFrame = self.hud.frame;
+    NSSize plateSize = self.liveTextPanel.frame.size;
+    NSScreen *screen = self.hud.screen ?: activeScreen();
+    NSRect visible = screen ? screen.visibleFrame : NSMakeRect(0, 0, 1440, 900);
+    NSString *placement = self.settings[@"placement"];
+    BOOL placeAbove = [placement isEqual:@"bottom"] || (NSMinY(hudFrame) - plateSize.height - 6.0 < NSMinY(visible));
+    CGFloat x = round(NSMidX(hudFrame) - plateSize.width * 0.5);
+    x = fmax(NSMinX(visible) + 8.0, fmin(x, NSMaxX(visible) - plateSize.width - 8.0));
+    CGFloat y = placeAbove ? (NSMaxY(hudFrame) + 4.0) : (NSMinY(hudFrame) - plateSize.height - 4.0);
+    y = fmax(NSMinY(visible) + 6.0, fmin(y, NSMaxY(visible) - plateSize.height - 6.0));
+    [self.liveTextPanel setFrameOrigin:NSMakePoint(x, y)];
+}
+
+- (void)updateLiveTextPlate {
+    BOOL enabled = [self.capturePreferences[@"livePreview"] boolValue] || [self.settings[@"livePreview"] boolValue];
+    if (!enabled || self.practice || !self.hud || !self.hud.visible || self.cancelled || self.stopping ||
+        (![self.phase isEqual:@"listening"] && ![self.phase isEqual:@"starting"])) {
+        [self hideLiveTextPlate];
+        return;
+    }
+    NSString *stable = self.previewStable ?: @"";
+    NSString *tentative = self.previewTentative ?: @"";
+    if (!stable.length && !tentative.length) {
+        [self.liveTextPanel orderOut:nil];
+        return;
+    }
+    if (!self.liveTextPanel) {
+        JardDictationPanel *panel = [[JardDictationPanel alloc] initWithContentRect:NSMakeRect(0, 0, 560, 44)
+            styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel backing:NSBackingStoreBuffered defer:NO];
+        panel.opaque = NO;
+        panel.backgroundColor = NSColor.clearColor;
+        panel.hasShadow = NO;
+        panel.ignoresMouseEvents = YES;
+        panel.hidesOnDeactivate = NO;
+        panel.level = NSStatusWindowLevel;
+        panel.collectionBehavior = dictationHUDBehavior;
+        self.liveTextView = [[JardLiveTextView alloc] initWithFrame:panel.contentView.bounds];
+        panel.contentView = self.liveTextView;
+        self.liveTextPanel = panel;
+    }
+    [self.liveTextView setStable:stable tentative:tentative];
+    [self positionLiveTextPlate];
+    if (!self.liveTextPanel.visible) {
+        reapplyHUDWindowBehavior(self.liveTextPanel, NO);
+        [self.liveTextPanel orderFrontRegardless];
+    }
+}
+
 - (void)hideHUD {
     [self.animation invalidate];
     self.animation = nil;
     self.hudRehomeAttempts = 0;
     self.hudRehomeDeadline = self.nextHUDPlacementAt = 0;
     self.inputRMS = 0;
+    [self hideLiveTextPlate];
     [self.hud orderOut:nil];
     [self.meter dismiss];
 }
@@ -2324,6 +2477,7 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     if (cancelled) { [self hideHUD]; return; }
     JardIndicatorStage stage = failed ? JardIndicatorFailed : [phase isEqual:@"processing"] ? JardIndicatorProcessing :
         [@[@"starting", @"listening"] containsObject:phase] ? JardIndicatorRecording : JardIndicatorDone;
+    if (stage != JardIndicatorRecording) [self hideLiveTextPlate];
     [self showHUD:label stage:stage];
 }
 
@@ -2808,8 +2962,8 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     self.send(@"jard.record", @{@"dictation": capture, @"global": @YES,
                                 @"languages": preferences[@"languages"], @"mode": @"mic",
                                 @"inputDevice": preferences[@"inputDevice"], @"avoidBluetooth": preferences[@"avoidBluetooth"],
-                                @"live": @(self.practice && [preferences[@"livePreview"] boolValue]),
-                                @"preRoll": @([preferences[@"audioWhileDictating"] isEqual:@"none"]),
+                                @"live": (self.practice || [preferences[@"livePreview"] boolValue]) ? @YES : @NO,
+                                @"preRoll": [preferences[@"audioWhileDictating"] isEqual:@"none"] ? @YES : @NO,
                                 @"keep": preferences[@"keepMicrophoneReady"],
                                 @"queuedAt": @(self.queuedCaptureStart)}, ^(id result, NSString *error) {
         if (![self.captureID isEqual:capture]) return;
@@ -4176,8 +4330,13 @@ static NSTimeInterval microphoneFailureAt(NSDictionary *event) {
     } else if ([kind isEqual:@"sourceChanged"] && !self.stopping && !self.cancelled) {
         self.message = event[@"message"] ?: @"The microphone changed.";
     } else if ([kind isEqual:@"preview"] && !self.cancelled && !self.stopping) {
-        NSString *text = event[@"text"];
+        NSString *text = [event[@"text"] isKindOfClass:NSString.class] ? event[@"text"] : @"";
+        NSString *stable = [event[@"stable"] isKindOfClass:NSString.class] ? event[@"stable"] : text;
+        NSString *tentative = [event[@"tentative"] isKindOfClass:NSString.class] ? event[@"tentative"] : @"";
         self.preview = text.length <= 500 ? text : [text substringFromIndex:text.length - 500];
+        self.previewStable = stable.length <= 500 ? stable : [stable substringFromIndex:stable.length - 500];
+        self.previewTentative = tentative.length <= 200 ? tentative : [tentative substringFromIndex:tentative.length - 200];
+        [self updateLiveTextPlate];
     } else if (error && !self.cancelled) {
         if ([event[@"noSpeech"] isEqual:@YES]) [self.printRequest finish:@{@"status": @"no-speech"} error:nil];
         [self fail:event[@"message"] ?: @"The microphone did not deliver audio."];
@@ -6467,10 +6626,6 @@ static NSArray *JardProfileApplications(void) {
 }
 
 - (void)control:(NSString *)action reply:(JardDictationReply)reply {
-    if ([action isEqual:@"setup"]) {
-        [self request:@{@"action": @"set", @"key": @"onboarding", @"value": @"welcome"} reply:reply];
-        return;
-    }
     if ([action isEqual:@"history-snapshot"]) {
         NSUInteger bytes = 0;
         for (NSDictionary *entry in self.history) {

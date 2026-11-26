@@ -5,13 +5,13 @@
 #include <string.h>
 
 enum {
-    HOLD_MS = 180, DOUBLE_TAP_MS = 350, KEY_POLL_MS = 20,
+    HOLD_MS = 180, DOUBLE_TAP_MS = 350, KEY_POLL_MS = 20, PASTE_PICKER_HOLD_MS = 200,
     WATCHDOG_MS = 1000, HOOK_SILENCE_MS = 3000, MAX_REARM_MS = 60000
 };
 enum {
     EVENT_START = WM_APP + 1, EVENT_FINISH, EVENT_CANCEL, EVENT_ESCAPE,
     EVENT_RECOVERY_TARGET, EVENT_PASTE_FOCUS_LOST, EVENT_RESET, EVENT_ACTIVITY, EVENT_START_RAW,
-    EVENT_COMMAND_TARGET
+    EVENT_COMMAND_TARGET, EVENT_PICKER_ROWS, EVENT_PICKER_KEY
 };
 typedef enum { HOLD, TAP, HOLD_DOUBLE, DOUBLE_TAP } ShortcutMode;
 typedef struct {
@@ -30,6 +30,11 @@ static bool locked, tap_armed, escape_owned;
 static volatile LONG cancel_armed;
 static bool recovery_key_down, recovery_pending, recovery_mask_alt;
 static HWND recovery_window;
+static DWORD recovery_pressed_at, picker_sequence, active_picker;
+static bool picker_held, picker_copy, picker_guard;
+static int picker_choice = -1;
+static bool picker_keys[256];
+static PVOID volatile pending_picker_rows;
 static DWORD pressed_at, last_tap;
 static volatile LONG *activity;
 static bool activity_pending;
@@ -135,13 +140,32 @@ static void lose_focus(FocusWatch *watch, const char *message) {
     }
 }
 
-static void lose_recovery_focus(void) {
+static bool reset_recovery_focus(void) {
+    bool had_focus = recovery_focus.target.window != NULL;
     recovery_pending = false;
     recovery_window = NULL;
-    if (recovery_focus.target.window) {
-        recovery_focus.target = (DictationTarget){0};
+    active_picker = 0;
+    picker_guard = picker_held = false;
+    picker_choice = -1;
+    recovery_focus.target = (DictationTarget){0};
+    return had_focus;
+}
+
+static void lose_recovery_focus(void) {
+    if (reset_recovery_focus())
         PostThreadMessageW(monitor_thread, EVENT_PASTE_FOCUS_LOST, 0, 0);
+}
+
+static void choose_paste_picker(int index, bool copy) {
+    close_paste_picker();
+    if (!active_picker) return;
+    DictationTarget current = active_target();
+    if (index < 0 || !same_target(recovery_focus.target, current) || current.focus != recovery_focus.target.focus) {
+        lose_recovery_focus();
+        return;
     }
+    picker_choice = index;
+    picker_copy = copy;
 }
 
 static void interrupt_hold(void) {
@@ -258,6 +282,25 @@ static bool custom_chord(const KBDLLHOOKSTRUCT *key, bool down) {
     return false;
 }
 
+static bool picker_keyboard(DWORD key, bool down) {
+    if (key >= sizeof(picker_keys) / sizeof(*picker_keys)) return false;
+    if (picker_keys[key]) {
+        if (!down) picker_keys[key] = false;
+        return true;
+    }
+    if (!active_picker || !down) return false;
+    bool shift = key_down(VK_SHIFT);
+    if (key != VK_ESCAPE && !(key == 'V' && recovery_chord())) {
+        if (key_down(VK_MENU) || key_down(VK_CONTROL) || key_down(VK_LWIN) || key_down(VK_RWIN)) return false;
+        if (key != VK_RETURN && key != VK_TAB && key != VK_UP && key != VK_DOWN &&
+            key != VK_PRIOR && key != VK_NEXT && key != 'V') return false;
+        if (shift && key != VK_TAB) return false;
+    }
+    if (!PostThreadMessageW(monitor_thread, EVENT_PICKER_KEY, key, shift)) return false;
+    picker_keys[key] = true;
+    return true;
+}
+
 static LRESULT CALLBACK keyboard_hook(int code, WPARAM event, LPARAM payload) {
     if (code != HC_ACTION) return CallNextHookEx(NULL, code, event, payload);
     last_hook_event = GetTickCount();
@@ -271,6 +314,15 @@ static LRESULT CALLBACK keyboard_hook(int code, WPARAM event, LPARAM payload) {
         }
         return CallNextHookEx(NULL, code, event, payload);
     }
+    if (key->vkCode == 'V' && recovery_key_down) {
+        if (!down) {
+            recovery_key_down = false;
+            picker_held = recovery_pending && recovery_chord() &&
+                GetTickCount() - recovery_pressed_at >= PASTE_PICKER_HOLD_MS;
+        }
+        return 1;
+    }
+    if (picker_keyboard(key->vkCode, down)) return 1;
     if (key->vkCode == VK_ESCAPE && (escape_owned || (down && (recording || cancel_armed)
                                                     && !key_down(VK_MENU) && !conflicting_modifiers()))) {
         if (down && !escape_owned) {
@@ -281,13 +333,10 @@ static LRESULT CALLBACK keyboard_hook(int code, WPARAM event, LPARAM payload) {
         return 1;
     }
     if (key->vkCode == 'V') {
-        if (recovery_key_down) {
-            if (!down) recovery_key_down = false;
-            return 1;
-        }
         if (down && !recording && recovery_chord()) {
             lose_recovery_focus();
             recovery_window = GetForegroundWindow();
+            recovery_pressed_at = GetTickCount();
             recovery_key_down = recovery_pending = recovery_mask_alt = true;
             PostThreadMessageW(monitor_thread, EVENT_RECOVERY_TARGET, (WPARAM)recovery_window,
                                activity ? *activity : 0);
@@ -326,6 +375,9 @@ static LRESULT CALLBACK mouse_hook(int code, WPARAM event, LPARAM payload) {
         last_hook_event = GetTickCount();
         if (event == WM_LBUTTONDOWN || event == WM_RBUTTONDOWN
             || event == WM_MBUTTONDOWN || event == WM_XBUTTONDOWN) {
+            const MSLLHOOKSTRUCT *mouse = (const MSLLHOOKSTRUCT *)payload;
+            if (active_picker && paste_picker_contains(mouse->pt))
+                return CallNextHookEx(NULL, code, event, payload);
             input_activity();
             lose_recovery_focus();
             interrupt_hold();
@@ -359,16 +411,16 @@ static void CALLBACK focus_event(HWINEVENTHOOK hook, DWORD event, HWND window, L
     DictationTarget current = active_target();
     bool changed = focus_event_changed(&dictation_focus, current, occurred);
     bool recovery_changed = focus_event_changed(&recovery_focus, current, occurred);
-    bool object_changed = false;
+    bool object_changed = false, recovery_object_changed = false;
     if (event == EVENT_OBJECT_FOCUS) {
         // Chromium can report logical focus changes through one native HWND.
         // Use them to end continuation without invalidating the foreground target.
         object_changed = focus_object_changed(&dictation_focus, window, object, child, occurred);
-        object_changed |= focus_object_changed(&recovery_focus, window, object, child, occurred);
+        recovery_object_changed = focus_object_changed(&recovery_focus, window, object, child, occurred);
     }
-    if (changed || recovery_changed || object_changed) input_activity();
+    if (changed || recovery_changed || object_changed || recovery_object_changed) input_activity();
     if (changed) lose_focus(&dictation_focus, "focus-lost");
-    if (recovery_changed) lose_recovery_focus();
+    if (recovery_changed || (picker_guard && recovery_object_changed)) lose_recovery_focus();
 }
 
 static void print_target(const char *event, DictationTarget target, bool include_application) {
@@ -414,6 +466,10 @@ static void announce_start(WPARAM window, LPARAM revision, bool raw) {
 
 static void command_target(DWORD request, bool recovery) {
     DictationTarget target = active_target();
+    if (active_picker) {
+        close_paste_picker();
+        if (reset_recovery_focus()) emit("paste-focus-lost");
+    }
     if (recovery) {
         recovery_pending = false;
         recovery_window = NULL;
@@ -426,19 +482,41 @@ static void command_target(DWORD request, bool recovery) {
     print_target(event, target, !recovery);
 }
 
+static void request_paste_picker(void) {
+    recovery_pending = false;
+    if (++picker_sequence == 0) ++picker_sequence;
+    active_picker = picker_sequence;
+    picker_guard = true;
+    char event[32];
+    snprintf(event, sizeof(event), "paste-picker %lu", (unsigned long)active_picker);
+    print_target(event, recovery_focus.target, false);
+}
+
 static void poll_gesture(void) {
     if (dictation_focus.target.window || recovery_focus.target.window) {
         DictationTarget current = active_target();
         bool changed = dictation_focus.target.window && !same_target(dictation_focus.target, current);
-        bool recovery_changed = recovery_focus.target.window && !same_target(recovery_focus.target, current);
+        bool recovery_changed = recovery_focus.target.window && (!same_target(recovery_focus.target, current) ||
+            (picker_guard && recovery_focus.target.focus != current.focus));
         if (changed || recovery_changed) input_activity();
         if (changed) lose_focus(&dictation_focus, "focus-lost");
         if (recovery_changed) lose_recovery_focus();
     }
-    if (recovery_pending && !recovery_key_down && !key_down(VK_MENU) && !key_down(VK_CONTROL)) {
+    bool released = !recovery_key_down && !key_down(VK_MENU) && !key_down(VK_CONTROL);
+    if (recovery_pending && recovery_focus.target.window &&
+        ((recovery_key_down && recovery_chord() && GetTickCount() - recovery_pressed_at >= PASTE_PICKER_HOLD_MS) ||
+         (released && picker_held))) {
+        request_paste_picker();
+    } else if (recovery_pending && released) {
         recovery_pending = false;
         if (recovery_focus.target.window && recovery_focus.target.process)
             print_target("paste-last", recovery_focus.target, false);
+    }
+    if (active_picker && picker_choice >= 0 && released && !conflicting_modifiers()) {
+        printf("%s %lu %d\n", picker_copy ? "picker-copy" : "picker-paste", (unsigned long)active_picker, picker_choice);
+        fflush(stdout);
+        active_picker = 0;
+        picker_choice = -1;
     }
     if (!held) return;
     // A consumed regular key does not reliably update GetAsyncKeyState.
@@ -471,7 +549,12 @@ static DWORD WINAPI wait_for_stop(void *context) {
     while (ReadFile((HANDLE)context, &byte, sizeof(byte), &received, NULL) && received) {
         if (byte == 'r') PostThreadMessageW(monitor_thread, EVENT_RESET, 0, 0);
         else if (byte == 'c' || byte == 'i') InterlockedExchange(&cancel_armed, byte == 'c');
-        else if (byte == 'f' || byte == 'p') {
+        else if (byte == 'k') {
+            PastePickerRows *rows = read_paste_picker((HANDLE)context);
+            if (!rows) break;
+            free_paste_picker(InterlockedExchangePointer(&pending_picker_rows, rows));
+            if (!PostThreadMessageW(monitor_thread, EVENT_PICKER_ROWS, 0, 0)) break;
+        } else if (byte == 'f' || byte == 'p') {
             DWORD request, offset = 0;
             while (offset < sizeof(request)) {
                 if (!ReadFile((HANDLE)context, (char *)&request + offset, sizeof(request) - offset, &received, NULL)
@@ -528,6 +611,8 @@ static void check_input_hooks(HHOOK *keyboard, HHOOK *mouse, DWORD now) {
             if (triggers[i].key && !key_down(triggers[i].key)) triggers[i].down = triggers[i].owned = false;
         if (!key_down(VK_ESCAPE)) escape_owned = false;
         if (!key_down('V')) recovery_key_down = false;
+        for (size_t key = 0; key < sizeof(picker_keys) / sizeof(*picker_keys); ++key)
+            if (picker_keys[key] && !key_down((int)key)) picker_keys[key] = false;
     }
 }
 
@@ -570,7 +655,23 @@ static int monitor(void) {
                 if (recovery_pending && recovery_window && (HWND)message.wParam == recovery_window)
                     watch_focus(&recovery_focus, posted_target(message.wParam, message.lParam));
             }
-            else if (message.message == EVENT_PASTE_FOCUS_LOST) emit("paste-focus-lost");
+            else if (message.message == EVENT_PASTE_FOCUS_LOST) {
+                if (!active_picker) close_paste_picker();
+                emit("paste-focus-lost");
+            }
+            else if (message.message == EVENT_PICKER_ROWS) {
+                PastePickerRows *rows = InterlockedExchangePointer(&pending_picker_rows, NULL);
+                if (!rows) continue;
+                if (rows->sequence != active_picker || !active_picker) free_paste_picker(rows);
+                else if (!rows->count || !show_paste_picker(rows, choose_paste_picker)) {
+                    free_paste_picker(rows);
+                    lose_recovery_focus();
+                }
+            }
+            else if (message.message == EVENT_PICKER_KEY && active_picker) {
+                if (message.wParam == VK_ESCAPE) choose_paste_picker(-1, false);
+                else paste_picker_key((WORD)message.wParam, message.lParam != 0);
+            }
             else if (message.message == EVENT_ACTIVITY) {
                 activity_pending = false;
                 printf("activity %lu\n", (unsigned long)(DWORD)*activity);
@@ -589,6 +690,7 @@ static int monitor(void) {
     if (focus) UnhookWinEvent(focus);
     if (foreground) UnhookWinEvent(foreground);
     if (timer) KillTimer(NULL, timer);
+    close_paste_picker();
     if (control) {
         CancelSynchronousIo(control);
         CloseHandle(control);

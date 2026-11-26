@@ -157,7 +157,8 @@ static bool shell_without_editor(DictationTarget target) {
     WCHAR window_class[64];
     if (!GetClassNameW(target.window, window_class, sizeof(window_class) / sizeof(window_class[0]))) return true;
     if (_wcsicmp(window_class, L"Progman") && _wcsicmp(window_class, L"WorkerW")
-        && _wcsicmp(window_class, L"Shell_TrayWnd") && _wcsicmp(window_class, L"Shell_SecondaryTrayWnd")) return false;
+        && _wcsicmp(window_class, L"Shell_TrayWnd") && _wcsicmp(window_class, L"Shell_SecondaryTrayWnd")
+        && _wcsicmp(window_class, L"TopLevelWindowForOverflowXamlIsland")) return false;
     if (!target.focus) return true;
     WCHAR focused_class[64];
     if (!GetClassNameW(target.focus, focused_class, sizeof(focused_class) / sizeof(focused_class[0]))) return true;

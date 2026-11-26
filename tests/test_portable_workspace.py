@@ -27,10 +27,195 @@ from linux_capture import LinuxRecording, capture_args, default_computer_audio, 
 from portable_dictation import OutputContext
 from portable_capture import CaptureError, PortableRecording, SAMPLE_RATE, draft_frames, draft_tracks, private_wav, release_cutoff, split_audio
 from native_recordings import source_tracks
+from session_store import SessionStore
 from windows_capture import parse_microphones, WindowsMeetingRecording, WindowsRecording, WindowsScreenAudio
 
 
 class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_onboarding_replay_is_owned_persistent_and_keeps_current_setup(self):
+        from engine_lifecycle import ClientLeases
+        from portable_onboarding import PortableOnboarding
+        from server import change_portable_onboarding, connect_browser, windows_onboarding_command
+        from windows_dictation_commands import ONBOARDING_ROUTE
+
+        origin = "http://127.0.0.1:43721"
+        route = "/api/portable/onboarding"
+        headers = {"Origin": origin}
+        record = {"port": 43721}
+        app = FastAPI()
+        configure_workspace(app, record, origin)
+        app.post(route)(change_portable_onboarding)
+        app.post(ONBOARDING_ROUTE)(windows_onboarding_command)
+        state = app.state
+        state.draining = False
+        state.portable_recording = state.portable_screencast = None
+        state.portable_dictation = SimpleNamespace(busy=False, authorizing=False, enabled=True, shortcut="Left Alt")
+        state.windows_dictation_control = {"token": "b" * 64}
+        state.leases = ClientLeases()
+        with TemporaryDirectory() as directory, patch("server.URL", origin):
+            root = Path(directory)
+            state.portable_onboarding = tour = PortableOnboarding(root)
+            first = tour.id
+            settings = vars(state.portable_dictation).copy()
+            native = SimpleNamespace(app=app, state=SimpleNamespace(portable_desktop=True), headers=headers)
+            stream = (await connect_browser(uuid4(), native)).body_iterator
+            async def update():
+                async with asyncio.timeout(2):
+                    async for event in stream:
+                        if event.startswith("event: onboarding\n"):
+                            return json.loads(event.splitlines()[1].removeprefix("data: "))["id"]
+
+            self.assertEqual(await update(), first)
+            try:
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+                    async def bootstrap(key):
+                        return await client.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record[key]})
+
+                    await bootstrap("workspaceKey")
+                    self.assertEqual((await client.post(route, headers=headers, json={"action": "restart"})).status_code, 403)
+                    self.assertEqual((await client.post(ONBOARDING_ROUTE, headers=headers)).status_code, 403)
+                    await bootstrap("workspaceDesktopKey")
+                    self.assertEqual((await client.post(route, json={"action": "restart"})).status_code, 403)
+                    state.portable_recording = object()
+                    self.assertEqual((await client.post(route, headers=headers, json={"action": "restart"})).status_code, 409)
+                    self.assertEqual(tour.id, first)
+                    state.portable_recording = None
+                    self.assertEqual((await client.post(route, headers=headers, json={"action": "finish", "id": first})).json(), {"id": None})
+                    self.assertIsNone(PortableOnboarding(root).id)
+                    self.assertIsNone(await update())
+                    with patch.dict(os.environ, {"JARO_DESKTOP_TRAY": str(root)}):
+                        restarted = (await client.post(ONBOARDING_ROUTE, headers={**headers,
+                            "Authorization": "Bearer " + state.windows_dictation_control["token"]})).raise_for_status().json()["id"]
+                    self.assertNotEqual(restarted, first)
+                    self.assertTrue((root / "open").is_file())
+                    self.assertEqual(await update(), restarted)
+                    self.assertEqual((await client.post(route, headers=headers, json={"action": "finish", "id": first})).status_code, 409)
+                    self.assertIsNotNone(PortableOnboarding(root).id)
+                    self.assertEqual(vars(state.portable_dictation), settings)
+            finally:
+                await stream.aclose()
+
+    async def test_annotation_agent_guides_require_an_owned_desktop(self):
+        from annotation_agent_skill import SKILL, guide
+        from server import portable_annotation_agent_skill
+
+        origin = "http://127.0.0.1:43721"
+        route = "/api/portable/annotation-agent-skill"
+        headers = {"Origin": origin}
+        record = {"port": 43721}
+        app = FastAPI()
+        configure_workspace(app, record, origin)
+        app.post(route)(portable_annotation_agent_skill)
+        app.state.jobs = set()
+        app.state.draining = False
+        with TemporaryDirectory() as directory, patch("server.URL", origin), patch("server.sys", SimpleNamespace(platform="win32")):
+            root = Path(directory)
+            with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(root)}):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+                    async def bootstrap(key):
+                        return await client.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record[key]})
+
+                    request = {"action": "install", "agent": "claude"}
+                    await bootstrap("workspaceKey")
+                    self.assertEqual((await client.post(route, headers=headers, json=request)).status_code, 403)
+                    self.assertFalse((root / SKILL).exists())
+                    await bootstrap("workspaceDesktopKey")
+                    self.assertEqual((await client.post(route, json=request)).status_code, 403)
+                    app.state.draining = True
+                    self.assertEqual((await client.post(route, headers=headers, json=request)).status_code, 409)
+                    app.state.draining = False
+                    response = await client.post(route, headers=headers, json=request)
+                    self.assertEqual(response.raise_for_status().headers["cache-control"], "no-store")
+                    self.assertEqual((root / SKILL).read_bytes(), guide())
+                    self.assertEqual((await client.post(route, headers=headers, json={**request, "agent": "../other"})).status_code, 422)
+
+    async def test_annotation_storage_requires_owned_workspace_and_keeps_selection_during_capture(self):
+        from server import portable_annotation_storage, run_linux_annotation_command, windows_annotation_command
+        from windows_dictation_commands import ANNOTATION_COMMAND_ROUTE
+
+        origin = "http://127.0.0.1:43721"
+        route = "/api/portable/annotation-storage"
+        headers = {"Origin": origin}
+        record = {"port": 43721}
+        app = FastAPI()
+        configure_workspace(app, record, origin)
+        app.post(route)(portable_annotation_storage)
+        app.post(ANNOTATION_COMMAND_ROUTE)(windows_annotation_command)
+        state = app.state
+        state.portable_screencast = None
+        state.portable_recording_lock = asyncio.Lock()
+        state.windows_dictation_control = {"token": "b" * 64}
+        state.draining = False
+        state.jobs = set()
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            state.library = SessionStore(root / "library")
+            state.screen_draft_dir = root / "screen-drafts"
+            first, second = root / "First drive", root / "Second drive"
+            first.mkdir()
+            second.mkdir()
+            with (patch("server.URL", origin), patch("server.sys", SimpleNamespace(platform="win32")),
+                  patch("desktop_file_dialog.file_dialog", return_value=Path("jaro-save-video")),
+                  patch("desktop_file_dialog.choose_file", new_callable=AsyncMock) as choose,
+                  patch("desktop_file_dialog.reveal_folder", new_callable=AsyncMock) as reveal):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
+                    async def action(name):
+                        return await client.post(route, headers=headers, json={"action": name})
+
+                    await client.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
+                    self.assertEqual((await action("choose")).status_code, 403)
+                    choose.assert_not_awaited()
+                    await client.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceDesktopKey"]})
+                    self.assertEqual((await client.post(route, json={"action": "status"})).status_code, 403)
+                    self.assertFalse((await action("status")).json()["custom"])
+                    choose.return_value = None
+                    self.assertFalse((await action("choose")).json()["custom"])
+                    choose.return_value = first
+                    selected = (await action("choose")).raise_for_status().json()
+                    self.assertTrue(selected["available"])
+                    self.assertEqual(selected["folder"], str(first.resolve()))
+                    choose.assert_awaited_with(Path("jaro-save-video"), "--choose-annotation-storage-folder", str(state.library.audio))
+                    await action("reveal")
+                    reveal.assert_awaited_once_with(str(first.resolve()))
+
+                    async def interrupted_picker(*_args):
+                        state.portable_screencast = SimpleNamespace(phase="recording", saving=False)
+                        return second
+
+                    choose.side_effect = interrupted_picker
+                    self.assertEqual((await action("choose")).status_code, 409)
+                    self.assertEqual((await action("status")).json(), selected)
+                    self.assertEqual((await action("reset")).status_code, 409)
+                    state.portable_screencast = None
+
+                    command = {"action": "storage", "storageAction": "set", "folder": str(second.resolve())}
+                    self.assertEqual((await client.post(ANNOTATION_COMMAND_ROUTE, headers=headers, json=command)).status_code, 403)
+                    auth = {**headers, "Authorization": "Bearer " + "b" * 64}
+                    changed = (await client.post(ANNOTATION_COMMAND_ROUTE, headers=auth, json=command)).raise_for_status().json()
+                    self.assertEqual(changed["folder"], str(second.resolve()))
+                    reset = await run_linux_annotation_command(state, {"action": "storage", "storageAction": "reset"})
+                    self.assertFalse(reset["custom"])
+
+    async def test_waiting_for_annotation_storage_does_not_keep_restart_busy(self):
+        from server import portable_work_in_progress, resume_recordings
+
+        state = SimpleNamespace(status="ready", draining=False, portable_workspace=True, startup_recovery=True,
+                                startup_stranded=set(), jobs=set(), submitting=False, model_setup=None,
+                                portable_recording=None, portable_screencast=None, portable_dictation=None,
+                                insights=SimpleNamespace(model=SimpleNamespace(audio_users=0)),
+                                inference=SimpleNamespace(waiting_dictation=False),
+                                library=SimpleNamespace(has_pending_recordings=Mock(side_effect=[True, False])))
+        guards = []
+
+        async def claim(*_args):
+            guards.append(portable_work_in_progress(state))
+            return False
+
+        with patch("server.asyncio.sleep", new_callable=AsyncMock), patch("server.recover_pending_recording", side_effect=claim):
+            await resume_recordings(state)
+        self.assertEqual(guards, [True, False])
+        self.assertFalse(state.startup_recovery)
+
     async def test_rules_manager_creates_a_source_once_before_recording(self):
         from annotation_deliveries import AnnotationDeliveries
         from server import portable_annotation_rules
@@ -1030,6 +1215,7 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_windows_screen_picker_rejects_external_and_stale_targets(self):
         from windows_screencast import capture_targets
+        from server import select_annotation_folder
 
         origin = "http://127.0.0.1:43721"
         record = {"port": 43721}
@@ -1057,6 +1243,10 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
               patch("windows_screencast.targets", opener),
               patch("windows_screencast.WindowsScreenRecording.record", new_callable=AsyncMock) as record_screen):
             app.state.screen_draft_dir = Path(staging)
+            app.state.library = SessionStore(Path(staging) / "library")
+            folder = Path(staging) / "captures"
+            folder.mkdir()
+            location = select_annotation_folder(app.state.library, str(folder.resolve()))
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as browser:
                 list_windows = endpoint + "/targets?source=window"
                 start = endpoint + "?source=window&target=1a%3A12345"
@@ -1081,6 +1271,7 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.json()["id"], app.state.portable_screencast.draft.key)
                 self.assertEqual(app.state.portable_screencast.target, "1a:12345")
                 self.assertEqual(app.state.portable_screencast.microphone_device, inputs[0]["id"])
+                self.assertEqual(app.state.portable_screencast.draft.annotation_location, location["storageId"])
                 await app.state.portable_screencast.task
                 record_screen.assert_awaited_once()
 
@@ -1510,6 +1701,7 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
               patch("linux_screencast.ScreenCastPortal", return_value=portal) as recording_portal,
               patch("linux_screencast.ScreenRecording.record", new_callable=AsyncMock)):
             state.screen_draft_dir = Path(staging)
+            state.library = SessionStore(Path(staging) / "library")
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as browser:
                 self.assertEqual((await browser.get(endpoint + "/microphones")).status_code, 403)
                 await browser.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
@@ -1576,6 +1768,7 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
               patch("linux_screencast.supported", return_value=True),
               patch("linux_screencast.ScreenCastPortal", return_value=portal)):
             app.state.screen_draft_dir = Path(staging)
+            app.state.library = SessionStore(Path(staging) / "library")
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as browser:
                 start = endpoint + "?source=display"
                 self.assertEqual((await browser.post(start, headers=headers)).status_code, 403)
@@ -1652,8 +1845,7 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
     async def test_screen_video_saves_after_audio_setup_failure_and_legacy_recovery(self):
         from annotation_assets import annotation_movie_tracks
         from screen_draft import ScreenDraft, writer_lock
-        from server import finish_screencast, portable_recording_drafts, save_portable_recording, session_annotation_asset
-        from session_store import SessionStore
+        from server import finish_screencast, portable_recording_drafts, save_portable_recording, select_annotation_folder, session_annotation_asset
         from windows_screencast import WindowsScreenRecording
 
         app = FastAPI()
@@ -1697,12 +1889,20 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ScreenDraft.read(take.draft.folder).audio_sources, ())
             self.assertEqual(take.status()["error"], "Microphone unavailable.")
 
-            previous = ScreenDraft(root / str(uuid4()), "window", ("mic", "system"))
+            drive = root / "Annotations drive"
+            drive.mkdir()
+            pinned = select_annotation_folder(state.library, str(drive.resolve()))["storageId"]
+            previous = ScreenDraft(root / str(uuid4()), "window", ("mic", "system"), pinned)
             previous.create()
             await generate_video(previous)
+            self.assertEqual(ScreenDraft.read(previous.folder).annotation_location, pinned)
+            select_annotation_folder(state.library, None)
             audible = ScreenDraft(root / str(uuid4()), "window", ("mic", "system"))
             audible.create()
             await generate_video(audible, audio=True)
+            metadata = audible.folder / "draft.json"
+            metadata.write_text(json.dumps({"version": 1, "source": "window", "audio": ["mic", "system"]}))
+            self.assertIsNone(ScreenDraft.read(audible.folder).annotation_location)
             without_preview = ScreenDraft(root / str(uuid4()), "area", ())
             without_preview.create()
             await generate_video(without_preview)
@@ -1716,9 +1916,22 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(saved.status_code, 202, saved.text)
                     self.assertEqual(saved.json(), {"id": take.draft.key})
                     self.assertIsNone(state.portable_screencast)
+                    disconnected = drive.rename(root / "Disconnected drive")
+                    drive.mkdir()
+                    state.library = SessionStore(state.library.root)
+                    waiting = await client.post(f"/api/portable/recording/{previous.key}/finish")
+                    self.assertEqual(waiting.status_code, 503)
+                    self.assertIn("Reconnect", waiting.json()["detail"])
+                    self.assertTrue(previous.movie.is_file())
+                    self.assertFalse(state.library.exists(previous.key))
+                    self.assertEqual(list(drive.iterdir()), [])
+                    drive.rmdir()
+                    disconnected.rename(drive)
                     recovered = await client.post(f"/api/portable/recording/{previous.key}/finish")
                     self.assertEqual(recovered.status_code, 202, recovered.text)
                     self.assertEqual(recovered.json(), {"id": previous.key})
+                    self.assertEqual(state.library.media(previous.key)[0].parent.parent, drive.resolve())
+                    self.assertEqual(state.library.media(take.draft.key)[0].parent.parent, state.library.audio)
                     pending = await client.post(f"/api/portable/recording/{audible.key}/finish")
                     self.assertEqual(pending.status_code, 503, pending.text)
                     self.assertTrue(audible.movie.is_file())
@@ -1737,6 +1950,11 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(sheet.headers["Content-Type"], "image/png")
                     self.assertEqual(sheet.content[:8], b"\x89PNG\r\n\x1a\n")
                     self.assertEqual(struct.unpack(">II", sheet.content[16:24]), (872, 282))
+                    self.assertEqual(annotation["keyframes"], [1, 2])
+                    self.assertEqual(annotation["keyframes"], manifest["keyframes"])
+                    still = (await client.get(f"/api/sessions/{draft.key}/annotation/frame-01")).raise_for_status()
+                    self.assertEqual(still.headers["Content-Type"], "image/png")
+                    self.assertEqual(struct.unpack(">II", still.content[16:24]), (64, 64))
                 annotation = state.library.get(without_preview.key)["annotation"]
                 self.assertEqual(annotation["frames"], [])
                 self.assertIsNone(annotation["contactSheetUrl"])
@@ -1876,6 +2094,7 @@ class PortableWorkspaceTests(unittest.IsolatedAsyncioTestCase):
               patch("linux_desktop_portal.ScreenshotPortal", return_value=still_portal),
               patch("linux_screencast.ScreenCastPortal", return_value=video_portal)):
             state.screen_draft_dir = Path(staging)
+            state.library = SessionStore(Path(staging) / "library")
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as browser:
                 await browser.post(BOOTSTRAP, headers={**headers, "X-Jaro-Workspace-Key": record["workspaceKey"]})
                 shot = asyncio.create_task(browser.post(still + "?source=picker", headers=headers))
@@ -3025,7 +3244,7 @@ sys.stdout.buffer.write(frame * 31)
                 "Cookie": "jaro-workspace-43722=" + record["workspaceKey"],
             })).status_code, 403)
 
-    async def test_video_export_requires_the_desktop_and_rejects_overlapping_saves(self):
+    async def test_annotation_export_requires_the_desktop_and_rejects_overlapping_saves(self):
         from server import export_portable_annotation
 
         origin = "http://127.0.0.1:43721"
@@ -3048,11 +3267,15 @@ sys.stdout.buffer.write(frame * 31)
         auth = {"Origin": origin}
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=origin) as client:
             with (patch("server.URL", origin), patch("desktop_file_dialog.file_dialog", return_value=Path("jaro-save-video")),
+                  patch("desktop_file_dialog.choose_file", new_callable=AsyncMock) as choose,
+                  patch("annotation_package.write_package", return_value={"saved": True}) as package,
                   patch("portable_video_export.save_annotation_video", new_callable=AsyncMock, side_effect=save) as export):
                 await client.post(BOOTSTRAP, headers={**auth, "X-Jaro-Workspace-Key": record["workspaceKey"]})
                 self.assertEqual((await client.post(route, headers=auth, json={})).status_code, 403)
                 await client.post(BOOTSTRAP, headers={**auth, "X-Jaro-Workspace-Key": record["workspaceDesktopKey"]})
                 self.assertEqual((await client.post(route, json={})).status_code, 403)
+                self.assertEqual((await client.post(route, headers=auth,
+                    json={"kind": "package", "span": {"startMs": 0, "endMs": 800}})).status_code, 422)
                 for span in ({"startMs": True, "endMs": 800}, {"startMs": 350, "endMs": 800}):
                     self.assertEqual((await client.post(route, headers=auth, json={"span": span})).status_code, 422)
                 export.assert_not_called()
@@ -3060,12 +3283,19 @@ sys.stdout.buffer.write(frame * 31)
                 pending = asyncio.create_task(client.post(route, headers=auth, json={"span": {"startMs": 100, "endMs": 800}}))
                 try:
                     await asyncio.wait_for(entered.wait(), 2)
-                    self.assertEqual((await client.post(route, headers=auth, json={})).status_code, 409)
+                    self.assertEqual((await client.post(route, headers=auth, json={"kind": "package"})).status_code, 409)
                     self.assertTrue(app.state.jobs)
                 finally:
                     finish.set()
                 self.assertEqual((await pending).json(), {"saved": True})
                 export.assert_awaited_once_with(app.state.library, Path("jaro-save-video"), key, (100, 800))
+                choose.return_value = None
+                self.assertEqual((await client.post(route, headers=auth, json={"kind": "package"})).json(), {"saved": False})
+                package.assert_not_called()
+                choose.return_value = Path("/export-folder")
+                self.assertEqual((await client.post(route, headers=auth, json={"kind": "package"})).json(), {"saved": True})
+                choose.assert_awaited_with(Path("jaro-save-video"), "--choose-annotation-export-folder")
+                package.assert_called_once_with(app.state.library, key, Path("/export-folder"))
 
     async def test_stupase_worker_passes_silent_chunks_and_guards_stale_retire(self):
         from dictation_input import StuPASECleanup

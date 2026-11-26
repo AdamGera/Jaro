@@ -1,6 +1,6 @@
 [project]
 name = "jaro"
-version = "0.0.10"
+version = "0.0.11"
 description = "Your recordings, transcripts, and notes stay on your Mac."
 license = "Apache-2.0"
 authors = [{ name = "Jard" }]

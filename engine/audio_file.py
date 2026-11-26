@@ -39,7 +39,30 @@ async def stop_process(process: asyncio.subprocess.Process):
         await process.communicate()
 
 
+def _fast_wav_duration(path: Path) -> float | None:
+    """Read uncompressed PCM WAV duration directly without spawning ffprobe."""
+    try:
+        if not path.is_file():
+            return None
+        size = path.stat().st_size
+        with wave.open(str(path), "rb") as stream:
+            channels = stream.getnchannels()
+            width = stream.getsampwidth()
+            rate = stream.getframerate()
+            frames = stream.getnframes()
+            if stream.getcomptype() != "NONE" or channels < 1 or width not in (1, 2, 3, 4) or rate <= 0 or frames <= 0:
+                return None
+        if size < 44 + frames * channels * width:
+            return None
+        return frames / rate
+    except (OSError, EOFError, wave.Error):
+        return None
+
+
 async def audio_duration(path: Path) -> float | None:
+    fast = _fast_wav_duration(path)
+    if fast is not None:
+        return fast
     process = await asyncio.create_subprocess_exec(
         codec_binary("ffprobe"), "-v", "error", *INPUT_OPTIONS, "-select_streams", "a:0",
         "-show_entries", "stream=index,duration:format=duration", "-of", "json", path,
@@ -124,10 +147,23 @@ def _decimate_48k_kernel():
     return kernel.astype(np.float32)
 
 
-def _read_fast_wav_pcm(path: Path) -> bytes | None:
-    """Decode short mono 16-bit 16/48 kHz PCM WAVs in-process without spawning ffmpeg."""
+def decimate_pcm16_to_16k_f32(raw: bytes, rate: int) -> bytes | None:
+    """Resample mono s16le 16 kHz or 48 kHz PCM to 16 kHz f32le in-process."""
     import numpy as np
 
+    if rate not in (SAMPLE_RATE, 48_000) or not raw or len(raw) % 2:
+        return None
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) * np.float32(1.0 / 32768.0)
+    if rate == 48_000:
+        kernel = _decimate_48k_kernel()
+        half = len(kernel) // 2
+        padded = np.pad(samples, half, mode="edge")
+        samples = np.convolve(padded, kernel, mode="valid")[::3]
+    return np.ascontiguousarray(samples, dtype="<f4").tobytes()
+
+
+def _read_fast_wav_pcm(path: Path) -> bytes | None:
+    """Decode short mono 16-bit 16/48 kHz PCM WAVs in-process without spawning ffmpeg."""
     try:
         with wave.open(str(path), "rb") as stream:
             if (stream.getnchannels(), stream.getsampwidth(), stream.getcomptype()) != (1, 2, "NONE"):
@@ -143,13 +179,7 @@ def _read_fast_wav_pcm(path: Path) -> bytes | None:
         return None
     if len(raw) != frames * 2:
         return None
-    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) * np.float32(1.0 / 32768.0)
-    if rate == 48_000:
-        kernel = _decimate_48k_kernel()
-        half = len(kernel) // 2
-        padded = np.pad(samples, half, mode="edge")
-        samples = np.convolve(padded, kernel, mode="valid")[::3]
-    return np.ascontiguousarray(samples, dtype="<f4").tobytes()
+    return decimate_pcm16_to_16k_f32(raw, rate)
 
 
 async def audio_blocks(path: Path, *, multilingual=False, pause_aware=False, fast_wav=False):

@@ -84,7 +84,7 @@ class DesktopPortal:
     async def dbus(self, member, signature, body):
         return await self.call(DBUS, member, signature, body, path="/org/freedesktop/DBus", destination=DBUS)
 
-    async def connect(self):
+    async def connect(self, *, app_id=APP_ID):
         self.bus = MessageBus(negotiate_unix_fd=self.negotiate_fds)
         async with asyncio.timeout(4):
             await self.bus.connect()
@@ -101,7 +101,7 @@ class DesktopPortal:
         await self.dbus("AddMatch", "s", [f"type='signal',sender='{DBUS}',interface='{DBUS}',member='NameOwnerChanged',arg0='{DESKTOP}'"])
         # Hosts without Registry support still supply their desktop association themselves.
         try:
-            await self.call(REGISTRY, "Register", "sa{sv}", [APP_ID, {}])
+            await self.call(REGISTRY, "Register", "sa{sv}", [app_id, {}])
         except DBusError as failure:
             if failure.type not in (DBUS + ".Error.UnknownMethod", DBUS + ".Error.UnknownInterface"):
                 raise

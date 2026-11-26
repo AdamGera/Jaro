@@ -95,7 +95,7 @@ export function OutputOverview({ native, status }: { native: DesktopBridge; stat
     }
   }
 
-  return <section className="dictation-settings dictation-preferences" aria-label={t("Dictation output")}>
+  return <section className="dictation-output-overview" aria-label={t("Dictation output")}>
     <SettingGroup id="dictation-output-settings-title" title={t("Output settings")}>
       <div className="dictation-output-content" data-setting-title={t("Output settings")}
         data-setting-description={t("Edit with agent or reveal the settings file")}>

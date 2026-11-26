@@ -22,10 +22,26 @@ async function run() {
     })
     await page.addInitScript(path => {
       window.copied = []
+      window.guideActions = []
       Object.defineProperty(navigator, "clipboard", {value: {writeText: async text => window.copied.push(text)}})
-      window.zero = {invoke: async command => {
+      const agents = [
+        {agent: "codex", found: true, state: "missing", path: "/fixture/.agents/skills/jaro-annotate/SKILL.md"},
+        {agent: "claude", found: true, state: "different", path: "/fixture/.claude/skills/jaro-annotate/SKILL.md"},
+        {agent: "opencode", found: true, state: "managed", path: "/fixture/.config/opencode/skills/jaro-annotate/SKILL.md"},
+        {agent: "pi", found: false, state: "missing", path: "/fixture/.pi/agent/skills/jaro-annotate/SKILL.md"},
+      ]
+      window.zero = {invoke: async (command, payload) => {
         if (command === "jard.agentSetup") return {cli: path}
         if (command === "jard.permission") return {status: "granted"}
+        if (command === "jard.annotation") return {phase: "idle"}
+        if (command === "jard.annotationAgentSkill") {
+          window.guideActions.push(payload)
+          if (payload.action === "guide") return {markdown: "# Jaro guide fixture\n"}
+          if (payload.action === "install" || payload.action === "update") {
+            agents.find(row => row.agent === payload.agent).state = "installed"
+          }
+          return {agents: agents.map(row => ({...row}))}
+        }
         return {}
       }}
     }, cli)
@@ -67,7 +83,22 @@ async function run() {
     for (const {section, preview} of narrow) {
       assert(preview[0] >= section[0] && preview[1] <= section[1] + 1, JSON.stringify({section, preview}))
     }
-    console.log("CLI and MCP Settings copied the bundle-specific prompt, command, and five client setups in WebKit.")
+    await page.setViewportSize({width: 1050, height: 760})
+    await page.getByRole("tablist", {name: "Settings", exact: true}).getByRole("tab", {name: "Annotate"}).click()
+    const agents = page.getByRole("region", {name: "Agents"})
+    assert.deepEqual(await page.evaluate(() => window.guideActions), [])
+    await agents.getByText("Capture review guides", {exact: true}).click()
+    await agents.getByRole("button", {name: "Copy guide"}).click()
+    assert.equal(await latest(), "# Jaro guide fixture\n")
+    await agents.getByText("Managed elsewhere", {exact: true}).waitFor()
+    await agents.getByText("Agent not configured", {exact: true}).waitFor()
+    await agents.getByRole("button", {name: "Install guide"}).click()
+    await agents.getByText("Guide installed. Open a new agent chat to use it.", {exact: true}).waitFor()
+    await agents.getByRole("button", {name: "Replace guide"}).click()
+    assert.deepEqual(await page.evaluate(() => window.guideActions.filter(command => command.agent)), [
+      {action: "install", agent: "codex"}, {action: "update", agent: "claude"},
+    ])
+    console.log("WebKit verified bundle-specific CLI and MCP copying, and annotation guide copying, installation, and replacement.")
   } finally { await browser.close() }
 }
 

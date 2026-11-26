@@ -19,6 +19,7 @@ from uuid import UUID
 
 import httpx
 
+from annotation_agent_skill import AGENTS, manage as manage_annotation_guide
 from diagnostics import EVENT_LOG, PROCESS_LOG, tail_log
 from dictation_settings import SETTINGS_LIMIT, validate_changes
 from engine_lifecycle import PORT, URL, desktop_control_path, library_path, read_native_token, running_engine
@@ -27,7 +28,7 @@ from managed_preferences import ManagedFeatureError
 from model_installation import ModelUnavailable, ensure_model, install_model, model_status
 from native_recordings import normalize_meeting_title
 from meeting_exports import clock_24
-from saved_annotations import annotation_context, annotation_detail
+from saved_annotations import annotation_context, annotation_detail, frame_time
 from saved_dictations import history_page, preferences_path, read_private_history_plist, render_history
 from saved_meetings import get_meeting, meeting_detail, meeting_search_report, meetings as saved_meetings, read_portable_live_meeting, render_export, timestamp
 from session_store import MissingSession, SessionStore
@@ -470,8 +471,27 @@ def read_history(args):
 def read_annotations(library, args):
     if args.action == "list":
         return {"version": 1, "annotations": library.annotations(limit=args.limit)}
-    detail = annotation_detail(library, args.id)
-    if args.action == "context":
+    from annotation_package import capture_document, is_package_reference, read_package, stroke_times
+
+    document = None
+    inspect_capture = args.action == "inspect" and (args.json or args.strokes)
+    if is_package_reference(args.id):
+        document, detail = read_package(args.id)
+    else:
+        detail = annotation_detail(library, args.id, include_capture=inspect_capture or args.action == "zoom")
+    if args.action in ("frames", "zoom"):
+        from annotation_review import extract_frames, zoom
+
+        if args.action == "frames":
+            return asyncio.run(extract_frames(detail, library.root, args))
+        return asyncio.run(zoom(detail, document or capture_document(detail), library.root, args))
+    if inspect_capture:
+        if document is None:
+            document = capture_document(detail)
+        if args.strokes:
+            return {"id": detail["id"], "strokes": stroke_times(document)}
+        return document
+    if args.action in ("context", "inspect"):
         return {**annotation_context(detail), "contactSheetPath": detail["contactSheetPath"]}
     return detail
 
@@ -591,10 +611,32 @@ def main():
     annotation_actions = annotate.add_subparsers(dest="action", required=True)
     annotation_list = annotation_actions.add_parser("list")
     annotation_list.add_argument("--limit", type=int, choices=range(1, 201), metavar="1–200", default=20)
-    annotation_show = annotation_actions.add_parser("show")
-    annotation_show.add_argument("id", help="Annotation Session UUID, unique prefix, or latest.")
+    annotation_skill = annotation_actions.add_parser("skill", help="Print or install the guide agents use to review captures.")
+    skill_options = annotation_skill.add_mutually_exclusive_group()
+    skill_options.add_argument("--status", action="store_true", help="List guide locations and installation status.")
+    skill_options.add_argument("--install", choices=AGENTS, help="Install the guide for a configured agent.")
+    skill_options.add_argument("--update", choices=AGENTS, help="Replace this agent's regular guide with the bundled version.")
+    annotation_show = annotation_actions.add_parser("show", help="Show annotation details and available file paths.")
     annotation_prompt = annotation_actions.add_parser("context", help="Write a saved annotation's narration and frame times as Markdown.")
-    annotation_prompt.add_argument("id", help="Annotation Session UUID, unique prefix, or latest.")
+    annotation_inspect = annotation_actions.add_parser("inspect", help="Read the narration, full JSON, or recorded strokes.")
+    annotation_inspect.add_argument("--strokes", action="store_true", help="List recorded strokes with their times.")
+    for action in (annotation_show, annotation_prompt, annotation_inspect):
+        action.add_argument("id", nargs="?", default="latest",
+                            help="Session UUID, unique prefix, latest (the default), or an exported package path.")
+    annotation_frames = annotation_actions.add_parser("frames", help="Export a range of video stills as PNG files.")
+    annotation_frames.add_argument("--from", dest="start", required=True, help="Start time in seconds, MM:SS, or HH:MM:SS.")
+    annotation_frames.add_argument("--to", dest="end", required=True, help="End time in the same format as --from.")
+    annotation_frames.add_argument("--fps", type=int, choices=range(1, 241), default=4, metavar="1–240")
+    annotation_zoom = annotation_actions.add_parser("zoom", help="Build a contact sheet around a moment in the recording.")
+    focus = annotation_zoom.add_mutually_exclusive_group(required=True)
+    focus.add_argument("--at", help="A timestamp or phrase from the timed narration.")
+    focus.add_argument("--mark", type=int, help="A stroke ID from annotate inspect --strokes.")
+    annotation_zoom.add_argument("--span", type=float, default=2, help="Seconds of video around that moment.")
+    annotation_zoom.add_argument("--frames", type=int, choices=range(1, 49), default=12, metavar="1–48")
+    annotation_zoom.add_argument("--full", action="store_true", help="Include the whole picture when reviewing a stroke.")
+    for action in (annotation_frames, annotation_zoom):
+        action.add_argument("id", nargs="?", default="latest", help="Session UUID, unique prefix, latest, or an exported package path.")
+        action.add_argument("--output", type=Path, help="Write a new folder inside this directory. Defaults to the system temporary folder.")
     annotation_start = annotation_actions.add_parser("start", help="Record the display under the pointer or choose a source.")
     annotation_start.add_argument("--source", choices=("display", "window", "area", "phone"),
                                   help="explicit source (phone requires a USB iPhone or iPad)")
@@ -614,7 +656,7 @@ def main():
     folder_options = annotation_storage.add_mutually_exclusive_group()
     folder_options.add_argument("--folder", type=Path, help="Save new annotations in this existing directory.")
     folder_options.add_argument("--default", action="store_true", help="Use the Jaro Session library.")
-    folder_options.add_argument("--reveal", action="store_true", help="Open the current Annotations folder in Finder.")
+    folder_options.add_argument("--reveal", action="store_true", help="Open the current Annotations folder in the desktop file manager.")
     annotation_destinations = annotation_actions.add_parser("destinations", help="List open local OpenCode v2 sessions.")
     annotation_destinations.add_argument("--query", default="", help="Match a session title, directory, or ID.")
     annotation_destinations.add_argument("--capture", help="Include the saved destination and suggestions for this annotation.")
@@ -643,7 +685,8 @@ def main():
                                  help="Allow OpenCode to restore changed files when the turn ran a successful file edit.")
     annotation_correct = annotation_actions.add_parser("correct", help="Ask OpenCode to disregard a delivered annotation.")
     annotation_correct.add_argument("delivery_id", help="Receipt ID returned by annotate send or annotate deliveries.")
-    for action in (annotation_list, annotation_show, annotation_prompt, annotation_start, annotation_status, annotation_targets,
+    for action in (annotation_list, annotation_skill, annotation_show, annotation_prompt, annotation_inspect, annotation_zoom, annotation_frames,
+                   annotation_storage, annotation_start, annotation_status, annotation_targets,
                    annotation_stop, annotation_toggle, annotation_draw, annotation_cancel, annotation_destinations, annotation_send, annotation_deliveries,
                    annotation_undo, annotation_correct, annotation_remember, annotation_forget, annotation_route):
         action.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
@@ -666,9 +709,15 @@ def main():
     clear_history = history_actions.add_parser("clear", help="Remove all retained dictations and reset Paste Last.")
     clear_history.add_argument("--yes", action="store_true", help="Confirm deletion of the entire dictation history.")
     clear_history.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
-    actions.add_parser("setup")
+    actions.add_parser("setup", help="Replay dictation setup.")
+    onboarding = actions.add_parser("onboarding", help="Replay the dictation tour.")
+    onboarding_actions = onboarding.add_subparsers(dest="action", required=True)
+    reset_onboarding = onboarding_actions.add_parser("reset", help="Reopen setup with your existing permissions and preferences.")
+    reset_onboarding.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     args = parser.parse_args()
     annotation_command = args.command in ("annotate", "capture")
+    annotation_guide = annotation_command and args.action == "skill"
+    annotation_read = annotation_command and args.action in ("list", "show", "context", "inspect", "frames", "zoom")
     if annotation_command and args.action == "start" and args.area is not None:
         if sys.platform != "linux":
             annotation_start.error("Exact coordinates require native Linux X11. Use --source area to select the region.")
@@ -679,9 +728,9 @@ def main():
         annotate.error("Use the recording controls to draw on this desktop.")
     portable_annotation_action = annotation_command and args.action in ("start", "status", "stop", "toggle", "cancel", "targets", "draw")
     annotation_handoff = annotation_command and args.action in ("destinations", "send", "undo", "correct", "remember", "forget", "route")
-    if os.name == "nt" and args.command not in ("model", "transcribe", "history", "dictation", "mcp") and not (
+    if os.name == "nt" and args.command not in ("model", "transcribe", "history", "dictation", "mcp", "setup", "onboarding") and not (
             (args.command == "meetings" and args.action != "watch") or portable_annotation_action or annotation_handoff
-            or (annotation_command and args.action in ("list", "show", "context", "deliveries"))):
+            or annotation_read or annotation_guide or (annotation_command and args.action in ("deliveries", "storage"))):
         parser.error("Choose model, transcribe, history, dictation, meetings, or annotate on Windows.")
     if args.command == "dictation":
         if args.raw and args.action not in ("start", "toggle"):
@@ -689,6 +738,18 @@ def main():
         if args.print_transcript and args.action not in ("start", "stop"):
             dictate.error("--print requires start or stop")
     try:
+        if annotation_guide:
+            action = "install" if args.install else "update" if args.update else "status" if args.status else "guide"
+            value = manage_annotation_guide(action, args.install or args.update)
+            if args.json:
+                print(json.dumps(value))
+            elif action == "guide":
+                sys.stdout.buffer.write(value["markdown"].encode("utf-8"))
+            else:
+                for row in value["agents"]:
+                    state = row["state"] if row["found"] else "agent not configured"
+                    print(f"{row['agent']}  {state}  {row['path']}")
+            return
         if args.command == "dictation" and args.print_transcript and args.action == "start" and sys.platform != "darwin":
             raise RuntimeError("Starting a print-only dictation is available on macOS. Use `dictation stop --print` here.")
         if args.command == "model":
@@ -743,6 +804,17 @@ def main():
             print(json.dumps(result, ensure_ascii=False) if args.json else result)
             return
         root = library_path()
+        if args.command in ("setup", "onboarding"):
+            if sys.platform in ("win32", "linux"):
+                if sys.platform == "win32":
+                    from windows_dictation_commands import dispatch_onboarding
+                else:
+                    from wayland_dictation_commands import dispatch_onboarding
+                result = dispatch_onboarding(root)
+            else:
+                result = desktop(root, "setup")
+            print(json.dumps(result, ensure_ascii=False))
+            return
         if args.command == "dictation" and sys.platform in ("win32", "linux"):
             if sys.platform == "win32":
                 from windows_dictation_commands import dispatch
@@ -757,7 +829,7 @@ def main():
                 print(json.dumps(result, ensure_ascii=False))
             return
         if annotation_command:
-            if args.action in ("list", "show", "context"):
+            if annotation_read:
                 value = read_annotations(SessionStore(root, read_only=True), args)
             elif portable_annotation_action and sys.platform in ("linux", "win32"):
                 if sys.platform == "win32":
@@ -815,7 +887,7 @@ def main():
                     if args.action == "undo" and args.restore_files:
                         options["restoreFiles"] = True
                 try:
-                    if sys.platform in ("linux", "win32") and annotation_handoff:
+                    if sys.platform in ("linux", "win32") and (annotation_handoff or args.action == "storage"):
                         if sys.platform == "win32":
                             from windows_dictation_commands import dispatch_annotation
                         else:
@@ -840,8 +912,20 @@ def main():
                     if args.cancel:
                         outbox.set_pending_route(capture, "cancelled", "Automatic send cancelled.")
                     value = stored_route_status(outbox, outbox.get_route(capture), capture)
-            if args.action == "context" and not args.json:
-                print(value["markdown"], end="")
+            if args.action in ("context", "inspect") and not args.json:
+                if args.action == "inspect" and args.strokes:
+                    lines = [f"Stroke {stroke['stroke']}  {frame_time(stroke['start'])}–{frame_time(stroke['end'])}"
+                             for stroke in value["strokes"]]
+                    print("\n".join(lines) or "No strokes recorded.")
+                else:
+                    print(value["markdown"], end="")
+            elif args.action == "frames" and not args.json:
+                print("\n".join(value["frames"]))
+            elif args.action == "zoom" and not args.json:
+                print(value["path"])
+                print("Frame times " + ", ".join(f"{second:.3f}s" for second in value["frames"]))
+                if value["narration"]:
+                    print(value["narration"])
             else:
                 print(json.dumps(value, ensure_ascii=False))
             return
@@ -949,8 +1033,6 @@ def main():
                     if not args.json:
                         print(value["text"])
                         return
-            else:
-                value = control(root, token, "setup" if args.command == "setup" else args.action)
         print(json.dumps(value, ensure_ascii=False))
     except KeyboardInterrupt:
         raise SystemExit(130) from None

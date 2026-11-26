@@ -11,6 +11,7 @@ from time import monotonic
 
 from starlette.concurrency import run_in_threadpool
 
+from desktop_clipboard import copy_text
 from dictation_output import canonical_host
 from portable_capture import CaptureError
 from portable_shortcuts import shortcut_parts
@@ -23,7 +24,9 @@ PASTE_CONTINUATION_CHANGED = 6
 PASTE_TARGET_ELEVATED = 7
 PASTE_REQUEST = Struct("<QQIIII32s")
 FOCUS_REQUEST = Struct("<cI")
+PICKER_HEADER = Struct("<cII")
 MAX_PASTE_BYTES = 128 * 1024
+PICKER_LIMIT = 8
 MODES = ("hold", "tap", "holdDouble", "doubleTap")
 DEFAULT_SHORTCUT = "Left Alt"
 MODIFIER_MASKS = {"Alt": 1, "Ctrl": 2, "Shift": 4, "Super": 8}
@@ -162,6 +165,9 @@ class WindowsDictation(PortableDictation):
         self.take_input_revision = 0
         self.last_insertion = None
         self.recovery_focus = None
+        self.picker_sequence = None
+        self.picker_rows = ()
+        self.picker_load = None
         self.gesture_accepted = False
         self.command_focus = None
         self.command_sequence = 0
@@ -244,6 +250,7 @@ class WindowsDictation(PortableDictation):
                         self.activity_channel = None
                         self.last_insertion = None
                         self.gesture_accepted = False
+                        self.close_picker()
                         await stop_process(helper)
                         try:
                             await self.cancel_capture(include_pending=True)
@@ -462,6 +469,24 @@ class WindowsDictation(PortableDictation):
                     else:
                         self.set_capture_target(focus, fields[5] if len(fields) == 6 else "")
                     reply.set_result(True)
+        elif action == "paste-picker":
+            fields = event.split()
+            if len(fields) == 5 and fields[1].isascii() and fields[1].isdecimal() and len(fields[1]) <= 10:
+                sequence = int(fields[1])
+                if 0 < sequence <= 0xFFFFFFFF:
+                    self.close_picker()
+                    self.picker_sequence = sequence
+                    self.recovery_focus = self.event_target(fields[2:5])
+                    self.picker_load = asyncio.create_task(self.load_picker(sequence))
+        elif action in ("picker-paste", "picker-copy"):
+            fields = event.split()
+            if len(fields) == 3 and fields[1] == str(self.picker_sequence) and fields[2] in (
+                    str(index) for index in range(len(self.picker_rows))):
+                entry = self.picker_rows[int(fields[2])]
+                self.close_picker()
+                if self.recovery_focus is not None and self.can_start_recording and not self.busy and not self.state.draining:
+                    self.phase = "pasting"
+                    self.action = asyncio.create_task(self.apply_picker_entry(entry, copy=action == "picker-copy"))
         elif action in ("start", "start-raw", "paste-last"):
             starting = action != "paste-last"
             if self.changing_listener or self.command_focus:
@@ -490,6 +515,7 @@ class WindowsDictation(PortableDictation):
             self.clear_focus()
             self.last_insertion = None
         elif event == "paste-focus-lost":
+            self.close_picker()
             if self.recovery_focus is not None:
                 self.last_insertion = None
             self.recovery_focus = None
@@ -512,6 +538,65 @@ class WindowsDictation(PortableDictation):
     def clear_focus(self):
         self.focus = None
         self.focus_revision += 1
+
+    def close_picker(self):
+        self.picker_sequence = None
+        self.picker_rows = ()
+        if self.picker_load is not None:
+            self.picker_load.cancel()
+            self.picker_load = None
+
+    def recent_picker_rows(self):
+        text = self.snapshot()["text"]
+        try:
+            recent = self.history.recent_paste_entries(PICKER_LIMIT)
+        except HISTORY_ERRORS:
+            recent = ()
+        rows = [(self.last_id, text)] if text else []
+        rows.extend((key, value) for key, value in recent if key != self.last_id or not text)
+        return tuple((key, value) for key, value in rows if picker_text(value))[:PICKER_LIMIT]
+
+    async def load_picker(self, sequence):
+        listener = self.listener
+        if listener is None:
+            return
+        try:
+            available = self.recovery_focus is not None and self.can_start_recording and not self.busy and not self.state.draining
+            rows = await run_in_threadpool(self.recent_picker_rows) if available else ()
+            if self.picker_sequence != sequence or self.listener is not listener:
+                return
+            values = [picker_text(text) for _, text in rows]
+            data = PICKER_HEADER.pack(b"k", sequence, len(rows))
+            data += b"".join(len(value).to_bytes(4, "little") for value in values) + b"".join(values)
+            self.picker_rows = rows
+            listener.stdin.write(data)
+            await listener.stdin.drain()
+        except (OSError, RuntimeError):
+            self.picker_rows = ()
+
+    async def apply_picker_entry(self, entry, *, copy):
+        focus = self.recovery_focus
+        try:
+            available = await run_in_threadpool(self.recent_picker_rows)
+            if not focus or self.recovery_focus is not focus or self.state.draining:
+                return
+            if entry not in available:
+                self.feedback = "That dictation is no longer in Paste Last."
+                return
+            text = entry[1]
+            if copy:
+                try:
+                    await copy_text(text)
+                    self.feedback = "Dictation copied."
+                except (OSError, ValueError):
+                    self.feedback = "Could not copy that dictation."
+            else:
+                # An explicit selection pastes the text shown in the preview.
+                self.feedback = await self.paste_to(text, focus, lambda: self.recovery_focus is focus,
+                                                    self.terminal, self.input_revision, raw=True)
+        finally:
+            self.recovery_focus = None
+            self.phase = "idle"
 
     async def paste_last(self):
         try:
@@ -617,6 +702,7 @@ class WindowsDictation(PortableDictation):
         self.activity_channel = None
         self.last_insertion = None
         self.gesture_accepted = False
+        self.close_picker()
         if self.events is not None:
             self.events.cancel()
             await asyncio.gather(self.events, return_exceptions=True)
@@ -630,3 +716,8 @@ class WindowsDictation(PortableDictation):
 
     async def close(self):
         await self.disable()
+
+
+def picker_text(text):
+    data = text.replace("\r\n", "\n").replace("\n", "\r\n").encode()
+    return data if b"\0" not in data and len(data) <= MAX_PASTE_BYTES else b""

@@ -462,6 +462,16 @@ def desktop_argument(value):
     return '"' + desktop_value(escaped).replace("%", "%%") + '"'
 
 
+def ensure_kde_shortcuts_entry(root):
+    applications = root.parent / "applications"
+    applications.mkdir(parents=True, exist_ok=True)
+    with suppress(FileExistsError):
+        with (applications / APP_ID).open("x", encoding="utf-8") as entry:
+            entry.write("[Desktop Entry]\nType=Application\nName=Jaro\nNoDisplay=true\nTerminal=false\n"
+                        f"Exec={desktop_argument(root / 'jaro')}\nIcon={desktop_value(root / 'current/share/jaro.png')}\n"
+                        f"StartupWMClass={APP_ID}\n")
+
+
 def read_manifest(path, publisher):
     with path.open("rb") as file:
         return verify_manifest(file.read(MAX_MANIFEST + 1), publisher)
@@ -504,6 +514,7 @@ def bootstrap(root, archive, manifest, publisher):
                          f"Exec={command}\nIcon={icon}\nStartupWMClass={APP_ID}\nCategories=AudioVideo;Audio;\n",
                          encoding="utf-8")
         entry.replace(entries / entry.name)
+    ensure_kde_shortcuts_entry(root)
     source_icon = root / "current/share/jaro.png"
     if source_icon.is_file():
         icon_dir = root.parent / "icons/hicolor/512x512/apps"
@@ -537,6 +548,7 @@ def uninstall(root):
     with update_lock(root), installation_lock(root, exclusive=True):
         read_publisher(root)
         remove_desktop_entry(root.parent / "applications" / name, command)
+        remove_desktop_entry(root.parent / "applications" / APP_ID, command)
         remove_desktop_entry(autostart, f"{command} --background", autostart=True)
         with suppress(OSError):
             (root.parent / f"icons/hicolor/512x512/apps/{APP_ID}.png").unlink(missing_ok=True)

@@ -24,3 +24,7 @@ https://github.com/ggml-org/llama.cpp/tree/b12521
 Cisco StuPASE (optional dictation and meeting noise cleanup)
 Apache License 2.0, with MIT components from ASLP-lab, Microsoft, and jishengpeng.
 https://huggingface.co/cisco-ai/stupase/tree/539963f425ae201ac8c379b6480e3b182a4840ad
+
+Rumble2 Flash for the bundled macOS Rust dictation helper
+Apache License 2.0. Q8_0 GGUF conversion by nicolamanzini. The bundle includes the conversion's LICENSE and NOTICE.
+https://huggingface.co/nicolamanzini/Rumble-2-Flash-transcribe-cpp-GGUF/tree/16579a78af16f526b0a949f8616d6038901686b0

@@ -33,6 +33,7 @@ def stage_workspace(target, dist):
         Path("sdk/typescript/index.mjs"),
         Path("sdk/typescript/index.d.mts"),
         Path("sdk/typescript/README.md"),
+        Path("skills/jaro-annotate/SKILL.md"),
     ]
     for path in files:
         if (ROOT / path).is_symlink():

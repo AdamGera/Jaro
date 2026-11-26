@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS preferences (
     shortcutEnabled INTEGER NOT NULL DEFAULT 0 CHECK (shortcutEnabled IN (0,1)),
     portalShortcutEnabled INTEGER NOT NULL DEFAULT 0 CHECK (portalShortcutEnabled IN (0,1)),
     portalRawShortcut INTEGER NOT NULL DEFAULT 0 CHECK (portalRawShortcut IN (0,1)),
+    kdePendingShortcuts TEXT NOT NULL DEFAULT '',
     pasteRestoreToken TEXT NOT NULL DEFAULT '',
     vocabularyEntries TEXT NOT NULL DEFAULT '[]',
     replacements TEXT NOT NULL DEFAULT '',
@@ -136,6 +137,8 @@ class PortableDictationHistory:
                     db.execute(f"ALTER TABLE preferences ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
             if "pasteRestoreToken" not in columns:
                 db.execute("ALTER TABLE preferences ADD COLUMN pasteRestoreToken TEXT NOT NULL DEFAULT ''")
+            if "kdePendingShortcuts" not in columns:
+                db.execute("ALTER TABLE preferences ADD COLUMN kdePendingShortcuts TEXT NOT NULL DEFAULT ''")
             if "vocabularyEntries" not in columns:
                 db.execute("ALTER TABLE preferences ADD COLUMN vocabularyEntries TEXT NOT NULL DEFAULT '[]'")
             if "replacements" not in columns:
@@ -369,6 +372,15 @@ class PortableDictationHistory:
         with self.connection(write=True, required=True) as db, db:
             db.execute("UPDATE preferences SET portalRawShortcut=?", (int(enabled),))
 
+    def kde_pending_shortcuts(self):
+        with self.connection(required=True) as db:
+            value, = db.execute("SELECT kdePendingShortcuts FROM preferences").fetchone()
+        return set(value.split())
+
+    def save_kde_pending_shortcuts(self, actions):
+        with self.connection(write=True, required=True) as db, db:
+            db.execute("UPDATE preferences SET kdePendingShortcuts=?", (" ".join(sorted(actions)),))
+
     def consume_paste_grant(self):
         with self.connection(write=True, required=True) as db, db:
             db.execute("BEGIN IMMEDIATE")
@@ -532,6 +544,18 @@ class PortableDictationHistory:
         if include_audio:
             self._add_audio_availability(result["entries"], now)
         return result
+
+    def recent_paste_entries(self, limit):
+        with self.connection(required=True) as db:
+            db.execute("BEGIN")
+            settings = self.preferences(db)
+            if not settings["retention"]:
+                return []
+            return [(row["id"], row["text"]) for row in db.execute(
+                """SELECT id,text FROM dictations
+                   WHERE time>=? AND kind!='printed' AND text!=''
+                   ORDER BY time DESC,id DESC LIMIT ?""",
+                (self.cutoff(settings, time()), limit))]
 
     def _add_audio_availability(self, entries, now):
         try:

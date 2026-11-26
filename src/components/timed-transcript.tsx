@@ -154,6 +154,7 @@ export const TimedTranscript = memo(function TimedTranscript({
 
   return <div ref={root} tabIndex={-1} className="transcript-text speaker-transcript">
     {content}
-    {listening && <p className="transcript-listening" role="status">{t("Listening…")}</p>}
+    {result.tentative && <p className="transcript-tentative" dir="auto" aria-live="polite">{result.tentative}</p>}
+    {listening && !result.tentative && <p className="transcript-listening" role="status">{t("Listening…")}</p>}
   </div>
 })

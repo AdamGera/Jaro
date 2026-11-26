@@ -1,6 +1,6 @@
 # Linux desktop installation
 
-Download the matching x64 package for Debian 13 or Ubuntu 24.04 LTS from the [latest GitHub release](https://github.com/AdamGera/Jaro/releases/latest).
+Download the matching x64 package for Debian 13 or Ubuntu 24.04 LTS from [GitHub Releases](https://github.com/AdamGera/Jaro/releases).
 
 ## Build from source
 
@@ -19,7 +19,11 @@ python3 desktop/portable/linux/package.py \
 
 `NATIVE_SDK_PATH` points to the installed `@native-sdk/cli` package directory. The packaging step verifies the Linux CPU wheels against `requirements.txt`. Supply `--wheelhouse /path/to/wheels` for offline Python dependency installation. FFmpeg, the system Python interpreter, and the main desktop libraries come from the target distribution. The app keeps its Python dependencies separate from the user's Python installations.
 
-Install the package for your distribution with `sudo apt install ./jaro_<version>-<revision>_ubuntu24.04_amd64.deb` on Ubuntu or `sudo apt install ./jaro_<version>-<revision>_amd64.deb` on Debian. Launch Jaro from the desktop menu or run `jaro`, then choose **Download models** on Home. If you already have the pinned assets in a local cache, use `jardctl model install --all --from /path/to/model-cache` to verify and copy them offline.
+Install the package for your distribution with `sudo apt install ./jaro_<version>-<revision>_ubuntu24.04_amd64.deb` on Ubuntu or `sudo apt install ./jaro_<version>-<revision>_amd64.deb` on Debian. Launch Jaro from the desktop menu or run `jaro` to open guided setup. It prepares local models, helps enable the shortcut and Wayland paste access, and lets you try dictation. If you already have the pinned assets in a local cache, use `jardctl model install --all --from /path/to/model-cache` to verify and copy them offline.
+
+Choose **Settings → Dictation → Replay setup** or run `jardctl onboarding reset` while Jaro is running. The tour checks existing models, approvals, and shortcuts. You can skip practice or finish setup later.
+
+On Wayland, choose **Configure shortcuts** if your desktop leaves the dictation key unassigned. You can cancel a pending desktop approval and retry it. On KDE Plasma, replay setup once after upgrading from a build that used the older shortcut registration. If automatic paste is unavailable or you prefer to leave it off, choose **Continue without automatic paste**. Dictate with your shortcut, then use **Copy last** in Dictation and paste manually.
 
 If you installed Rumble2 Flash alone, use **Settings → General → Local models** in the desktop app to add speaker labels, word timing, and writing support. Speech remains available during setup.
 
@@ -77,13 +81,13 @@ Under **While dictating**, choose whether to leave playback alone, mute or lower
 
 Jaro asks the desktop to prevent idle sleep while it records dictation, audio, or video. When recording ends, Jaro releases the request and the system resumes its usual power policy.
 
-Add names and alternate spellings with **Vocabulary** under **Voice input**. Enter whole-phrase rules such as `kitchen table => studio desk` under **Dictation → Output** or **Settings → Dictation**. Rules apply to new system dictations and can hold up to 4,000 characters. History shows the corrected text and keeps the original audio.
+Add names and alternate spellings with **Vocabulary** under **Voice input**. Enter whole-phrase rules such as `kitchen table => studio desk` under **Settings → Dictation → Output and vocabulary corrections**. Rules apply to new system dictations and can hold up to 4,000 characters. History shows the corrected text and keeps the original audio.
 
 Use **Settings → Dictation → Shortcuts** to choose how a registered X11 or Wayland portal shortcut starts and finishes dictation. **Tap to start and stop** is the default. **Hold** finishes when you release the shortcut. **Hold or double-tap** also lets you double-tap to keep recording hands-free. **Double-tap only** starts on two quick taps. Press the shortcut once to finish a hands-free take.
 
 When a global shortcut ends a take, Jaro keeps 200 ms of audio for the last syllable. If you're still speaking, it waits for a pause for up to 600 ms total. Workspace and command stops end capture immediately.
 
-If the microphone stops delivering audio mid-dictation, Jaro transcribes the speech it already heard and copies it to the clipboard. You can review it in **Dictation → History** when History is enabled, or use **Copy last** if the desktop blocked clipboard access.
+If the microphone stops delivering audio mid-dictation, Jaro transcribes the speech it already heard and copies it to the clipboard. You can review it in **Dictation → Saved dictations** when History is enabled, or use **Copy last** if the desktop blocked clipboard access.
 
 You can start another dictation while Jaro processes the first. Jaro finishes takes in order and waits until the microphone closes before pasting. X11 keeps each take tied to its original field. On Wayland, older overlapping takes also paste when the desktop accessibility service confirms that the original field still has focus. Otherwise, they stay available in History when enabled.
 
@@ -91,17 +95,17 @@ On Wayland with the AT-SPI accessibility service, back-to-back takes and **Paste
 
 Chromium must expose its editor to the desktop accessibility service for joining to work. If Jaro observes the original field and it loses focus before paste, the transcript stays available in History or through **Copy last**. [Chromium accessibility](https://new.chromium.org/developers/accessibility/testing/automated-testing/ax-inspect/)
 
-Choose **Enable shortcut** under **Dictation → General** to use the global shortcut. Jaro reconnects after restart once the speech model is ready. On Wayland, restoration requires a saved assignment from the desktop. If the keys are unavailable, choose **Enable shortcut** to retry or **Disable on launch** to clear the saved preference. [Global Shortcuts portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html)
+Choose **Enable shortcut** under **Settings → Dictation** to use the global shortcut. Jaro reconnects after restart once the speech model is ready. On Wayland, restoration requires a saved assignment from the desktop. If the keys are unavailable, choose **Enable shortcut** to retry or **Disable on launch** to clear the saved preference. [Global Shortcuts portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html)
 
-Choose **Cancel dictation** from **Dictation → General** while the take is starting, listening, or processing. On X11, **Escape** cancels a hands-free take. Wayland requests **Ctrl+Alt+Shift+X** at shortcut setup, and shows the desktop’s assigned key when it grants one.
+Choose **Cancel dictation** from **Settings → Dictation** while the take is starting, listening, or processing. On X11, **Escape** cancels a hands-free take. Wayland requests **Ctrl+Alt+Shift+X** at shortcut setup, and shows the desktop’s assigned key when it grants one.
 
-With Dictation History on, open **Dictation → History** and select an entry to play its original microphone audio for up to 24 hours. Dictation text follows your History retention setting. Deleting an entry or clearing History also deletes its audio.
+With Dictation History on, open **Dictation → Saved dictations** and select an entry to play its original microphone audio for up to 24 hours. Dictation text follows your History retention setting. Deleting an entry or clearing History also deletes its audio.
 
 Use `jardctl history --text` to read retained dictations or `jardctl history clear --yes` to clear them and reset Paste Last. Clear also resets Paste Last when History is off.
 
 With the X11 or Wayland shortcut enabled, use `jardctl dictation start`, `stop`, `toggle`, `cancel`, or `paste-last`. The same commands are available when **Enable commands** is selected on Wayland. Add `--raw` to `start` or `toggle` to skip output processing. Use `jardctl dictation stop --print` to get the active take on stdout, or add `--json` for structured output. Printed takes leave the focused field, clipboard, and Paste Last unchanged and appear as **Printed** in History when enabled. A silent take exits with code 4.
 
-On GNOME Wayland, open **Dictation → General** and select **Add GNOME shortcuts**. Keep Jaro open while using the keys. Press **Ctrl+Alt+Shift+D** once to begin and again to finish. Use **Ctrl+Alt+Shift+X** to discard the take, or **Ctrl+Alt+V** to paste the last dictation after allowing keyboard and clipboard access. Existing setups can choose **Add cancel shortcut**. If a default key is already assigned, choose a free key in **GNOME Settings → Keyboard → Custom Shortcuts**. Choose **Remove GNOME shortcuts** to remove Jaro’s bindings while keeping manual commands available.
+On GNOME Wayland, open **Settings → Dictation** and select **Add GNOME shortcuts**. Keep Jaro open while using the keys. Press **Ctrl+Alt+Shift+D** once to begin and again to finish. Use **Ctrl+Alt+Shift+X** to discard the take, or **Ctrl+Alt+V** to paste the last dictation after allowing keyboard and clipboard access. Existing setups can choose **Add cancel shortcut**. If a default key is already assigned, choose a free key in **GNOME Settings → Keyboard → Custom Shortcuts**. Choose **Remove GNOME shortcuts** to remove Jaro’s bindings while keeping manual commands available.
 
 On Wayland, choose **Allow paste** and follow any permission prompt from your desktop. On Ubuntu 24.04 with GNOME, turn on **Allow Remote Interaction** and **Allow Clipboard Access**, then choose **Share**. On Sway, Jaro remembers this choice and checks for clipboard access and `wtype` support again after restart. GNOME and Plasma keep the Remote Desktop session open until you disable paste or quit. The desktop’s access indicator may stay visible while the session is open. When the compositor offers data control, Jaro preserves the clipboard formats and leaves any newer copy in place. If the desktop remembers a portal grant, Jaro can reconnect after restart. Choose **Disable paste** to end the session and clear Jaro’s saved choice. If the current desktop cannot restore virtual keyboard access, choose **Forget saved access** to clear that choice. **Copy last** remains available without automatic paste. [Remote Desktop portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)
 
@@ -135,9 +139,9 @@ Choose **Project’s newest chat** to follow the most recently updated open chat
 
 On X11, enable the shortcut in **Settings → Annotate**. Press **Ctrl+Alt+Shift+S** to record the display under the pointer with microphone narration. Press it again or click **Stop & Save** on the recording control. The shortcut can be changed independently of dictation. The control may appear in the video. Use **Draw** in the workspace to mark the live preview.
 
-On desktops with Wayland shortcut approval, enable the shortcut in **Dictation → General** and assign **Annotate** in the desktop prompt. Tap it to choose a display and record with microphone narration. Tap again to save to Sessions. On displays that support desktop drawing, hold the shortcut to draw and release it to stop drawing. If you approved desktop shortcuts before Annotate was available, disable and re-enable them to request the new assignment.
+On desktops with Wayland shortcut approval, enable the shortcut in **Settings → Dictation** and assign **Annotate** in the desktop prompt. Tap it to choose a display and record with microphone narration. Tap again to save to Sessions. On displays that support desktop drawing, hold the shortcut to draw and release it to stop drawing. If you approved desktop shortcuts before Annotate was available, disable and re-enable them to request the new assignment.
 
-On GNOME, **Add GNOME shortcuts** in **Dictation → General** also installs **Jaro · Annotate**. If you already use Jaro’s custom shortcuts, choose **Update GNOME shortcuts**. Annotate uses Ctrl+Alt+Shift+S when available. If another shortcut uses those keys, assign a new key in **GNOME Settings → Keyboard → Custom Shortcuts**. GNOME custom shortcuts act on keypress, so use **Draw** in the recording controls when you want to draw.
+On GNOME, **Add GNOME shortcuts** in **Settings → Dictation** also installs **Jaro · Annotate**. If you already use Jaro’s custom shortcuts, choose **Update GNOME shortcuts**. Annotate uses Ctrl+Alt+Shift+S when available. If another shortcut uses those keys, assign a new key in **GNOME Settings → Keyboard → Custom Shortcuts**. GNOME custom shortcuts act on keypress, so use **Draw** in the recording controls when you want to draw.
 
 Enable **Microphone narration** or **Computer audio** to include those sources. For narration, keep **System default** or choose a microphone for the recording. If the selected microphone disconnects before recording starts, choose another input. The recorder shows a meter for each enabled source. With both enabled, Jaro transcribes the mix locally with speaker labels and keeps the individual tracks in the MP4. Select **Stop and save**, then play the MP4 in the session’s Overview.
 
@@ -154,6 +158,10 @@ If Jaro closes before you save, reopen it and select **Recover** under **Interru
 Open **Images** in the saved recording’s **Overview** to review sampled frames. Select a timestamp to jump in the video or choose **Save contact sheet** to download the PNG.
 
 In Jaro’s desktop window, choose **Save video…** for a full MP4 copy, or choose **Trim video**, set the range, and preview it. **Save clip…** opens the system save dialog. The trimmed copy includes the drawings and all saved audio tracks.
+
+Choose **Export annotation…** to save a `.jaroannotation` folder with the timestamped narration, strokes, and available media and images. The export keeps the original capture in Sessions.
+
+In **Settings → Annotate → Storage**, choose a folder for future captures, reveal it in your file manager, or return to the Session library with **Use Default**. Existing recordings and interrupted takes keep their original destination. If that drive is disconnected, reconnect it to finish recovery or access those recordings. With Jaro running, the same controls are available through `jardctl annotate storage`.
 
 Jaro checks for updates shortly after launch and hourly while it is open. Choose **Look for new versions** next to Settings or in **Settings → General** to check immediately. The desktop tray menu also offers **Check for Updates**, **Download Update**, or **Restart to Update** when available. For a `.deb` installation, **Download Update** opens the matching distribution package in your browser. Close Jaro and wait for its CLI jobs before installing the new package with APT. `sudo apt purge jaro` removes the packaged app. Sessions and models remain in `${XDG_DATA_HOME:-$HOME/.local/share}/jaro`.
 

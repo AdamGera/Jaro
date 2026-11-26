@@ -244,6 +244,9 @@ class PortableUpdateTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "signature"):
                 linux_direct.read_manifest(manifest, linux_direct.PUBLISHER)
             self.assertEqual((root / "jaro").readlink(), Path("manager.py"))
+            kde_entry = root.parent / "applications" / linux_direct.APP_ID
+            self.assertIn("NoDisplay=true", kde_entry.read_text(encoding="utf-8"))
+            self.assertIn(f"Exec={linux_direct.desktop_argument(root / 'jaro')}", kde_entry.read_text(encoding="utf-8"))
             library = work / "jaro"
             library.mkdir()
             (library / "session.txt").touch()
@@ -422,6 +425,8 @@ class PortableUpdateTests(unittest.IsolatedAsyncioTestCase):
             command = linux_direct.desktop_argument(root / "jaro")
             launcher.parent.mkdir()
             launcher.write_text(f"[Desktop Entry]\nExec={command}\n")
+            linux_direct.ensure_kde_shortcuts_entry(root)
+            kde_entry = launcher.with_name(linux_direct.APP_ID)
             login.parent.mkdir(parents=True)
             login.write_text("[Desktop Entry]\nExec=/home/test/custom-launcher\n")
             with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(data / "config"), "RUMBLE_DATA_DIR": str(library)}):
@@ -429,10 +434,12 @@ class PortableUpdateTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaisesRegex(ValueError, "Close Jaro"):
                         linux_direct.uninstall(root)
                 self.assertTrue(launcher.exists())
+                self.assertTrue(kde_entry.exists())
                 self.assertTrue(root.exists())
                 linux_direct.uninstall(root)
             self.assertFalse(root.exists())
             self.assertFalse(launcher.exists())
+            self.assertFalse(kde_entry.exists())
             self.assertTrue(login.exists())
             self.assertTrue(session.exists())
 

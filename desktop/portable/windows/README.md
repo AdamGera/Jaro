@@ -22,7 +22,9 @@ python desktop/portable/windows/package.py \
 
 Run Inno Setup 7.1.1's `ISCC.exe` with the staged `setup.iss` path to produce the installer in the stage's `output` folder. [Inno Setup compiler](https://jrsoftware.org/inno-setup/documentation/topic_compilercmdline.htm)
 
-Open Jaro from the Start menu and choose **Download models** on Home. For an offline install from a pinned model cache, run `jardctl model install --all --from` followed by the cache path. The CLI lives at `%LOCALAPPDATA%\Programs\Jaro\bin\jardctl.exe`.
+Open Jaro from the Start menu to start guided setup. It prepares the local models, points you to **Privacy & security → Microphone** if desktop microphone access is off, and lets you practice with your dictation shortcut. For an offline install from a pinned model cache, run `jardctl model install --all --from` followed by the cache path. The CLI lives at `%LOCALAPPDATA%\Programs\Jaro\bin\jardctl.exe`.
+
+Choose **Settings → Dictation → Replay setup** or run `jardctl onboarding reset` while Jaro is running. The tour checks your existing models, microphone access, and shortcut. You can skip practice or finish setup later.
 
 If you installed Rumble2 Flash alone, use **Settings → General → Local models** in the desktop app to add speaker labels, word timing, and writing support. Speech remains available during setup.
 
@@ -80,29 +82,31 @@ Under **While dictating**, choose whether to leave playback alone, mute or lower
 
 Jaro asks Windows to prevent idle sleep while it records dictation, audio, or video. When recording ends, Jaro releases the request and Windows resumes its usual power policy.
 
-Press **Escape** to discard a hands-free take or cancel a take that is still processing. **Cancel dictation** in **Dictation → General** is also available while Jaro starts, listens, or processes the take.
+Press **Escape** to discard a hands-free take or cancel a take that is still processing. **Cancel dictation** in **Settings → Dictation** is also available while Jaro starts, listens, or processes the take.
 
-Add names and alternate spellings with **Vocabulary** under **Voice input**. Enter whole-phrase rules such as `kitchen table => studio desk` under **Dictation → Output** or **Settings → Dictation**. Rules apply to new system dictations and can hold up to 4,000 characters. History shows the corrected text and keeps the original audio.
+Add names and alternate spellings with **Vocabulary** under **Voice input**. Enter whole-phrase rules such as `kitchen table => studio desk` under **Settings → Dictation → Output and vocabulary corrections**. Rules apply to new system dictations and can hold up to 4,000 characters. History shows the corrected text and keeps the original audio.
 
-In **Dictation → Output**, assign **Dictate without processing** to a separate shortcut. It starts unassigned and uses your current shortcut mode. The original Rumble2 Flash transcript goes to the active field and appears as **Raw** in History. **Paste Last** inserts that text verbatim.
+In **Settings → Dictation → Output and vocabulary corrections**, assign **Dictate without processing** to a separate shortcut. It starts unassigned and uses your current shortcut mode. The original Rumble2 Flash transcript goes to the active field and appears as **Raw** in History. **Paste Last** inserts that text verbatim.
 
 Use **Settings → Dictation → Shortcuts** to choose how Left Alt controls dictation. **Hold** is the default. Choose **Tap to start and stop**, **Hold or double-tap**, or **Double-tap only** for hands-free dictation. Tap Left Alt to finish a hands-free take. If the destination field changes, use **Copy last** to recover the transcript.
 
-Enable the shortcut in **Dictation → General**. Jaro remembers your choice and reconnects after restart once the speech model is ready. If the listener cannot start, choose **Enable shortcut** to retry or **Disable on launch** to clear the saved preference.
+Enable the shortcut in **Settings → Dictation**. Jaro remembers your choice and reconnects after restart once the speech model is ready. If the listener cannot start, choose **Enable shortcut** to retry or **Disable on launch** to clear the saved preference.
 
 When the global shortcut ends a take, Jaro keeps 200 ms of audio for the last syllable. If you're still speaking, it waits for a pause for up to 600 ms total. Stopping from the workspace ends capture immediately.
 
-If the microphone stops delivering audio mid-dictation, Jaro transcribes what it heard and copies the text to the clipboard. You can review it in **Dictation → History** when History is enabled, or use **Copy last** if the clipboard was unavailable.
+If the microphone stops delivering audio mid-dictation, Jaro transcribes what it heard and copies the text to the clipboard. You can review it in **Dictation → Saved dictations** when History is enabled, or use **Copy last** if the clipboard was unavailable.
 
 You can start another dictation while Jaro processes the first. Results finish in order, and paste waits until the microphone closes. If focus leaves a take's original field, that transcript stays available in History when enabled.
 
 Back-to-back dictations in the same field join with a space and sentence-aware capitalization. **Paste Last** can continue the same text. Typing, clicking, or switching focus ends the join. History keeps each take's own transcript.
 
+Tap **Ctrl+Left Alt+V** to paste the last dictation. Hold the shortcut for about 200 ms to preview up to eight recent dictations. Use the arrow keys or click a row to read the full text. Choose **Paste** or press **Enter** to insert the previewed text into the original field, or choose **Copy** to put it on the clipboard. **Esc**, a click outside the picker, or a change in focus dismisses it. With History off, the picker can show the last dictation from the current run.
+
 Windows can block automatic paste into an app running as administrator. When Jaro detects this, Dictation offers **Copy last** so you can paste manually, even with History off. [Windows input security](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)
 
 In the same section, choose **Language** to give Rumble2 Flash a spoken-language hint for system-wide dictation. **Detect automatically** is the default.
 
-With Dictation History on, open **Dictation → History** and select an entry to play its original microphone audio for up to 24 hours. Dictation text follows your History retention setting. Deleting an entry or clearing History also deletes its audio.
+With Dictation History on, open **Dictation → Saved dictations** and select an entry to play its original microphone audio for up to 24 hours. Dictation text follows your History retention setting. Deleting an entry or clearing History also deletes its audio.
 
 Use `jardctl history --text` to read retained dictations or `jardctl history clear --yes` to clear them and reset Paste Last. Clear also resets Paste Last when History is off.
 
@@ -125,6 +129,10 @@ Use **Draw** for window recordings or when the desktop pen is unavailable. **Don
 Open **Images** in the saved recording’s **Overview** to review sampled frames. Select a timestamp to jump in the video or choose **Save contact sheet** to download the PNG.
 
 In Jaro’s desktop window, choose **Save video…** for a full MP4 copy, or choose **Trim video**, set the range, and preview it. **Save clip…** opens the system save dialog. The trimmed copy includes the drawings and all saved audio tracks.
+
+Choose **Export annotation…** to save a `.jaroannotation` folder with the timestamped narration, strokes, and available media and images. The export keeps the original capture in Sessions.
+
+In **Settings → Annotate → Storage**, choose a folder for future captures, reveal it in Explorer, or return to the Session library with **Use Default**. Existing recordings and interrupted takes keep their original destination. If that drive is disconnected, reconnect it to finish recovery or access those recordings. Windows applies the selected folder's permissions. With Jaro running, the same controls are available through `jardctl annotate storage`.
 
 In a saved session’s **Overview**, open **Add images** to capture a window, display, or area. Display screenshots wait three seconds so you can switch windows. For an area screenshot, select and save a crop of the preview. The image appears in that session’s gallery.
 

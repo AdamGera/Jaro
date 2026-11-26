@@ -1337,44 +1337,48 @@ static void testNarrationWithoutVideo(void) {
     puts("Screen permission loss waited for narration, saved strokes and no contact sheet, and rejected a stale finish callback.");
 }
 
+static void testAnnotationInteraction(const char *movie, BOOL verifyFade) {
+    __block BOOL checkedLease = NO;
+    JardAnnotation *annotation = [[JardAnnotation alloc] initWithSend:^(NSString *command, NSDictionary *payload,
+            JardDictationReply reply) {
+        assert([command isEqual:@"jard.annotationLease"]);
+        NSString *identifier = payload[@"id"];
+        assert([[NSUUID alloc] initWithUUIDString:identifier] && [identifier isEqual:identifier.lowercaseString]);
+        checkedLease = YES;
+        reply(nil, @"Stop the fixture before requesting permissions.");
+    } stateChanged:nil];
+    [annotation start:@[] source:@"window" microphone:nil origin:nil quartzPointer:nil reply:^(id result, NSString *error) { assert(!result && error); }];
+    assert(checkedLease && !annotation.busy);
+    NSRect primary = JardAnnotationAppKitRect(CGRectMake(40, 60, 800, 400), 900);
+    assert(NSEqualRects(primary, NSMakeRect(40, 440, 800, 400)));
+    NSRect above = JardAnnotationAppKitRect(CGRectMake(-800, -200, 800, 100), 900);
+    assert(NSEqualRects(above, NSMakeRect(-800, 1000, 800, 100)));
+    assert(NSEqualPoints(JardAnnotationUnitPoint(NSMakePoint(100, 30), NSMakeSize(400, 120)), NSMakePoint(.25, .25)));
+    assert(NSEqualPoints(JardAnnotationUnitPoint(NSMakePoint(-10, 200), NSMakeSize(400, 120)), NSMakePoint(0, 1)));
+    testPhonePicture();
+    testAnnotationAudioSettings();
+    testScreenshotSelection();
+    testRoutingOrigin();
+    testAreaSelection();
+    testAnnotationKeys();
+    testWindowTracking();
+    testPointerDisplaySelection();
+    testWindowSelection();
+    testAnnotationCaptureFilters();
+    testLiveCaptureFilter();
+    testAnnotationControls();
+    testAnnotationFeedback([NSURL fileURLWithPath:@(movie)]);
+    testAnnotationResultPanel();
+    testAnnotationDestinations();
+    testFilteredAnnotationMovie([NSURL fileURLWithPath:@(movie)], verifyFade);
+    testNarrationWithoutVideo();
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         BOOL verifyFade = argc == 4 && [@(argv[3]) isEqual:@"--verify-fade"];
         assert(argc == 3 || verifyFade);
-        __block BOOL checkedLease = NO;
-        JardAnnotation *annotation = [[JardAnnotation alloc] initWithSend:^(NSString *command, NSDictionary *payload,
-                JardDictationReply reply) {
-            assert([command isEqual:@"jard.annotationLease"]);
-            NSString *identifier = payload[@"id"];
-            assert([[NSUUID alloc] initWithUUIDString:identifier] && [identifier isEqual:identifier.lowercaseString]);
-            checkedLease = YES;
-            reply(nil, @"Stop the fixture before requesting permissions.");
-        } stateChanged:nil];
-        [annotation start:@[] source:@"window" microphone:nil origin:nil quartzPointer:nil reply:^(id result, NSString *error) { assert(!result && error); }];
-        assert(checkedLease && !annotation.busy);
-        NSRect primary = JardAnnotationAppKitRect(CGRectMake(40, 60, 800, 400), 900);
-        assert(NSEqualRects(primary, NSMakeRect(40, 440, 800, 400)));
-        NSRect above = JardAnnotationAppKitRect(CGRectMake(-800, -200, 800, 100), 900);
-        assert(NSEqualRects(above, NSMakeRect(-800, 1000, 800, 100)));
-        assert(NSEqualPoints(JardAnnotationUnitPoint(NSMakePoint(100, 30), NSMakeSize(400, 120)), NSMakePoint(.25, .25)));
-        assert(NSEqualPoints(JardAnnotationUnitPoint(NSMakePoint(-10, 200), NSMakeSize(400, 120)), NSMakePoint(0, 1)));
-        testPhonePicture();
-        testAnnotationAudioSettings();
-        testScreenshotSelection();
-        testRoutingOrigin();
-        testAreaSelection();
-        testAnnotationKeys();
-        testWindowTracking();
-        testPointerDisplaySelection();
-        testWindowSelection();
-        testAnnotationCaptureFilters();
-        testLiveCaptureFilter();
-        testAnnotationControls();
-        testAnnotationFeedback([NSURL fileURLWithPath:@(argv[1])]);
-        testAnnotationResultPanel();
-        testAnnotationDestinations();
-        testFilteredAnnotationMovie([NSURL fileURLWithPath:@(argv[1])], verifyFade);
-        testNarrationWithoutVideo();
+        if (!getenv("JARD_TEST_ANNOTATION_ASSETS_ONLY")) testAnnotationInteraction(argv[1], verifyFade);
 
         assert(JardAnnotationInkAlpha(.65) == 1 && fabs(JardAnnotationInkAlpha(.975) - .25) < .00001);
         assert(JardAnnotationInkAlpha(1.30) == 0);
@@ -1415,7 +1419,8 @@ int main(int argc, const char *argv[]) {
         }
         NSString *source = [[@(argv[1]) pathExtension] isEqual:@"mov"] ? @"phone" : @"window";
         NSDictionary *origin = [source isEqual:@"window"]
-            ? @{@"app": @"com.fixture.Browser", @"name": @"Jard", @"site": @"example.test"} : nil;
+            ? @{@"app": @"com.fixture.Browser", @"name": @"Jard", @"site": @"example.test",
+                @"siteUrl": @"https://example.test/project/notes?fixture=private#anchor"} : nil;
         JardWriteAnnotationAssets(movie, source, origin, events, nil, ^(NSImage *preview, NSError *error) {
             assert(error || (preview.size.width > 0 && preview.size.height > 0));
             failure = error;
@@ -1431,6 +1436,17 @@ int main(int argc, const char *argv[]) {
         assert([manifest[@"source"] isEqual:source] && [manifest[@"version"] isEqual:@1]);
         assert(origin ? [manifest[@"origin"] isEqual:origin] : !manifest[@"origin"]);
         assert([manifest[@"events"] count] == 4 && [manifest[@"frames"] count] >= 2);
+        assert([manifest[@"keyframes"] count] == [manifest[@"frames"] count]);
+        for (NSNumber *index in manifest[@"keyframes"]) {
+            NSString *name = [NSString stringWithFormat:@"frame-%02ld.png", index.longValue];
+            NSURL *url = [folder URLByAppendingPathComponent:name];
+            CGImageSourceRef still = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+            assert(still);
+            CGImageRef frame = CGImageSourceCreateImageAtIndex(still, 0, NULL);
+            assert(frame && CGImageGetWidth(frame) <= 1280 && CGImageGetHeight(frame) <= 800);
+            CGImageRelease(frame);
+            CFRelease(still);
+        }
         assert([manifest[@"events"][0][@"liftedAt"] isEqual:@.50]);
         assert(([manifest[@"events"][0][@"from"] isEqual:@[@.15, @.25]] && [manifest[@"events"][2][@"clear"] boolValue]));
         NSURL *preview = [folder URLByAppendingPathComponent:@"contact-sheet.png"];

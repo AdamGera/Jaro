@@ -1,18 +1,17 @@
 import { useInterfaceLanguage } from "@/interface-language"
 import { MicrophoneLevel } from "./microphone-level"
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react"
-import { Activity, ArrowLeft, ArrowRight, Bluetooth, BookOpen, Check, ChevronLeft, ChevronRight, CircleAlert, Clipboard, Clock, Copy, FileText, Keyboard, Languages, LockKeyhole, Mic, Play, Search, ShieldCheck, SlidersHorizontal, Sparkles, Square, Trash2, Type, Volume2, Zap } from "lucide-react"
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from "react"
+import { Activity, ArrowLeft, ArrowRight, Bluetooth, BookOpen, Check, ChevronLeft, ChevronRight, CircleAlert, Clipboard, Clock, Copy, FileText, Keyboard, Languages, LockKeyhole, Mic, Play, Search, Settings, ShieldCheck, SlidersHorizontal, Sparkles, Square, Trash2, Type, Volume2, Zap } from "lucide-react"
 import { AlertDialog, Dialog } from "radix-ui"
 import type { DesktopBridge, DesktopInputDevices } from "@/desktop"
-import { profileName, useNoiseCleanup, type DictationHistory, type DictationHistoryEntry, type DictationHistoryStats, type DictationPreferences, type DictationShortcutSide, type DictationStep, type SystemDictationControls } from "@/system-dictation"
+import { profileName, useNoiseCleanup, type DictationHistory, type DictationHistoryEntry, type DictationHistoryStats, type DictationPreferences, type DictationShortcutSide, type DictationStatus, type DictationStep, type SystemDictationControls } from "@/system-dictation"
 import { OutputOverview, OutputProfiles } from "./dictation-output-profiles"
 import { DictationSoundPicker } from "./dictation-sound-picker"
 import { VocabularySetting } from "./dictation-vocabulary"
 import { LaunchAtLogin } from "./launch-at-login"
 import { RuleEditor, SettingDisclosure, SettingGroup, SettingRow } from "./settings-rows"
-import { SettingsSearch } from "./settings-search"
+import { ActionTooltip } from "./ui/tooltip"
 import { Button } from "./ui/button"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs"
 import "./system-dictation.css"
 
 const steps = ["welcome", "access", "practice", "ready"] as const
@@ -137,24 +136,32 @@ function Waveform({ live = false }: { live?: boolean }) {
 }
 
 type TourProps = { controls: SystemDictationControls; modelReady: boolean; modelFailed: boolean; native?: DesktopBridge }
-export function SystemDictationTour({ controls, modelReady, modelFailed, native }: TourProps) {
+export function SystemDictationTour(props: TourProps) {
+  const status = props.controls.status
+  if (!status) return null
+  const current = steps.findIndex(item => item === status.onboarding)
+  if (current < 0) return null
+  return <DictationTourRun key={current === 0 ? "welcome" : "setup"} {...props} status={status} current={current} />
+}
+
+function DictationTourRun({ controls, modelReady, modelFailed, native, status, current }: TourProps & {
+  status: DictationStatus; current: number
+}) {
   const { t } = useInterfaceLanguage()
-  const { status, run, error, pending } = controls
+  const { run, error, pending } = controls
   const [text, setText] = useState("")
   const [practiced, setPracticed] = useState(false)
   const field = useRef<HTMLTextAreaElement>(null)
   const title = useRef<HTMLHeadingElement>(null)
-  const step = status?.onboarding
-  const current = steps.findIndex(item => item === step)
-  const open = current >= 0
-  const microphoneAllowed = status?.microphone === "granted"
+  const step = status.onboarding
+  const microphoneAllowed = status.microphone === "granted"
   const accessAllowed = microphoneAllowed && status.accessibility
   const ready = accessAllowed && status.listener && modelReady
   const recovering = (step === "practice" || step === "ready") && !ready
   const showAccess = step === "access" || recovering
   const accessStep = !microphoneAllowed ? "microphone" : !accessAllowed ? "accessibility" : "model"
   const shortcutNeedsHelp = accessAllowed && status.listenerNeedsRestart && !status.listener
-  const busy = status?.phase === "starting" || status?.phase === "listening" || status?.phase === "processing"
+  const busy = status.phase === "starting" || status.phase === "listening" || status.phase === "processing"
 
   useEffect(() => {
     if (!showAccess && step !== "practice" && step !== "ready") return
@@ -162,7 +169,6 @@ export function SystemDictationTour({ controls, modelReady, modelFailed, native 
     return () => cancelAnimationFrame(frame)
   }, [step, showAccess, accessStep])
 
-  if (!open || !status) return null
   function go(next: DictationStep) {
     return run({ action: "set", key: "onboarding", value: next })
   }
@@ -292,27 +298,37 @@ type SettingsProps = {
   languages: { code: string; name: string }[]
 }
 
-export function SystemDictationSettings({ openVocabulary, controls, native, languages, monitor = true, visible = true }: SettingsProps & {
-  monitor?: boolean; visible?: boolean
+export function SystemDictationSettings({ openVocabulary, controls, native, languages, visible = true, outputRequest }: SettingsProps & {
+  visible?: boolean; outputRequest?: string
 }) {
   const { t } = useInterfaceLanguage()
   const { status, run, error, pending, setSettingsVisible } = controls
   const [devices, setDevices] = useState<DesktopInputDevices>()
   const refreshDevices = useRef<(() => void) | null>(null)
-  const [feedbackVisible, setFeedbackVisible] = useState(false)
   const cleanupStatus = useNoiseCleanup(native, visible && status?.noiseCleanup === true)
   const stopSoundPreview = useCallback(() => {
     void native.request("systemDictation", { action: "stopSoundPreview" }).catch(() => {})
   }, [native])
   const inputs = devices?.inputs ?? []
+  const outputGroup = useRef<HTMLDivElement>(null)
+  const loaded = Boolean(status)
+
+  useEffect(() => {
+    if (!visible || !outputRequest || !loaded) return
+    const frame = requestAnimationFrame(() => {
+      const summary = outputGroup.current?.querySelector("summary")
+      summary?.scrollIntoView({ block: "start" })
+      summary?.focus({ preventScroll: true })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [visible, outputRequest, loaded])
 
   useEffect(() => stopSoundPreview, [stopSoundPreview])
 
   useEffect(() => {
-    if (!monitor) return
     setSettingsVisible(true)
     return () => { setSettingsVisible(false) }
-  }, [monitor, setSettingsVisible])
+  }, [setSettingsVisible])
 
   useEffect(() => {
     if (!visible) return
@@ -388,8 +404,9 @@ export function SystemDictationSettings({ openVocabulary, controls, native, lang
         <div><strong>{t(microphoneProblem ? "Microphone unavailable" : "Last dictation failed")}</strong><p>{t(failureMessage)}</p></div>
       </div>}
       <div className="dictation-settings-actions">
-        <Button type="button" size="sm" variant="outline" disabled={pending}
-          onClick={() => void set("onboarding", "welcome")}><Sparkles />{access ? "Replay setup" : t("Set up dictation")}</Button>
+        <Button type="button" size="sm" variant="outline" disabled={pending || Boolean(status.pendingJobs) ||
+          status.phase === "starting" || status.phase === "listening" || status.phase === "processing"}
+          onClick={() => void set("onboarding", "welcome")}><Sparkles />{access ? t("Replay setup") : t("Set up dictation")}</Button>
         <Button type="button" size="sm" variant="outline" disabled={!status.hasLast || pending}
           onClick={() => void run({ action: "copyLast" })}><Clipboard />Copy last</Button>
       </div>
@@ -480,98 +497,98 @@ export function SystemDictationSettings({ openVocabulary, controls, native, lang
           </span>
         )}
       </SettingRow>
-      <SettingRow icon={Sparkles} title={t("Noise cleanup (StuPASE)")}
-        detail={status.noiseCleanup && cleanupStatus === "downloading" ? t("Downloading 2.3 GB. Dictation is available during setup.")
-          : status.noiseCleanup && cleanupStatus === "error" ? t("Noise cleanup is unavailable. Turn this setting off and on to retry.")
-          : status.noiseCleanup && cleanupStatus === "ready" ? t("Cleans up background noise locally before transcription.")
-          : t("Downloads 2.3 GB the first time you turn it on.")}>
-        {labels => <input {...labels} type="checkbox" role="switch" checked={status.noiseCleanup ?? false} disabled={pending}
-          onChange={event => void set("noiseCleanup", event.target.checked)} />}
-      </SettingRow>
-      <SettingRow icon={Activity} title={t("Boost microphone (+6 dB)")} detail={t("Raises quiet audio and limits loud peaks before transcription.")}>
-        {labels => <input {...labels} type="checkbox" role="switch" checked={status.boostMicrophone ?? false} disabled={pending}
-          onChange={event => void set("boostMicrophone", event.target.checked)} />}
-      </SettingRow>
       <SettingRow icon={Zap} title="Keep microphone ready" find={t("Turn off the mic when not dictating")} detail="macOS shows the mic in use while Jard is ready to dictate.">
         {labels => (
           <input {...labels} type="checkbox" role="switch" checked={status.keepMicrophoneReady ?? false} disabled={pending}
             onChange={event => void set("keepMicrophoneReady", event.target.checked)} />
         )}
       </SettingRow>
-    </SettingGroup>
-
-    <section className="dictation-preference-section dictation-advanced" aria-labelledby="dictation-advanced-title" data-setting-group="Advanced">
-      <h3 id="dictation-advanced-title">{t("Advanced")}</h3>
-      <SettingDisclosure icon={Volume2} title="Audio and feedback"
-        onToggle={setFeedbackVisible}>
-        <SettingRow icon={Volume2} title={t("While dictating")} find="Playback volume, mute, lower audio or pause media">
-          {labels => (
-            <select {...labels} value={status.audioWhileDictating ?? "none"} disabled={pending}
-              onChange={event => void set("audioWhileDictating", event.target.value as DictationPreferences["audioWhileDictating"])}>
-              <option value="none">{t("Do nothing")}</option><option value="mute">{t("Mute")}</option>
-              <option value="lower">{t("Lower audio")}</option><option value="pause">{t("Pause media")}</option>
-            </select>
-          )}
+      <SettingDisclosure icon={Activity} title={t("Audio processing")}>
+        <SettingRow icon={Sparkles} title={t("Noise cleanup (StuPASE)")}
+          detail={status.noiseCleanup && cleanupStatus === "downloading" ? t("Downloading 2.3 GB. Dictation is available during setup.")
+            : status.noiseCleanup && cleanupStatus === "error" ? t("Noise cleanup is unavailable. Turn this setting off and on to retry.")
+            : status.noiseCleanup && cleanupStatus === "ready" ? t("Cleans up background noise locally before transcription.")
+            : t("Downloads 2.3 GB the first time you turn it on.")}>
+          {labels => <input {...labels} type="checkbox" role="switch" checked={status.noiseCleanup ?? false} disabled={pending}
+            onChange={event => void set("noiseCleanup", event.target.checked)} />}
         </SettingRow>
-        {status.audioWhileDictating === "lower" && <SettingRow icon={Volume2} title={t("Lower to")} detail={t("Percent of the current output volume.")}>
-          {labels => (
-            <input {...labels} type="number" min={0} max={100} step={1} required disabled={pending}
-              key={status.lowerAudioPercent} defaultValue={status.lowerAudioPercent ?? 20}
-              onBlur={event => {
-                const input = event.currentTarget
-                const previous = status.lowerAudioPercent ?? 20
-                if (!input.validity.valid) input.valueAsNumber = previous
-                else if (input.valueAsNumber !== previous) void set("lowerAudioPercent", input.valueAsNumber)
-              }}
-              onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur() }} />
-          )}
-        </SettingRow>}
-        {status.audioWhileDictating === "pause" && <SettingRow icon={LockKeyhole} title="Playback control" find={false}
-          detail={status.mediaAccessMessage || "Open Music, Spotify, or VLC before allowing playback control."} label={false}>
-          <div className="dictation-row-actions dictation-media-actions">
-            <Button variant="outline" size="sm" disabled={pending}
-              onClick={() => void run({ action: "requestMediaAccess" })}>Allow playback control</Button>
-            <Button variant="ghost" size="sm" disabled={pending}
-              onClick={() => void run({ action: "openMediaAutomationSettings" })}>Automation settings</Button>
-          </div>
-        </SettingRow>}
-        <SettingRow icon={Bluetooth} title="Prefer the Mac’s mic over Bluetooth">
-          {labels => (
-            <input {...labels} type="checkbox" role="switch" checked={status.avoidBluetooth ?? false} disabled={pending || !!status.inputDevice}
-              onChange={event => void set("avoidBluetooth", event.target.checked)} />
-          )}
-        </SettingRow>
-        <SettingRow icon={Activity} title={t("Recording indicator")} find="Dictation HUD position">
-          {labels => (
-            <select {...labels} value={status.placement} disabled={pending}
-              onChange={event => void set("placement", event.target.value as DictationPreferences["placement"])}>
-              <option value="top">Top of screen</option><option value="bottom">Bottom of screen</option><option value="cursor">Near the cursor</option><option value="off">Hidden</option>
-            </select>
-          )}
-        </SettingRow>
-        <SettingRow icon={FileText} title="Show live words in practice" detail="Show a draft in the setup practice field while you speak.">
-          {labels => (
-            <input {...labels} type="checkbox" role="switch" checked={status.livePreview ?? false} disabled={pending}
-              onChange={event => void set("livePreview", event.target.checked)} />
-          )}
-        </SettingRow>
-        <SettingRow icon={Volume2} title="Play dictation sounds">
-          {labels => (
-            <input {...labels} type="checkbox" role="switch" checked={status.sound ?? false} disabled={pending}
-              onChange={event => void set("sound", event.target.checked)} />
-          )}
-        </SettingRow>
-        <DictationSoundPicker controls={controls} visible={feedbackVisible} />
-        <SettingRow icon={Volume2} title={t("Sound volume")}>
-          {labels => (
-            <input {...labels} key={soundVolume} defaultValue={soundVolume} type="range" min={0} max={100}
-              disabled={pending || !status.sound} onPointerUp={event => saveSoundVolume(event.currentTarget)}
-              onKeyUp={event => saveSoundVolume(event.currentTarget)} />
-          )}
+        <SettingRow icon={Activity} title={t("Boost microphone (+6 dB)")} detail={t("Raises quiet audio and limits loud peaks before transcription.")}>
+          {labels => <input {...labels} type="checkbox" role="switch" checked={status.boostMicrophone ?? false} disabled={pending}
+            onChange={event => void set("boostMicrophone", event.target.checked)} />}
         </SettingRow>
       </SettingDisclosure>
+    </SettingGroup>
 
-      <SettingDisclosure icon={Type} title="Output and vocabulary corrections">
+    <SettingGroup id="dictation-recording-controls" title={t("Recording controls")}>
+      <SettingRow icon={Volume2} title={t("While dictating")} find="Playback volume, mute, lower audio or pause media">
+        {labels => (
+          <select {...labels} value={status.audioWhileDictating ?? "none"} disabled={pending}
+            onChange={event => void set("audioWhileDictating", event.target.value as DictationPreferences["audioWhileDictating"])}>
+            <option value="none">{t("Do nothing")}</option><option value="mute">{t("Mute")}</option>
+            <option value="lower">{t("Lower audio")}</option><option value="pause">{t("Pause media")}</option>
+          </select>
+        )}
+      </SettingRow>
+      {status.audioWhileDictating === "lower" && <SettingRow icon={Volume2} title={t("Lower to")} detail={t("Percent of the current output volume.")}>
+        {labels => (
+          <input {...labels} type="number" min={0} max={100} step={1} required disabled={pending}
+            key={status.lowerAudioPercent} defaultValue={status.lowerAudioPercent ?? 20}
+            onBlur={event => {
+              const input = event.currentTarget
+              const previous = status.lowerAudioPercent ?? 20
+              if (!input.validity.valid) input.valueAsNumber = previous
+              else if (input.valueAsNumber !== previous) void set("lowerAudioPercent", input.valueAsNumber)
+            }}
+            onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur() }} />
+        )}
+      </SettingRow>}
+      {status.audioWhileDictating === "pause" && <SettingRow icon={LockKeyhole} title="Playback control" find={false}
+        detail={status.mediaAccessMessage || "Open Music, Spotify, or VLC before allowing playback control."} label={false}>
+        <div className="dictation-row-actions dictation-media-actions">
+          <Button variant="outline" size="sm" disabled={pending}
+            onClick={() => void run({ action: "requestMediaAccess" })}>Allow playback control</Button>
+          <Button variant="ghost" size="sm" disabled={pending}
+            onClick={() => void run({ action: "openMediaAutomationSettings" })}>Automation settings</Button>
+        </div>
+      </SettingRow>}
+      <SettingRow icon={Bluetooth} title="Prefer the Mac’s mic over Bluetooth">
+        {labels => (
+          <input {...labels} type="checkbox" role="switch" checked={status.avoidBluetooth ?? false} disabled={pending || !!status.inputDevice}
+            onChange={event => void set("avoidBluetooth", event.target.checked)} />
+        )}
+      </SettingRow>
+      <SettingRow icon={Activity} title={t("Recording indicator")} find="Dictation HUD position">
+        {labels => (
+          <select {...labels} value={status.placement} disabled={pending}
+            onChange={event => void set("placement", event.target.value as DictationPreferences["placement"])}>
+            <option value="top">Top of screen</option><option value="bottom">Bottom of screen</option><option value="cursor">Near the cursor</option><option value="off">Hidden</option>
+          </select>
+        )}
+      </SettingRow>
+      <SettingRow icon={FileText} title="Real-time dictation preview" detail="Show live words beside the dictation indicator while you speak.">
+        {labels => (
+          <input {...labels} type="checkbox" role="switch" checked={status.livePreview ?? false} disabled={pending}
+            onChange={event => void set("livePreview", event.target.checked)} />
+        )}
+      </SettingRow>
+      <SettingRow icon={Volume2} title="Play dictation sounds">
+        {labels => (
+          <input {...labels} type="checkbox" role="switch" checked={status.sound ?? false} disabled={pending}
+            onChange={event => void set("sound", event.target.checked)} />
+        )}
+      </SettingRow>
+      <DictationSoundPicker controls={controls} visible={visible} />
+      <SettingRow icon={Volume2} title={t("Sound volume")}>
+        {labels => (
+          <input {...labels} key={soundVolume} defaultValue={soundVolume} type="range" min={0} max={100}
+            disabled={pending || !status.sound} onPointerUp={event => saveSoundVolume(event.currentTarget)}
+            onKeyUp={event => saveSoundVolume(event.currentTarget)} />
+        )}
+      </SettingRow>
+    </SettingGroup>
+
+    <div className="dictation-output-settings" ref={outputGroup}>
+      <SettingDisclosure key={outputRequest} icon={Type} title={t("Output and vocabulary corrections")} openInitially={outputRequest ? true : undefined}>
         <SettingRow icon={Clipboard} title="Insert text by">
           {labels => (
             <select {...labels} value={status.output} disabled={pending}
@@ -613,8 +630,9 @@ export function SystemDictationSettings({ openVocabulary, controls, native, lang
         </SettingRow>
         <RuleEditor label="App and website insertion" help="Use an app name or site:domain, followed by paste, type, or copy. For example, Terminal => type." value={status.appRules}
           save={value => set("appRules", value)} />
+        {visible && <OutputOverview native={native} status={status} />}
       </SettingDisclosure>
-    </section>
+    </div>
     <SettingGroup id="dictation-labs-title" title={t("Labs")}>
       <SettingRow icon={BookOpen} title={t("Vocabulary menu")} detail={t("Add a term or open your vocabulary from the menu bar.")}>
         {labels => <input {...labels} type="checkbox" role="switch" checked={status.vocabularyMenu ?? false} disabled={pending}
@@ -627,40 +645,37 @@ export function SystemDictationSettings({ openVocabulary, controls, native, lang
   </section>
 }
 
-export function SystemDictationWorkspace({ destination, ...props }: SettingsProps & {
-  destination: "dictation" | "history" | "output"
+export function SystemDictationWorkspace({ controls, native, onSettings }: {
+  controls: SystemDictationControls; native: DesktopBridge; onSettings: () => void
 }) {
-  const { t } = useInterfaceLanguage()
-  const [tab, setTab] = useState(destination === "dictation" ? "general" : destination)
-  const general = useRef<HTMLDivElement>(null)
-  const output = useRef<HTMLDivElement>(null)
-  const { status, pending, run, setSettingsVisible } = props.controls
+  const { status, pending, run, setSettingsVisible } = controls
   useEffect(() => {
     setSettingsVisible(true)
-    return () => { setSettingsVisible(false) }
+    return () => setSettingsVisible(false)
   }, [setSettingsVisible])
-  return <Tabs value={tab} onValueChange={setTab} className="dictation-workspace-tabs">
-    <div className="dictation-workspace-header">
-      <TabsList aria-label="Dictation tabs" variant="line">
-        <TabsTrigger value="general">{t("General")}</TabsTrigger>
-        <TabsTrigger value="output">{t("Output")}</TabsTrigger>
-        <TabsTrigger value="history">{t("History")}</TabsTrigger>
-      </TabsList>
-      <div className="dictation-workspace-actions">
-        <SettingsSearch scope={tab === "output" ? output : general} localFind={tab !== "history"}
-          onReveal={() => setTab(tab === "output" ? "output" : "general")} />
-      {tab === "history" && status && <HistoryRetention value={status.retention} pending={pending}
+  return <>
+    <DictationHistoryHeader onSettings={onSettings}>
+      {status && <HistoryRetention value={status.retention} pending={pending}
         onChange={value => void run({ action: "set", key: "retention", value })} />}
-      </div>
+    </DictationHistoryHeader>
+    <DictationHistoryTab controls={controls} native={native} />
+  </>
+}
+
+export function DictationHistoryHeader({ children, onSettings }: { children: ReactNode; onSettings: () => void }) {
+  const { t } = useInterfaceLanguage()
+  const label = t("Open dictation settings")
+  return <div className="dictation-workspace-header">
+    <h2>{t("Saved dictations")}</h2>
+    <div className="dictation-workspace-actions">
+      {children}
+      <ActionTooltip label={label}>
+        <Button type="button" variant="outline" size="icon-sm" aria-label={label} onClick={onSettings}>
+          <Settings aria-hidden="true" />
+        </Button>
+      </ActionTooltip>
     </div>
-    <TabsContent value="general" forceMount hidden={tab !== "general"}>
-      <div ref={general}><SystemDictationSettings {...props} monitor={false} visible={tab === "general"} /></div>
-    </TabsContent>
-    <TabsContent value="output"><div ref={output}>
-      {status && <OutputOverview native={props.native} status={status} />}
-    </div></TabsContent>
-    <TabsContent value="history" tabIndex={-1}><DictationHistoryTab controls={props.controls} native={props.native} /></TabsContent>
-  </Tabs>
+  </div>
 }
 
 export function HistoryRetention({ value, pending, onChange }: {

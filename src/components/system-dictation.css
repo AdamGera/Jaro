@@ -47,6 +47,15 @@
 }
 .dictation-tour-scene > p { max-width: 48ch; margin: 0; color: var(--muted-foreground); line-height: 1.55; font-size: .9rem; }
 .dictation-tour-scene > p.dictation-tour-hint { margin: 12px 0; font-size: .79rem; }
+.dictation-tour-scene > .dictation-practice, .dictation-tour-scene > .portable-tour-checks { margin-top: 16px; }
+.portable-tour-checks { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; font-size: .85rem; }
+.portable-tour-checks.dictation-permission { flex-direction: row; align-items: center; }
+.portable-tour-checks .dictation-permission { width: 100%; }
+.portable-tour-checks .dictation-permission > span, .portable-tour-checks.dictation-permission > span,
+.dictation-tour-scene > .dictation-access-ready { display: flex; align-items: center; gap: 9px; }
+.portable-tour-checks svg, .dictation-access-ready svg { flex-shrink: 0; }
+.portable-tour-checks p { margin: 0; color: var(--muted-foreground); }
+.dictation-tour-scene > .dictation-access-ready { margin: 16px 0 0; }
 
 .shortcut-mode-dialog {
   width: min(550px, calc(100vw - 28px));
@@ -254,17 +263,18 @@
   gap: 8px 14px;
   margin-bottom: 16px;
 }
+.dictation-workspace-header h2 { margin: 0; font-size: 1rem; font-weight: 650; }
+.dictation-output-overview { display: grid; gap: 18px; padding: 12px var(--setting-inset); }
 .dictation-workspace-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .dictation-preferences { display: grid; gap: 18px; container-type: inline-size; }
-.dictation-workspace-tabs .dictation-preferences { margin-top: 0; padding-top: 0; border-top: 0; }
-.dictation-workspace-tabs:not(:has(.dictation-history-browser)) > :is(.dictation-workspace-header, [role="tabpanel"]) { max-width: 48rem; }
-.dictation-preference-group, .dictation-advanced > details, .dictation-history-index-card, .dictation-history-detail {
+.dictation-preference-group, .dictation-preferences > .dictation-preference-disclosure, .dictation-output-settings > .dictation-preference-disclosure, .dictation-advanced > details,
+.dictation-history-index-card, .dictation-history-detail {
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--surface);
   box-shadow: 0 2px 5px rgb(0 0 0 / 8%);
 }
-.dictation-preference-group, .dictation-advanced > details { --setting-inset: 16px; }
+.dictation-preference-group, .dictation-preferences > .dictation-preference-disclosure, .dictation-output-settings > .dictation-preference-disclosure, .dictation-advanced > details { --setting-inset: 16px; }
 .dictation-preference-section > h3 {
   margin: 0 0 8px;
   padding-inline: 4px;

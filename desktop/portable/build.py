@@ -87,7 +87,7 @@ def build(target, output):
                             "-municode", "-lole32", "-loleaut32", "-luser32", "-o", output / "bin/jaro-capture.exe"], check=True)
             subprocess.run([*flags, HERE / "windows_screen.c", HERE / "windows_pen.c", "-ld3d11", "-ldxgi", "-ldwmapi", "-lgdi32",
                             "-luser32", "-lole32", "-o", output / "bin/jaro-screen.exe"], check=True)
-            subprocess.run([*flags, HERE / "windows_hotkeys.c", HERE / "windows_clipboard.c",
+            subprocess.run([*flags, HERE / "windows_hotkeys.c", HERE / "windows_clipboard.c", HERE / "windows_paste_picker.c",
                             "-luser32", "-lgdi32", "-lole32", "-ladvapi32", "-o", output / "bin/jaro-dictation.exe"], check=True)
             subprocess.run([*flags, HERE / "windows_indicator.c", "-municode", "-Wl,--subsystem,windows",
                             "-luser32", "-lgdi32", "-lshcore", "-o", output / "bin/jaro-indicator.exe"], check=True)
@@ -96,7 +96,7 @@ def build(target, output):
             subprocess.run([*flags, HERE / "windows_tray.c", "-municode", "-Wl,--subsystem,windows", "-luser32",
                             "-lshell32", "-o", output / "bin/jaro-tray.exe"], check=True)
             subprocess.run([*flags, HERE / "save_dialog.c", "-municode", "-Wl,--subsystem,windows", "-lole32",
-                            "-luuid", "-o", output / "bin/jaro-save-video.exe"], check=True)
+                            "-luuid", "-lshell32", "-o", output / "bin/jaro-save-video.exe"], check=True)
             shutil.copyfile(HERE / "windows/Jaro.ico", output / "bin/jaro-tray.ico")
             subprocess.run([*flags, HERE / "windows_audio_control.c", HERE / "windows_media_control.c",
                             "-lole32", "-lapi-ms-win-core-winrt-l1-1-0", "-lapi-ms-win-core-winrt-string-l1-1-0",

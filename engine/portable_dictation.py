@@ -346,6 +346,8 @@ class PortableDictation:
                     return False
                 self.watch_focus()
                 self.phase = "starting"
+                if prewarm := getattr(self.state, "schedule_prewarm", None):
+                    prewarm()
             self.action = asyncio.create_task(self.toggle(released_at=released_at, raw=raw, printed=printed))
             return True
         return False
@@ -451,6 +453,8 @@ class PortableDictation:
                     self.feedback = "Dictation is unavailable while Jaro starts or records audio."
                     return
                 self.phase = "starting"
+                if prewarm := getattr(self.state, "schedule_prewarm", None):
+                    prewarm()
                 self.capture_sound = self.sound
                 # An audition or previous completion sound cannot run into the new take.
                 await self.sounds.stop()

@@ -89,6 +89,7 @@ function pushUntimedBubbles(text: string, from: number, bubbles: Utterance[]) {
 }
 
 export function transcriptTurns({ segments, words, text }: Transcript) {
+  if (!segments.length && !text) return []
   const turns = segments.length ? segments : [{ text, start: 0, end: null, speaker: undefined }]
   const nextAnchor: (number | null)[] = []
   for (let i = words.length - 1; i >= 0; i--) {

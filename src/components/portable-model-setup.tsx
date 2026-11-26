@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useId, useState } from "react"
 import { Download } from "lucide-react"
 import { useInterfaceLanguage } from "@/interface-language"
 import { SettingGroup, SettingRow } from "./settings-rows"
@@ -13,8 +13,9 @@ export type ModelSetup = {
   repair?: boolean
 }
 
-export function PortableModelSetup({ setup, onStarted }: { setup: ModelSetup; onStarted: () => void }) {
+export function PortableModelSetup({ setup, onStarted, inTour = false }: { setup: ModelSetup; onStarted: () => void; inTour?: boolean }) {
   const { t, locale } = useInterfaceLanguage()
+  const heading = useId()
   const [requestPending, setRequestPending] = useState(false)
   const [requestFailed, setRequestFailed] = useState(false)
   const { phase, total, completed = 0, additional, repair } = setup
@@ -64,9 +65,15 @@ export function PortableModelSetup({ setup, onStarted }: { setup: ModelSetup; on
     {(phase !== "needed" || !desktop || requestFailed) && <div className="update-settings-feedback">{feedback}</div>}
   </SettingGroup>
 
-  return <section className="transcript-panel portable-model-setup" aria-labelledby="portable-model-title">
+  if (inTour) return <div className="portable-tour-checks">
+    {phase === "needed" && size && <p>{t("Download size: {size} GB. After setup, these models work offline.", { size })}</p>}
+    {feedback}
+    {button}
+  </div>
+
+  return <section className="transcript-panel portable-model-setup" aria-labelledby={heading}>
     <span className="empty-icon" aria-hidden="true"><Download /></span>
-    <h1 id="portable-model-title">{t("Set up Jaro’s local models")}</h1>
+    <h1 id={heading}>{t("Set up Jaro’s local models")}</h1>
     <p>{t("Install Rumble2 Flash for transcription, Nemotron for speaker labels, and Qwen for notes and summaries.")}</p>
     {phase === "needed" && size && <p>{t("Download size: {size} GB. After setup, these models work offline.", { size })}</p>}
     {feedback}

@@ -1,5 +1,6 @@
 #undef NDEBUG
 #include <assert.h>
+#include <wchar.h>
 #include "../windows_dictation.h"
 
 static DictationTarget frontend;
@@ -197,5 +198,46 @@ int main(void) {
     poll_gesture();
     assert(recording && held);
     puts("A Left Alt tap leaves a held raw take recording.");
+
+    held = recording = false;
+    keys[VK_CONTROL] = keys[VK_MENU] = true;
+    recovery_key_down = recovery_pending = true;
+    recovery_pressed_at = GetTickCount() - PASTE_PICKER_HOLD_MS;
+    recovery_focus.target = frontend;
+    poll_gesture();
+    assert(active_picker && picker_guard && !recovery_pending);
+    DWORD sequence = active_picker;
+    HANDLE reader, writer;
+    assert(CreatePipe(&reader, &writer, NULL, 0));
+    const char first[] = "Latest", second[] = "Older transcript.\r\nSecond line.";
+    DWORD fields[] = {sequence, 2, sizeof(first) - 1, sizeof(second) - 1}, written = 0;
+    assert(WriteFile(writer, fields, sizeof(fields), &written, NULL) && written == sizeof(fields));
+    assert(WriteFile(writer, first, fields[2], &written, NULL) && written == fields[2]);
+    assert(WriteFile(writer, second, fields[3], &written, NULL) && written == fields[3]);
+    CloseHandle(writer);
+    PastePickerRows *rows = read_paste_picker(reader);
+    CloseHandle(reader);
+    assert(rows && rows->sequence == sequence && rows->count == 2);
+    HWND actual_foreground = GetForegroundWindow();
+    assert(show_paste_picker(rows, choose_paste_picker));
+    HWND picker = FindWindowW(L"JaroPastePicker", NULL);
+    HWND edit = FindWindowExW(picker, NULL, L"EDIT", NULL);
+    assert(picker && edit && (GetWindowLongPtrW(picker, GWL_EXSTYLE) & WS_EX_NOACTIVATE));
+    assert(GetForegroundWindow() == actual_foreground);
+
+    recovery_key_down = keys[VK_CONTROL] = keys[VK_LMENU] = keys[VK_MENU] = false;
+    assert(picker_keyboard(VK_DOWN, true) && picker_keyboard(VK_DOWN, false));
+    assert(PeekMessageW(&message, NULL, EVENT_PICKER_KEY, EVENT_PICKER_KEY, PM_REMOVE));
+    paste_picker_key((WORD)message.wParam, message.lParam != 0);
+    WCHAR transcript[80];
+    assert(GetWindowTextW(edit, transcript, 80) && !wcscmp(transcript, L"Older transcript.\r\nSecond line."));
+    paste_picker_key(VK_RETURN, false);
+    assert(picker_choice == 1 && active_picker == sequence);
+    assert(!IsWindow(picker));
+    poll_gesture();
+    assert(!active_picker && picker_guard && picker_choice == -1);
+    focus_event(NULL, EVENT_OBJECT_FOCUS, frontend.focus, OBJID_CLIENT, 1, 1, GetTickCount() + 1);
+    assert(!picker_guard && !recovery_focus.target.window);
+    puts("Hold opens a nonactivating Paste Last preview and a logical focus change invalidates its target.");
     return 0;
 }

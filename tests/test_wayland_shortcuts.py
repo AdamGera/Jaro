@@ -21,7 +21,8 @@ if sys.platform == "linux" and find_spec("dbus_fast"):
     from linux_capture import CaptureError
     from linux_desktop_portal import APP_ID, DBUS, DESKTOP, PATH, REGISTRY, REQUEST, SESSION
     from portable_dictation_history import PortableDictationHistory
-    from wayland_dictation import ANNOTATE, CANCEL, PASTE_LAST, RAW, SHORTCUT, SHORTCUTS, GlobalShortcuts, WaylandDictation
+    from wayland_dictation import (ANNOTATE, CANCEL, KDE_SHORTCUTS_APP_ID, KGLOBALACCEL, KGLOBALACCEL_INTERFACE, PASTE_LAST, RAW,
+                                   SHORTCUT, SHORTCUTS, GlobalShortcuts, WaylandDictation)
 
 
 PRIMARY_LABEL = "Super+D"
@@ -56,6 +57,9 @@ class PortalFixture:
         self.primary_label = PRIMARY_LABEL
         self.was_closed = False
         self.request_closed = False
+        self.version = 2
+        self.kde_actions = {}
+        self.kde_removed = []
 
     async def open(self, address=None):
         self.bus = await MessageBus(bus_address=address).connect()
@@ -88,12 +92,26 @@ class PortalFixture:
     def route(self, message):
         if message.message_type is not MessageType.METHOD_CALL:
             return
+        if message.interface == KGLOBALACCEL_INTERFACE:
+            if message.member == "allActionsForComponent" and message.body == [[KDE_SHORTCUTS_APP_ID]]:
+                rows = [[KDE_SHORTCUTS_APP_ID, key, "Jaro", key] for key in self.kde_actions]
+                return Message.new_method_return(message, "aas", [rows])
+            if message.member == "shortcutKeys":
+                component, key, application, label = message.body[0]
+                assert (component, application, label) == (KDE_SHORTCUTS_APP_ID, "Jaro", key)
+                return Message.new_method_return(message, "a(ai)", [self.kde_actions[key]])
+            if message.member == "unregister":
+                component, key = message.body
+                assert component == KDE_SHORTCUTS_APP_ID
+                self.kde_removed.append(key)
+                del self.kde_actions[key]
+                return Message.new_method_return(message, "b", [True])
         if message.interface == REGISTRY and message.member == "Register":
             self.client = message.sender
             self.registered = message.body[0]
             return Message.new_method_return(message)
         if message.interface == DBUS + ".Properties" and message.body == [SHORTCUTS, "version"]:
-            return Message.new_method_return(message, "v", [Variant("u", 2)])
+            return Message.new_method_return(message, "v", [Variant("u", self.version)])
         if message.interface == SHORTCUTS and message.member == "CreateSession":
             sender = message.sender[1:].replace(".", "_")
             key = message.body[0]["session_handle_token"].value
@@ -157,6 +175,82 @@ class WaylandShortcutTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(3):
             while len(self.events) < count:
                 await asyncio.sleep(.01)
+
+    async def test_cancel_pending_shortcut_approval_preserves_saved_paste(self):
+        self.desktop.approve = None
+        state = SimpleNamespace(draining=False, portable_screencast=None)
+        with TemporaryDirectory() as folder:
+            history = PortableDictationHistory(folder)
+            history.initialize()
+            history.save_paste_grant("existing-paste-grant")
+            dictation = WaylandDictation(state, None, history)
+            try:
+                with patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "KDE"}):
+                    dictation.enable()
+                    async with asyncio.timeout(3):
+                        while self.desktop.bound is None:
+                            await asyncio.sleep(.01)
+                    await dictation.cancel_approval()
+                    self.assertFalse(dictation.authorizing)
+                    self.assertIsNone(dictation.portal)
+                    self.assertTrue(self.desktop.request_closed)
+                    self.assertTrue(self.desktop.was_closed)
+                    self.assertEqual(history.consume_paste_grant(), ("existing-paste-grant", False))
+                    self.assertEqual(dictation.feedback, "Desktop approval was canceled.")
+                    self.desktop.approve = True
+                    dictation.enable()
+                    await dictation.approval
+                    self.assertEqual(dictation.shortcut, PRIMARY_LABEL)
+            finally:
+                await dictation.close()
+
+    async def test_kde_retry_only_removes_abandoned_actions_that_still_have_no_key(self):
+        await self.desktop.bus.request_name(KGLOBALACCEL)
+        self.desktop.kde_actions[CANCEL] = []
+        self.desktop.approve = False
+        state = SimpleNamespace(draining=False, portable_screencast=None)
+        with TemporaryDirectory() as folder, patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "KDE"}):
+            history = PortableDictationHistory(folder)
+            history.initialize()
+            first = WaylandDictation(state, None, history)
+            try:
+                first.enable()
+                await first.approval
+                self.assertFalse(first.enabled)
+                self.assertEqual(self.desktop.registered, KDE_SHORTCUTS_APP_ID)
+                self.assertEqual(history.kde_pending_shortcuts(), {SHORTCUT, PASTE_LAST})
+            finally:
+                await first.close()
+
+            self.desktop.kde_actions.update({SHORTCUT: [[[0]]], PASTE_LAST: [[[0x04000056]]]})
+            self.desktop.approve = True
+            restarted = WaylandDictation(state, None, PortableDictationHistory(folder))
+            try:
+                restarted.enable(restoring=True)
+                await restarted.approval
+                self.assertEqual(self.desktop.kde_removed, [])
+                self.assertEqual(history.kde_pending_shortcuts(), {SHORTCUT, PASTE_LAST})
+                await restarted.disable()
+                restarted.enable()
+                await restarted.approval
+                self.assertEqual(self.desktop.kde_removed, [SHORTCUT])
+                self.assertEqual(set(self.desktop.kde_actions), {CANCEL, PASTE_LAST})
+                self.assertEqual(restarted.shortcut, PRIMARY_LABEL)
+                self.assertEqual(history.kde_pending_shortcuts(), set())
+            finally:
+                await restarted.close()
+
+    async def test_kde_v1_restores_existing_shortcut_without_reopening_settings(self):
+        self.desktop.version = 1
+        with patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "KDE"}):
+            restored = await self.portal.bind(restoring=True)
+        self.assertEqual(restored, {SHORTCUT: PRIMARY_LABEL, PASTE_LAST: RECOVERY_LABEL})
+        self.assertEqual(self.desktop.list_count, 1)
+        self.assertIsNone(self.desktop.bound)
+        self.desktop.notify("Activated")
+        self.desktop.notify("Deactivated")
+        await self.wait_for(2)
+        self.assertEqual(self.events, [(SHORTCUT, True), (SHORTCUT, False)])
 
     async def test_annotation_only_assignment_restores_and_scopes_tap_and_hold(self):
         from portable_annotation_shortcut import AnnotationShortcut

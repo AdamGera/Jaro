@@ -53,7 +53,7 @@ class DictationFastPathTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(captured["timed"])
-        self.assertIsNone(captured["cache"])
+        self.assertEqual(captured["cache"], "static")
         self.assertTrue(captured["include_word_times"])
         self.assertEqual(result["words"], [{"word": "hello", "start": 0.1, "end": 0.4}])
 
@@ -178,6 +178,122 @@ class DictationFastPathTests(unittest.IsolatedAsyncioTestCase):
             stereo = root / "stereo.wav"
             _write_pcm16_wav(stereo, np.zeros(SAMPLE_RATE * 2, dtype=np.float32), rate=SAMPLE_RATE, channels=2)
             self.assertIsNone(audio_file._read_fast_wav_pcm(stereo))
+
+    def test_rumble_prewarm_skips_when_recent_and_warms_when_stale(self):
+        import time
+
+        engine = RumbleModel.__new__(RumbleModel)
+        engine.np = np
+        engine.last_run = 0.0
+        decode_calls = []
+        screen_calls = []
+        released = []
+
+        fail_first_static = True
+
+        def fake_decode(audio, *, max_new_tokens=512, cache_implementation=None, **_kwargs):
+            nonlocal fail_first_static
+            decode_calls.append((len(audio), max_new_tokens, cache_implementation))
+            if cache_implementation == "static" and fail_first_static:
+                fail_first_static = False
+                raise RuntimeError("MPS backend out of memory")
+            engine.last_run = time.monotonic()
+            return "", None
+
+        engine._decode = fake_decode
+        engine.release_device_cache = lambda: released.append(True)
+        engine.aligner = SimpleNamespace(warm_screen=lambda: screen_calls.append(True))
+
+        # Cold model: runs silent prewarm (falling back to dynamic cache on OOM) + warms aligner screen
+        self.assertTrue(engine.prewarm())
+        self.assertEqual(decode_calls, [(SAMPLE_RATE // 2, 1, "static"), (SAMPLE_RATE // 2, 1, None)])
+        self.assertEqual(released, [True])
+        self.assertEqual(screen_calls, [True])
+
+        # Recently run: skips prewarm
+        decode_calls.clear()
+        screen_calls.clear()
+        self.assertTrue(engine.is_warm())
+        self.assertFalse(engine.prewarm())
+        self.assertEqual(decode_calls, [])
+        self.assertEqual(screen_calls, [])
+
+        # Stale again: prewarms with static cache
+        engine.last_run = time.monotonic() - 120.0
+        self.assertFalse(engine.is_warm())
+        self.assertTrue(engine.prewarm())
+        self.assertEqual(decode_calls, [(SAMPLE_RATE // 2, 1, "static")])
+        self.assertEqual(screen_calls, [True])
+
+    async def test_schedule_prewarm_runs_when_idle_and_skips_when_warm_or_busy(self):
+        import asyncio
+
+        calls = []
+
+        class FakeModel:
+            warm = False
+
+            def is_warm(self):
+                return self.warm
+
+            def prewarm(self):
+                calls.append(True)
+                self.warm = True
+                return True
+
+        state = SimpleNamespace(
+            status="ready", draining=False, model=FakeModel(),
+            inference=server.SpeechInference(), prewarm_task=None,
+        )
+        self.assertTrue(server.schedule_prewarm(state))
+        task = state.prewarm_task
+        self.assertIsNotNone(task)
+        await asyncio.wait_for(task, timeout=2)
+        self.assertEqual(calls, [True])
+        # Now warm -> skipped
+        self.assertFalse(server.schedule_prewarm(state))
+        # Stale but busy -> skipped
+        state.model.warm = False
+        state.inference.active = True
+        self.assertFalse(server.schedule_prewarm(state))
+
+    async def test_lazy_diarizer_defers_load_until_needed_and_unloads_when_idle(self):
+        import asyncio
+        import sys
+        import types
+
+        loaded = []
+
+        class FakeDiarizer:
+            def __init__(self, device):
+                loaded.append(device)
+
+        fake_module = types.ModuleType("diarization")
+        fake_module.Diarizer = FakeDiarizer
+        released = []
+        state = SimpleNamespace(
+            diarizer=None, diarizer_lazy=False, diarizer_lock=asyncio.Lock(), diarizer_last_used=0.0,
+            draining=False, jobs=set(), submitting=set(), live_speakers={}, portable_recording=None,
+            inference=server.SpeechInference(),
+            model=SimpleNamespace(device="mps", aligner=object(), release_device_cache=lambda: released.append(True)),
+        )
+        with patch("server.diarization_installed", return_value=True), patch.dict(sys.modules, {"diarization": fake_module}):
+            await server.load_speaker_tools(state)
+            self.assertIsNone(state.diarizer)
+            self.assertTrue(state.diarizer_lazy)
+            self.assertTrue(server.diarization_ready(state))
+            self.assertEqual(loaded, [])
+
+            diarizer = await server.ensure_diarizer(state)
+            self.assertIsInstance(diarizer, FakeDiarizer)
+            self.assertEqual(loaded, ["mps"])
+
+            # Idle past threshold -> unloads diarizer and trims MPS cache
+            state.diarizer_last_used -= server.IDLE_DIARIZER_UNLOAD_SECONDS + 1
+            await server.maybe_unload_idle_diarizer(state)
+            self.assertIsNone(state.diarizer)
+            self.assertTrue(server.diarization_ready(state))
+            self.assertEqual(released, [True])
 
 
 if __name__ == "__main__":

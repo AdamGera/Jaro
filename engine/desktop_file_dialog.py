@@ -13,9 +13,9 @@ def file_dialog():
     return helper if helper.is_file() else None
 
 
-async def choose_file(dialog, argument):
+async def choose_file(dialog, argument, *arguments):
     process = await asyncio.create_subprocess_exec(
-        dialog, argument, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        dialog, argument, *arguments, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
     try:
@@ -30,3 +30,17 @@ async def choose_file(dialog, argument):
             raise ValueError("The desktop file dialog returned an invalid path.")
         return path
     return None
+
+
+async def reveal_folder(folder):
+    if os.name == "nt":
+        await asyncio.to_thread(os.startfile, folder, "explore")
+        return
+    process = await asyncio.create_subprocess_exec("gio", "open", folder, stdout=asyncio.subprocess.DEVNULL,
+                                                   stderr=asyncio.subprocess.DEVNULL)
+    try:
+        async with asyncio.timeout(10):
+            if await process.wait():
+                raise OSError("Could not reveal the Annotations folder.")
+    finally:
+        await stop_process(process)

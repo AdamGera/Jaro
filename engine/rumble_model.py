@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 from unicodedata import normalize
 
@@ -18,6 +19,12 @@ MAX_SAMPLES = 25 * SAMPLE_RATE
 DIARIZATION_ID = "nvidia/Nemotron-3-Diarization"
 DIARIZATION_REVISION = "52a432672732425e4c19765b9fec9b5810e6f4ba"
 DIARIZATION_DIR = MODEL_DIR / "nemotron3"
+DIARIZATION_FILES = ("README.md", "config.json", "processor_config.json", "model.safetensors")
+PREWARM_RECENT_SECONDS = 30.0
+
+
+def diarization_installed():
+    return all((DIARIZATION_DIR / name).is_file() for name in DIARIZATION_FILES)
 
 
 def vocabulary_echo(text, vocabulary):
@@ -120,7 +127,7 @@ def prepare_model():
     prepare_assets(MODEL_ID, REVISION, MODEL_DIR, ("ctc/ctc_head.safetensors", "ctc/ctc_vocab.json"))
     prepare_assets(
         DIARIZATION_ID, DIARIZATION_REVISION, DIARIZATION_DIR,
-        ("README.md", "config.json", "processor_config.json", "model.safetensors"),
+        DIARIZATION_FILES,
     )
 
 
@@ -170,9 +177,14 @@ class RumbleModel:
         ).to(self.device).eval()
         self.aligner = None
         self.reported_screen_failure = False
-        warmup = np.zeros(SAMPLE_RATE * 2, dtype=np.float32)
+        self.last_run = 0.0
+        self._warm_decode(SAMPLE_RATE * 2, max_new_tokens=4)
+        self.release_device_cache()
+
+    def _warm_decode(self, samples: int, *, max_new_tokens: int):
+        warmup = self.np.zeros(samples, dtype=self.np.float32)
         try:
-            self._decode(warmup, max_new_tokens=4, cache_implementation="static")
+            self._decode(warmup, max_new_tokens=max_new_tokens, cache_implementation="static")
         except RuntimeError as error:
             if "out of memory" not in str(error).lower():
                 raise
@@ -181,7 +193,22 @@ class RumbleModel:
             warmup_oom = False
         if warmup_oom:
             self.release_device_cache()
-            self._decode(warmup, max_new_tokens=4)
+            self._decode(warmup, max_new_tokens=max_new_tokens)
+
+    def is_warm(self, *, recent: float = PREWARM_RECENT_SECONDS) -> bool:
+        return self.last_run > 0.0 and (time.monotonic() - self.last_run) < recent
+
+    def prewarm(self, *, force: bool = False) -> bool:
+        """Fault idle Metal/CPU weights back into RAM before dictation finishes."""
+        if not force and self.is_warm():
+            return False
+        self._warm_decode(SAMPLE_RATE // 2, max_new_tokens=1)
+        if self.aligner is not None:
+            try:
+                self.aligner.warm_screen()
+            except (RuntimeError, ValueError):
+                logging.getLogger("uvicorn.error").warning("Could not warm the native dictation speech screen.")
+        return True
 
     def release_device_cache(self):
         if self.device == "mps":
@@ -291,4 +318,5 @@ class RumbleModel:
             )
             generated = output[:, inputs["input_ids"].shape[-1]:]
             result = self.processor.decode(generated, return_format="parsed")[0]
+        self.last_run = time.monotonic()
         return result["transcription"].strip(), result["language"]

@@ -17,6 +17,10 @@ ASSETS = {
     "manifest": ("annotation.json", ".annotation.json", "application/json", 24 * 1024 * 1024),
     "contact-sheet": ("contact-sheet.png", ".annotation.png", "image/png", 12 * 1024 * 1024),
 }
+KEYFRAME_KINDS = tuple(f"frame-{index:02d}" for index in range(1, 7))
+KEYFRAME_SIZE = (1280, 800)
+ASSETS.update({kind: (f"{kind}.png", f".annotation.{kind}.png", "image/png", 5 * 1024 * 1024)
+               for kind in KEYFRAME_KINDS})
 MAX_TIMELINE_SECONDS = 3 * 60 * 60 + 2
 MISSING_VIDEO_REASONS = {
     "noFrames": "The screen recording produced no video frames.",
@@ -69,6 +73,17 @@ async def annotation_movie_tracks(path, probe=None, *, container_duration=False)
 def annotation_input(path, kind):
     if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= ASSETS[kind][3]:
         raise ValueError("An annotation asset is missing or exceeds its size limit.")
+    return path
+
+
+def annotation_png(path, kind, max_size):
+    with annotation_input(path, kind).open("rb") as image:
+        header = image.read(24)
+    label = "contact sheet" if kind == "contact-sheet" else "still"
+    if len(header) != 24 or header[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR":
+        raise ValueError(f"Invalid annotation {label}.")
+    if not all(0 < size <= limit for size, limit in zip(struct.unpack(">II", header[16:24]), max_size)):
+        raise ValueError(f"Invalid annotation {label} size.")
     return path
 
 
@@ -150,15 +165,12 @@ def annotation_origin(value):
     return origin
 
 
-def read_staged_annotation(source):
-    paths = staged_annotation_paths(source)
-    with annotation_input(paths["manifest"], "manifest").open("rb") as data:
-        manifest = json.load(data)
-    if (not isinstance(manifest, dict) or type(manifest.get("version")) is not int or manifest["version"] != 1
-            or manifest.get("coordinateSpace") != "normalized-bottom-left" or manifest.get("source") not in ("display", "window", "area", "phone")):
+def annotation_timeline(manifest):
+    if (not isinstance(manifest, dict) or manifest.get("coordinateSpace") != "normalized-bottom-left"
+            or manifest.get("source") not in ("display", "window", "area", "phone")):
         raise ValueError("Invalid annotation manifest.")
     events, frames = manifest.get("events"), manifest.get("frames")
-    if not isinstance(events, list) or len(events) > 100_000 or not isinstance(frames, list) or len(frames) > 6:
+    if not isinstance(events, list) or len(events) > 100_000 or not isinstance(frames, list) or len(frames) > len(KEYFRAME_KINDS):
         raise ValueError("Invalid annotation timeline.")
     reason = manifest.get("missingVideo")
     if "missingVideo" in manifest and (not isinstance(reason, str) or reason not in MISSING_VIDEO_REASONS or frames):
@@ -179,17 +191,34 @@ def read_staged_annotation(source):
         strokes.add(stroke)
     if any(not number(frame, 0, MAX_TIMELINE_SECONDS) for frame in frames) or any(a >= b for a, b in zip(frames, frames[1:])):
         raise ValueError("Invalid annotation frame times.")
-    if frames:
-        with annotation_input(paths["contact-sheet"], "contact-sheet").open("rb") as sheet:
-            header = sheet.read(24)
-        if len(header) != 24 or header[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR":
-            raise ValueError("Invalid annotation contact sheet.")
-        width, height = struct.unpack(">II", header[16:24])
-        if not 0 < width <= 872 or not 0 < height <= 846:
-            raise ValueError("Invalid annotation contact sheet size.")
-    result = {"version": 1, "source": manifest["source"], "strokeCount": len(strokes), "frames": frames}
-    if reason:
-        result["missingVideo"] = reason
+    stills = manifest.get("keyframes", [])
+    if (not isinstance(stills, list) or len(stills) > len(frames)
+            or any(type(index) is not int or not 1 <= index <= len(frames) for index in stills)
+            or any(a >= b for a, b in zip(stills, stills[1:]))):
+        raise ValueError("Invalid annotation keyframe indexes.")
+    return strokes
+
+
+def read_staged_annotation(source):
+    paths = staged_annotation_paths(source)
+    with annotation_input(paths["manifest"], "manifest").open("rb") as data:
+        manifest = json.load(data)
+    if not isinstance(manifest, dict) or type(manifest.get("version")) is not int or manifest["version"] != 1:
+        raise ValueError("Invalid annotation manifest.")
+    strokes = annotation_timeline(manifest)
+    if manifest["frames"]:
+        annotation_png(paths["contact-sheet"], "contact-sheet", (872, 846))
+    result = {"version": 1, "source": manifest["source"], "strokeCount": len(strokes), "frames": manifest["frames"]}
+    stills = []
+    for index in manifest.get("keyframes", []):
+        kind = KEYFRAME_KINDS[index - 1]
+        with suppress(ValueError, OSError):
+            annotation_png(paths[kind], kind, KEYFRAME_SIZE)
+            stills.append(index)
+    if stills:
+        result["keyframes"] = stills
+    if "missingVideo" in manifest:
+        result["missingVideo"] = manifest["missingVideo"]
     if origin := annotation_origin(manifest.get("origin")):
         result["origin"] = origin
     return result

@@ -9,7 +9,7 @@ from starlette.responses import HTMLResponse, Response
 
 from sdk_embedded import SDK_PATH
 from engine_lifecycle import WORKSPACE_CONNECT as BOOTSTRAP, workspace_key
-from windows_dictation_commands import (ANNOTATION_COMMAND_ROUTE, MEETING_COMMAND_ROUTE, MEETING_TRASH_ROUTE,
+from windows_dictation_commands import (ANNOTATION_COMMAND_ROUTE, MEETING_COMMAND_ROUTE, MEETING_TRASH_ROUTE, ONBOARDING_ROUTE,
                                         ROUTE as DICTATION_COMMAND, authorized as authorized_command)
 
 OPEN_WORKSPACE = """
@@ -82,7 +82,7 @@ class WorkspaceAccess:
         if path.startswith(SDK_PATH + "/"):
             return True
         if self.shared_state is None:
-            if path in (DICTATION_COMMAND, MEETING_TRASH_ROUTE, MEETING_COMMAND_ROUTE, ANNOTATION_COMMAND_ROUTE):
+            if path in (DICTATION_COMMAND, MEETING_TRASH_ROUTE, MEETING_COMMAND_ROUTE, ANNOTATION_COMMAND_ROUTE, ONBOARDING_ROUTE):
                 return (path == DICTATION_COMMAND and request.method == "GET") or (request.method == "POST" and authorized_command(
                     getattr(request.app.state, "windows_dictation_control", None), request.headers.get("authorization", ""),
                 ))

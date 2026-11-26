@@ -54,6 +54,20 @@ async def microphone_inputs():
         raise CaptureError("Jaro could not read the available microphones.") from None
 
 
+def microphone_privacy_denied():
+    import winreg
+
+    consent = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
+    switches = ((winreg.HKEY_LOCAL_MACHINE, consent), (winreg.HKEY_CURRENT_USER, consent),
+                (winreg.HKEY_CURRENT_USER, consent + r"\NonPackaged"))
+    for hive, name in switches:
+        with suppress(OSError), winreg.OpenKey(hive, name) as key:
+            value, kind = winreg.QueryValueEx(key, "Value")
+            if kind == winreg.REG_SZ and value.casefold() == "deny":
+                return True
+    return False
+
+
 async def audio_stream_apps(command):
     try:
         return set((await capture_inventory(command)).decode().splitlines())

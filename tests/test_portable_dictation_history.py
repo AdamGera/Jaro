@@ -80,6 +80,7 @@ class PortableDictationHistoryTests(unittest.TestCase):
         for column in ("x11AnnotationShortcut", "windowsAnnotationShortcut", "x11RawShortcut", "windowsRawShortcut"):
             old_schema = old_schema.replace(f",\n    {column} TEXT NOT NULL DEFAULT ''", "")
         old_schema = old_schema.replace(",\n    pasteRestoreToken TEXT NOT NULL DEFAULT ''", "")
+        old_schema = old_schema.replace(",\n    kdePendingShortcuts TEXT NOT NULL DEFAULT ''", "")
         old_schema = old_schema.replace(",\n    vocabularyEntries TEXT NOT NULL DEFAULT '[]'", "")
         old_schema = old_schema.replace(",\n    replacements TEXT NOT NULL DEFAULT ''", "")
         old_schema = old_schema.replace(",\n    outputProfiles TEXT NOT NULL DEFAULT ''", "")
@@ -106,6 +107,7 @@ class PortableDictationHistoryTests(unittest.TestCase):
         self.assertEqual(self.history.linux_shortcut_mode(), "tap")
         self.assertFalse(self.history.shortcut_enabled())
         self.assertFalse(self.history.shortcut_enabled(portal=True))
+        self.assertEqual(self.history.kde_pending_shortcuts(), set())
         self.assertFalse(self.history.portal_raw_shortcut())
         self.assertEqual(self.history.annotation_shortcut(), ("", False))
         self.assertEqual(self.history.desktop_shortcut(raw=True), "")

@@ -29,10 +29,10 @@ import UniformTypeIdentifiers
         }
         guard let command = args.first,
               (["open-audio", "open-models"].contains(command) && args.count == 1)
-              || (["meeting-export-folder", "annotation-folder"].contains(command) && args.count == 2)
+              || (["meeting-export-folder", "annotation-folder", "annotation-export-folder"].contains(command) && args.count == 2)
               || (command == "save" && args.count == 2)
               || (command == "confirm" && args.count == 3) else {
-            send(["error": "Use open-audio, open-models, meeting-export-folder <folder>, annotation-folder <folder>, save <name>, or confirm <title> <message>."])
+            send(["error": "Use open-audio, open-models, meeting-export-folder <folder>, annotation-folder <folder>, annotation-export-folder <folder>, save <name>, or confirm <title> <message>."])
             exit(2)
         }
         let app = NSApplication.shared
@@ -60,13 +60,15 @@ import UniformTypeIdentifiers
             let panel = NSOpenPanel()
             let exports = command == "meeting-export-folder"
             let annotations = command == "annotation-folder"
-            let folder = exports || annotations || command == "open-models"
+            let annotationExport = command == "annotation-export-folder"
+            let folder = exports || annotations || annotationExport || command == "open-models"
             panel.canChooseFiles = !folder
             panel.canChooseDirectories = folder
             panel.allowsMultipleSelection = false
             panel.title = exports ? "Choose a meeting export folder" : annotations ? "Choose an Annotations folder"
+                : annotationExport ? "Choose an annotation export folder"
                 : folder ? "Choose the Jard model folder" : "Open audio"
-            if exports || annotations {
+            if exports || annotations || annotationExport {
                 panel.canCreateDirectories = true
                 panel.prompt = "Choose"
                 panel.directoryURL = args[1].isEmpty || !FileManager.default.fileExists(atPath: args[1])

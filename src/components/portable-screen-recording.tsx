@@ -11,6 +11,8 @@ import { PortableShortcut } from "./portable-dictation-workspace"
 import { SettingGroup, SettingRow } from "./settings-rows"
 import { useInterfaceLanguage } from "@/interface-language"
 import { AnnotationRules } from "./annotation-rules"
+import { AnnotationAgentGuides } from "./annotation-agent-guides"
+import { AnnotationFolder } from "./desktop-annotation"
 
 const endpoint = "/api/portable/screencast"
 export const hasPortableScreenRecording = document.documentElement.hasAttribute("data-jaro-screen-recording")
@@ -18,7 +20,9 @@ const watchDesktopShortcut = document.documentElement.hasAttribute("data-jaro-an
 const hasOpenCodeWsl = document.documentElement.hasAttribute("data-jaro-opencode-wsl")
 const hasOpenCodeRules = document.documentElement.hasAttribute("data-jaro-opencode-handoff")
 const hasDesktopAnnotationShortcut = document.documentElement.hasAttribute("data-jaro-desktop-annotation")
-export const hasDesktopAnnotationSettings = hasDesktopAnnotationShortcut || hasOpenCodeWsl || hasOpenCodeRules
+const hasAnnotationStorage = document.documentElement.hasAttribute("data-jaro-annotation-storage")
+const hasAnnotationAgentGuides = document.documentElement.hasAttribute("data-jaro-annotation-agents")
+export const hasDesktopAnnotationSettings = hasDesktopAnnotationShortcut || hasAnnotationStorage || hasOpenCodeWsl || hasOpenCodeRules || hasAnnotationAgentGuides
 type Source = "display" | "window" | "area"
 type Sources = { sources: Source[]; picker?: "workspace" }
 type Microphone = { id: string; label: string }
@@ -70,10 +74,15 @@ async function request(path = "", options?: RequestInit) {
 }
 
 export function DesktopAnnotationSettings({ busy }: { busy: boolean }) {
+  const { t } = useInterfaceLanguage()
   return <div className="dictation-preferences">
     {hasDesktopAnnotationShortcut ? <AnnotationShortcutSetting busy={busy} /> : null}
+    {hasAnnotationStorage && <SettingGroup id="annotation-storage" title={t("Storage")}>
+      <AnnotationFolder busy={busy} />
+    </SettingGroup>}
     {hasOpenCodeWsl ? <OpenCodeWslSetting disabled={busy} /> : null}
     {hasOpenCodeRules ? <AnnotationRules disabled={busy} /> : null}
+    {hasAnnotationAgentGuides && <AnnotationAgentGuides busy={busy} />}
   </div>
 }
 

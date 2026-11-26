@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { Activity, Clipboard, Keyboard, Languages, Mic, Play, Sparkles, Terminal, Volume2 } from "lucide-react"
 import { useInterfaceLanguage } from "@/interface-language"
+import { changePortableOnboarding, hasPortableOnboarding } from "@/portable-onboarding"
 import { dictationSoundStyles, type DictationHistory, type DictationOutputPreview, type DictationOutputProfiles,
   type DictationPreferences, type ProfileApplication, type DictationVocabularyEntry } from "@/system-dictation"
 import { Button } from "./ui/button"
 import type { Language } from "./language-picker"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs"
-import { RuleEditor, SettingGroup, SettingRow } from "./settings-rows"
+import { RuleEditor, SettingDisclosure, SettingGroup, SettingRow } from "./settings-rows"
 import { DictationVocabulary, type SaveDictationVocabulary } from "./dictation-vocabulary"
 import { OutputProfileEditor } from "./dictation-output-profiles"
-import { DictationHistoryBrowser, HistoryRetention } from "./system-dictation"
+import { DictationHistoryBrowser, DictationHistoryHeader, HistoryRetention } from "./system-dictation"
 
 export const hasPortableDictation = document.documentElement.hasAttribute("data-jaro-portable-dictation")
 
@@ -30,6 +30,8 @@ type DictationStatus = {
   canCancel?: boolean
   canStart?: boolean
   queueFull?: boolean
+  pendingJobs?: number
+  microphoneDenied?: boolean
   shortcutMode?: DictationPreferences["mode"]
   authorizing: boolean
   configurable: boolean
@@ -120,7 +122,7 @@ function previewProfiles({ text, profiles, app, site }: { text: string; profiles
   return profilesRequest<DictationOutputPreview>("/preview", { text, profiles, app, site })
 }
 
-function usePortableDictation(visible: boolean) {
+export function usePortableDictation(visible: boolean) {
   const [status, setStatus] = useState<DictationStatus>()
   const [pending, setPending] = useState(false)
   const [feedback, setFeedback] = useState("")
@@ -266,14 +268,16 @@ function VoiceInput({ visible, disabled, status, languages, configure, saveVocab
         {options?.inputs.map(input => <option key={input.id} value={input.id}>{input.label}</option>)}
       </select>}
     </SettingRow>
-    <SettingRow icon={Sparkles} title={t("Noise cleanup (StuPASE)")} detail={t(cleanupDetail)}>
-      {labels => <input {...labels} type="checkbox" role="switch" checked={status?.noiseCleanup ?? false} disabled={disabled}
-        onChange={event => void configure("/voice-input", { setting: "noiseCleanup", enabled: event.target.checked })} />}
-    </SettingRow>
-    <SettingRow icon={Activity} title={t("Boost microphone (+6 dB)")} detail={t("Raises quiet audio and limits loud peaks before transcription.")}>
-      {labels => <input {...labels} type="checkbox" role="switch" checked={status?.boostMicrophone ?? false} disabled={disabled}
-        onChange={event => void configure("/voice-input", { setting: "boostMicrophone", enabled: event.target.checked })} />}
-    </SettingRow>
+    <SettingDisclosure icon={Activity} title={t("Audio processing")}>
+      <SettingRow icon={Sparkles} title={t("Noise cleanup (StuPASE)")} detail={t(cleanupDetail)}>
+        {labels => <input {...labels} type="checkbox" role="switch" checked={status?.noiseCleanup ?? false} disabled={disabled}
+          onChange={event => void configure("/voice-input", { setting: "noiseCleanup", enabled: event.target.checked })} />}
+      </SettingRow>
+      <SettingRow icon={Activity} title={t("Boost microphone (+6 dB)")} detail={t("Raises quiet audio and limits loud peaks before transcription.")}>
+        {labels => <input {...labels} type="checkbox" role="switch" checked={status?.boostMicrophone ?? false} disabled={disabled}
+          onChange={event => void configure("/voice-input", { setting: "boostMicrophone", enabled: event.target.checked })} />}
+      </SettingRow>
+    </SettingDisclosure>
     {feedback && <p role="status" className="update-settings-feedback">{t(feedback)}</p>}
   </SettingGroup>
 }
@@ -362,7 +366,7 @@ function FeedbackSettings({ status, disabled, configure }: {
     if (input.valueAsNumber !== status?.soundVolume) void configure("/sound", { volume: input.valueAsNumber })
   }
 
-  return <SettingGroup id={heading} title={t("Feedback")}>
+  return <SettingGroup id={heading} title={t("Recording controls")}>
     <SettingRow icon={Activity} title={t("Recording indicator")} find="Dictation HUD position"
       detail={t(status.indicatorAvailable ? "Shows when Jaro is listening and processing your dictation."
         : "The floating indicator is unavailable on this desktop.")}>
@@ -457,32 +461,176 @@ export function PortableDictationSettings({ visible, disabled, languages }: {
   visible: boolean; disabled: boolean; languages: Language[]
 }) {
   const { t } = useInterfaceLanguage()
-  const shortcutHeading = useId()
-  const { status, pending, feedback, configure, saveVocabulary, saveProfiles } = usePortableDictation(visible)
-  return <div className="dictation-preferences">
-    {hasShortcutMode(status) && <SettingGroup id={shortcutHeading} title={t("Shortcuts")}>
-      {status.defaultShortcut && <PortableShortcut shortcut={status.shortcut} defaultShortcut={status.defaultShortcut}
-        disabled={disabled || pending || status.phase !== "idle"} save={(shortcut, reportError) => configure("/shortcut", { shortcut }, reportError)} />}
-      <ShortcutMode platform={status.platform} mode={status.shortcutMode}
-        disabled={disabled || pending || status.authorizing || status.phase !== "idle"}
-        onChange={mode => void configure("/shortcut-mode", { mode })} />
-    </SettingGroup>}
+  const { status, pending, feedback, setFeedback, configure, saveVocabulary, saveProfiles } = usePortableDictation(visible)
+  const [copied, setCopied] = useState<{ text: string; message: string }>()
+
+  async function copy() {
+    if (!status?.text) return
+    try {
+      await navigator.clipboard.writeText(status.text)
+      setCopied({ text: status.text, message: "Copied last dictation." })
+    } catch {
+      setCopied({ text: status.text, message: "Could not copy the dictation." })
+    }
+  }
+
+  async function copyCommand(action: (typeof desktopCommands)[number][0]) {
+    if (!status?.commandPrefix) return
+    try {
+      await navigator.clipboard.writeText(`${status.commandPrefix} ${action}`)
+      setFeedback("Copied shortcut command.")
+    } catch {
+      setFeedback("Could not copy the shortcut command.")
+    }
+  }
+
+  async function replaySetup() {
+    try {
+      await changePortableOnboarding("restart")
+    } catch (error) {
+      setFeedback(error instanceof Error ? error.message : "Could not replay dictation setup.")
+    }
+  }
+
+  const windows = status?.platform === "windows"
+  const activity = status?.queueFull ? "Finish the queued dictations before starting another." :
+    status?.phase === "starting" ? "Starting microphone…" :
+    status?.phase === "recording" ? "Recording dictation…" :
+    status?.phase === "transcribing" ? "Transcribing dictation…" :
+    status?.phase === "delivering" ? "Delivering dictation…" :
+    status?.phase === "pasting" ? "Pasting last dictation…" :
+    status?.pasteAuthorizing ? "Approve keyboard and clipboard access in the desktop dialog." :
+    status?.authorizing ? (windows ? "Starting the keyboard shortcut…" : "Approve the shortcut in the desktop dialog.") : status?.message
+  const message = status?.phase === "idle" ? feedback || activity : activity || feedback
+  const wayland = status?.platform === "wayland"
+  const shortcutConnected = status?.enabled || status?.configurable || !!status?.annotationShortcut
+
+  return <div className="dictation-preferences" data-setting-group={t("Dictation")}>
+    <SettingGroup id="linux-dictation-title" title={t("System dictation")}>
+      {hasPortableOnboarding && <SettingRow icon={Sparkles} title={t("Dictation setup")} label={false}>
+        <Button size="sm" variant="outline" disabled={pending || status?.phase !== "idle" || Boolean(status.pendingJobs)}
+          onClick={() => void replaySetup()}>{t("Replay setup")}</Button>
+      </SettingRow>}
+      {status?.defaultShortcut && <PortableShortcut shortcut={status.shortcut} defaultShortcut={status.defaultShortcut}
+        disabled={pending || status.phase !== "idle"} save={(shortcut, reportError) => configure("/shortcut", { shortcut }, reportError)} />}
+      {!status?.commandMode && <SettingRow icon={Keyboard} title={status?.defaultShortcut
+        ? t("Global shortcut") : status?.shortcut || t("Global shortcut")} label={false}
+        detail={windows ? undefined : t(
+          wayland ? status.keyboardAllowed ? "Finish with the shortcut in the field where you want the text." :
+          "Use Copy last to paste until you allow automatic paste." :
+          "The shortcut inserts the transcript into the field where you started.")}>
+        {status?.configurable && <Button size="sm" variant="ghost" disabled={pending || status.phase !== "idle"}
+          onClick={() => void configure("/configure")}>{t("Configure shortcuts")}</Button>}
+        {status?.shortcutRequested && !shortcutConnected && !status.authorizing &&
+          <Button size="sm" variant="ghost" disabled={pending}
+            onClick={() => void configure("/disable")}>{t("Disable on launch")}</Button>}
+        <Button size="sm" variant="outline" disabled={!status || pending}
+          onClick={() => void configure(wayland && status?.authorizing ? "/cancel-approval" : shortcutConnected || status?.authorizing ? "/disable" : "/enable")}>
+          {t(status?.authorizing ? "Cancel approval" : shortcutConnected ? "Disable shortcut" : "Enable shortcut")}
+        </Button>
+      </SettingRow>}
+      {hasShortcutMode(status) && <ShortcutMode platform={status.platform} mode={status.shortcutMode}
+        disabled={pending || status.authorizing || status.phase !== "idle"}
+        onChange={mode => void configure("/shortcut-mode", { mode })} />}
+      {status?.enabled && status.recoveryShortcut && <SettingRow icon={Keyboard} title={t("Paste last dictation")}
+        detail={t(wayland && !status.keyboardAllowed ? "Allow automatic paste to use this shortcut." :
+          windows ? "Tap to paste. Hold to preview recent dictations." : "Reinsert the last dictation at the current cursor.")} label={false}>
+        <kbd>{status.recoveryShortcut}</kbd>
+      </SettingRow>}
+      {status?.cancelShortcut && <SettingRow icon={Keyboard} title={t("Cancel dictation shortcut")}
+        detail={t(wayland ? "Discard the current take before it is pasted." : "Discard a hands-free take.")} label={false}>
+        <kbd>{status.cancelShortcut}</kbd>
+      </SettingRow>}
+      {status?.annotationShortcut && <SettingRow icon={Keyboard} title={t("Annotate shortcut")}
+        detail={t("Tap to choose a display or save. Hold to draw on supported displays.")} label={false}>
+        <kbd>{status.annotationShortcut}</kbd>
+      </SettingRow>}
+      {status?.gnomeAnnotation && <SettingRow icon={Keyboard} title={t("Annotate shortcut")} label={false} children={null}
+        detail={t("Tap to choose a display or save. Assign the key in GNOME Settings → Keyboard → Custom Shortcuts.")} />}
+      {wayland && status.commandPrefix && (!shortcutConnected || status.commandMode) && <SettingRow icon={Terminal}
+        title={t("Desktop shortcut commands")} label={false}
+        detail={t(status.commandMode ? "Assign these commands in your desktop’s keyboard settings." :
+          "Use your desktop’s keyboard settings to bind a shortcut, even without the shortcut portal.")}>
+        <Button size="sm" variant="outline" disabled={pending || status.authorizing || status.phase !== "idle"}
+          onClick={() => void configure(status.commandMode ? "/disable" : "/enable-commands")}>
+          {t(status.commandMode ? "Disable commands" : "Enable commands")}
+        </Button>
+      </SettingRow>}
+      {wayland && status.gnomeShortcutAvailable && (!shortcutConnected || status.commandMode) && <SettingRow
+        icon={Keyboard} title={t("GNOME keyboard shortcuts")} label={false}
+        detail={t(status.gnomeShortcuts
+          ? "Change these keys in GNOME Settings → Keyboard → Custom Shortcuts."
+          : "Use Ctrl+Alt+Shift+D to dictate, Ctrl+Alt+Shift+X to cancel, and Ctrl+Alt+V to paste the last dictation.")}>
+        <div className="dictation-row-actions">
+          {status.gnomeShortcutsNeedUpdate && <Button size="sm" variant="outline"
+            disabled={pending || status.authorizing || status.pasteAuthorizing || status.phase !== "idle"}
+            onClick={() => void configure("/add-gnome-shortcuts")}>{t("Update GNOME shortcuts")}</Button>}
+          <Button size="sm" variant="outline" disabled={pending || status.authorizing || status.pasteAuthorizing || status.phase !== "idle"}
+            onClick={() => void configure(status.gnomeShortcuts ? "/remove-gnome-shortcuts" : "/add-gnome-shortcuts")}>
+            {t(status.gnomeShortcuts ? "Remove GNOME shortcuts" : "Add GNOME shortcuts")}
+          </Button>
+        </div>
+      </SettingRow>}
+      {wayland && status.enabled && <SettingRow icon={Clipboard} title={t("Automatic paste")} label={false}
+        detail={t("Allow keyboard and clipboard access to paste into the active field. Supported desktops can remember this access.")}>
+        <div className="dictation-row-actions">
+          {status.savedVirtualPaste && !status.keyboardAllowed && !status.pasteAuthorizing &&
+            <Button size="sm" variant="outline" disabled={pending || status.phase !== "idle"}
+              onClick={() => void configure("/disable-paste")}>{t("Forget saved access")}</Button>}
+          <Button size="sm" variant="outline" disabled={pending || status.phase !== "idle"}
+            onClick={() => void configure(status.pasteAuthorizing ? "/cancel-approval" : status.keyboardAllowed ? "/disable-paste" : "/allow-paste")}>
+            {t(status.pasteAuthorizing ? "Cancel approval" : status.keyboardAllowed ? "Disable paste" : "Allow paste")}
+          </Button>
+        </div>
+      </SettingRow>}
+      {wayland && <SettingRow icon={Clipboard} title={t("Manual dictation")} label={false}>
+        <Button size="sm" variant="outline" disabled={pending || status.authorizing || status.pasteAuthorizing ||
+          (status.phase !== "recording" && !(status.canStart ?? status.phase === "idle"))}
+          onClick={() => void configure("/toggle")}>
+          {t(status.phase === "recording" ? "Finish dictation" : "Start dictation")}
+        </Button>
+      </SettingRow>}
+      {status?.canCancel && <SettingRow icon={Mic} title={t("Current dictation")} label={false}
+        detail={status.cancelShortcutConflict ? t("Another app is using Escape.") : undefined}>
+        <Button size="sm" variant="outline" disabled={pending}
+          onClick={() => void configure("/cancel")}>{t("Cancel dictation")}</Button>
+      </SettingRow>}
+      {status?.enabled && (!wayland || status.keyboardAllowed) && <SettingRow icon={Clipboard} title={t("Paste shortcut")}
+        detail={t("Select Ctrl+Shift+V for terminals that use it.")}>
+        {labels => <select {...labels} disabled={pending} value={status.terminal ? "terminal" : "standard"}
+          onChange={event => void configure("/paste-shortcut?terminal=" + (event.target.value === "terminal"))}>
+          <option value="standard">Ctrl+V</option>
+          <option value="terminal">Ctrl+Shift+V</option>
+        </select>}
+      </SettingRow>}
+      {message && <p role="status" className="update-settings-feedback">{t(message)}</p>}
+    </SettingGroup>
     <VoiceInput visible={visible} disabled={disabled || pending || status?.phase !== "idle"}
       status={status} languages={languages} configure={configure} saveVocabulary={saveVocabulary} />
     <FeedbackSettings status={status} disabled={disabled || pending} configure={configure} />
-    <PortableTextOutput status={status} disabled={disabled || pending || !status}
-      configure={configure} saveProfiles={saveProfiles} />
-    {feedback && <p role="status" className="update-settings-feedback">{t(feedback)}</p>}
+    {status?.commandMode && <SettingGroup id="linux-dictation-commands" title={t("Commands to bind")}>
+      {desktopCommands.map(([action, label]) => <SettingRow key={action} icon={Keyboard} title={t(label)} label={false}>
+        <Button size="sm" variant="outline" aria-label={t("Copy command") + " · " + t(label)}
+          onClick={() => void copyCommand(action)}>{t("Copy command")}</Button>
+      </SettingRow>)}
+    </SettingGroup>}
+    {status?.text && <SettingGroup id="linux-dictation-last" title={t("Last dictation")}>
+      <SettingRow icon={Clipboard} title={t("Copy to paste into your app")} label={false}>
+        <Button size="sm" variant="outline" onClick={() => void copy()}>{t("Copy last")}</Button>
+      </SettingRow>
+      <p className="update-settings-feedback whitespace-pre-wrap break-words" dir="auto">{status.text}</p>
+      {copied && copied.text === status.text && <p role="status" className="update-settings-feedback">{t(copied.message)}</p>}
+    </SettingGroup>}
+    <SettingDisclosure icon={Clipboard} title={t("Output and vocabulary corrections")}>
+      <PortableTextOutput status={status} disabled={disabled || pending || !status}
+        configure={configure} saveProfiles={saveProfiles} />
+    </SettingDisclosure>
   </div>
 }
 
-export function PortableDictationWorkspace({ destination, languages }: {
-  destination: "dictation" | "history" | "output"; languages: Language[]
-}) {
+export function PortableDictationWorkspace({ onSettings }: { onSettings: () => void }) {
   const { t } = useInterfaceLanguage()
-  const [tab, setTab] = useState(destination === "dictation" ? "general" : destination)
-  const { status, pending, feedback, setFeedback, configure, saveVocabulary, saveProfiles } = usePortableDictation(true)
-  const [copied, setCopied] = useState<{ text: string; message: string }>()
+  const { status, pending, feedback, setFeedback, configure } = usePortableDictation(true)
   const [playingID, setPlayingID] = useState<string>()
   const playback = useRef<{ id: string; player: HTMLAudioElement }>(null)
 
@@ -541,178 +689,18 @@ export function PortableDictationWorkspace({ destination, languages }: {
     }
   }
 
-  async function copy() {
-    if (!status?.text) return
-    try {
-      await navigator.clipboard.writeText(status.text)
-      setCopied({ text: status.text, message: "Copied last dictation." })
-    } catch {
-      setCopied({ text: status.text, message: "Could not copy the dictation." })
-    }
-  }
-
-  async function copyCommand(action: (typeof desktopCommands)[number][0]) {
-    if (!status?.commandPrefix) return
-    try {
-      await navigator.clipboard.writeText(`${status.commandPrefix} ${action}`)
-      setFeedback("Copied shortcut command.")
-    } catch {
-      setFeedback("Could not copy the shortcut command.")
-    }
-  }
-
-  const windows = status?.platform === "windows"
-  const activity = status?.queueFull ? "Finish the queued dictations before starting another." :
-    status?.phase === "starting" ? "Starting microphone…" :
-    status?.phase === "recording" ? "Recording dictation…" :
-    status?.phase === "transcribing" ? "Transcribing dictation…" :
-    status?.phase === "delivering" ? "Delivering dictation…" :
-    status?.phase === "pasting" ? "Pasting last dictation…" :
-    status?.pasteAuthorizing ? "Approve keyboard and clipboard access in the desktop dialog." :
-    status?.authorizing ? (windows ? "Starting the keyboard shortcut…" : "Approve the shortcut in the desktop dialog.") : status?.message
-  const message = status?.phase === "idle" ? feedback || activity : activity || feedback
-  const wayland = status?.platform === "wayland"
-  const shortcutConnected = status?.enabled || status?.configurable || !!status?.annotationShortcut
-
-  return <Tabs value={tab} onValueChange={setTab} className="dictation-workspace-tabs">
-    <div className="dictation-workspace-header">
-      <TabsList aria-label={t("Dictation tabs")} variant="line">
-        <TabsTrigger value="general">{t("General")}</TabsTrigger>
-        <TabsTrigger value="history">{t("History")}</TabsTrigger>
-        <TabsTrigger value="output">{t("Output")}</TabsTrigger>
-      </TabsList>
-      {tab === "history" && status && <div className="dictation-workspace-actions">
-        <HistoryRetention value={status.retention} pending={pending || !status.historyAvailable}
-          onChange={retention => void configure("/history", { action: "retention", retention })} />
-      </div>}
-    </div>
-    <TabsContent value="general"><div className="dictation-preferences">
-    <SettingGroup id="linux-dictation-title" title={t("System dictation")}>
-      {status?.defaultShortcut && <PortableShortcut shortcut={status.shortcut} defaultShortcut={status.defaultShortcut}
-        disabled={pending || status.phase !== "idle"} save={(shortcut, reportError) => configure("/shortcut", { shortcut }, reportError)} />}
-      {!status?.commandMode && <SettingRow icon={Keyboard} title={status?.defaultShortcut
-        ? t("Global shortcut") : status?.shortcut || t("Global shortcut")} label={false}
-        detail={windows ? undefined : t(
-          wayland ? status.keyboardAllowed ? "Finish with the shortcut in the field where you want the text." :
-          "Use Copy last to paste until you allow automatic paste." :
-          "The shortcut inserts the transcript into the field where you started.")}>
-        {status?.configurable && <Button size="sm" variant="ghost" disabled={pending || status.phase !== "idle"}
-          onClick={() => void configure("/configure")}>{t("Configure shortcuts")}</Button>}
-        {status?.shortcutRequested && !shortcutConnected && !status.authorizing &&
-          <Button size="sm" variant="ghost" disabled={pending}
-            onClick={() => void configure("/disable")}>{t("Disable on launch")}</Button>}
-        <Button size="sm" variant="outline" disabled={!status || pending}
-          onClick={() => void configure(shortcutConnected || status?.authorizing ? "/disable" : "/enable")}>
-          {t(status?.authorizing ? "Cancel approval" : shortcutConnected ? "Disable shortcut" : "Enable shortcut")}
-        </Button>
-      </SettingRow>}
-      {hasShortcutMode(status) && <ShortcutMode platform={status.platform} mode={status.shortcutMode}
-        disabled={pending || status.authorizing || status.phase !== "idle"}
-        onChange={mode => void configure("/shortcut-mode", { mode })} />}
-      {status?.enabled && status.recoveryShortcut && <SettingRow icon={Keyboard} title={t("Paste last dictation")}
-        detail={t(wayland && !status.keyboardAllowed ? "Allow automatic paste to use this shortcut." :
-          "Reinsert the last dictation at the current cursor.")} label={false}>
-        <kbd>{status.recoveryShortcut}</kbd>
-      </SettingRow>}
-      {status?.cancelShortcut && <SettingRow icon={Keyboard} title={t("Cancel dictation shortcut")}
-        detail={t(wayland ? "Discard the current take before it is pasted." : "Discard a hands-free take.")} label={false}>
-        <kbd>{status.cancelShortcut}</kbd>
-      </SettingRow>}
-      {status?.annotationShortcut && <SettingRow icon={Keyboard} title={t("Annotate shortcut")}
-        detail={t("Tap to choose a display or save. Hold to draw on supported displays.")} label={false}>
-        <kbd>{status.annotationShortcut}</kbd>
-      </SettingRow>}
-      {status?.gnomeAnnotation && <SettingRow icon={Keyboard} title={t("Annotate shortcut")} label={false} children={null}
-        detail={t("Tap to choose a display or save. Assign the key in GNOME Settings → Keyboard → Custom Shortcuts.")} />}
-      {wayland && status.commandPrefix && (!shortcutConnected || status.commandMode) && <SettingRow icon={Terminal}
-        title={t("Desktop shortcut commands")} label={false}
-        detail={t(status.commandMode ? "Assign these commands in your desktop’s keyboard settings." :
-          "Use your desktop’s keyboard settings to bind a shortcut, even without the shortcut portal.")}>
-        <Button size="sm" variant="outline" disabled={pending || status.authorizing || status.phase !== "idle"}
-          onClick={() => void configure(status.commandMode ? "/disable" : "/enable-commands")}>
-          {t(status.commandMode ? "Disable commands" : "Enable commands")}
-        </Button>
-      </SettingRow>}
-      {wayland && status.gnomeShortcutAvailable && (!shortcutConnected || status.commandMode) && <SettingRow
-        icon={Keyboard} title={t("GNOME keyboard shortcuts")} label={false}
-        detail={t(status.gnomeShortcuts
-          ? "Change these keys in GNOME Settings → Keyboard → Custom Shortcuts."
-          : "Use Ctrl+Alt+Shift+D to dictate, Ctrl+Alt+Shift+X to cancel, and Ctrl+Alt+V to paste the last dictation.")}>
-        <div className="dictation-row-actions">
-          {status.gnomeShortcutsNeedUpdate && <Button size="sm" variant="outline"
-            disabled={pending || status.authorizing || status.pasteAuthorizing || status.phase !== "idle"}
-            onClick={() => void configure("/add-gnome-shortcuts")}>{t("Update GNOME shortcuts")}</Button>}
-          <Button size="sm" variant="outline" disabled={pending || status.authorizing || status.pasteAuthorizing || status.phase !== "idle"}
-            onClick={() => void configure(status.gnomeShortcuts ? "/remove-gnome-shortcuts" : "/add-gnome-shortcuts")}>
-            {t(status.gnomeShortcuts ? "Remove GNOME shortcuts" : "Add GNOME shortcuts")}
-          </Button>
-        </div>
-      </SettingRow>}
-      {wayland && status.enabled && <SettingRow icon={Clipboard} title={t("Automatic paste")} label={false}
-        detail={t("Allow keyboard and clipboard access to paste into the active field. Supported desktops can remember this access.")}>
-        <div className="dictation-row-actions">
-          {status.savedVirtualPaste && !status.keyboardAllowed && !status.pasteAuthorizing &&
-            <Button size="sm" variant="outline" disabled={pending || status.phase !== "idle"}
-              onClick={() => void configure("/disable-paste")}>{t("Forget saved access")}</Button>}
-          <Button size="sm" variant="outline" disabled={pending || status.phase !== "idle"}
-            onClick={() => void configure(status.keyboardAllowed || status.pasteAuthorizing ? "/disable-paste" : "/allow-paste")}>
-            {t(status.pasteAuthorizing ? "Cancel approval" : status.keyboardAllowed ? "Disable paste" : "Allow paste")}
-          </Button>
-        </div>
-      </SettingRow>}
-      {wayland && <SettingRow icon={Clipboard} title={t("Manual dictation")} label={false}>
-        <Button size="sm" variant="outline" disabled={pending || status.authorizing || status.pasteAuthorizing ||
-          (status.phase !== "recording" && !(status.canStart ?? status.phase === "idle"))}
-          onClick={() => void configure("/toggle")}>
-          {t(status.phase === "recording" ? "Finish dictation" : "Start dictation")}
-        </Button>
-      </SettingRow>}
-      {status?.canCancel && <SettingRow icon={Mic} title={t("Current dictation")} label={false}
-        detail={status.cancelShortcutConflict ? t("Another app is using Escape.") : undefined}>
-        <Button size="sm" variant="outline" disabled={pending}
-          onClick={() => void configure("/cancel")}>{t("Cancel dictation")}</Button>
-      </SettingRow>}
-      {status?.enabled && (!wayland || status.keyboardAllowed) && <SettingRow icon={Clipboard} title={t("Paste shortcut")}
-        detail={t("Select Ctrl+Shift+V for terminals that use it.")}>
-        {labels => <select {...labels} disabled={pending} value={status.terminal ? "terminal" : "standard"}
-          onChange={event => void configure("/paste-shortcut?terminal=" + (event.target.value === "terminal"))}>
-          <option value="standard">Ctrl+V</option>
-          <option value="terminal">Ctrl+Shift+V</option>
-        </select>}
-      </SettingRow>}
-      {message && <p role="status" className="update-settings-feedback">{t(message)}</p>}
-    </SettingGroup>
-    <VoiceInput visible={tab === "general"} disabled={pending || status?.phase !== "idle"}
-      status={status} languages={languages} configure={configure} saveVocabulary={saveVocabulary} />
-    <FeedbackSettings status={status} disabled={pending} configure={configure} />
-    {status?.commandMode && <SettingGroup id="linux-dictation-commands" title={t("Commands to bind")}>
-      {desktopCommands.map(([action, label]) => <SettingRow key={action} icon={Keyboard} title={t(label)} label={false}>
-        <Button size="sm" variant="outline" aria-label={t("Copy command") + " · " + t(label)}
-          onClick={() => void copyCommand(action)}>{t("Copy command")}</Button>
-      </SettingRow>)}
-    </SettingGroup>}
-    {status?.text && <SettingGroup id="linux-dictation-last" title={t("Last dictation")}>
-      <SettingRow icon={Clipboard} title={t("Copy to paste into your app")} label={false}>
-        <Button size="sm" variant="outline" onClick={() => void copy()}>{t("Copy last")}</Button>
-      </SettingRow>
-      <p className="update-settings-feedback whitespace-pre-wrap break-words" dir="auto">{status.text}</p>
-      {copied && copied.text === status.text && <p role="status" className="update-settings-feedback">{t(copied.message)}</p>}
-    </SettingGroup>}
-    </div></TabsContent>
-    <TabsContent value="history" tabIndex={-1}>
-      <section className="dictation-history-tab" aria-label={t("Dictation history")}>
-        {status?.retention === 0 && <p className="update-settings-feedback">{t("History is off. New dictations will not be saved.")}</p>}
-        <DictationHistoryBrowser loadHistory={loadHistory} copyHistory={copyHistory} pending={pending}
-          deleteHistory={ids => configure("/history", ids ? { action: "delete", ids } : { action: "clear" })}
-          audio={{ playingID, stop: stopAudio, toggle: toggleAudio }}
-          historyRevision={String(status?.historyRevision)} />
-        {feedback && <p className="dictation-error" role="alert">{t(feedback)}</p>}
-      </section>
-    </TabsContent>
-    <TabsContent value="output" tabIndex={-1}>
-      <PortableTextOutput status={status} disabled={pending || !status}
-        configure={configure} saveProfiles={saveProfiles} />
+  return <>
+    <DictationHistoryHeader onSettings={onSettings}>
+      {status && <HistoryRetention value={status.retention} pending={pending || !status.historyAvailable}
+        onChange={retention => void configure("/history", { action: "retention", retention })} />}
+    </DictationHistoryHeader>
+    <section className="dictation-history-tab" aria-label={t("Dictation history")}>
+      {status?.retention === 0 && <p className="update-settings-feedback">{t("History is off. New dictations will not be saved.")}</p>}
+      <DictationHistoryBrowser loadHistory={loadHistory} copyHistory={copyHistory} pending={pending}
+        deleteHistory={ids => configure("/history", ids ? { action: "delete", ids } : { action: "clear" })}
+        audio={{ playingID, stop: stopAudio, toggle: toggleAudio }}
+        historyRevision={String(status?.historyRevision)} />
       {feedback && <p className="dictation-error" role="alert">{t(feedback)}</p>}
-    </TabsContent>
-  </Tabs>
+    </section>
+  </>
 }

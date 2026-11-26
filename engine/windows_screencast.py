@@ -195,9 +195,10 @@ class WindowsPen(PenProcess):
 
 
 class WindowsScreenRecording:
-    def __init__(self, staging, source, target, microphone=False, computer_audio=False, *, microphone_device="", notice=None):
+    def __init__(self, staging, source, target, microphone=False, computer_audio=False, *, microphone_device="", notice=None,
+                 annotation_location=None):
         audio_sources = tuple(name for name, enabled in (("mic", microphone), ("system", computer_audio)) if enabled)
-        self.draft = ScreenDraft(staging / str(uuid4()), source, audio_sources)
+        self.draft = ScreenDraft(staging / str(uuid4()), source, audio_sources, annotation_location)
         self.target = target
         self.microphone_device = microphone_device
         self.phase = "previewing" if source == "area" else "starting"

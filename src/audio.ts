@@ -8,6 +8,7 @@ export type SpeakerSegment = { speaker: number | null; start: number; end: numbe
 export type WordTiming = { speaker?: number | null; separator?: string; blockStart?: number; start: number | null; end: number | null; text: string }
 export type Transcript = {
   text: string
+  tentative?: string
   durationSeconds: number | null
   detectedLanguages: string[]
   segments: SpeakerSegment[]
@@ -262,7 +263,7 @@ export type SavedSession = {
   meetingBrief?: MeetingBrief | null
   meetingExport?: MeetingExport | null
   recordingTracks?: Partial<Record<"mic" | "system", string>>
-  annotation?: { version: 1; source: "display" | "window" | "area" | "phone"; strokeCount: number; frames: number[];
+  annotation?: { version: 1; source: "display" | "window" | "area" | "phone"; strokeCount: number; frames: number[]; keyframes?: number[];
     missingVideo?: "noFrames" | "permissionDenied" | "screenInterrupted";
     manifestUrl: string | null; contactSheetUrl: string | null }
   model: string; modelRevision: string; speakerModel: string | null; speakerModelRevision: string | null

@@ -21,6 +21,9 @@ from wayland_paste import PASTE_FALLBACK, WaylandPaste
 
 logger = logging.getLogger(__name__)
 SHORTCUTS = "org.freedesktop.portal.GlobalShortcuts"
+KGLOBALACCEL = "org.kde.kglobalaccel"
+KGLOBALACCEL_INTERFACE = "org.kde.KGlobalAccel"
+KDE_SHORTCUTS_APP_ID = APP_ID.removesuffix(".desktop")
 SHORTCUT = "toggle-dictation"
 RAW = "raw-dictation"
 PASTE_LAST = "paste-last"
@@ -55,7 +58,7 @@ def assigned_shortcuts(result):
 
 
 class GlobalShortcuts(DesktopPortal):
-    def __init__(self, edge, change, closed, *, annotation=False, raw=False):
+    def __init__(self, edge, change, closed, *, annotation=False, raw=False, history=None):
         super().__init__(closed)
         self.edge = edge
         self.change = change
@@ -63,6 +66,7 @@ class GlobalShortcuts(DesktopPortal):
         self.version = 0
         self.confirmed = False
         self.assigned = {}
+        self.history = history
         self.definitions = SHORTCUT_DEFINITIONS
         if annotation:
             self.definitions += ((ANNOTATE, "Record, save, or draw on the screen with Jaro", "CTRL+ALT+SHIFT+s"),)
@@ -70,25 +74,68 @@ class GlobalShortcuts(DesktopPortal):
             self.definitions += ((RAW, "Dictate without processing", "CTRL+ALT+SHIFT+j"),)
         self.requested = {key for key, _, _ in self.definitions}
 
+    async def prepare_kde_approval(self):
+        try:
+            pending = await run_in_threadpool(self.history.kde_pending_shortcuts)
+            owner, = await self.dbus("GetNameOwner", "s", [KGLOBALACCEL])
+
+            async def accelerator(member, signature, body):
+                result, = await self.call(KGLOBALACCEL_INTERFACE, member, signature, body,
+                                          path="/kglobalaccel", destination=owner)
+                return result
+
+            rows = await accelerator("allActionsForComponent", "as", [[KDE_SHORTCUTS_APP_ID]])
+            registered = {row[1]: row for row in rows if len(row) == 4 and row[0] == KDE_SHORTCUTS_APP_ID}
+            for key in sorted(pending & self.requested & registered.keys()):
+                # Use KDE's complete action ID to read all assigned keys before removing a rejected entry.
+                keys = await accelerator("shortcutKeys", "as", [registered[key]])
+                if not any(any(chord) for chord, in keys) and await accelerator(
+                    "unregister", "ss", [KDE_SHORTCUTS_APP_ID, key]
+                ):
+                    del registered[key]
+            untouched = pending - self.requested
+            # Record new IDs before the portal call so a shutdown can be recovered on the next explicit try.
+            await run_in_threadpool(self.history.save_kde_pending_shortcuts, untouched | (self.requested - registered.keys()))
+            return untouched
+        except HISTORY_ERRORS + (DBusError, TimeoutError, EOFError, TypeError):
+            logger.debug("Could not prepare the KDE shortcut retry.", exc_info=True)
+            return None
+
+    async def finish_kde_approval(self, remaining):
+        if remaining is not None:
+            try:
+                await run_in_threadpool(self.history.save_kde_pending_shortcuts, remaining)
+            except HISTORY_ERRORS:
+                logger.warning("Could not update the KDE shortcut retry state.", exc_info=True)
+
     async def bind(self, *, restoring=False, add_raw=False, active_assignments=None):
-        await self.connect()
+        desktops = os.environ.get("XDG_CURRENT_DESKTOP", "").lower().split(":")
+        kde = "kde" in desktops
+        # Plasma treats IDs ending in .desktop as service launchers, which cannot register portal actions.
+        await self.connect(app_id=KDE_SHORTCUTS_APP_ID if kde else APP_ID)
         try:
             self.version = await self.property(SHORTCUTS, "version")
         except DBusError as failure:
             raise CaptureError("This Wayland desktop doesn't provide global shortcuts. Use Start dictation in Jaro.") from failure
+        kde_approval = None
+        if kde and not restoring and self.version >= 2 and self.history is not None:
+            kde_approval = await self.prepare_kde_approval()
         await self.create_session(SHORTCUTS)
         definitions = self.definitions
         primary_keys = self.requested & {SHORTCUT, RAW, ANNOTATE}
         previous = set()
-        desktops = os.environ.get("XDG_CURRENT_DESKTOP", "").lower().split(":")
         if restoring:
-            previous = set(assigned_shortcuts(await self.request(SHORTCUTS, "ListShortcuts", "oa{sv}", [self.session])))
+            listed = assigned_shortcuts(await self.request(SHORTCUTS, "ListShortcuts", "oa{sv}", [self.session]))
+            previous = set(listed)
             if not previous and "gnome" in desktops:
                 # GNOME 48 only lists assignments already bound to this session.
                 saved = await run_in_threadpool(gnome_shortcuts.portal_shortcut_ids, APP_ID)
                 previous = saved if saved is not None else (active_assignments or set())
             if primary_keys.isdisjoint(previous):
                 raise CaptureError("The desktop has no saved dictation or annotation shortcut. Choose Enable shortcut to approve it again.")
+            if kde and self.version == 1 and active_assignments is None:
+                # Plasma already activates saved keys in CreateSession. Binding again opens System Settings.
+                return self.confirm_assignments(listed)
             definitions = tuple(definition for definition in definitions
                                 if definition[0] in previous or (add_raw and definition[0] == RAW))
         self.requested = {key for key, _, _ in definitions}
@@ -100,9 +147,11 @@ class GlobalShortcuts(DesktopPortal):
             shortcuts.append([key, options])
         try:
             result = await self.request(SHORTCUTS, "BindShortcuts", "oa(sa{sv})sa{sv}",
-                                        [self.session, shortcuts, ""], seconds=90)
+                                        [self.session, shortcuts, ""], seconds=1800 if kde and not restoring else 90)
             granted = assigned_shortcuts(result)
         except PortalResponseError as failure:
+            if failure.code != 1:
+                await self.finish_kde_approval(kde_approval)
             # GNOME's 48.0 backend can report failure after registering an approved shortcut.
             expected = assigned_shortcuts(failure.result)
             key = next((key for key in (SHORTCUT, RAW, ANNOTATE) if key in expected and key in primary_keys), SHORTCUT)
@@ -115,6 +164,11 @@ class GlobalShortcuts(DesktopPortal):
                        if expected.get(key) == label == self.assigned.get(key)}
             if key not in granted:
                 raise failure
+        else:
+            await self.finish_kde_approval(kde_approval)
+        return self.confirm_assignments(granted)
+
+    def confirm_assignments(self, granted):
         self.confirmed = self.session is not None
         self.assigned = {key: label for key, label in granted.items() if key in self.requested} if self.confirmed else {}
         return self.assigned
@@ -223,7 +277,7 @@ class WaylandDictation(LinuxDictation):
         self.authorizing = True
         portal = GlobalShortcuts(self.on_shortcut, self.shortcut_changed, self.disconnected,
                                  annotation=bool(getattr(self.state, "portable_annotation_shortcut", None)),
-                                 raw=self.raw_shortcut_requested)
+                                 raw=self.raw_shortcut_requested, history=self.history)
         self.portal = portal
         try:
             self.shortcut_changed(await portal.bind(restoring=restoring, add_raw=add_raw, active_assignments=active_assignments))
@@ -814,14 +868,26 @@ class WaylandDictation(LinuxDictation):
         self.shortcut_changed({})
         self.configurable = False
 
-    async def disable(self, *, forget_paste=False):
-        self.command_mode = False
-        self.gnome_presses.clear()
+    async def stop_shortcut_approval(self):
         if self.approval is not None:
             self.approval.cancel()
             await asyncio.gather(self.approval, return_exceptions=True)
             self.approval = None
         self.authorizing = False
+
+    async def cancel_approval(self):
+        if self.authorizing and self.approval is not None and not self.approval.done():
+            await self.stop_shortcut_approval()
+        elif self.paste_authorizing:
+            await self.disable_paste(forget=False)
+        else:
+            return
+        self.feedback = "Desktop approval was canceled."
+
+    async def disable(self, *, forget_paste=False):
+        self.command_mode = False
+        self.gnome_presses.clear()
+        await self.stop_shortcut_approval()
         await self.cancel_capture(include_pending=True)
         try:
             await self.disable_paste(forget=forget_paste)

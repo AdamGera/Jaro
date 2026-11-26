@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS annotation_file_operations (
 """
 ROOT_MARKER = ".jaro-annotation-folder"
 CAPTURE_MARKER = ".jaro-annotation-id"
+NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0)
 
 
 class Unavailable(OSError):
@@ -39,10 +40,15 @@ def canonical_id(value):
 
 
 def read_marker(path):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    expected = path.lstat()
+    if not stat.S_ISREG(expected.st_mode) or reparse_point(expected):
+        raise Unavailable()
+    fd = os.open(path, os.O_RDONLY | NO_FOLLOW | getattr(os, "O_NONBLOCK", 0))
     with os.fdopen(fd, "rb") as file:
         info = os.fstat(file.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if not stat.S_ISREG(info.st_mode) or not os.path.samestat(info, expected):
+            raise Unavailable()
+        if os.name != "nt" and (info.st_uid != os.getuid() or info.st_mode & 0o077):
             raise Unavailable()
         try:
             key = file.read(37).decode("ascii")
@@ -54,7 +60,7 @@ def read_marker(path):
 
 
 def write_marker(path, key):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NO_FOLLOW, 0o600)
     try:
         with os.fdopen(fd, "wb") as file:
             file.write(key.encode("ascii"))
@@ -65,10 +71,19 @@ def write_marker(path, key):
         raise
 
 
+def reparse_point(info):
+    return bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def plain_directory(path):
+    info = path.lstat()
+    return stat.S_ISDIR(info.st_mode) and not reparse_point(info)
+
+
 def root_path(folder, location):
     try:
         path = Path(folder)
-        if path.resolve(strict=True) == path and path.is_dir() and read_marker(path / ROOT_MARKER) == location:
+        if plain_directory(path) and path.resolve(strict=True) == path and read_marker(path / ROOT_MARKER) == location:
             return path
     except (OSError, ValueError, RuntimeError):
         pass
@@ -85,6 +100,13 @@ def location_root(db, location):
 def current(db):
     return db.execute("""SELECT a.id,a.folder FROM annotation_location_preference p
                          JOIN annotation_locations a ON a.id=p.location WHERE p.id=1""").fetchone()
+
+
+def capture_location(db):
+    if row := current(db):
+        root_path(row["folder"], row["id"])
+        return row["id"]
+    return None
 
 
 def status(db, default):
@@ -138,7 +160,7 @@ def bundle_path(root, key):
 
 def check_bundle(folder, key):
     try:
-        if not folder.is_symlink() and folder.is_dir() and read_marker(folder / CAPTURE_MARKER) == key:
+        if plain_directory(folder) and read_marker(folder / CAPTURE_MARKER) == key:
             return folder
     except (OSError, ValueError):
         pass
@@ -179,7 +201,7 @@ def duplicate(source, destination):
     try:
         os.link(source, destination, follow_symlinks=False)
     except OSError as error:
-        if error.errno not in LINK_FALLBACK_ERRNOS:
+        if error.errno not in LINK_FALLBACK_ERRNOS and getattr(error, "winerror", None) not in (1, 17, 50):
             raise
         with source.open("rb") as reader, destination.open("xb") as output:
             if hasattr(os, "fchmod"):

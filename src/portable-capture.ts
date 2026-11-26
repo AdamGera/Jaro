@@ -102,19 +102,21 @@ export function portableRecordingPreview(id: string, onText: (transcript: Transc
   let pending = false
   let failures = 0
   let through = 0
+  let rev = 0
   return {
     async update() {
       if (controller.signal.aborted || pending || performance.now() < nextCheck) return
       pending = true
-      nextCheck = performance.now() + 900
+      nextCheck = performance.now() + 450
       try {
-        const response = await request(`/${id}/preview?after=${through}`, { signal: controller.signal })
+        const response = await request(`/${id}/preview?after=${through}&rev=${rev}`, { signal: controller.signal })
         failures = 0
         if (response.status === 204) return
-        const data: { through: number; text: string; segments: Transcript["segments"] } = await response.json()
+        const data: { through: number; rev?: number; text: string; tentative?: string; segments: Transcript["segments"] } = await response.json()
         if (controller.signal.aborted) return
         through = data.through
-        onText({ ...EMPTY_TRANSCRIPT, text: data.text, segments: data.segments })
+        if (typeof data.rev === "number") rev = data.rev
+        onText({ ...EMPTY_TRANSCRIPT, text: data.text, tentative: data.tentative || undefined, segments: data.segments })
       } catch {
         if (!controller.signal.aborted && ++failures === 2) onSlow()
       } finally {

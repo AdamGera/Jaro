@@ -178,10 +178,6 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
         NSString *identifier = request[@"id"];
         NSString *action = request[@"action"];
         if (![identifier isKindOfClass:NSString.class] || ![action isKindOfClass:NSString.class]) return;
-        if ([action isEqual:@"setup"] && !self.updating) {
-            [self showWorkspace];
-            [NSApp activate];
-        }
         JardDictationReply reply = ^(id result, NSString *error) {
             if (!error && [action isEqual:@"status"]) {
                 NSMutableDictionary *status = [result mutableCopy];
@@ -189,13 +185,11 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
                 result = status;
             }
             NSDictionary *response = error ? @{@"ok": @NO, @"error": error} : @{@"ok": @YES, @"result": result ?: @{}};
-            if ([action isEqual:@"setup"] && !error && self.showingApp) {
-                NSData *detail = [NSJSONSerialization dataWithJSONObject:result ?: @{} options:0 error:nil];
-                if (detail) native_sdk_appkit_emit_window_event(self.host, 1, SDK_BYTES(@"jard-dictation-setup"), detail.bytes, detail.length);
-            }
             [self sendToHelper:@"jard.controlReply" payload:@{@"id": identifier, @"response": response} request:nil completion:nil];
         };
-        if ([action isEqual:@"sdk-start"]) {
+        if ([action isEqual:@"setup"]) {
+            [self replayDictationSetupShowingWindow:YES reply:reply];
+        } else if ([action isEqual:@"sdk-start"]) {
             [self approveSDKCapture:identifier];
         } else if ([action isEqual:@"desktop-status"]) {
             reply([self desktopStatus], nil);
@@ -458,6 +452,36 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     [self finishBackgroundStartup];
     [self setDockIconVisible:YES];
     native_sdk_appkit_show_window(self.host, 1);
+}
+
+- (void)replayDictationSetupShowingWindow:(BOOL)show reply:(JardDictationReply)reply {
+    if (self.updating || self.updateRestartInProgress || self.closing) {
+        reply(nil, @"Jaro is preparing to close.");
+        return;
+    }
+    if ([self hasActiveCapture]) {
+        reply(nil, @"Finish the current recording before replaying dictation setup.");
+        return;
+    }
+    if (show && !self.window) {
+        reply(nil, @"The Jaro workspace is unavailable.");
+        return;
+    }
+    [self.systemDictation request:@{@"action": @"set", @"key": @"onboarding", @"value": @"welcome"}
+                           reply:^(id result, NSString *error) {
+        if (!error) {
+            [self updateWindowClosePolicy];
+            if (show) {
+                [self showWorkspace];
+                [NSApp activate];
+                if (self.showingApp) {
+                    NSData *detail = [NSJSONSerialization dataWithJSONObject:result options:0 error:nil];
+                    if (detail) native_sdk_appkit_emit_window_event(self.host, 1, SDK_BYTES(@"jard-dictation-setup"), detail.bytes, detail.length);
+                }
+            }
+        }
+        reply(result, error);
+    }];
 }
 
 - (BOOL)canReturnFromPermissionSettings {
@@ -1045,18 +1069,24 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
             }];
             return;
         }
-        [self.systemDictation request:message[@"payload"] reply:^(id result, NSString *error) {
+        JardDictationReply reply = ^(id result, NSString *error) {
             if (error) [self reject:request reason:error];
             else {
                 [self updateWindowClosePolicy];
                 [self respond:@{@"id": request, @"ok": @YES, @"result": result ?: NSNull.null}];
             }
-        }];
+        };
+        if ([payload[@"action"] isEqual:@"set"] && [payload[@"key"] isEqual:@"onboarding"] &&
+            [payload[@"value"] isEqual:@"welcome"]) {
+            [self replayDictationSetupShowingWindow:NO reply:reply];
+        } else {
+            [self.systemDictation request:message[@"payload"] reply:reply];
+        }
         return;
     }
     NSArray *commands = self.showingApp
         ? @[@"jard.devices", @"jard.inputDevices", @"jard.microphoneLevel", @"jard.record", @"jard.stop", @"jard.dictation",
-            @"jard.dictationCleanup", @"jard.live", @"jard.openAudio", @"jard.revealSessionMedia", @"jard.export", @"jard.meetingExports", @"jard.annotationStorage", @"jard.annotationRoutingPolicy", @"jard.annotationRules", @"jard.annotationDestinations", @"jard.annotationRoute", @"jard.rememberAnnotationDestination", @"jard.forgetAnnotationDestination", @"jard.sendAnnotation", @"jard.annotationAgentDestinations", @"jard.sendAnnotationToAgent", @"jard.sendSessionToAgent", @"jard.annotationDeliveries", @"jard.undoAnnotationDelivery", @"jard.correctAnnotationDelivery", @"jard.recover", @"jard.discard", @"jard.open"]
+            @"jard.dictationCleanup", @"jard.live", @"jard.openAudio", @"jard.revealSessionMedia", @"jard.export", @"jard.meetingExports", @"jard.annotationStorage", @"jard.annotationAgentSkill", @"jard.annotationRoutingPolicy", @"jard.annotationRules", @"jard.annotationDestinations", @"jard.annotationRoute", @"jard.rememberAnnotationDestination", @"jard.forgetAnnotationDestination", @"jard.sendAnnotation", @"jard.annotationAgentDestinations", @"jard.sendAnnotationToAgent", @"jard.sendSessionToAgent", @"jard.annotationDeliveries", @"jard.undoAnnotationDelivery", @"jard.correctAnnotationDelivery", @"jard.recover", @"jard.discard", @"jard.open"]
         : @[@"jard.prepare", @"jard.setup"];
     if (![origin isEqual:(self.showingApp ? self.origin : @"zero://inline")] || ![commands containsObject:command]) {
         [self reject:request reason:@"This command is unavailable in this view."];

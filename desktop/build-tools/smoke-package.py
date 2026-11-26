@@ -555,6 +555,20 @@ def run(app, model_source):
             audio = work / "sample.aiff"
             subprocess.run(["/usr/bin/say", "-v", "Samantha", "-o", audio,
                             "The books for the library arrive on Monday."], check=True, timeout=20)
+            if (helpers / "jaro-speech").is_file():
+                with api("/api/native/staging?dictation=true", b"") as response:
+                    stage = json.load(response)
+                staged_wav = Path(stage["path"]).with_suffix(".wav")
+                subprocess.run(["/usr/bin/afconvert", "-f", "WAVE", "-d", "LEI16@48000", "-c", "1",
+                                audio, staged_wav], check=True, timeout=20)
+                staged_wav.replace(stage["path"])
+                address = f"/api/native/staging/{stage['id']}"
+                with api(address + "/dictate?language=en", b"") as response:
+                    dictation = json.load(response)
+                assert dictation.get("speechEngine") == "rust" and "library" in dictation["text"].lower(), dictation
+                with api(address + "?dictation=true", method="DELETE"):
+                    pass
+                print("Packaged macOS dictation used the supervised Rust Rumble2 Flash helper.", flush=True)
             sdk_file = app / "Contents/Resources/sdk/typescript/index.mjs"
             sdk_record = library / ".jard-sdk.json"
             assert sdk_file.is_file() and sdk_record.stat().st_mode & 0o777 == 0o600

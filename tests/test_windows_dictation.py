@@ -2,14 +2,15 @@ from types import SimpleNamespace
 import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import time
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from portable_dictation_history import DEFAULT
+from portable_dictation_history import DEFAULT, PortableDictationHistory
 from portable_capture import CaptureError
 from portable_dictation import OutputContext
 from windows_dictation import (
-    COPY_LAST, ELEVATED_COPY_LAST, FOCUS_REQUEST, PASTE_CONTINUATION_CHANGED, PASTE_REQUEST, PASTE_TARGET_ELEVATED,
+    COPY_LAST, ELEVATED_COPY_LAST, FOCUS_REQUEST, PASTE_CONTINUATION_CHANGED, PASTE_REQUEST, PASTE_TARGET_ELEVATED, PICKER_HEADER,
     WindowsDictation, join_dictation, windows_shortcut_parts,
 )
 
@@ -151,6 +152,81 @@ class WindowsDictationTests(unittest.IsolatedAsyncioTestCase):
         self.dictation.deliver.assert_awaited_once_with("A recovered dictation", recovery=True)
         self.dictation.history.record.assert_not_called()
         self.dictation.schedule.assert_not_called()
+
+    async def test_picker_previews_recent_text_without_pasting_and_commits_exact_selection(self):
+        controller = self.dictation
+        controller.listener = SimpleNamespace(stdin=Mock())
+        controller.listener.stdin.drain = AsyncMock()
+        controller.last_id = "new"
+        controller.text = "Newest dictation."
+        controller.history.recent_paste_entries.return_value = [("new", controller.text), ("old", "Previous\nline.")]
+        controller.paste_to = AsyncMock(return_value="Paste shortcut sent.")
+
+        await controller.handle_event("paste-picker 25 12 34 56")
+        await controller.picker_load
+        packet = controller.listener.stdin.write.call_args.args[0]
+        self.assertEqual(PICKER_HEADER.unpack_from(packet), (b"k", 25, 2))
+        self.assertEqual(packet[PICKER_HEADER.size + 8:], b"Newest dictation.Previous\r\nline.")
+        controller.paste_to.assert_not_awaited()
+        await controller.handle_event("picker-paste 24 1")
+        self.assertIsNone(controller.action)
+        await controller.handle_event("picker-paste 25 1")
+        await controller.action
+        self.assertEqual(controller.paste_to.await_args.args[:2], ("Previous\nline.", ("12", "34", "56")))
+        self.assertTrue(controller.paste_to.await_args.kwargs["raw"])
+        self.assertEqual(controller.feedback, "Paste shortcut sent.")
+
+    async def test_picker_rechecks_deleted_entries_and_cancels_when_focus_changes(self):
+        controller = self.dictation
+        controller.listener = SimpleNamespace(stdin=Mock())
+        controller.listener.stdin.drain = AsyncMock()
+        controller.history.recent_paste_entries.return_value = [("old", "Older text")]
+        controller.paste_to = AsyncMock()
+
+        for sequence, event in ((12, "picker-paste 12 0"), (13, "picker-copy 13 0")):
+            with self.subTest(action=event):
+                controller.history.recent_paste_entries.return_value = [("old", "Older text")]
+                await controller.handle_event(f"paste-picker {sequence} 12 34 56")
+                await controller.picker_load
+                with patch("windows_dictation.copy_text", new_callable=AsyncMock) as copy:
+                    if sequence == 12:
+                        controller.history.recent_paste_entries.return_value = []
+                    else:
+                        await controller.handle_event("paste-focus-lost")
+                    await controller.handle_event(event)
+                    if controller.action is not None:
+                        await controller.action
+                    controller.paste_to.assert_not_awaited()
+                    copy.assert_not_awaited()
+
+    async def test_picker_copy_only_copies_selected_retained_text(self):
+        controller = self.dictation
+        controller.listener = SimpleNamespace(stdin=Mock())
+        controller.listener.stdin.drain = AsyncMock()
+        controller.history.recent_paste_entries.return_value = [("saved", "Older text")]
+        controller.paste_to = AsyncMock()
+        await controller.handle_event("paste-picker 14 12 34 56")
+        await controller.picker_load
+        with patch("windows_dictation.copy_text", new_callable=AsyncMock) as copy:
+            await controller.handle_event("picker-copy 14 0")
+            await controller.action
+            copy.assert_awaited_once_with("Older text")
+        controller.paste_to.assert_not_awaited()
+        controller.history.record.assert_not_called()
+
+    def test_picker_history_excludes_printed_expired_and_disabled_entries(self):
+        with TemporaryDirectory() as folder:
+            history = PortableDictationHistory(Path(folder))
+            history.initialize()
+            now = time()
+            for index, age, kind in ((1, 0, "printed"), (2, 1, "raw"), (3, 2, "dictation"),
+                                     (4, 8 * 86_400, "dictation")):
+                history.record({"id": str(index), "time": now - age, "kind": kind,
+                                "text": f"Text {index}", "app": "", "seconds": 1,
+                                "inferenceMs": 1, "totalMs": 2})
+            self.assertEqual(history.recent_paste_entries(8), [("2", "Text 2"), ("3", "Text 3")])
+            history.configure(retention=0)
+            self.assertEqual(history.recent_paste_entries(8), [])
 
     def test_continuation_respects_existing_spaces_punctuation_and_names(self):
         self.assertEqual(join_dictation("We talked,", "And listened."), " and listened.")

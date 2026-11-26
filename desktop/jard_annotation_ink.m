@@ -109,11 +109,23 @@ static void drawFrameTime(CGContextRef context, NSTimeInterval time, CGPoint loc
     CFRelease(font);
 }
 
-static NSArray<NSNumber *> *writeContactSheet(AVURLAsset *asset, NSURL *path, NSArray<NSNumber *> *times, id *firstFrame) {
+static BOOL writeAnnotationPNG(CGImageRef image, NSURL *path) {
+    if (!image) return NO;
+    NSMutableData *png = NSMutableData.data;
+    CGImageDestinationRef output = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)png, CFSTR("public.png"), 1, NULL);
+    if (!output) return NO;
+    CGImageDestinationAddImage(output, image, NULL);
+    BOOL saved = CGImageDestinationFinalize(output) && [png writeToURL:path options:NSDataWritingAtomic error:nil];
+    CFRelease(output);
+    return saved;
+}
+
+static NSArray<NSNumber *> *writeContactSheet(AVURLAsset *asset, NSURL *folder, NSArray<NSNumber *> *times,
+                                                id *firstFrame, NSArray<NSNumber *> **keyframes) {
     if (!times.count) return @[];
     AVAssetImageGenerator *generator = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
     generator.appliesPreferredTrackTransform = YES;
-    generator.maximumSize = CGSizeMake(420, 248);
+    generator.maximumSize = CGSizeMake(1280, 800);
     generator.requestedTimeToleranceBefore = generator.requestedTimeToleranceAfter = CMTimeMake(1, 5);
     NSMutableArray *images = NSMutableArray.array;
     NSMutableArray<NSNumber *> *sampled = NSMutableArray.array;
@@ -154,17 +166,20 @@ static NSArray<NSNumber *> *writeContactSheet(AVURLAsset *asset, NSURL *path, NS
     }
     CGImageRef sheet = CGBitmapContextCreateImage(context);
     CGContextRelease(context);
-    NSMutableData *png = NSMutableData.data;
-    CGImageDestinationRef output = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)png, CFSTR("public.png"), 1, NULL);
-    BOOL saved = NO;
-    if (sheet && output) {
-        CGImageDestinationAddImage(output, sheet, NULL);
-        if (CGImageDestinationFinalize(output)) saved = [png writeToURL:path options:NSDataWritingAtomic error:nil];
-    }
-    if (output) CFRelease(output);
+    BOOL saved = writeAnnotationPNG(sheet, [folder URLByAppendingPathComponent:@"contact-sheet.png"]);
     if (sheet) CGImageRelease(sheet);
-    if (saved) *firstFrame = images.firstObject;
-    return saved ? sampled : @[];
+    if (!saved) return @[];
+    *firstFrame = images.firstObject;
+    NSMutableArray<NSNumber *> *stills = NSMutableArray.array;
+    for (NSUInteger i = 0; i < images.count; i++) {
+        @autoreleasepool {
+            NSString *name = [NSString stringWithFormat:@"frame-%02lu.png", (unsigned long)(i + 1)];
+            if (writeAnnotationPNG((__bridge CGImageRef)images[i], [folder URLByAppendingPathComponent:name]))
+                [stills addObject:@(i + 1)];
+        }
+    }
+    *keyframes = stills;
+    return sampled;
 }
 
 void JardAnnotationMovieHasFrame(NSURL *movie, void (^completion)(BOOL)) {
@@ -189,10 +204,11 @@ void JardWriteAnnotationAssets(NSURL *media, NSString *source, NSDictionary *ori
             NSURL *folder = media.URLByDeletingLastPathComponent;
             id firstFrame = nil;
             NSArray *frames = @[];
+            NSArray<NSNumber *> *keyframes = @[];
             if (!missingVideo) {
                 AVURLAsset *asset = [AVURLAsset URLAssetWithURL:media options:nil];
                 NSArray *times = JardAnnotationFrameTimes(events, CMTimeGetSeconds(asset.duration));
-                frames = writeContactSheet(asset, [folder URLByAppendingPathComponent:@"contact-sheet.png"], times, &firstFrame);
+                frames = writeContactSheet(asset, folder, times, &firstFrame, &keyframes);
             }
             NSMutableArray *serialized = [NSMutableArray arrayWithCapacity:events.count];
             for (NSDictionary *event in events) {
@@ -205,6 +221,7 @@ void JardWriteAnnotationAssets(NSURL *media, NSString *source, NSDictionary *ori
             }
             NSMutableDictionary *manifest = [@{@"version": @1, @"source": source, @"coordinateSpace": @"normalized-bottom-left",
                                                @"events": serialized, @"frames": frames} mutableCopy];
+            if (keyframes.count) manifest[@"keyframes"] = keyframes;
             if (origin.count) manifest[@"origin"] = origin;
             if (missingVideo) manifest[@"missingVideo"] = missingVideo;
             NSError *error = nil;

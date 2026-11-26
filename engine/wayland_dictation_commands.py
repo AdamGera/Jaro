@@ -50,7 +50,7 @@ def same_user(connection):
     return uid == os.geteuid()
 
 
-async def listen(root, perform, *, trash_meeting=None, meeting_command=None, annotation_command=None):
+async def listen(root, perform, *, trash_meeting=None, meeting_command=None, annotation_command=None, onboarding=None):
     from linux_capture import CaptureError
 
     async def request(reader, writer):
@@ -72,6 +72,8 @@ async def listen(root, perform, *, trash_meeting=None, meeting_command=None, ann
                     result = await meeting_command(json.loads(action.removeprefix(MEETING_COMMAND)))
                 elif action.startswith(ANNOTATION_COMMAND) and annotation_command is not None:
                     result = {"annotation": await annotation_command(json.loads(action.removeprefix(ANNOTATION_COMMAND)))}
+                elif action == "onboarding-reset" and onboarding is not None:
+                    result = await onboarding()
                 elif action == PRINT_ACTION or action in ACTIONS or action in GNOME_ACTIONS or action in RAW_ACTIONS:
                     if perform is None:
                         raise CaptureError("System dictation is unavailable on this desktop.")
@@ -129,6 +131,10 @@ def dispatch_annotation(root, action, **options):
     if not isinstance(reply.get("annotation"), dict):
         raise RuntimeError("Jaro returned an invalid annotation reply.")
     return reply["annotation"]
+
+
+def dispatch_onboarding(root):
+    return request_command(root, "onboarding-reset", timeout=5, limit=2048, purpose="replay dictation setup")
 
 
 def request_command(root, action, *, timeout, limit, purpose):

@@ -16,9 +16,9 @@ case "$target" in
             --cross-prefix=x86_64-w64-mingw32- --disable-x86asm --extra-ldflags=-static)
         jobs=${JARO_CODEC_JOBS:-4}
         programs=(ffmpeg.exe ffprobe.exe)
-        screen_flags=(--enable-mediafoundation --enable-demuxer=rawvideo --enable-decoder=rawvideo,h264
-            --enable-encoder=h264_mf,libopenh264,mjpeg,rawvideo --enable-muxer=mpjpeg,rawvideo --enable-libopenh264
-            --enable-filter=adelay,ass,format,fps,scale,showinfo,split,trim --enable-libass
+        screen_flags=(--enable-mediafoundation --enable-demuxer=rawvideo --enable-decoder=rawvideo
+            --enable-encoder=h264_mf,libopenh264,mjpeg --enable-muxer=mpjpeg --enable-libopenh264
+            --enable-filter=adelay,ass,split,trim --enable-libass
             --pkg-config=pkg-config --pkg-config-flags=--static --extra-libs=-lstdc++)
         ;;
     *) printf 'Unsupported codec target: %s\n' "$target" >&2; exit 1 ;;
@@ -46,8 +46,9 @@ fi
 ./configure "${platform_flags[@]}" --disable-autodetect --disable-doc --disable-debug --disable-network \
   --disable-everything --disable-ffplay --enable-ffmpeg --enable-ffprobe \
   --enable-protocol=file,pipe --enable-demuxer=aac,aiff,caf,flac,matroska,mov,mp3,ogg,wav,pcm_s16le,pcm_f32le \
-  --enable-decoder='aac*,alac,flac,mp3*,opus,vorbis,pcm_*,adpcm_*' \
+  --enable-decoder='aac*,alac,flac,mp3*,opus,vorbis,pcm_*,adpcm_*,h264,hevc,mpeg4' \
   --enable-parser=aac,aac_latm,flac,mpegaudio,opus,vorbis \
-  --enable-filter=aresample,aformat,amix,anull,apad,atrim,volume --enable-muxer=ipod,mp4,wav,pcm_f32le,pcm_s16le \
-  --enable-encoder=aac,pcm_s16le,pcm_f32le ${screen_flags[@]+"${screen_flags[@]}"}
+  --enable-filter=aresample,aformat,amix,anull,apad,atrim,volume,crop,format,fps,scale,showinfo \
+  --enable-muxer=ipod,mp4,wav,pcm_f32le,pcm_s16le,rawvideo,image2pipe \
+  --enable-encoder=aac,pcm_s16le,pcm_f32le,rawvideo,ppm ${screen_flags[@]+"${screen_flags[@]}"}
 make -j "$jobs" "${programs[@]}"

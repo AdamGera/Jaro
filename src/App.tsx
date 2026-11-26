@@ -13,6 +13,8 @@ import { portableLogin, PortableApplicationSettings } from "@/components/launch-
 import { AgentSetupSettings } from "@/components/agent-setup-settings"
 import { hasPortableDictation, PortableDictationSettings, PortableDictationWorkspace } from "@/components/portable-dictation-workspace"
 import { PortableModelSetup, type ModelSetup } from "@/components/portable-model-setup"
+import { PortableOnboardingTour } from "@/components/portable-onboarding-tour"
+import { hasPortableOnboarding } from "@/portable-onboarding"
 import { hasPortableScreenRecording, hasDesktopAnnotationSettings, PortableScreenRecording, DesktopAnnotationSettings } from "@/components/portable-screen-recording"
 import { portableUpdates, useDesktopUpdate } from "@/desktop-update"
 import { useSystemDictation } from "./system-dictation"
@@ -120,6 +122,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     return () => { observer.disconnect(); window.removeEventListener("resize", report) }
   }, [native])
   const [client] = useState(() => crypto.randomUUID())
+  const [portableOnboarding, setPortableOnboarding] = useState<string | null>(null)
   const desktopUpdate = useDesktopUpdate(native, client)
   const recordingAccess = useRecordingAccess(native)
   const systemDictation = useSystemDictation(native)
@@ -198,6 +201,10 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       connection = new EventSource(endpoint + "/stream")
       if (portableUpdates) connection.addEventListener("update", event => {
         window.dispatchEvent(new CustomEvent("native-sdk:jard-update", { detail: JSON.parse(event.data) }))
+      })
+      if (hasPortableOnboarding) connection.addEventListener("onboarding", event => {
+        const { id } = JSON.parse(event.data) as { id: string | null }
+        setPortableOnboarding(id)
       })
     }
     const disconnect = () => {
@@ -302,7 +309,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     const tab = sessionTab(saved, wanted)
     setCurrent({ ...saved, saved })
     setResult(previous => preserveLive && saved.status === "processing" && !saved.transcript.text && previous.text
-      ? { ...previous, transcriptSource: "rolling" } : saved.transcript)
+      ? { ...previous, tentative: undefined, transcriptSource: "rolling" } : saved.transcript)
     setTab(tab)
     setJump(at)
     setCopied(false)
@@ -383,11 +390,12 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         break
       case "preview":
         if (nativeCapture.current && live && !nativeStopping.current) {
-          setResult({ ...EMPTY_TRANSCRIPT, text: event.text, segments: event.segments ?? [] })
+          setResult({ ...EMPTY_TRANSCRIPT, text: event.text, tentative: event.tentative || undefined, segments: event.segments ?? [] })
         }
         break
       case "finished":
         nativeStopping.current = true
+        setResult(previous => previous.tentative ? { ...previous, tentative: undefined } : previous)
         setPhase("transcribing")
         if (event.reason && event.reason !== "Stopped") setFeedback(event.reason)
         break
@@ -440,7 +448,14 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           setMode(devices.capture.mode)
           setLive(devices.capture.live)
           setElapsed(Math.floor(devices.capture.seconds ?? 0))
-          if (devices.capture.text) setResult({ ...EMPTY_TRANSCRIPT, text: devices.capture.text, segments: devices.capture.segments ?? [] })
+          if (devices.capture.text || devices.capture.tentative) {
+            setResult({
+              ...EMPTY_TRANSCRIPT,
+              text: devices.capture.text ?? "",
+              tentative: devices.capture.tentative || undefined,
+              segments: devices.capture.segments ?? [],
+            })
+          }
           setPhase("recording")
         }
       } catch (error) {
@@ -766,6 +781,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         })
     }
     if (active && live) active.preview?.stop()
+    if (live) setResult(previous => previous.tentative ? { ...previous, tentative: undefined } : previous)
     if (active && !live) {
       const onPreviewDelayed = () => setPreviewPaused(true)
       active.preview = "captureId" in active.microphone
@@ -1002,10 +1018,9 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         calls, languages: selectedLanguages.map(language => language.code), viewing: meetingTake,
         canView: desktopReady && !screenBusy, onView: call => void startRecording(true, call),
       } : undefined}
-      dictation={native ? ((destination, id) => <SystemDictationWorkspace key={id} destination={destination}
-        controls={systemDictation} native={native} languages={languageOptions} openVocabulary={openVocabulary} />) :
-        hasPortableDictation ? ((destination, id) => <PortableDictationWorkspace key={id} destination={destination}
-          languages={languageOptions} />) : undefined}
+      dictation={native ? ((onSettings, id) => <SystemDictationWorkspace key={id} onSettings={onSettings}
+        controls={systemDictation} native={native} />) :
+        hasPortableDictation ? ((onSettings, id) => <PortableDictationWorkspace key={id} onSettings={onSettings} />) : undefined}
       settings={native ? {
         general: <div className="dictation-preferences">
           <DesktopUpdateSettings controls={desktopUpdate} busy={updateBusy} />
@@ -1013,12 +1028,13 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           <RecordingAccessSettings native={native} access={recordingAccess} refusedSource={refusedSource} />
           <AgentSetupSettings native={native} />
         </div>,
-        dictation: visible => <SystemDictationSettings openVocabulary={openVocabulary} controls={systemDictation} native={native} languages={languageOptions} visible={visible} />,
+        dictation: (visible, outputRequest) => <SystemDictationSettings openVocabulary={openVocabulary} controls={systemDictation}
+          native={native} languages={languageOptions} visible={visible} outputRequest={outputRequest} />,
         meetings: <DesktopMeetingControls native={native} languages={selectedLanguages.map(language => language.code)} busy={updateBusy} />,
         annotate: <DesktopAnnotationControls native={native} languages={selectedLanguages.map(language => language.code)}
           controls={systemDictation} busy={updateBusy}
           allowConcurrentCapture={phase === "recording" && !!liveMeeting?.shared && !meetingStopPending && !choosingFile && !dictating} />,
-      } : portableUpdates || portableLogin || hasPortableAudio || hasDesktopAnnotationSettings ? {
+      } : portableUpdates || portableLogin || hasPortableAudio || hasDesktopAnnotationSettings || hasPortableDictation ? {
         general: <div className="dictation-preferences">
           {portableUpdates && <DesktopUpdateSettings controls={desktopUpdate} busy={updateBusy} />}
           {portableLogin && <PortableApplicationSettings />}
@@ -1040,6 +1056,10 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       }}>
     {(native || portableUpdates) && <DesktopUpdateFeedback controls={desktopUpdate} busy={updateBusy} />}
     <SystemDictationTour native={native} controls={systemDictation} modelReady={status === "ready"} modelFailed={status === "error"} />
+    {portableOnboarding && <PortableOnboardingTour key={portableOnboarding} id={portableOnboarding}
+      modelReady={status === "ready"} modelFailed={status === "error"} modelSetup={modelSetup}
+      onModelStarted={() => setModelStatusRequest(value => value + 1)}
+      onFinished={() => setPortableOnboarding(current => current === portableOnboarding ? null : current)} />}
     <div className="soundfolio-shell" data-session={viewingSession}>
       <header className="soundfolio-header">
         <div className="wordmark">

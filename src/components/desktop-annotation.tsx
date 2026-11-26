@@ -1,11 +1,12 @@
 import { useInterfaceLanguage } from "@/interface-language"
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { AppWindow, AudioLines, Crop, FolderOpen, HardDrive, History, Keyboard, Mic, ScreenShare, Smartphone, Square, X, type LucideIcon } from "lucide-react"
 import { AlertDialog } from "radix-ui"
 import type { DesktopAnnotation, DesktopAnnotationAction, DesktopAnnotationSource, DesktopBridge } from "@/desktop"
 import type { SystemDictationControls } from "@/system-dictation"
 import { AnnotationAccess } from "./annotation-access"
 import { AnnotationRules } from "./annotation-rules"
+import { AnnotationAgentGuides } from "./annotation-agent-guides"
 import { SettingGroup, SettingRow } from "./settings-rows"
 import { Button } from "./ui/button"
 
@@ -112,6 +113,7 @@ export function DesktopAnnotationControls({ native, busy, languages, controls, a
     {!annotation.managed && <AnnotationShortcut native={native} controls={controls} busy={busy || pending || !!annotation.busy} />}
     {!annotation.managed && <AnnotationStorage native={native} busy={busy || pending || !!annotation.busy} />}
     {!annotation.managed && <AnnotationRules native={native} />}
+    {!annotation.managed && <AnnotationAgentGuides native={native} busy={busy} />}
     <AlertDialog.Root open={discarding} onOpenChange={setDiscarding}>
       <AlertDialog.Portal>
         <AlertDialog.Overlay className="note-language-scrim" />
@@ -232,31 +234,45 @@ function AnnotationStorage({ native, busy }: { native: DesktopBridge; busy: bool
   </SettingGroup>
 }
 
-function AnnotationFolder({ native, busy }: { native: DesktopBridge; busy: boolean }) {
+type FolderAction = "status" | "choose" | "reveal" | "reset"
+type FolderStatus = { folder: string; custom: boolean; available: boolean }
+
+export function AnnotationFolder({ native, busy }: { native?: DesktopBridge; busy: boolean }) {
   const { t } = useInterfaceLanguage()
-  const [location, setLocation] = useState<{ folder: string; custom: boolean; available: boolean }>()
+  const [location, setLocation] = useState<FolderStatus>()
   const [error, setError] = useState("")
   const [pending, setPending] = useState(false)
   const revision = useRef(0)
+  const requestFolder = useCallback(async (action: FolderAction): Promise<FolderStatus> => {
+    if (native) return native.request("annotationStorage", { action })
+    const response = await fetch("/api/portable/annotation-storage", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action }),
+    })
+    const value = await response.json()
+    if (!response.ok) throw new Error(typeof value.detail === "string" ? value.detail : "Could not access the Annotations folder.")
+    return value
+  }, [native])
   useEffect(() => {
     let current = true
     function read() {
       const version = revision.current
-      void native.request("annotationStorage", { action: "status" }).then(value => {
+      void requestFolder("status").then(value => {
         if (current && revision.current === version) setLocation(value)
-      }).catch(() => {})
+      }).catch(failure => {
+        if (current && revision.current === version) setError(failure instanceof Error ? failure.message : "Could not read the Annotations folder.")
+      })
     }
     read()
     window.addEventListener("focus", read)
     return () => { current = false; window.removeEventListener("focus", read) }
-  }, [native])
+  }, [requestFolder])
 
   async function change(action: "choose" | "reveal" | "reset") {
     revision.current++
     setPending(true)
     setError("")
     try {
-      setLocation(await native.request("annotationStorage", { action }))
+      setLocation(await requestFolder(action))
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Could not open the Annotations folder.")
     } finally { revision.current++; setPending(false) }

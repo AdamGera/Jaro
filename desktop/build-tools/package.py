@@ -91,15 +91,54 @@ def copy_transform_licenses(crates, directory):
         )
 
 
+def prepare_speech_runtime():
+    crate = DESKTOP / "speech-engine"
+    target = CACHE / "speech-target"
+    env = {**os.environ, "MACOSX_DEPLOYMENT_TARGET": "26.0", "CARGO_TARGET_DIR": str(target)}
+    subprocess.run(["cargo", "build", "--release", "--locked"], check=True, cwd=crate, env=env)
+    metadata = subprocess.check_output(
+        ["cargo", "metadata", "--format-version", "1", "--locked", "--filter-platform", "aarch64-apple-darwin"],
+        cwd=crate, env=env,
+    )
+    crates = [package for package in json.loads(metadata)["packages"] if package["source"]]
+    sys_crate = next(item for item in crates if item["name"] == "transcribe-cpp-sys")
+    upstream = next(parent for parent in Path(sys_crate["manifest_path"]).parents
+                    if (parent / "LICENSE").is_file() and (parent / "ggml/LICENSE").is_file())
+    model_cache = CACHE / "speech-model"
+    model_cache.mkdir(exist_ok=True)
+    source = ("https://huggingface.co/nicolamanzini/Rumble-2-Flash-transcribe-cpp-GGUF/"
+              "resolve/16579a78af16f526b0a949f8616d6038901686b0/")
+    for name, digest in (
+        ("Rumble-2-Flash-Q8_0.gguf", "bef26807d155ddb50a92aac5c985d51e7cd9206e311b51d640482d1d3e5431af"),
+        ("LICENSE", "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
+        ("NOTICE", "c38caa4a9fab2de4f91b728a7b018210b0e67e19abf4a4204cd267745a58207b"),
+    ):
+        destination = model_cache / name
+        if not destination.is_file():
+            with tempfile.TemporaryDirectory(dir=model_cache) as scratch:
+                candidate = Path(scratch) / name
+                run("curl", "--fail", "--location", "--retry", "3", "--output", candidate, source + name)
+                with candidate.open("rb") as stream:
+                    if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                        raise SystemExit(f"Rust speech asset has the wrong checksum: {name}")
+                candidate.rename(destination)
+        else:
+            with destination.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
+                    raise SystemExit(f"Cached Rust speech asset has the wrong checksum: {name}")
+    return target / "release/jaro-speech", crates, upstream, model_cache
+
+
 def copy_engine(resources):
     target = resources / "engine"
     target.mkdir()
     # Only ship engine source and catalogs, even if a checkout holds private files.
     for name in (
         "audio_file.py", "chat_context.py", "diarization.py", "diagnostics.py", "engine_lifecycle.py", "engine_paths.py",
-        "insights.py", "local_qwen.py", "meeting_transcript.py", "model_installation.py", "native_recordings.py", "note_stream.py", "overview_exchanges.py", "place_hints.py",
-        "personal_notes.py", "rumble_model.py", "annotation_assets.py", "annotation_deliveries.py", "annotation_retention.py", "annotation_routing.py",
-        "annotation_agents.py", "annotation_automation.py", "annotation_projects.py", "annotation_sites.py", "annotation_storage.py",
+        "insights.py", "live_preview.py", "local_qwen.py", "meeting_transcript.py", "model_installation.py", "native_recordings.py", "note_stream.py", "overview_exchanges.py", "place_hints.py",
+        "personal_notes.py", "rumble_model.py", "rust_speech.py", "annotation_assets.py", "annotation_deliveries.py", "annotation_retention.py", "annotation_routing.py",
+        "annotation_agents.py", "annotation_agent_skill.py", "annotation_automation.py", "annotation_package.py", "annotation_projects.py", "annotation_review.py",
+        "annotation_sites.py", "annotation_storage.py", "screen_contact_sheet.py",
         "annotation_rollback.py", "saved_annotations.py", "dictation_output.py", "dictation_settings.py", "output_transform_catalog.py", "output_transform_network.py", "output_transform_policy.py", "output_transform_operations.py", "output_transform_runtime.py", "output_transform_workspace.py", "jardctl.py", "server.py", "session_images.py", "session_notes.py", "session_store.py",
         "meeting_mcp.py", "meeting_brief.py", "meeting_edits.py", "meeting_exports.py", "meeting_retention.py", "meeting_rolling.py", "meeting_search.py", "saved_dictations.py", "saved_meetings.py",
         "linux_capture.py", "managed_preferences.py", "portable_capture.py", "portable_workspace.py", "sdk_discovery.py", "sdk_embedded.py", "speaker_alignment.py", "transcription_pieces.py", "title_words.py", "writing_api.py", "writing_cache.py",
@@ -109,6 +148,7 @@ def copy_engine(resources):
     ):
         shutil.copy2(ENGINE / name, target)
     shutil.copytree(REPO / "dist", target / "dist")
+    shutil.copytree(REPO / "skills/jaro-annotate", target / "skills/jaro-annotate")
     shutil.copytree(ENGINE / "stupase_model", target / "stupase_model", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copytree(DESKTOP / "transforms" / "starter", target / "transform-starter")
     shutil.copytree(REPO / "licenses", resources / "licenses")
@@ -228,7 +268,7 @@ def development_release_notes(version, notes, previous):
         builds.pop()
 
 
-def assemble(app, updates, transforms):
+def assemble(app, updates, transforms, speech):
     contents = app / "Contents"
     info_file = contents / "Info.plist"
     with info_file.open("rb") as data:
@@ -266,6 +306,16 @@ def assemble(app, updates, transforms):
     helpers = contents / "Helpers"
     helpers.mkdir(exist_ok=True)
     shutil.copy2(transform_executable, helpers / "jaro-transforms")
+    speech_executable, speech_crates, speech_upstream, speech_model = speech
+    shutil.copy2(speech_executable, helpers / "jaro-speech")
+    speech_resources = resources / "Speech"
+    speech_resources.mkdir()
+    for name in ("Rumble-2-Flash-Q8_0.gguf", "LICENSE", "NOTICE"):
+        shutil.copy2(speech_model / name, speech_resources / name)
+    speech_licenses = resources / "licenses/Speech Runtime"
+    copy_transform_licenses(speech_crates, speech_licenses)
+    shutil.copy2(speech_upstream / "LICENSE", speech_licenses / "transcribe.cpp.txt")
+    shutil.copy2(speech_upstream / "ggml/LICENSE", speech_licenses / "ggml.txt")
     run("xcrun", "clang", "-O2", "-arch", "arm64", "-mmacosx-version-min=26", TOOLS / "helper.c", "-o", helpers / "jard-engine")
     shutil.copy2(helpers / "jard-engine", helpers / "jard-ui")
     shutil.copy2(helpers / "jard-engine", helpers / "jardctl")
@@ -415,6 +465,7 @@ def main():
     run("bun", "install", "--frozen-lockfile")
     run("bun", "run", "build")
     transforms = prepare_transform_runtime()
+    speech = prepare_speech_runtime()
     if not opts.reuse_shell:
         run(TOOLS / "build-shell.sh")
     # Build entirely in staging so a compile or signing failure preserves the previous app.
@@ -422,7 +473,7 @@ def main():
         stage = Path(stage)
         app = stage / "Jaro.app"
         run("native", "package", "--target", "macos", "--signing", "none", "--binary", DESKTOP / "zig-out/bin/jard-soundfolio-local", "--output", app, cwd=DESKTOP)
-        assemble(app, updates, transforms)
+        assemble(app, updates, transforms, speech)
         if dev_notes is not None:
             (app / "Contents/Resources" / DEV_NOTES_NAME).write_bytes(dev_notes)
             (stage / DEV_NOTES_NAME).write_bytes(dev_notes)

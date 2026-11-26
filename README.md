@@ -8,7 +8,7 @@
 
 Jaro is a local audio app for macOS and Linux. Dictate into the app you’re already using, record meetings, or transcribe an audio file. Transcription runs on your computer.
 
-**[Download for Mac](https://github.com/AdamGera/Jaro/releases/latest/download/Jaro-arm64.dmg)** · **[Download for Linux](https://github.com/AdamGera/Jaro/releases/latest)**
+**[Download for Mac](https://github.com/AdamGera/Jaro/releases/latest/download/Jaro-arm64.dmg)** · **[Download for Linux](https://github.com/AdamGera/Jaro/releases)**
 
 ## Meetings
 
@@ -46,7 +46,7 @@ To use the same session library in your browser, choose **File → Open in Brows
 
 ### Linux x64
 
-On Debian 13 or Ubuntu 24.04 LTS, download the matching `.deb` from the [latest release](https://github.com/AdamGera/Jaro/releases/latest). Install it with `sudo apt install ./filename.deb`, open Jaro, and choose **Download models**. Debian 13 also has a per-user install with **Restart to Update**. See the [Linux setup guide](desktop/portable/linux/README.md) for the installer, desktop shortcuts, and audio permissions.
+On Debian 13 or Ubuntu 24.04 LTS, download the matching `.deb` from [GitHub Releases](https://github.com/AdamGera/Jaro/releases). Install it with `sudo apt install ./filename.deb`, open Jaro, and choose **Download models**. Debian 13 also has a per-user install with **Restart to Update**. See the [Linux setup guide](desktop/portable/linux/README.md) for the installer, desktop shortcuts, and audio permissions.
 
 ## Mobile previews
 

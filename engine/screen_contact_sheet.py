@@ -12,7 +12,7 @@ import zlib
 
 from starlette.concurrency import run_in_threadpool
 
-from annotation_assets import MAX_TIMELINE_SECONDS, number
+from annotation_assets import KEYFRAME_KINDS, KEYFRAME_SIZE, MAX_TIMELINE_SECONDS, number
 from audio_file import codec_binary
 
 
@@ -57,13 +57,20 @@ def frame_candidates(duration, events):
     return sorted(selected)
 
 
-async def read_preview_frame(movie, seconds, codec):
+async def read_preview_frame(movie, seconds, codec, *, crop=None, max_size=None):
     options = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+    limit_width, limit_height = max_size or (TILE_WIDTH, TILE_HEIGHT)
+    scale = (f"w='min(iw,{limit_width})':h='min(ih,{limit_height})'" if max_size
+             else f"{limit_width}:{limit_height}")
+    filters = f"scale={scale}:force_original_aspect_ratio=decrease,format=rgb24,showinfo"
+    if crop is not None:
+        left, top, width, height = crop
+        filters = f"crop=iw*{width:.8f}:ih*{height:.8f}:iw*{left:.8f}:ih*{top:.8f}:exact=1," + filters
     process = await asyncio.create_subprocess_exec(
         codec, "-hide_banner", "-nostdin", "-loglevel", "info", "-copyts", "-start_at_zero",
         "-ss", f"{seconds:.6f}", "-threads", "2", "-protocol_whitelist", "file,pipe",
         "-format_whitelist", "mov", "-i", movie, "-map", "0:v:0",
-        "-vf", f"scale={TILE_WIDTH}:{TILE_HEIGHT}:force_original_aspect_ratio=decrease,format=rgb24,showinfo",
+        "-vf", filters,
         "-frames:v", "1", "-threads", "1", "-c:v", "rawvideo", "-fps_mode", "passthrough", "-f", "rawvideo", "pipe:1",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **options,
     )
@@ -83,8 +90,8 @@ async def read_preview_frame(movie, seconds, codec):
     except ValueError:
         return None
     width, height = int(width), int(height)
-    if (not number(time, 0, MAX_TIMELINE_SECONDS) or not 0 < width <= TILE_WIDTH
-            or not 0 < height <= TILE_HEIGHT or len(pixels) != width * height * 3):
+    if (not number(time, 0, MAX_TIMELINE_SECONDS) or not 0 < width <= limit_width
+            or not 0 < height <= limit_height or len(pixels) != width * height * 3):
         return None
     return round(time, 3), width, height, pixels
 
@@ -93,8 +100,38 @@ def png_chunk(kind, content):
     return struct.pack(">I", len(content)) + kind + content + struct.pack(">I", zlib.crc32(kind + content))
 
 
-def write_sheet(output, frames):
-    columns = min(2, len(frames))
+def rgb_png(width, height, rows):
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", header) + png_chunk(b"IDAT", zlib.compress(rows, 3)) + png_chunk(b"IEND", b"")
+
+
+def frame_png(width, height, pixels):
+    stride = width * 3
+    rows = bytearray((stride + 1) * height)
+    for row in range(height):
+        start = row * (stride + 1) + 1
+        rows[start:start + stride] = pixels[row * stride:(row + 1) * stride]
+    return rgb_png(width, height, rows)
+
+
+def thumbnail(frame):
+    time, width, height, pixels = frame
+    factor = min(TILE_WIDTH / width, TILE_HEIGHT / height)
+    if factor == 1:
+        return frame
+    out_width, out_height = max(1, int(width * factor)), max(1, int(height * factor))
+    columns = [3 * ((2 * column + 1) * width // (2 * out_width)) for column in range(out_width)]
+    stride = width * 3
+    resized = bytearray()
+    for row in range(out_height):
+        start = ((2 * row + 1) * height // (2 * out_height)) * stride
+        line = pixels[start:start + stride]
+        resized.extend(b"".join(line[column:column + 3] for column in columns))
+    return time, out_width, out_height, resized
+
+
+def write_sheet(output, frames, *, columns=2):
+    columns = min(columns, len(frames))
     rows = math.ceil(len(frames) / columns)
     width, height = columns * CELL_WIDTH, rows * CELL_HEIGHT
     stride = width * 3 + 1
@@ -107,25 +144,37 @@ def write_sheet(output, frames):
         for row in range(frame_height):
             start = (top + row) * stride + left * 3 + 1
             canvas[start:start + line_size] = pixels[row * line_size:(row + 1) * line_size]
-    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     file = NamedTemporaryFile(dir=output.parent, prefix=".contact-sheet-", delete=False)
     temporary = Path(file.name)
     try:
         with file:
-            file.write(b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", header)
-                       + png_chunk(b"IDAT", zlib.compress(canvas, 3)) + png_chunk(b"IEND", b""))
+            file.write(rgb_png(width, height, canvas))
         temporary.replace(output)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-async def make_contact_sheet(movie, output, duration, events):
+def write_preview_assets(paths, frames):
+    write_sheet(paths["contact-sheet"], [thumbnail(frame) for frame in frames])
+    stills = []
+    for index, (_, width, height, pixels) in enumerate(frames, 1):
+        path = paths[KEYFRAME_KINDS[index - 1]]
+        try:
+            path.write_bytes(frame_png(width, height, pixels))
+            stills.append(index)
+        except OSError:
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+    return stills
+
+
+async def make_contact_sheet(movie, paths, duration, events):
     frames = []
     try:
         codec = codec_binary("ffmpeg")
         async with asyncio.timeout(PREVIEW_TIMEOUT):
             for seconds in frame_candidates(min(duration, MAX_TIMELINE_SECONDS), events):
-                frame = await read_preview_frame(movie, seconds, codec)
+                frame = await read_preview_frame(movie, seconds, codec, max_size=KEYFRAME_SIZE)
                 if frame and (not frames or int(frame[0] * 10 + .0001) > int(frames[-1][0] * 10 + .0001)):
                     frames.append(frame)
     except (OSError, TimeoutError):
@@ -133,6 +182,6 @@ async def make_contact_sheet(movie, output, duration, events):
         pass
     if frames:
         with suppress(OSError):
-            await run_in_threadpool(write_sheet, output, frames)
-            return [frame[0] for frame in frames]
-    return []
+            keyframes = await run_in_threadpool(write_preview_assets, paths, frames)
+            return [frame[0] for frame in frames], keyframes
+    return [], []

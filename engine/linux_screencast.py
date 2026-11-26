@@ -130,9 +130,9 @@ async def preview_pipe():
 
 class ScreenRecording:
     def __init__(self, staging, source, microphone, computer_audio=False, *, microphone_device="", native_x11=False, notice=None,
-                 draw_on_start=False, x11_area=None, show_area_picker=None):
+                 draw_on_start=False, x11_area=None, show_area_picker=None, annotation_location=None):
         audio = tuple(name for name, enabled in (("mic", microphone), ("system", computer_audio)) if enabled)
-        self.draft = ScreenDraft(staging / str(uuid4()), source, audio)
+        self.draft = ScreenDraft(staging / str(uuid4()), source, audio, annotation_location)
         self.microphone_device = microphone_device
         self.levels = dict.fromkeys(audio, 0)
         self.unavailable_audio = set()

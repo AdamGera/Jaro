@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -125,6 +126,30 @@ class SessionStoreTests(unittest.TestCase):
         self.assertFalse(full_movie.parent.exists())
         self.assertTrue((self.trash / f"Jaro Annotation {record}" / "Capture" / full_movie.name).is_file())
 
+    def test_interrupted_annotation_waits_for_its_original_media_folder(self):
+        drive = self.root / "Annotations"
+        drive.mkdir()
+        with self.store.connection() as db:
+            annotation_storage.select(db, str(drive.resolve()), self.store.root)
+            location = annotation_storage.capture_location(db)
+        key, source = self.retention_annotation(0, processing=True, location=location)
+        with self.store.connection() as db:
+            db.execute("INSERT INTO meeting_finalization(session_id) VALUES(?)", (key,))
+        self.store.finish(self.key)
+        offline = drive.rename(self.root / "Disconnected")
+        drive.mkdir()
+        reopened = SessionStore(self.store.root)
+        self.assertTrue(reopened.has_pending_recordings())
+        self.assertIsNone(reopened.claim_recording_finalization())
+        self.assertEqual(reopened.get(key)["status"], "interrupted")
+        with reopened.connection() as db:
+            self.assertEqual(db.execute("SELECT attempts FROM meeting_finalization WHERE session_id=?", (key,)).fetchone()[0], 0)
+        drive.rmdir()
+        offline.rename(drive)
+        claim = reopened.claim_recording_finalization()
+        self.assertEqual((claim["id"], claim["source"]), (key, source))
+        self.assertTrue(claim["source"].is_file())
+
     def test_annotation_folder_recovery_only_removes_its_own_unpublished_capture(self):
         folder = self.root / "External"
         folder.mkdir()
@@ -195,6 +220,262 @@ class SessionStoreTests(unittest.TestCase):
             db.execute("UPDATE sessions SET created='2000-01-01T00:00:00Z' WHERE id=?", (key,))
         self.assertEqual(annotation_retention.sweep(self.store, self.send_to_fixture_trash), (1, []))
         self.assertTrue((self.trash / f"Jaro Annotation {key}" / "Capture" / narration.name).is_file())
+
+    def test_annotation_package_is_a_separate_copy_and_keeps_details_after_media_expires(self):
+        from annotation_package import write_package
+
+        key, movie = self.retention_annotation(8)
+        source, _ = self.store.annotation_asset(key, "manifest")
+        events = [{"time": 0.4, "stroke": 1, "from": [0.2, 0.3], "to": [0.4, 0.5]}]
+        source.write_text(json.dumps({"version": 1, "coordinateSpace": "normalized-bottom-left",
+                                     "source": "display", "events": events, "frames": [0.6],
+                                     "video": "/private/local.mp4"}))
+        jpeg = bytes.fromhex("ffd8 ffc0 000b 08 0002 0003 01 01 1100 ffd9")
+        with self.store.connection() as db:
+            session_images.add(db, key, jpeg)
+        with self.assertRaisesRegex(ValueError, "outside the session library"):
+            write_package(self.store, key, movie.parent)
+
+        first = self.root / write_package(self.store, key, self.root)["name"]
+        document = json.loads((first / "annotation.json").read_text())
+        self.assertEqual(first.suffix, ".jaroannotation")
+        self.assertEqual(document["formatVersion"], 1)
+        capture = document["annotation"]
+        self.assertEqual((capture["id"], capture["events"]), (key, events))
+        self.assertEqual(capture["transcript"]["text"], "Look at this chart.")
+        self.assertEqual((first / capture["video"]).read_bytes(), movie.read_bytes())
+        self.assertEqual((first / capture["contactSheet"]).read_bytes(), b"fixture sheet")
+        self.assertEqual((first / capture["images"][0]).read_bytes(), jpeg)
+        self.assertIn("Look at this chart.", (first / "summary.md").read_text())
+
+        self.assertEqual(annotation_retention.sweep(self.store, self.send_to_fixture_trash), (1, []))
+        second = self.root / write_package(self.store, key, self.root)["name"]
+        self.assertNotEqual(first, second)
+        self.assertTrue((first / capture["video"]).is_file())
+        self.assertNotIn("video", json.loads((second / "annotation.json").read_text())["annotation"])
+
+    def test_annotation_package_cleans_up_a_failed_copy_and_accepts_narration_only(self):
+        from annotation_package import write_package
+
+        key, narration = self.retention_annotation(1, missing_video="screenInterrupted")
+        source, _ = self.store.annotation_asset(key, "manifest")
+        source.write_text(json.dumps({"version": 1, "events": [], "coordinateSpace": "normalized-bottom-left"}))
+        with patch("annotation_package.shutil.copyfile", side_effect=OSError("write failed")):
+            with self.assertRaisesRegex(OSError, "write failed"):
+                write_package(self.store, key, self.root)
+        self.assertEqual(list(self.root.glob("*.jaroannotation")), [])
+        folder = self.root / write_package(self.store, key, self.root)["name"]
+        capture = json.loads((folder / "annotation.json").read_text())["annotation"]
+        self.assertEqual((folder / capture["audio"]).read_bytes(), narration.read_bytes())
+        self.assertEqual(capture["missingVideo"], "screenInterrupted")
+        self.assertNotIn("video", capture)
+
+    def test_annotation_stills_survive_video_expiry_and_follow_record_retention(self):
+        from annotation_assets import read_staged_annotation
+        from annotation_package import write_package
+        from screen_contact_sheet import frame_png
+
+        source = self.root / "Capture.mp4"
+        source.write_bytes(b"fixture movie")
+        paths = staged_annotation_paths(source)
+        paths["manifest"].write_text(json.dumps({"version": 1, "source": "display",
+            "coordinateSpace": "normalized-bottom-left", "events": [], "frames": [0.5, 1.5], "keyframes": [1, 2]}))
+        first = frame_png(2, 1, b"\x20\x40\x60" * 2)
+        second = frame_png(2, 1, b"\x30\x70\xb0" * 2)
+        paths["contact-sheet"].write_bytes(first)
+        paths["frame-01"].write_bytes(first)
+        paths["frame-02"].write_bytes(second)
+        annotation = read_staged_annotation(source)
+        key, movie = self.store.create(source, source.name, "video/mp4", {"recording": False, "diarization": False},
+                                       3, annotation=annotation, video_only=True)
+        with self.store.connection() as db:
+            db.execute("UPDATE sessions SET created=? WHERE id=?", ((datetime.now(timezone.utc) - timedelta(days=8)).isoformat(), key))
+        self.assertEqual(annotation_retention.sweep(self.store, self.send_to_fixture_trash), (1, []))
+        self.assertFalse(movie.exists())
+        package = self.root / write_package(self.store, key, self.root)["name"]
+        exported = json.loads((package / "annotation.json").read_bytes())["annotation"]
+        self.assertEqual(exported["keyframes"], [1, 2])
+        self.assertNotIn("video", exported)
+        self.assertIn("Saved stills", (package / "summary.md").read_text())
+        self.assertEqual((package / "frames/frame-02.png").read_bytes(), second)
+        outputs = self.root / "outputs"
+        outputs.mkdir()
+        for reference in (key, str(package)):
+            result = subprocess.run([sys.executable, str(ENGINE_ROOT / "jardctl.py"), "annotate", "frames",
+                                     reference, "--from", "1.48", "--to", "1.52", "--output", str(outputs), "--json"],
+                                    env={**os.environ, "RUMBLE_DATA_DIR": str(self.store.root), "RUMBLE_PORT": "1"},
+                                    text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            value = json.loads(result.stdout)
+            self.assertEqual((value["source"], value["frameTimes"]), ("saved", [1.5]))
+            still, = value["frames"]
+            self.assertEqual(Path(still).read_bytes(), second)
+        self.assertEqual(list(outputs.iterdir()), [])
+        with self.store.connection() as db:
+            db.execute("UPDATE sessions SET created='2000-01-01T00:00:00Z' WHERE id=?", (key,))
+        self.assertEqual(annotation_retention.sweep(self.store, self.send_to_fixture_trash), (1, []))
+        self.assertFalse(self.store.exists(key))
+        self.assertEqual((self.trash / f"Jaro Annotation {key}" / "Capture/frame-02.png").read_bytes(), second)
+
+    def test_annotation_cli_opens_a_moved_package_without_a_library(self):
+        from annotation_package import write_package
+
+        key, _ = self.retention_annotation(1)
+        source, _ = self.store.annotation_asset(key, "manifest")
+        events = [{"time": 0.2, "stroke": 1, "from": [0.2, 0.3], "to": [0.4, 0.5]},
+                  {"time": 0.4, "liftedAt": 0.8, "stroke": 1, "from": [0.4, 0.5], "to": [0.6, 0.7]},
+                  {"time": 0.9, "clear": True}]
+        source.write_text(json.dumps({"version": 1, "events": events, "coordinateSpace": "normalized-bottom-left"}))
+        jpeg = bytes.fromhex("ffd8 ffc0 000b 08 0002 0003 01 01 1100 ffd9")
+        with self.store.connection() as db:
+            session_images.add(db, key, jpeg)
+        active = self.root / write_package(self.store, key, self.root)["name"]
+        moved = active.rename(self.root / "Shared مراجعة.jaroannotation")
+        manifest = moved / "annotation.json"
+        payload = json.loads(manifest.read_bytes())
+        payload["additiveMetadata"] = {"example": "future field"}
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        library = self.root / "unused-library"
+        env = {**os.environ, "RUMBLE_DATA_DIR": str(library), "RUMBLE_PORT": "1", "PYTHONUTF8": "1"}
+
+        def command(*args):
+            result = subprocess.run([sys.executable, str(ENGINE_ROOT / "jardctl.py"), "annotate", *args],
+                                    cwd=self.root, env=env, text=True, encoding="utf-8", capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout
+
+        shown = json.loads(command("show", moved.name))
+        self.assertEqual((shown["id"], shown["created"]), (key, self.store.get(key)["created"]))
+        self.assertIsNone(shown["route"])
+        self.assertEqual(Path(shown["videoPath"]).read_bytes(), b"fixture movie")
+        self.assertEqual([Path(path).read_bytes() for path in shown["imagePaths"]], [jpeg])
+        self.assertEqual(json.loads(command("inspect", str(manifest), "--json")), payload)
+        self.assertEqual(json.loads(command("inspect", moved.name, "--strokes", "--json"))["strokes"],
+                         [{"stroke": 1, "start": 0.2, "end": 0.8, "segments": 2}])
+        self.assertIn("Look at this chart.", command("context", moved.name))
+        self.assertIn("Stroke 1", command("inspect", moved.name, "--strokes"))
+        (moved / payload["annotation"]["video"]).unlink()
+        shown = json.loads(command("show", str(manifest)))
+        self.assertIsNone(shown["videoPath"])
+        self.assertEqual(shown["transcript"], "Look at this chart.")
+        self.assertEqual(Path(shown["contactSheetPath"]).read_bytes(), b"fixture sheet")
+        self.assertFalse(library.exists())
+        self.assertEqual(json.loads(manifest.read_bytes()), payload)
+
+    def test_annotation_cli_exports_stills_and_reviews_timed_narration_and_strokes(self):
+        from annotation_package import write_package
+
+        generator = os.environ.get("JARO_TEST_VIDEO_GENERATOR") or shutil.which("ffmpeg")
+        if not generator:
+            self.skipTest("FFmpeg is required to generate the video fixture.")
+        key, movie = self.retention_annotation(1, processing=True)
+        subprocess.run([generator, "-v", "error", "-y", "-f", "lavfi",
+                        "-i", "testsrc2=size=128x96:rate=10:duration=3", "-c:v", "mpeg4", str(movie)],
+                       check=True, capture_output=True, timeout=15)
+        source, _ = self.store.annotation_asset(key, "manifest")
+        events = [{"time": 1.4, "liftedAt": 1.7, "stroke": 4, "from": [0.1, 0.15], "to": [0.2, 0.3]}]
+        source.write_text(json.dumps({"version": 1, "events": events, "coordinateSpace": "normalized-bottom-left"}))
+        text = "Review the café chart."
+        self.store.append(key, {"text": text, "language": "English", "words": [
+            {"start": 1.1, "end": 1.3, "text": "Review"}, {"start": 1.3, "end": 1.4, "text": "the"},
+            {"start": 1.4, "end": 1.6, "text": "café"}, {"start": 1.6, "end": 1.8, "text": "chart."}],
+            "segments": [{"speaker": 1, "start": 1.1, "end": 1.8, "text": text}]}, 2)
+        self.store.finish(key)
+        package = self.root / write_package(self.store, key, self.root)["name"]
+        manifest = package / "annotation.json"
+        manifest_before = manifest.read_bytes()
+        video = package / json.loads(manifest_before)["annotation"]["video"]
+        video_before = video.read_bytes()
+        unused = self.root / "unused-library"
+
+        def command(action, ref, *args, library=unused, succeeds=True):
+            result = subprocess.run([sys.executable, str(ENGINE_ROOT / "jardctl.py"), "annotate",
+                                     action, str(ref), *args, "--json"], cwd=self.root,
+                                    env={**os.environ, "RUMBLE_DATA_DIR": str(library), "RUMBLE_PORT": "1",
+                                         "PYTHONUTF8": "1"}, text=True, encoding="utf-8", capture_output=True,
+                                    timeout=30)
+            if not succeeds:
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                return result.stderr + result.stdout
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout)
+
+        stills = command("frames", package, "--from", "0:00.4", "--to", "2.4", "--fps", "2",
+                         "--output", str(self.root))
+        self.assertEqual((stills["id"], stills["from"], stills["to"], len(stills["frames"])), (key, 0.4, 2.4, 4))
+        frames = [Path(path).read_bytes() for path in stills["frames"]]
+        self.assertTrue(all(data.startswith(b"\x89PNG\r\n\x1a\n") for data in frames))
+        self.assertEqual([struct.unpack(">II", data[16:24]) for data in frames], [(128, 96)] * 4)
+        self.assertEqual(len(set(frames)), 4)
+        still = command("frames", package, "--from", "1", "--to", "1", "--output", str(self.root))
+        self.assertEqual(len(still["frames"]), 1)
+
+        phrase = command("zoom", key, "--at", "CAFE chart", "--frames", "4",
+                         "--output", str(self.root), library=self.store.root)
+        self.assertEqual(phrase["from"], 0.9)
+        self.assertIn(text, phrase["narration"])
+        self.assertEqual(phrase["frames"], sorted(set(phrase["frames"])))
+        self.assertEqual(len(phrase["frames"]), 4)
+        mark_args = ("--mark", "4", "--span", "1.2", "--frames", "4", "--output", str(self.root))
+        marked = command("zoom", manifest, *mark_args)
+        full = command("zoom", manifest, *mark_args, "--full")
+        self.assertEqual((marked["stroke"], marked["frames"]), (4, full["frames"]))
+        self.assertNotEqual(Path(marked["path"]).read_bytes(), Path(full["path"]).read_bytes())
+        self.assertIn("up to 240 frames", command("frames", package, "--from", "0", "--to", "2",
+                                                  "--fps", "240", succeeds=False))
+        self.assertIn("outside the capture", command("frames", package, "--from", "0", "--to", "2",
+                                                     "--output", str(package), succeeds=False))
+        self.assertFalse(unused.exists())
+        self.assertEqual(manifest.read_bytes(), manifest_before)
+        self.assertEqual(video.read_bytes(), video_before)
+        video.unlink()
+        self.assertIn("no video available", command("frames", package, "--from", "0", "--to", "2", succeeds=False))
+
+    def test_annotation_package_reader_rejects_incomplete_and_external_paths(self):
+        from annotation_package import read_package
+
+        folder = self.root / "review.jaroannotation"
+        folder.mkdir()
+        manifest = folder / "annotation.json"
+        with self.assertRaisesRegex(ValueError, "manifest is missing"):
+            read_package(folder)
+        stroke = {"time": 1, "stroke": 1, "from": [0.2, 0.3], "to": [0.4, 0.5]}
+        annotation = {"id": str(uuid4()), "title": "Review", "source": "display", "coordinateSpace": "normalized-bottom-left",
+                      "created": "2026-11-25T10:00:00+00:00", "status": "complete", "frames": [], "events": [stroke],
+                      "transcript": {"text": "", "words": [], "segments": []}}
+
+        def write(**changes):
+            manifest.write_text(json.dumps({"formatVersion": 1, "annotation": {**annotation, **changes}}), encoding="utf-8")
+
+        for path in ("../secret.png", "frames/../../secret.png", "frames\\secret.png", "C:/secret.png", "/secret.png",
+                     "frames/CON.png", "frames/a.png:private", "frames//image.png"):
+            with self.subTest(path=path):
+                write(contactSheet=path)
+                with self.assertRaisesRegex(ValueError, "invalid asset path"):
+                    read_package(manifest)
+        manifest.write_text('{"formatVersion":2,"annotation":{}}', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Unsupported annotation package version"):
+            read_package(folder)
+        write(events=[{**stroke, "time": float("inf")}])
+        with self.assertRaisesRegex(ValueError, "unreadable manifest"):
+            read_package(folder)
+        write(events=[{**stroke, "to": [-1, 0.5]}])
+        with self.assertRaisesRegex(ValueError, "Invalid annotation stroke"):
+            read_package(folder)
+        write(video="missing.mp4")
+        with patch("annotation_package.MAX_PACKAGE_MANIFEST", 10):
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                read_package(folder)
+        if os.name != "nt":
+            (folder / "images").symlink_to(self.root, target_is_directory=True)
+            write(images=["images/meeting.wav"])
+            with self.assertRaisesRegex(ValueError, "regular files and folders"):
+                read_package(folder)
+            alternate = folder / "alternate.json"
+            manifest.rename(alternate)
+            manifest.symlink_to(alternate)
+            with self.assertRaisesRegex(ValueError, "regular files and folders"):
+                read_package(folder)
 
     def test_annotation_trash_failure_keeps_data_available_and_recovers_after_restart(self):
         media, movie = self.retention_annotation(9)
@@ -277,7 +558,8 @@ class SessionStoreTests(unittest.TestCase):
             upload = self.root / f"sample-{index}.mp4"
             upload.write_bytes(b"fixture movie")
             artifacts = staged_annotation_paths(upload)
-            artifacts["manifest"].write_text("{}")
+            artifacts["manifest"].write_text(json.dumps({"version": 1, "coordinateSpace": "normalized-bottom-left",
+                                                         "events": [{"time": 0.5, "clear": True}]}))
             artifacts["contact-sheet"].write_bytes(sheet)
             self.store.create(upload, f"Annotation {index}.mp4", "video/mp4", {
                 "recording": False, "diarization": False, "languageHints": ["en"],
@@ -315,6 +597,9 @@ class SessionStoreTests(unittest.TestCase):
         self.assertIn("more than one", command("annotate", "show", "aaaaaa", check=False))
         self.assertEqual(command("annotate", "show", self.key, check=False), "Annotation not found.")
         context = command("annotate", "context", "latest")
+        inspected = command("annotate", "inspect", "latest")["annotation"]
+        self.assertEqual(inspected["transcript"]["text"], narration)
+        self.assertEqual(inspected["events"], [{"time": 0.5, "clear": True}])
         self.assertIn("0:00.2, 0:01.1", context["markdown"])
         self.assertIn(narration, context["markdown"])
         self.assertEqual(context["contactSheetPath"], latest["contactSheetPath"])

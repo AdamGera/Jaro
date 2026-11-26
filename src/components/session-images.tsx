@@ -118,20 +118,28 @@ export function SessionImages({ session, children }: { session: SavedSession; ch
 
   const sheet = session.annotation?.contactSheetUrl
   const frames = session.annotation?.frames ?? []
+  const savedFrames = new Set(session.annotation?.keyframes)
   const columns = Math.min(2, frames.length)
   const rows = columns ? Math.ceil(frames.length / columns) : 0
   const tiles: Tile[] = [
-    ...(sheet ? frames.map((seconds, index) => {
+    ...frames.flatMap((seconds, index) => {
+      const id = `frame-${index}`
+      const label = `Screen capture at ${clock(seconds)}`
+      if (savedFrames.has(index + 1)) {
+        const slot = String(index + 1).padStart(2, "0")
+        return [{ id, label, url: `/api/sessions/${session.id}/annotation/frame-${slot}` }]
+      }
+      if (!sheet) return []
       const column = index % columns
       const row = Math.floor(index / columns)
-      return {
-        id: `frame-${index}`, url: sheet, label: `Screen capture at ${clock(seconds)}`,
+      return [{
+        id, url: sheet, label,
         crop: {
           backgroundImage: `url("${sheet}")`, backgroundSize: `${100 * columns}% ${100 * rows}%`,
           backgroundPosition: `${columns === 1 ? 0 : column * 100 / (columns - 1)}% ${rows === 1 ? 0 : row * 100 / (rows - 1)}%`,
         },
-      }
-    }) : []),
+      }]
+    }),
     ...assets.map((asset, index) => ({ ...asset, label: `Image ${index + 1}`, removable: true })),
   ]
 
