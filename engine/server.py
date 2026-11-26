@@ -433,7 +433,7 @@ async def load_bundled_speech(state):
     if rust_speech_client(state) is not None:
         return
     try:
-        bundled = await start_bundled_speech(Path(__file__).resolve().parents[1])
+        bundled = await start_bundled_speech(Path(__file__).resolve().parents[1], state.library.root)
         if bundled:
             state.rust_speech, state.rust_speech_process = bundled
             logger.info("Bundled Rust dictation ready with Rumble2 Flash.")

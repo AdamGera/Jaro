@@ -76,7 +76,9 @@ Meetings Settings controls whole-meeting retention. The 24-hour default covers n
 
 Model provenance and SHA-256 digests live in `models.json`. The release notes identify ad-hoc builds. For a Developer ID release, verify notarization and stapling and test the downloaded DMG on a separate clean Apple Silicon Mac.
 
-To run the packaged smoke test, pass the built app path to `desktop/build-tools/smoke-package.py`. Add `--models /path/to/model` to exercise real local inference, word timing, speaker labels, and playback. The test creates a temporary copy of the verified weights, runs the bundle using the system PATH, and removes its own library on exit.
+The Apple Silicon bundle includes the Rust dictation helper. On first launch it downloads a pinned Rumble2 Flash GGUF (557 MB), verifies its SHA-256, and keeps the weights in the local library. Dictation can use the existing local engine during the download or if the helper fails to start.
+
+To run the packaged smoke test, pass the built app path to `desktop/build-tools/smoke-package.py`. Add `--models /path/to/model` to exercise real local inference, word timing, speaker labels, and playback. Add `--rust-model /path/to/Rumble-2-Flash-Q8_0.gguf` to exercise the Rust helper with verified weights. The test copies the supplied weights into a temporary library, runs the bundle using the system PATH, and removes its own library on exit.
 
 ## Signing successive builds with the same publisher certificate
 

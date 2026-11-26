@@ -412,7 +412,7 @@ def verify_annotation_retention(library, helper, api, base):
                 os.rename(entry, (destination or library) / ("Restored disposable " + entry.name))
 
 
-def run(app, model_source):
+def run(app, model_source, rust_model=None):
     app = app.resolve()
     helpers = app / "Contents/Helpers"
     subprocess.run(["codesign", "--verify", "--deep", "--strict", app], check=True)
@@ -520,6 +520,10 @@ def run(app, model_source):
             print("The standalone packaged engine served its workspace before model setup and shut down cleanly.", flush=True)
             return
         assert json.loads(helper("jard-engine", "models", "--from", str(model_source.resolve())).splitlines()[-1])["ready"]
+        if rust_model:
+            model_cache = library / "speech-models"
+            model_cache.mkdir(mode=0o700)
+            shutil.copyfile(rust_model, model_cache / "Rumble-2-Flash-Q8_0.gguf")
         previous_logs = []
         for name, filler, recent in (
             ("live.ndjson", b'{"kind":"fixture","phase":"old"}\n', b'{"phase":"saved"}\n'),
@@ -555,7 +559,8 @@ def run(app, model_source):
             audio = work / "sample.aiff"
             subprocess.run(["/usr/bin/say", "-v", "Samantha", "-o", audio,
                             "The books for the library arrive on Monday."], check=True, timeout=20)
-            if (helpers / "jaro-speech").is_file():
+            if rust_model:
+                assert (helpers / "jaro-speech").is_file()
                 with api("/api/native/staging?dictation=true", b"") as response:
                     stage = json.load(response)
                 staged_wav = Path(stage["path"]).with_suffix(".wav")
@@ -846,5 +851,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("app", type=Path)
     parser.add_argument("--models", type=Path, help="Existing pinned model folder to verify and exercise actual inference.")
+    parser.add_argument("--rust-model", type=Path, help="Pinned Rumble2 Flash GGUF to exercise packaged Rust dictation.")
     args = parser.parse_args()
-    run(args.app, args.models)
+    if args.rust_model and not args.models:
+        parser.error("--rust-model requires --models")
+    run(args.app, args.models, args.rust_model)

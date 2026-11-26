@@ -109,7 +109,6 @@ def prepare_speech_runtime():
     source = ("https://huggingface.co/nicolamanzini/Rumble-2-Flash-transcribe-cpp-GGUF/"
               "resolve/16579a78af16f526b0a949f8616d6038901686b0/")
     for name, digest in (
-        ("Rumble-2-Flash-Q8_0.gguf", "bef26807d155ddb50a92aac5c985d51e7cd9206e311b51d640482d1d3e5431af"),
         ("LICENSE", "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
         ("NOTICE", "c38caa4a9fab2de4f91b728a7b018210b0e67e19abf4a4204cd267745a58207b"),
     ):
@@ -310,7 +309,7 @@ def assemble(app, updates, transforms, speech):
     shutil.copy2(speech_executable, helpers / "jaro-speech")
     speech_resources = resources / "Speech"
     speech_resources.mkdir()
-    for name in ("Rumble-2-Flash-Q8_0.gguf", "LICENSE", "NOTICE"):
+    for name in ("LICENSE", "NOTICE"):
         shutil.copy2(speech_model / name, speech_resources / name)
     speech_licenses = resources / "licenses/Speech Runtime"
     copy_transform_licenses(speech_crates, speech_licenses)

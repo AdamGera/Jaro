@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import hashlib
 import json
 import os
 from secrets import token_hex
@@ -20,6 +21,11 @@ import httpx
 
 DEFAULT_SPEECH_HOST = "127.0.0.1"
 DEFAULT_SPEECH_PORT = 8766
+RUMBLE_GGUF_NAME = "Rumble-2-Flash-Q8_0.gguf"
+RUMBLE_GGUF_BYTES = 557329984
+RUMBLE_GGUF_SHA256 = "bef26807d155ddb50a92aac5c985d51e7cd9206e311b51d640482d1d3e5431af"
+RUMBLE_GGUF_URL = ("https://huggingface.co/nicolamanzini/Rumble-2-Flash-transcribe-cpp-GGUF/"
+                  "resolve/16579a78af16f526b0a949f8616d6038901686b0/" + RUMBLE_GGUF_NAME)
 
 
 def configured_speech_url() -> str | None:
@@ -262,11 +268,53 @@ async def stop_speech_process(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
-async def start_bundled_speech(resources: Path) -> tuple[RustSpeechClient, asyncio.subprocess.Process] | None:
+async def download_rumble_gguf(directory: Path) -> Path:
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    model = directory / RUMBLE_GGUF_NAME
+
+    def verified(path: Path) -> bool:
+        if not path.is_file() or path.stat().st_size != RUMBLE_GGUF_BYTES:
+            return False
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest() == RUMBLE_GGUF_SHA256
+
+    if await asyncio.to_thread(verified, model):
+        return model
+
+    partial = model.with_suffix(".partial")
+    if partial.is_file() and partial.stat().st_size >= RUMBLE_GGUF_BYTES:
+        if await asyncio.to_thread(verified, partial):
+            partial.replace(model)
+            return model
+        partial.unlink()
+    download = await asyncio.create_subprocess_exec(
+        "/usr/bin/curl", "--disable", "--fail", "--location", "--silent", "--show-error",
+        "--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "30",
+        "--retry", "3", "--continue-at", "-",
+        "--output", partial, RUMBLE_GGUF_URL,
+    )
+    try:
+        if await download.wait():
+            raise RuntimeError("Could not download the Rust Rumble2 Flash weights.")
+    finally:
+        if download.returncode is None:
+            with suppress(ProcessLookupError):
+                download.kill()
+            await download.wait()
+    if not await asyncio.to_thread(verified, partial):
+        partial.unlink(missing_ok=True)
+        raise ValueError("The downloaded Rust speech model failed verification.")
+    partial.replace(model)
+    return model
+
+
+async def start_bundled_speech(
+    resources: Path, library: Path,
+) -> tuple[RustSpeechClient, asyncio.subprocess.Process] | None:
     binary = resources.parent / "Helpers/jaro-speech"
-    model = resources / "Speech/Rumble-2-Flash-Q8_0.gguf"
-    if not binary.is_file() or not model.is_file():
+    if not binary.is_file():
         return None
+    model = await download_rumble_gguf(library / "speech-models")
     token = token_hex(32)
     with TemporaryDirectory(prefix="jaro-speech-") as folder:
         ready = Path(folder) / "port"

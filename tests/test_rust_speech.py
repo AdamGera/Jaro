@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
 import json
 import math
 import struct
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -14,6 +17,40 @@ import server
 
 
 class RustSpeechTests(unittest.TestCase):
+    def test_rumble_download_resumes_and_reuses_verified_model(self):
+        data = b"pinned model"
+
+        async def resume(*args):
+            self.assertIn("--continue-at", args)
+            partial = args[args.index("--output") + 1]
+            with partial.open("ab") as stream:
+                stream.write(data[stream.tell():])
+            return SimpleNamespace(returncode=0, wait=AsyncMock(return_value=0))
+
+        with TemporaryDirectory() as directory, patch.multiple(
+            rust_speech, RUMBLE_GGUF_BYTES=len(data), RUMBLE_GGUF_SHA256=hashlib.sha256(data).hexdigest(),
+        ), patch.object(asyncio, "create_subprocess_exec", side_effect=resume) as curl:
+            model = Path(directory) / rust_speech.RUMBLE_GGUF_NAME
+            partial = model.with_suffix(".partial")
+            partial.write_bytes(data[:4])
+            self.assertEqual(asyncio.run(rust_speech.download_rumble_gguf(model.parent)), model)
+            self.assertEqual(model.read_bytes(), data)
+            self.assertFalse(partial.exists())
+            self.assertEqual(asyncio.run(rust_speech.download_rumble_gguf(model.parent)), model)
+            curl.assert_awaited_once()
+
+    def test_rumble_download_discards_invalid_weights(self):
+        async def download(*args):
+            args[args.index("--output") + 1].write_bytes(b"bad")
+            return SimpleNamespace(returncode=0, wait=AsyncMock(return_value=0))
+
+        with TemporaryDirectory() as directory, patch.multiple(
+            rust_speech, RUMBLE_GGUF_BYTES=3, RUMBLE_GGUF_SHA256=hashlib.sha256(b"abc").hexdigest(),
+        ), patch.object(asyncio, "create_subprocess_exec", side_effect=download):
+            with self.assertRaisesRegex(ValueError, "failed verification"):
+                asyncio.run(rust_speech.download_rumble_gguf(Path(directory)))
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_decimate_pcm16_48k_to_16k_f32_preserves_length_and_dc(self):
         # 0.5 s of 48 kHz mono s16le constant value ~0.5
         frames = 24_000
