@@ -87,7 +87,8 @@ pub struct TranscriptionResult {
 
 #[derive(Clone, Debug)]
 pub struct StreamConfig {
-    pub language: Option<String>,
+    pub languages: Vec<String>,
+    pub prompt: Option<String>,
     pub vocabulary: Vec<String>,
     pub partials: bool,
     pub screen_speech: bool,
@@ -108,7 +109,8 @@ enum Command {
     },
     TranscribeOffline {
         samples: Vec<f32>,
-        language: Option<String>,
+        languages: Vec<String>,
+        prompt: Option<String>,
         vocabulary: Vec<String>,
         screen_speech: bool,
         reply: Sender<Result<TranscriptionResult>>,
@@ -209,7 +211,8 @@ impl SpeechEngine {
     pub fn transcribe_offline(
         &self,
         samples: Vec<f32>,
-        language: Option<String>,
+        languages: Vec<String>,
+        prompt: Option<String>,
         vocabulary: Vec<String>,
         screen_speech: bool,
     ) -> Result<TranscriptionResult> {
@@ -217,7 +220,8 @@ impl SpeechEngine {
         self.commands
             .send(Command::TranscribeOffline {
                 samples,
-                language,
+                languages,
+                prompt,
                 vocabulary,
                 screen_speech,
                 reply: tx,
@@ -336,14 +340,16 @@ impl Worker {
                 }
                 Command::TranscribeOffline {
                     samples,
-                    language,
+                    languages,
+                    prompt,
                     vocabulary,
                     screen_speech,
                     reply,
                 } => {
                     let result = self.run_offline(
                         &samples,
-                        language.as_deref(),
+                        &languages,
+                        prompt.as_deref(),
                         &vocabulary,
                         screen_speech,
                     );
@@ -421,7 +427,8 @@ impl Worker {
     fn run_offline(
         &mut self,
         samples: &[f32],
-        language: Option<&str>,
+        languages: &[String],
+        prompt: Option<&str>,
         vocabulary: &[String],
         screen_speech: bool,
     ) -> Result<TranscriptionResult> {
@@ -436,7 +443,7 @@ impl Worker {
         }
         let started = Instant::now();
         let session = self.ensure_session()?;
-        let text = session.transcribe_offline(samples, language, vocabulary, None)?;
+        let text = session.transcribe_offline(samples, languages, prompt, vocabulary, None)?;
         Ok(TranscriptionResult {
             text,
             inference_ms: started.elapsed().as_millis() as u64,
@@ -502,7 +509,8 @@ impl Worker {
 
         let mut finish_started = Instant::now();
         let stream_outcome = session.with_stream(
-            config.language.as_deref(),
+            &config.languages,
+            config.prompt.as_deref(),
             &config.vocabulary,
             &stream_opts,
             &cancel,
@@ -600,7 +608,8 @@ impl Worker {
                 // Fallback to whole-clip offline decode so nothing is ever lost.
                 let fallback = self.run_offline(
                     &all_samples,
-                    config.language.as_deref(),
+                    &config.languages,
+                    config.prompt.as_deref(),
                     &config.vocabulary,
                     false,
                 );
@@ -668,7 +677,8 @@ impl Worker {
                             && let Some(session) = self.session.as_mut()
                             && let Ok(text) = session.transcribe_offline(
                                 clause,
-                                config.language.as_deref(),
+                                &config.languages,
+                                config.prompt.as_deref(),
                                 &config.vocabulary,
                                 Some(&cancel),
                             )
@@ -698,7 +708,8 @@ impl Worker {
                             && let Some(session) = self.session.as_mut()
                             && let Ok(tentative) = session.transcribe_offline(
                                 tail,
-                                config.language.as_deref(),
+                                &config.languages,
+                                config.prompt.as_deref(),
                                 &config.vocabulary,
                                 Some(&cancel),
                             )
@@ -738,7 +749,8 @@ impl Worker {
                             self.ensure_session().and_then(|s| {
                                 s.transcribe_offline(
                                     tail,
-                                    config.language.as_deref(),
+                                    &config.languages,
+                                    config.prompt.as_deref(),
                                     &config.vocabulary,
                                     None,
                                 )
@@ -760,7 +772,8 @@ impl Worker {
                     } else {
                         self.run_offline(
                             &all_samples,
-                            config.language.as_deref(),
+                            &config.languages,
+                            config.prompt.as_deref(),
                             &config.vocabulary,
                             false,
                         )

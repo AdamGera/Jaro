@@ -573,6 +573,25 @@ def run(app, model_source, rust_model=None):
                 assert dictation.get("speechEngine") == "rust" and "library" in dictation["text"].lower(), dictation
                 with api(address + "?dictation=true", method="DELETE"):
                     pass
+                hebrew_audio = work / "sample-he.aiff"
+                if subprocess.run(["/usr/bin/say", "-v", "Carmit", "-o", hebrew_audio,
+                                   "שלום, שמי כרמית. היום מזג האוויר יפה מאוד."],
+                                  stderr=subprocess.DEVNULL, timeout=20).returncode == 0:
+                    with api("/api/native/staging?dictation=true", b"") as response:
+                        he_stage = json.load(response)
+                    he_wav = Path(he_stage["path"]).with_suffix(".wav")
+                    subprocess.run(["/usr/bin/afconvert", "-f", "WAVE", "-d", "LEI16@48000", "-c", "1",
+                                    hebrew_audio, he_wav], check=True, timeout=20)
+                    he_wav.replace(he_stage["path"])
+                    he_address = f"/api/native/staging/{he_stage['id']}"
+                    for query in ("", "?language=he", "?language=he&language=en"):
+                        with api(he_address + "/dictate" + query, b"") as response:
+                            he_dictation = json.load(response)
+                        assert he_dictation.get("speechEngine") == "rust", he_dictation
+                        assert any("א" <= char <= "ת" for char in he_dictation["text"]), he_dictation
+                        assert "language Hebrew" not in he_dictation["text"], he_dictation
+                    with api(he_address + "?dictation=true", method="DELETE"):
+                        pass
                 print("Packaged macOS dictation used the supervised Rust Rumble2 Flash helper.", flush=True)
             sdk_file = app / "Contents/Resources/sdk/typescript/index.mjs"
             sdk_record = library / ".jard-sdk.json"

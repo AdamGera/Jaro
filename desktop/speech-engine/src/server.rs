@@ -95,6 +95,9 @@ struct CreateStreamRequest {
     sample_format: SampleFormat,
     language: Option<String>,
     #[serde(default)]
+    languages: Vec<String>,
+    prompt: Option<String>,
+    #[serde(default)]
     vocabulary: Vec<String>,
     #[serde(default)]
     partials: bool,
@@ -129,6 +132,8 @@ struct TranscribeQuery {
     sample_rate: u32,
     format: Option<SampleFormat>,
     language: Option<String>,
+    languages: Option<String>,
+    prompt: Option<String>,
     #[serde(default = "default_true")]
     screen_speech: bool,
     vocabulary: Option<String>,
@@ -338,11 +343,28 @@ async fn transcribe_offline(
         })
         .unwrap_or_default();
 
+    let mut languages: Vec<String> = query
+        .languages
+        .as_deref()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if languages.is_empty()
+        && let Some(lang) = query.language.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    {
+        languages.push(lang.to_string());
+    }
+
     let engine = state.engine.clone();
-    let language = query.language;
+    let prompt = query.prompt;
     let screen_speech = query.screen_speech;
     let result = tokio::task::spawn_blocking(move || {
-        engine.transcribe_offline(samples_16k, language, vocabulary, screen_speech)
+        engine.transcribe_offline(samples_16k, languages, prompt, vocabulary, screen_speech)
     })
     .await
     .map_err(|e| {
@@ -389,8 +411,15 @@ async fn create_stream(
     }
 
     let caps = state.engine.capabilities();
+    let mut languages = body.languages;
+    if languages.is_empty()
+        && let Some(lang) = body.language.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    {
+        languages.push(lang.to_string());
+    }
     let config = StreamConfig {
-        language: body.language,
+        languages,
+        prompt: body.prompt,
         vocabulary: body.vocabulary,
         partials: body.partials,
         screen_speech: body.screen_speech,

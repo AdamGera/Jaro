@@ -1,0 +1,124 @@
+diff --git a/src/arch/qwen3_asr/qwen3_asr.h b/src/arch/qwen3_asr/qwen3_asr.h
+index 1111111..2222222 100644
+--- a/src/arch/qwen3_asr/qwen3_asr.h
++++ b/src/arch/qwen3_asr/qwen3_asr.h
+@@ -69,6 +69,10 @@ struct ChatTokens {
+     int32_t role_system    = -1;
+     int32_t role_user      = -1;
+     int32_t role_assistant = -1;
++    // Optional Reson8 / Rumble-2-Flash system control tokens (present in vocab when trained with them).
++    int32_t ctl_digits     = -1;
++    int32_t ctl_nofiller   = -1;
++    int32_t ctl_verbatim   = -1;
+ };
+ 
+ struct QwenAsrModel final : public transcribe_model {
+diff --git a/src/arch/qwen3_asr/model.cpp b/src/arch/qwen3_asr/model.cpp
+index 3333333..4444444 100644
+--- a/src/arch/qwen3_asr/model.cpp
++++ b/src/arch/qwen3_asr/model.cpp
+@@ -349,9 +349,21 @@ transcribe_status resolve_chat_tokens(const transcribe::Tokenizer & tok, ChatTok
+         }
+         *p.slot = id;
+     }
++    out.ctl_digits   = tok.find("<digits>");
++    out.ctl_nofiller = tok.find("<nofiller>");
++    out.ctl_verbatim = tok.find("<verbatim>");
+     return TRANSCRIBE_OK;
+ }
+ 
++bool has_reson8_controls(const ChatTokens & ct) {
++    return ct.ctl_digits >= 0 && ct.ctl_nofiller >= 0 && ct.ctl_verbatim >= 0;
++}
++
++bool is_unclosed_language_envelope(const std::string & raw_text) {
++    const size_t first = raw_text.find_first_not_of(" \t\r\n");
++    return first != std::string::npos && raw_text.compare(first, 9, "language ") == 0;
++}
++
+ // Build the prompt token sequence + audio-position list, mirroring the
+ // Qwen3-ASR chat template at the token level:
+ //
+@@ -376,6 +388,11 @@ void build_prompt_tokens(const QwenAsrHParams &       hp,
+     out_ids.push_back(ct.im_start);
+     out_ids.push_back(ct.role_system);
+     out_ids.push_back(ct.newline);
++    if (has_reson8_controls(ct)) {
++        out_ids.push_back(ct.ctl_digits);
++        out_ids.push_back(ct.ctl_nofiller);
++        out_ids.push_back(ct.ctl_verbatim);
++    }
+     out_ids.insert(out_ids.end(), system_ids.begin(), system_ids.end());
+     out_ids.push_back(ct.im_end);
+     out_ids.push_back(ct.newline);
+@@ -410,8 +427,9 @@ constexpr int k_chat_frame_tokens = 15;
+ 
+ // Length build_prompt_tokens produces with an empty system message, so the
+ // system context can be budgeted before the prompt is built.
+-int prompt_tokens_without_system(int T_enc, const std::vector<int32_t> * lang_prefix_ids) {
+-    return k_chat_frame_tokens + T_enc + (lang_prefix_ids != nullptr ? static_cast<int>(lang_prefix_ids->size()) : 0);
++int prompt_tokens_without_system(const ChatTokens & ct, int T_enc, const std::vector<int32_t> * lang_prefix_ids) {
++    return k_chat_frame_tokens + (has_reson8_controls(ct) ? 3 : 0) + T_enc +
++           (lang_prefix_ids != nullptr ? static_cast<int>(lang_prefix_ids->size()) : 0);
+ }
+ 
+ // Generic prompting -> system-message ids: vocabulary joined " " (measured
+@@ -695,7 +713,7 @@ transcribe_status run(transcribe_session *          session,
+     // the same bound as the prompt gate below, checked before an over-length
+     // clip pays for the encoder.
+     const int ceiling = qwen3_context_ceiling(cc->n_ctx, cm->hparams);
+-    if (const int T_min = prompt_tokens_without_system(timing.T_enc, lang_prefix_ptr);
++    if (const int T_min = prompt_tokens_without_system(cm->chat_tokens, timing.T_enc, lang_prefix_ptr);
+         T_min + k_gen_reserve > ceiling) {
+         transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                             "qwen3_asr run: input too long — %d audio + %d prompt tokens "
+@@ -829,7 +847,8 @@ transcribe_status run(transcribe_session *          session,
+     std::vector<int64_t> audio_positions;
+     std::vector<int32_t> system_ids;
+     if (const transcribe_status st = encode_system_context(
+-            cm->tok, params, ceiling - k_gen_reserve - prompt_tokens_without_system(T_enc, lang_prefix_ptr),
++            cm->tok, params,
++            ceiling - k_gen_reserve - prompt_tokens_without_system(cm->chat_tokens, T_enc, lang_prefix_ptr),
+             system_ids);
+         st != TRANSCRIBE_OK) {
+         return st;
+@@ -1150,6 +1169,10 @@ transcribe_status run(transcribe_session *          session,
+             }
+         }
+         transcript_text = raw_text.substr(sep + std::strlen("<asr_text>"));
++    } else if (lang_prefix_ptr == nullptr && is_unclosed_language_envelope(raw_text)) {
++        // Unclosed auto-detect envelope (no <asr_text>): never leak "language X"
++        // as transcript text.
++        transcript_text.clear();
+     }
+ 
+     // Write full_text + a single segment (no timestamps; TIMESTAMPS_NONE).
+@@ -1596,6 +1619,8 @@ transcribe_session::ResultSet finalize_utterance(QwenAsrModel *               cm
+             }
+         }
+         transcript_text = raw_text.substr(sep + std::strlen("<asr_text>"));
++    } else if (lang_prefix_ptr == nullptr && is_unclosed_language_envelope(raw_text)) {
++        transcript_text.clear();
+     }
+ 
+     rs.full_text   = transcript_text;
+@@ -1666,7 +1691,8 @@ transcribe_status run_batch(transcribe_session *          session,
+     // then goes serial (see fit_terms_and_context: otherwise the fits match).
+     const int ceiling       = qwen3_context_ceiling(cc->n_ctx, cm->hparams);
+     auto      system_budget = [&](int T_enc) {
+-        return std::max(ceiling - k_gen_reserve - prompt_tokens_without_system(T_enc, lang_prefix_ptr), 0);
++        return std::max(
++            ceiling - k_gen_reserve - prompt_tokens_without_system(cm->chat_tokens, T_enc, lang_prefix_ptr), 0);
+     };
+     std::vector<int32_t> system_ids;
+     if (encode_system_context(cm->tok, params, system_budget(0), system_ids) != TRANSCRIBE_OK) {
+@@ -1689,7 +1715,8 @@ transcribe_status run_batch(transcribe_session *          session,
+     // real max prompt length before allocating it.
+     std::vector<std::vector<float>> enc_hosts(n);
+     std::vector<int>                T_enc(n, 0);
+-    const int     T_enc_cap  = ceiling - k_gen_reserve - prompt_tokens_without_system(0, lang_prefix_ptr);
++    const int     T_enc_cap =
++        ceiling - k_gen_reserve - prompt_tokens_without_system(cm->chat_tokens, 0, lang_prefix_ptr);
+     const int64_t t_encpass0 = ggml_time_us();
+     if (const transcribe_status st = encode_all_batched(cc, cm, pcm, n_samples, n, T_enc_cap, valid, fail_status,
+                                                         enc_hosts, T_enc, mel_us, enc_us);

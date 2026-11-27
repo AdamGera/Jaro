@@ -58,7 +58,7 @@ enum Commands {
         #[arg(long)]
         vad: Option<PathBuf>,
         #[arg(long)]
-        language: Option<String>,
+        language: Vec<String>,
         #[arg(long, default_value_t = false)]
         stream: bool,
         #[arg(long, default_value_t = false)]
@@ -143,7 +143,8 @@ async fn main() -> Result<()> {
             let result = if stream {
                 let (id, _cancel, mut events_rx) = {
                     let (id, cancel, tx) = engine.begin_stream(engine::StreamConfig {
-                        language: language.clone(),
+                        languages: language.clone(),
+                        prompt: None,
                         vocabulary: Vec::new(),
                         partials: true,
                         screen_speech: true,
@@ -164,7 +165,7 @@ async fn main() -> Result<()> {
                 }
                 final_res
             } else {
-                engine.transcribe_offline(samples, language, Vec::new(), true)?
+                engine.transcribe_offline(samples, language, None, Vec::new(), true)?
             };
 
             let out = serde_json::json!({

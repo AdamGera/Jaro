@@ -136,7 +136,7 @@ def language_prompt(language_codes: tuple[str, ...]) -> str | None:
         return None
     # A processor prompt adds context to one clip. Its language option forces a
     # single output language per clip, even when a batch passes a list.
-    names = ", ".join(LANGUAGES[code] for code in language_codes)
+    names = ", ".join(LANGUAGES.get(code, code) for code in language_codes)
     return f"\nExpected spoken languages: {names}. Transcribe speech in its original language."
 
 

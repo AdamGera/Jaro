@@ -292,7 +292,7 @@ impl GgufSession {
     fn probe_silence(&mut self, stream_options: &StreamOptions) -> transcribe_cpp::Result<()> {
         let cancel = CancelToken::new();
         let silence = vec![0.0f32; STREAM_PREWARM_SAMPLES];
-        self.with_stream(None, &[], stream_options, &cancel, |stream| {
+        self.with_stream(&[], None, &[], stream_options, &cancel, |stream| {
             stream.feed(&silence)?;
             stream.finalize().map(|_| ())
         })?
@@ -328,7 +328,8 @@ impl GgufSession {
     /// drops the `Session` so streaming scratch buffers are freed.
     pub fn with_stream<R>(
         &mut self,
-        language: Option<&str>,
+        languages: &[String],
+        prompt: Option<&str>,
         vocabulary: &[String],
         stream_options: &StreamOptions,
         cancel: &CancelToken,
@@ -339,7 +340,7 @@ impl GgufSession {
             None => self.model.session_with(&self.session_options)?,
         };
         session.set_cancel_token(cancel);
-        let run_opts = self.build_run_options(language, vocabulary, true);
+        let run_opts = self.build_run_options(languages, prompt, vocabulary, true);
         let result = session
             .stream(&run_opts, stream_options)
             .map(|mut stream| drive(&mut stream));
@@ -356,14 +357,15 @@ impl GgufSession {
     pub fn transcribe_offline(
         &mut self,
         samples: &[f32],
-        language: Option<&str>,
+        languages: &[String],
+        prompt: Option<&str>,
         vocabulary: &[String],
         cancel: Option<&CancelToken>,
     ) -> Result<String> {
         if samples.is_empty() {
             return Ok(String::new());
         }
-        let run_opts = self.build_run_options(language, vocabulary, false);
+        let run_opts = self.build_run_options(languages, prompt, vocabulary, false);
         let ranges = chunk_ranges(samples, self.max_chunk_samples);
         let mut parts = Vec::with_capacity(ranges.len());
 
@@ -376,7 +378,15 @@ impl GgufSession {
             let transcript = self
                 .run_raw(&prepared, &run_opts, cancel, RunKind::Transcript)
                 .context("offline transcription failed")?;
-            let text = clean_transcript(&transcript.text, run_opts.prompt.as_deref());
+            let text = if is_vocabulary_echo(&transcript.text, vocabulary) {
+                let base_opts = self.build_run_options(languages, prompt, &[], false);
+                let retried = self
+                    .run_raw(&prepared, &base_opts, cancel, RunKind::Transcript)
+                    .context("offline transcription retry failed")?;
+                clean_transcript(&retried.text, &[])
+            } else {
+                clean_transcript(&transcript.text, vocabulary)
+            };
             if !text.is_empty() {
                 parts.push(text);
             }
@@ -397,15 +407,45 @@ impl GgufSession {
 
     fn build_run_options(
         &self,
-        language: Option<&str>,
+        languages: &[String],
+        prompt: Option<&str>,
         vocabulary: &[String],
         is_stream: bool,
     ) -> RunOptions {
         let mut opts = self.base_options.clone();
-        if let Some(lang) = language.map(str::trim).filter(|l| !l.is_empty() && *l != "auto") {
-            opts.language = Some(lang.to_string());
+        let filtered_languages: Vec<&str> = languages
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("auto"))
+            .collect();
+
+        if self.info.architecture == "qwen3_asr" {
+            // Leave `opts.language` unset for Qwen3-ASR / Rumble-2-Flash so the
+            // model supports every language (and multi-language switching) via
+            // its system prompt instead of being gated by a hardcoded language list.
+            let max_chars = match self.vocabulary_slot {
+                VocabularySlot::Prompt(limit) => limit,
+                _ => 1_200,
+            };
+            if let Some(combined) =
+                build_qwen3_prompt(&filtered_languages, prompt, vocabulary, is_stream, max_chars)
+            {
+                opts.prompt = Some(combined);
+            }
+            return opts;
+        }
+
+        if filtered_languages.len() == 1 {
+            opts.language = Some(filtered_languages[0].to_string());
         }
         if vocabulary.is_empty() {
+            if let Some(extra) = prompt.map(str::trim).filter(|p| !p.is_empty())
+                && matches!(self.vocabulary_slot, VocabularySlot::Prompt(_))
+                && !is_stream
+            {
+                opts.prompt = Some(extra.to_string());
+            }
             return opts;
         }
         match self.vocabulary_slot {
@@ -413,9 +453,14 @@ impl GgufSession {
                 opts.vocabulary = vocabulary.to_vec();
             }
             VocabularySlot::Prompt(max_chars) if !is_stream => {
-                let prompt = format_vocabulary_prompt(vocabulary, max_chars);
-                if !prompt.is_empty() {
-                    opts.prompt = Some(prompt);
+                let vocab = format_vocabulary_prompt(vocabulary, max_chars);
+                let combined = match prompt.map(str::trim).filter(|p| !p.is_empty()) {
+                    Some(extra) if !vocab.is_empty() => format!("{extra}\n{vocab}"),
+                    Some(extra) => extra.to_string(),
+                    None => vocab,
+                };
+                if !combined.is_empty() {
+                    opts.prompt = Some(combined);
                 }
             }
             _ => {}
@@ -503,6 +548,48 @@ fn session_options_for(device_type: DeviceType) -> SessionOptions {
     }
 }
 
+fn build_qwen3_prompt(
+    languages: &[&str],
+    prompt: Option<&str>,
+    vocabulary: &[String],
+    is_stream: bool,
+    max_chars: usize,
+) -> Option<String> {
+    let mut out = String::new();
+    if let Some(explicit) = prompt.filter(|p| !p.trim().is_empty()) {
+        out.push_str(explicit);
+    } else if !languages.is_empty() {
+        out.push_str("\nExpected spoken languages: ");
+        out.push_str(&languages.join(", "));
+        out.push_str(". Transcribe speech in its original language.");
+    }
+    if !is_stream && !vocabulary.is_empty() {
+        let mut kept: Vec<&str> = Vec::new();
+        let mut used = out.len();
+        for term in vocabulary {
+            let trimmed = term.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Account for JSON quotes + comma separator overhead.
+            let extra = trimmed.len() + 4;
+            if used + extra > max_chars && !kept.is_empty() {
+                break;
+            }
+            used += extra;
+            kept.push(trimmed);
+        }
+        if let Ok(serialized) = serde_json::to_string(&kept)
+            && !kept.is_empty()
+        {
+            out.push_str("\nPossible names and terms in this audio: ");
+            out.push_str(&serialized);
+            out.push_str(". Use them only when spoken.");
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 fn format_vocabulary_prompt(terms: &[String], max_chars: usize) -> String {
     let mut out = String::new();
     for term in terms {
@@ -520,26 +607,51 @@ fn format_vocabulary_prompt(terms: &[String], max_chars: usize) -> String {
     out
 }
 
-/// Strips accidental prompt echoes (when an autoregressive decoder repeats the
-/// vocabulary list verbatim on short/quiet audio) and trims whitespace.
-pub fn clean_transcript(text: &str, prompt: Option<&str>) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if let Some(prompt) = prompt {
-        let norm = |s: &str| {
-            s.chars()
-                .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-                .collect::<String>()
-                .split_whitespace()
-                .map(str::to_lowercase)
-                .collect::<Vec<_>>()
-        };
-        let prompt_words = norm(prompt);
-        if prompt_words.len() >= 2 && norm(trimmed) == prompt_words {
-            return String::new();
+fn strip_non_speech_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<non_speech>") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "<non_speech>".len()..];
+        if let Some(end) = after.find("</non_speech>") {
+            rest = &after[end + "</non_speech>".len()..];
+        } else {
+            return out;
         }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn is_vocabulary_echo(text: &str, vocabulary: &[String]) -> bool {
+    if vocabulary.len() < 2 {
+        return false;
+    }
+    let stripped = strip_non_speech_tags(text);
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let norm = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect::<String>()
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+    };
+    let vocab_words = norm(&vocabulary.join(" "));
+    vocab_words.len() >= 2 && norm(trimmed) == vocab_words
+}
+
+/// Strips `<non_speech>...</non_speech>` spans, drops accidental vocabulary
+/// echoes (when an autoregressive decoder repeats the vocabulary list verbatim
+/// on short/quiet audio), and trims whitespace.
+pub fn clean_transcript(text: &str, vocabulary: &[String]) -> String {
+    let stripped = strip_non_speech_tags(text);
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() || is_vocabulary_echo(trimmed, vocabulary) {
+        return String::new();
     }
     trimmed.to_string()
 }
@@ -550,13 +662,47 @@ mod tests {
 
     #[test]
     fn clean_transcript_drops_exact_vocabulary_echo() {
+        let vocab = vec!["Jaro".into(), "Soundfolio".into(), "Parakeet".into()];
+        assert_eq!(clean_transcript("Jaro, Soundfolio, Parakeet", &vocab), "");
         assert_eq!(
-            clean_transcript("Jaro, Soundfolio, Parakeet", Some("Jaro, Soundfolio, Parakeet")),
-            ""
-        );
-        assert_eq!(
-            clean_transcript("Hello from Jaro.", Some("Jaro, Soundfolio, Parakeet")),
+            clean_transcript("Hello from Jaro.", &vocab),
             "Hello from Jaro."
+        );
+    }
+
+    #[test]
+    fn clean_transcript_strips_non_speech_tags() {
+        assert_eq!(
+            clean_transcript("<non_speech>laughter</non_speech> שלום", &[]),
+            "שלום"
+        );
+        assert_eq!(clean_transcript("<non_speech>cough</non_speech>", &[]), "");
+    }
+
+    #[test]
+    fn qwen3_prompt_combines_languages_and_vocabulary() {
+        let prompt = build_qwen3_prompt(
+            &["Hebrew", "English"],
+            None,
+            &["Jaro".into(), "Rumble".into()],
+            false,
+            1_200,
+        )
+        .unwrap();
+        assert!(prompt.contains("Expected spoken languages: Hebrew, English."));
+        assert!(prompt.contains("Possible names and terms in this audio: [\"Jaro\",\"Rumble\"]."));
+
+        let explicit = build_qwen3_prompt(
+            &["he"],
+            Some("\nExpected spoken languages: Hebrew. Transcribe speech in its original language."),
+            &[],
+            false,
+            1_200,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit,
+            "\nExpected spoken languages: Hebrew. Transcribe speech in its original language."
         );
     }
 

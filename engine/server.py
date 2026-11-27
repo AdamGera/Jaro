@@ -5160,7 +5160,7 @@ async def transcribe_dictation(state, source, languages, vocabulary=None, *, sdk
         nonlocal inference_ns, speech_queue_ns, used_rust
         if boost:
             pcm = boost_microphone(pcm)
-        rust = rust_speech_client(state) if len(languages) <= 1 else None
+        rust = rust_speech_client(state)
         if rust is not None:
             try:
                 started = time.monotonic_ns()
@@ -5573,7 +5573,7 @@ async def preview_stage(request: Request, key: UUID, start: int = Query(ge=0, le
         raise HTTPException(400, "Could not decode live audio.") from error
     vocabulary = () if dictation else await speech_vocabulary(state)
     async with state.insights.model.audio_priority():
-        if dictation and len(languages) <= 1 and (rust := rust_speech_client(state)) is not None:
+        if dictation and (rust := rust_speech_client(state)) is not None:
             try:
                 result = await rust.transcribe_pcm(pcm, languages=languages)
                 return {**result, "segments": [], "words": [], "activity": []}

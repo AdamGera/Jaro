@@ -18,6 +18,8 @@ from typing import Any
 
 import httpx
 
+from rumble_model import language_prompt
+
 
 DEFAULT_SPEECH_HOST = "127.0.0.1"
 DEFAULT_SPEECH_PORT = 8766
@@ -206,8 +208,10 @@ class RustSpeechClient:
             "format": sample_format,
             "screenSpeech": "true" if screen_speech else "false",
         }
-        if len(languages) == 1:
-            params["language"] = languages[0]
+        if languages:
+            params["languages"] = ",".join(languages)
+            if prompt := language_prompt(languages):
+                params["prompt"] = prompt
         if vocabulary:
             params["vocabulary"] = ",".join(vocabulary)
         response = await self.http.post(
@@ -237,8 +241,10 @@ class RustSpeechClient:
             "partials": partials,
             "screenSpeech": screen_speech,
         }
-        if len(languages) == 1:
-            payload["language"] = languages[0]
+        if languages:
+            payload["languages"] = list(languages)
+            if prompt := language_prompt(languages):
+                payload["prompt"] = prompt
         response = await self.http.post(
             f"{self.base_url}/v1/streams",
             json=payload,

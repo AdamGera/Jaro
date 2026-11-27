@@ -8,6 +8,9 @@ publish = false
 # Pin anomalyco/transcribe.cpp (0.4.1 + Metal idle residency heartbeat,
 # Parakeet vocabulary bias/sounds-like, Nemotron/Fluid pre-block & padding fixes,
 # and Qwen3-ASR / Rumble-2-Flash + Silero VAD support).
+# Note: `desktop/build-tools/package.py` applies `patches/transcribe-rumble.patch`
+# (Reson8 `<digits><nofiller><verbatim>` control tokens + unclosed envelope guard)
+# and builds via `TRANSCRIBE_DIR`.
 [patch.crates-io]
 transcribe-cpp = { git = "https://github.com/anomalyco/transcribe.cpp", rev = "60bed89dab84f7c1fddc3a17ad7fa8a27ddfba19" }
 transcribe-cpp-sys = { git = "https://github.com/anomalyco/transcribe.cpp", rev = "60bed89dab84f7c1fddc3a17ad7fa8a27ddfba19" }

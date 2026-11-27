@@ -71,7 +71,14 @@ class RustSpeechTests(unittest.TestCase):
         requests_seen = []
 
         def handler(request: httpx.Request) -> httpx.Response:
-            requests_seen.append((request.method, request.url.path, request.headers.get("x-jard-token")))
+            body_json = json.loads(request.content.decode()) if request.url.path == "/v1/streams" else None
+            requests_seen.append((
+                request.method,
+                request.url.path,
+                request.headers.get("x-jard-token"),
+                dict(request.url.params),
+                body_json,
+            ))
             if request.url.path == "/v1/prewarm":
                 return httpx.Response(202, json={"warming": True})
             if request.url.path == "/v1/transcribe":
@@ -95,11 +102,13 @@ class RustSpeechTests(unittest.TestCase):
             async with httpx.AsyncClient(transport=transport) as http:
                 client = rust_speech.RustSpeechClient("http://127.0.0.1:8766", token="secret", http=http)
                 self.assertTrue(await client.prewarm())
-                res = await client.transcribe_pcm(b"\x00\x00\x00\x00", languages=("en",), vocabulary=("Jaro",))
+                res = await client.transcribe_pcm(b"\x00\x00\x00\x00", languages=("he", "en"), vocabulary=("Jaro",))
                 self.assertEqual(res["text"], "Hello from Rust")
                 self.assertEqual(res["inferenceMs"], 42)
 
-                stream = await client.open_stream(sample_rate=48_000, sample_format="s16le", partials=True)
+                stream = await client.open_stream(
+                    sample_rate=48_000, sample_format="s16le", languages=("he",), partials=True,
+                )
                 await stream.feed(b"\x00\x00" * 160)
                 seen = [event async for event in stream.events()]
                 self.assertEqual(seen[0]["type"], "partial")
@@ -110,7 +119,13 @@ class RustSpeechTests(unittest.TestCase):
                 self.assertEqual(final["text"], "Hello world")
 
         asyncio.run(run())
-        self.assertTrue(all(token == "secret" for _, _, token in requests_seen))
+        self.assertTrue(all(token == "secret" for _, _, token, _, _ in requests_seen))
+        transcribe_params = next(params for _, path, _, params, _ in requests_seen if path == "/v1/transcribe")
+        self.assertEqual(transcribe_params["languages"], "he,en")
+        self.assertIn("Hebrew, English", transcribe_params["prompt"])
+        stream_body = next(body for _, path, _, _, body in requests_seen if path == "/v1/streams")
+        self.assertEqual(stream_body["languages"], ["he"])
+        self.assertIn("Hebrew", stream_body["prompt"])
 
     def test_schedule_prewarm_delegates_to_rust_speech_when_configured(self):
         async def run():

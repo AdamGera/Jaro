@@ -91,11 +91,45 @@ def copy_transform_licenses(crates, directory):
         )
 
 
+def prepare_patched_transcribe(upstream, patch_file):
+    prefix = CACHE / "transcribe-prefix"
+    stamp_file = prefix / ".stamp"
+    patch_hash = hashlib.sha256(patch_file.read_bytes()).hexdigest()
+    expected = f"{upstream.resolve()}\n{patch_hash}\n"
+    if (prefix / "lib/transcribe-link.json").is_file() and stamp_file.is_file() and stamp_file.read_text() == expected:
+        return prefix
+
+    src_dir = CACHE / "transcribe-src"
+    build_dir = CACHE / "transcribe-build"
+    for directory in (src_dir, build_dir, prefix):
+        if directory.exists():
+            shutil.rmtree(directory)
+    shutil.copytree(upstream, src_dir, symlinks=True, ignore=shutil.ignore_patterns(".git"))
+    run("patch", "-p1", "-N", "-t", "-F0", "-i", patch_file, cwd=src_dir)
+    run(
+        "cmake", "-S", src_dir, "-B", build_dir,
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DTRANSCRIBE_INSTALL=ON",
+        "-DTRANSCRIBE_BUILD_TESTS=OFF",
+        "-DTRANSCRIBE_BUILD_EXAMPLES=OFF",
+        "-DTRANSCRIBE_BUILD_TOOLS=OFF",
+        "-DTRANSCRIBE_BUILD_SHARED=OFF",
+        "-DTRANSCRIBE_METAL=ON",
+        "-DGGML_METAL_EMBED_LIBRARY=ON",
+        "-DGGML_NATIVE=OFF",
+        "-DTRANSCRIBE_USE_OPENMP=OFF",
+        "-DCMAKE_OSX_DEPLOYMENT_TARGET=26.0",
+    )
+    run("cmake", "--build", build_dir, "--parallel")
+    run("cmake", "--install", build_dir, "--prefix", prefix)
+    stamp_file.write_text(expected, encoding="utf-8")
+    return prefix
+
+
 def prepare_speech_runtime():
     crate = DESKTOP / "speech-engine"
     target = CACHE / "speech-target"
     env = {**os.environ, "MACOSX_DEPLOYMENT_TARGET": "26.0", "CARGO_TARGET_DIR": str(target)}
-    subprocess.run(["cargo", "build", "--release", "--locked"], check=True, cwd=crate, env=env)
     metadata = subprocess.check_output(
         ["cargo", "metadata", "--format-version", "1", "--locked", "--filter-platform", "aarch64-apple-darwin"],
         cwd=crate, env=env,
@@ -104,6 +138,9 @@ def prepare_speech_runtime():
     sys_crate = next(item for item in crates if item["name"] == "transcribe-cpp-sys")
     upstream = next(parent for parent in Path(sys_crate["manifest_path"]).parents
                     if (parent / "LICENSE").is_file() and (parent / "ggml/LICENSE").is_file())
+    transcribe_prefix = prepare_patched_transcribe(upstream, crate / "patches/transcribe-rumble.patch")
+    env["TRANSCRIBE_DIR"] = str(transcribe_prefix)
+    subprocess.run(["cargo", "build", "--release", "--locked"], check=True, cwd=crate, env=env)
     model_cache = CACHE / "speech-model"
     model_cache.mkdir(exist_ok=True)
     source = ("https://huggingface.co/nicolamanzini/Rumble-2-Flash-transcribe-cpp-GGUF/"
