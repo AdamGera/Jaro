@@ -1,0 +1,25 @@
+[package]
+name = "jaro-cli"
+version = "0.0.12"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+libc = "0.2"
+plist = "1"
+regex = "1"
+rusqlite = { version = "0.37", features = ["bundled", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+unicode-general-category = "1"
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

@@ -33,6 +33,7 @@ __pycache__/
 /desktop/zig-out/
 /desktop/transforms/target/
 /desktop/speech-engine/target/
+/desktop/cli/target/
 /desktop/out/
 
 # Local configuration, engine state, and private recording libraries

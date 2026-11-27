@@ -3210,8 +3210,22 @@ async def preview_portable_recording(state, capture, languages, diarization):
                 if not getattr(capture, "preview_live", capture.preview_enabled):
                     continue
                 async with state.insights.model.audio_priority():
-                    result = await decode_pcm(state, pcm, languages, None, action.start, live=True, timed_output=False,
-                                              vocabulary=vocabulary, screen_nonspeech=True)
+                    result = None
+                    if len(languages) <= 1 and (rust := rust_speech_client(state)) is not None:
+                        try:
+                            result = await rust.transcribe_pcm(
+                                pcm,
+                                sample_rate=SAMPLE_RATE,
+                                sample_format="f32le",
+                                languages=languages,
+                                vocabulary=vocabulary,
+                                screen_speech=True,
+                            )
+                        except (httpx.HTTPError, ValueError):
+                            logger.debug("Rust portable tentative preview unavailable.", exc_info=True)
+                    if result is None:
+                        result = await decode_pcm(state, pcm, languages, None, action.start, live=True, timed_output=False,
+                                                  vocabulary=vocabulary, screen_nonspeech=True)
                 if state.portable_recording is not capture:
                     return
                 planner.mark_tentative(action.start + action.frames)
@@ -5279,6 +5293,17 @@ async def native_transcribe_file(request: Request):
     return await browser_dictation(request)
 
 
+@app.get("/api/native/speech-endpoint")
+async def native_speech_endpoint(request: Request):
+    if "origin" in request.headers:
+        raise HTTPException(403, "Use native endpoints from a trusted local process.")
+    check_native(request)
+    rust = rust_speech_client(request.app.state)
+    if rust is None:
+        return JSONResponse({"url": None, "token": None}, headers={"Cache-Control": "no-store"})
+    return JSONResponse({"url": rust.base_url, "token": rust.token}, headers={"Cache-Control": "no-store"})
+
+
 def sdk_record(request, *, authenticate=True):
     state = request.app.state
     if "origin" in request.headers:
@@ -5580,6 +5605,20 @@ async def preview_stage(request: Request, key: UUID, start: int = Query(ge=0, le
             except (httpx.HTTPError, ValueError):
                 logger.debug("Rust dictation preview unavailable.", exc_info=True)
         if tentative and not dictation:
+            if len(languages) <= 1 and (rust := rust_speech_client(state)) is not None:
+                try:
+                    result = await rust.transcribe_pcm(
+                        pcm,
+                        sample_rate=SAMPLE_RATE,
+                        sample_format="f32le",
+                        languages=languages,
+                        vocabulary=vocabulary,
+                        screen_speech=True,
+                    )
+                    return {"text": result.get("text", ""), "language": result.get("language"),
+                            "segments": [], "words": [], "activity": [], "tentative": True}
+                except (httpx.HTTPError, ValueError):
+                    logger.debug("Rust tentative preview unavailable.", exc_info=True)
             result = await decode_pcm(state, pcm, languages, None, start * SAMPLE_RATE // MEETING_RATE,
                                       live=True, timed_output=False, dictation=False, vocabulary=vocabulary,
                                       screen_nonspeech=True)

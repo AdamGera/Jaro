@@ -72,6 +72,22 @@ def prepare_transform_runtime():
     return build / target / "release/jaro-transforms", crates
 
 
+def prepare_cli_runtime():
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        raise SystemExit("Install Rust 1.97 and Cargo to build the native CLI runtime.")
+    manifest = DESKTOP / "cli/Cargo.toml"
+    target = "aarch64-apple-darwin"
+    build = CACHE / "cli-target"
+    env = {**os.environ, "MACOSX_DEPLOYMENT_TARGET": "26.0", "CARGO_TARGET_DIR": str(build)}
+    subprocess.run([cargo, "build", "--release", "--locked", "--manifest-path", manifest, "--target", target],
+                   check=True, cwd=REPO, env=env)
+    metadata = subprocess.check_output([cargo, "metadata", "--format-version", "1", "--locked",
+                                        "--manifest-path", manifest, "--filter-platform", target], cwd=REPO, env=env)
+    crates = [package for package in json.loads(metadata)["packages"] if package["source"]]
+    return build / target / "release/jaro-cli", crates
+
+
 def copy_transform_licenses(crates, directory):
     directory.mkdir()
     for package in crates:
@@ -304,7 +320,7 @@ def development_release_notes(version, notes, previous):
         builds.pop()
 
 
-def assemble(app, updates, transforms, speech):
+def assemble(app, updates, transforms, speech, cli):
     contents = app / "Contents"
     info_file = contents / "Info.plist"
     with info_file.open("rb") as data:
@@ -342,6 +358,9 @@ def assemble(app, updates, transforms, speech):
     helpers = contents / "Helpers"
     helpers.mkdir(exist_ok=True)
     shutil.copy2(transform_executable, helpers / "jaro-transforms")
+    cli_executable, cli_crates = cli
+    shutil.copy2(cli_executable, helpers / "jardctl")
+    copy_transform_licenses(cli_crates, resources / "licenses/CLI Runtime")
     speech_executable, speech_crates, speech_upstream, speech_model = speech
     shutil.copy2(speech_executable, helpers / "jaro-speech")
     speech_resources = resources / "Speech"
@@ -354,7 +373,6 @@ def assemble(app, updates, transforms, speech):
     shutil.copy2(speech_upstream / "ggml/LICENSE", speech_licenses / "ggml.txt")
     run("xcrun", "clang", "-O2", "-arch", "arm64", "-mmacosx-version-min=26", TOOLS / "helper.c", "-o", helpers / "jard-engine")
     shutil.copy2(helpers / "jard-engine", helpers / "jard-ui")
-    shutil.copy2(helpers / "jard-engine", helpers / "jardctl")
     swift = ["xcrun", "swiftc", "-O", "-parse-as-library", "-swift-version", "5", "-target", "arm64-apple-macos26.0"]
     capture = DESKTOP / "capture"
     run(*swift, *(capture / n for n in ("CLI.swift", "Capture.swift", "Recording.swift", "WarmMicrophone.swift", "MeetingSystemAudio.swift")), "-o", helpers / "jard-capture")
@@ -502,6 +520,7 @@ def main():
     run("bun", "run", "build")
     transforms = prepare_transform_runtime()
     speech = prepare_speech_runtime()
+    cli = prepare_cli_runtime()
     if not opts.reuse_shell:
         run(TOOLS / "build-shell.sh")
     # Build entirely in staging so a compile or signing failure preserves the previous app.
@@ -509,7 +528,7 @@ def main():
         stage = Path(stage)
         app = stage / "Jaro.app"
         run("native", "package", "--target", "macos", "--signing", "none", "--binary", DESKTOP / "zig-out/bin/jard-soundfolio-local", "--output", app, cwd=DESKTOP)
-        assemble(app, updates, transforms, speech)
+        assemble(app, updates, transforms, speech, cli)
         if dev_notes is not None:
             (app / "Contents/Resources" / DEV_NOTES_NAME).write_bytes(dev_notes)
             (stage / DEV_NOTES_NAME).write_bytes(dev_notes)

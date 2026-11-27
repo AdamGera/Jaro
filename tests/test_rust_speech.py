@@ -138,6 +138,147 @@ class RustSpeechTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_native_speech_endpoint_reports_bundled_rust_helper_and_requires_token(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+        app.get("/api/native/speech-endpoint")(server.native_speech_endpoint)
+        app.state.native_token = "a" * 64
+        app.state.rust_speech_checked = True
+        app.state.rust_speech = rust_speech.RustSpeechClient("http://127.0.0.1:54321", token="tok123")
+
+        client = TestClient(app)
+        # Missing token -> rejected
+        self.assertEqual(client.get("/api/native/speech-endpoint").status_code, 403)
+        # Browser Origin -> rejected
+        self.assertEqual(
+            client.get(
+                "/api/native/speech-endpoint",
+                headers={"X-Jard-Token": "a" * 64, "Origin": "http://127.0.0.1:8765"},
+            ).status_code,
+            403,
+        )
+        # Valid native token -> returns bundled endpoint with no-store
+        resp = client.get("/api/native/speech-endpoint", headers={"X-Jard-Token": "a" * 64})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.headers.get("cache-control"), "no-store")
+        self.assertEqual(resp.json(), {"url": "http://127.0.0.1:54321", "token": "tok123"})
+
+        # Inactive Rust speech -> nulls
+        app.state.rust_speech = None
+        resp2 = client.get("/api/native/speech-endpoint", headers={"X-Jard-Token": "a" * 64})
+        self.assertEqual(resp2.status_code, 200)
+        self.assertEqual(resp2.json(), {"url": None, "token": None})
+
+    def test_mac_bridge_discovers_and_caches_bundled_speech_endpoint(self):
+        import desktop.mac_bridge as mac_bridge
+
+        async def run():
+            with TemporaryDirectory() as temp:
+                engine_http = httpx.AsyncClient(headers={"X-Jard-Token": "engine-secret"})
+                bridge = mac_bridge.MacBridge(Path(temp), engine_http)
+                api_mock = AsyncMock(return_value={"url": "http://127.0.0.1:55555", "token": "secret-tok"})
+                try:
+                    with patch.dict("os.environ", {"JARD_SPEECH_URL": ""}, clear=False), patch.object(
+                        bridge, "api", api_mock
+                    ):
+                        client1 = await bridge._rust_speech_client()
+                        client2 = await bridge._rust_speech_client()
+                        self.assertIsNotNone(client1)
+                        self.assertIsNotNone(client2)
+                        self.assertEqual(client1.base_url, "http://127.0.0.1:55555")
+                        self.assertEqual(client1.token, "secret-tok")
+                        # Separate HTTP client ensures engine X-Jard-Token is never leaked to speech URLs.
+                        self.assertIsNot(client1.http, engine_http)
+                        self.assertNotIn("x-jard-token", {k.lower() for k in client1.http.headers})
+                        # Second call reuses cache without hitting the engine again.
+                        api_mock.assert_awaited_once_with("GET", "native/speech-endpoint")
+                finally:
+                    if bridge._speech_http is not None:
+                        await bridge._speech_http.aclose()
+                    await engine_http.aclose()
+
+        asyncio.run(run())
+
+    def test_tentative_meeting_preview_uses_rust_while_committed_turn_preserves_pytorch_diarization(self):
+        from contextlib import asynccontextmanager
+        import wave
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        @asynccontextmanager
+        async def audio_priority():
+            yield
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            stage_dir = root / "staging"
+            stage_dir.mkdir()
+            stage_id = "11111111-1111-4111-8111-111111111111"
+            wav_path = stage_dir / stage_id
+            with wave.open(str(wav_path), "wb") as stream:
+                stream.setparams((1, 2, 48_000, 0, "NONE", "not compressed"))
+                stream.writeframes(b"\x00\x00" * (48_000 * 2))
+
+            app = FastAPI()
+            app.post("/api/native/staging/{key}/preview")(server.preview_stage)
+            app.state.status = "ready"
+            app.state.native_token = "b" * 64
+            app.state.staging = stage_dir
+            app.state.live_speakers = {}
+            app.state.rust_speech_checked = True
+            rust_mock = SimpleNamespace(
+                transcribe_pcm=AsyncMock(return_value={"text": "rust tentative", "language": "English"})
+            )
+            app.state.rust_speech = rust_mock
+            app.state.insights = SimpleNamespace(model=SimpleNamespace(audio_priority=audio_priority))
+
+            fake_speakers = object()
+            pytorch_decode = AsyncMock(
+                return_value={
+                    "text": "committed pytorch turn",
+                    "language": "English",
+                    "segments": [{"speaker": 1, "start": 0.0, "end": 1.0, "text": "committed pytorch turn"}],
+                    "words": [{"start": 0.1, "end": 0.4, "text": "committed"}],
+                }
+            )
+            with (
+                patch.object(server, "decode_pcm", pytorch_decode),
+                patch.object(server, "live_speakers", AsyncMock(return_value=fake_speakers)),
+                patch.object(server, "speech_vocabulary", AsyncMock(return_value=())),
+            ):
+                client = TestClient(app)
+                # 1. Tentative single-language preview -> routes to Rust, skips PyTorch
+                r_tent = client.post(
+                    f"/api/native/staging/{stage_id}/preview",
+                    params={"start": 0, "frames": 48_000, "tentative": "true", "meeting": "true", "language": "en"},
+                    headers={"X-Jard-Token": "b" * 64},
+                )
+                self.assertEqual(r_tent.status_code, 200)
+                self.assertEqual(r_tent.json()["text"], "rust tentative")
+                self.assertTrue(r_tent.json()["tentative"])
+                rust_mock.transcribe_pcm.assert_awaited_once()
+                pytorch_decode.assert_not_awaited()
+
+                # 2. Committed meeting turn (tentative=false) -> MUST stay on PyTorch with speakers + timed_output=True
+                r_commit = client.post(
+                    f"/api/native/staging/{stage_id}/preview",
+                    params={"start": 0, "frames": 48_000, "meeting": "true", "diarization": "true", "language": "en"},
+                    headers={"X-Jard-Token": "b" * 64},
+                )
+                self.assertEqual(r_commit.status_code, 200)
+                body = r_commit.json()
+                self.assertEqual(body["text"], "committed pytorch turn")
+                self.assertEqual(body["segments"][0]["speaker"], 1)
+                self.assertEqual(body["words"][0]["start"], 0.1)
+                # Rust was NOT called again for the committed turn
+                rust_mock.transcribe_pcm.assert_awaited_once()
+                pytorch_decode.assert_awaited_once()
+                call_args = pytorch_decode.await_args
+                self.assertIs(call_args.args[3], fake_speakers)
+                self.assertTrue(call_args.kwargs["timed_output"])
+
 
 if __name__ == "__main__":
     unittest.main()

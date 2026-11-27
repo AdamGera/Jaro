@@ -220,6 +220,8 @@ class MacBridge:
         self.control_dir = None
         self.control_path = None
         self.control_pending = {}
+        self._speech_endpoint_cache = None
+        self._speech_http = None
         self.sdk_capture = SDKCapture(self.helpers / "jard-capture", self.transcribe_sdk_take, self.release_sdk_capture)
 
     async def api(self, method, route, **options):
@@ -1094,7 +1096,7 @@ class MacBridge:
         if meeting:
             metadata["meeting"] = meeting
         path = Path(take.stage["path"])
-        if capture_id and os.environ.get("JARD_SPEECH_URL", "").strip():
+        if capture_id:
             if await self._rust_live_preview(take, path, capture, metadata):
                 return
         planner = LiveWindowPlanner(48_000) if record_rolling else None
@@ -1246,10 +1248,33 @@ class MacBridge:
                 copy_state["through"] = start
                 copy_state["changed"].set()
 
-    async def _rust_live_preview(self, take, path, capture, metadata):
+    def _speech_http_client(self):
+        if self._speech_http is None:
+            self._speech_http = httpx.AsyncClient(trust_env=False, timeout=httpx.Timeout(30, connect=3))
+        return self._speech_http
+
+    async def _rust_speech_client(self):
         from rust_speech import RustSpeechClient
 
-        client = RustSpeechClient.from_env(http=self.http)
+        speech_http = self._speech_http_client()
+        client = RustSpeechClient.from_env(http=speech_http)
+        if client is not None:
+            return client
+        if self._speech_endpoint_cache is None:
+            try:
+                endpoint = await self.api("GET", "native/speech-endpoint")
+            except httpx.HTTPError:
+                return None
+            url = (endpoint or {}).get("url")
+            if not isinstance(url, str) or not url.strip():
+                return None
+            token = endpoint.get("token")
+            self._speech_endpoint_cache = (url.strip(), token if isinstance(token, str) and token else None)
+        url, token = self._speech_endpoint_cache
+        return RustSpeechClient(url, token, http=speech_http)
+
+    async def _rust_live_preview(self, take, path, capture, metadata):
+        client = await self._rust_speech_client()
         if client is None:
             return False
         languages = tuple(take.settings.get("language") or ())
@@ -1266,6 +1291,7 @@ class MacBridge:
                 screen_speech=True,
             )
         except httpx.HTTPError:
+            self._speech_endpoint_cache = None
             return False
 
         async def consume_events():
@@ -2663,6 +2689,9 @@ class MacBridge:
             with contextlib.suppress(httpx.HTTPError):
                 await self.api("DELETE", "clients/" + self.client_id)
             write_event("desktop", "disconnected")
+        if self._speech_http is not None:
+            await self._speech_http.aclose()
+            self._speech_http = None
 
 
 async def main():
