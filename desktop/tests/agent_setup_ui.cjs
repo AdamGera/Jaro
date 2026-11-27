@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Run after bun run build, with playwright-core and its WebKit installed.
 const assert = require("node:assert/strict")
+const fs = require("node:fs/promises")
 const path = require("node:path")
 const { webkit } = require("playwright-core")
 const dist = path.resolve(__dirname, "../../dist")
@@ -98,7 +99,42 @@ async function run() {
     assert.deepEqual(await page.evaluate(() => window.guideActions.filter(command => command.agent)), [
       {action: "install", agent: "codex"}, {action: "update", agent: "claude"},
     ])
-    console.log("WebKit verified bundle-specific CLI and MCP copying, and annotation guide copying, installation, and replacement.")
+    for (const [portableCLI, quotedCLI, command] of [
+      ["/usr/bin/jardctl", "'/usr/bin/jardctl'", "'/usr/bin/jardctl'"],
+      [String.raw`C:\Users\Owner's PC\Jaro\bin\jardctl.exe`,
+        String.raw`'C:\Users\Owner''s PC\Jaro\bin\jardctl.exe'`,
+        String.raw`& 'C:\Users\Owner''s PC\Jaro\bin\jardctl.exe'`],
+    ]) {
+      const portable = await browser.newPage()
+      try {
+        await portable.addInitScript(() => {
+          window.copied = []
+          Object.defineProperty(navigator, "clipboard", {value: {writeText: async text => window.copied.push(text)}})
+        })
+        const html = (await fs.readFile(path.join(dist, "index.html"), "utf8"))
+          .replace("<html", "<html data-jaro-portable-workspace")
+        await portable.route("**/*", route => {
+          const {pathname} = new URL(route.request().url())
+          if (pathname === "/") return route.fulfill({contentType: "text/html", body: html})
+          if (pathname === "/api/portable/agent-setup") return route.fulfill({json: {cli: portableCLI}})
+          if (pathname === "/api/status") return route.fulfill({json: {status: "ready", languages: [], diarization: true}})
+          if (pathname.endsWith("/stream")) return route.fulfill({status: 204})
+          if (pathname.startsWith("/api/")) return route.fulfill({status: 404, json: {detail: "Unavailable in fixture"}})
+          return route.fulfill({path: path.join(dist, pathname)})
+        })
+        await portable.goto("http://127.0.0.1:18997/")
+        await portable.getByRole("button", {name: "Settings", exact: true}).click()
+        const group = portable.getByRole("region", {name: "CLI and MCP"})
+        await group.getByRole("button", {name: "Copy CLI command"}).click()
+        await group.getByRole("status").getByText("CLI command copied.", {exact: true}).waitFor()
+        assert.equal(await portable.evaluate(() => window.copied.at(-1)), command + " --json status")
+        await group.getByText("Setup guide", {exact: true}).click()
+        await group.getByRole("button", {name: "Copy MCP setup"}).click()
+        await group.getByRole("status").getByText("MCP setup copied.", {exact: true}).waitFor()
+        assert.equal(await portable.evaluate(() => window.copied.at(-1)), `codex mcp add jaro -- ${quotedCLI} mcp`)
+      } finally { await portable.close() }
+    }
+    console.log("WebKit verified CLI and MCP setup for macOS, Linux, and Windows, and annotation guide management.")
   } finally { await browser.close() }
 }
 

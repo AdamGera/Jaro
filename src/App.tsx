@@ -10,7 +10,7 @@ import type { PortableMeetingControls } from "@/components/meetings-workspace"
 import { DesktopUpdateControl, DesktopUpdateFeedback, DesktopUpdateSettings } from "@/components/desktop-update"
 import { DesktopApplicationSettings } from "@/components/desktop-application-settings"
 import { portableLogin, PortableApplicationSettings } from "@/components/launch-at-login"
-import { AgentSetupSettings } from "@/components/agent-setup-settings"
+import { AgentSetupSettings, portableAgentSetup } from "@/components/agent-setup-settings"
 import { hasPortableDictation, PortableDictationSettings, PortableDictationWorkspace } from "@/components/portable-dictation-workspace"
 import { PortableModelSetup, type ModelSetup } from "@/components/portable-model-setup"
 import { PortableOnboardingTour } from "@/components/portable-onboarding-tour"
@@ -1073,11 +1073,12 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         annotate: <DesktopAnnotationControls native={native} languages={selectedLanguages.map(language => language.code)}
           controls={systemDictation} busy={updateBusy}
           allowConcurrentCapture={phase === "recording" && !!liveMeeting?.shared && !meetingStopPending && !choosingFile && !dictating} />,
-      } : portableUpdates || portableLogin || hasPortableAudio || hasDesktopAnnotationSettings || hasPortableDictation ? {
+      } : portableUpdates || portableLogin || hasPortableAudio || hasDesktopAnnotationSettings || hasPortableDictation || portableAgentSetup ? {
         general: <div className="dictation-preferences">
           {portableUpdates && <DesktopUpdateSettings controls={desktopUpdate} busy={updateBusy} />}
           {portableLogin && <PortableApplicationSettings />}
           {modelSetup?.additional && <PortableModelSetup setup={modelSetup} onStarted={() => setModelStatusRequest(value => value + 1)} />}
+          {portableAgentSetup && <AgentSetupSettings />}
         </div>,
         dictation: hasPortableDictation ? visible => <PortableDictationSettings visible={visible}
           disabled={updateBusy} languages={languageOptions} /> : undefined,

@@ -525,17 +525,39 @@ class PortableDictationHistory:
                 self._sweep_audio(db, time())
                 return removed
 
+    def vocabulary_entries(self):
+        with self.connection() as db:
+            if db is None:
+                return []
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(preferences)")}
+            if "vocabularyEntries" not in columns:
+                return []
+            raw = db.execute("SELECT vocabularyEntries FROM preferences").fetchone()[0]
+            return validate_dictation_vocabulary(json.loads(raw))
+
     def page(self, *, include_timing=False, include_audio=False, **filters):
         now = time()
+        vocab = []
         with self.connection() as db:
             if db is not None:
                 db.execute("BEGIN")
+                columns = {row["name"] for row in db.execute("PRAGMA table_info(preferences)")}
+                if "vocabularyEntries" in columns:
+                    try:
+                        vocab = validate_dictation_vocabulary(json.loads(
+                            db.execute("SELECT vocabularyEntries FROM preferences").fetchone()[0]
+                        ))
+                    except (ValueError, json.JSONDecodeError):
+                        vocab = []
             settings = self.preferences(db)
             entries = [] if db is None else [dict(row) for row in db.execute(
                 "SELECT * FROM dictations WHERE time>=? ORDER BY time DESC, id DESC LIMIT ?",
                 (self.cutoff(settings, now), HISTORY_LIMIT))]
-        snapshot = {"JardSystemDictation": {**settings, "vocabulary": ""},
-                    "JardSystemDictationHistory": [{"kind": "dictation", **entry} for entry in entries]}
+        snapshot = {"JardSystemDictation": {
+            **settings,
+            "vocabulary": "\n".join(entry["term"] for entry in vocab),
+            "vocabularySoundsLike": {entry["term"].casefold(): entry["soundsLike"] for entry in vocab if entry["soundsLike"]},
+        }, "JardSystemDictationHistory": [{"kind": "dictation", **entry} for entry in entries]}
         result = history_page(None, snapshot=snapshot, now=datetime.fromtimestamp(now, timezone.utc), **filters)
         if include_timing:
             details = {entry["id"]: entry for entry in entries}

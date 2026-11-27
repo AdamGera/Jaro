@@ -115,12 +115,12 @@ def interrupted_meetings(library):
                "processed": 0, "status": "interrupted"}, Path(draft["path"])
 
 
-def meetings(library, query="", limit=20, *, since=None, until=None, live=None, include_in_progress=True):
+def meetings(library, query="", limit=20, *, since=None, until=None, live=None, include_in_progress=True, meetings_only=True):
     now = datetime.now(timezone.utc)
     first, last = date_bound(since, now), date_bound(until, now, through=True)
     if first is not None and last is not None and first >= last:
         raise ValueError("The until time must be after the since time.")
-    rows = library.list("", meetings_only=True)
+    rows = library.list("", meetings_only=meetings_only)
     saved = {row["id"] for row in rows}
     rows.extend(draft for draft, _ in interrupted_meetings(library)
                 if draft["id"] not in saved and (not live or draft["id"] != live["id"]))
@@ -142,9 +142,9 @@ def meetings(library, query="", limit=20, *, since=None, until=None, live=None, 
     return [row for _, _, row in matches[:limit]]
 
 
-def get_meeting(library, identifier, *, turns=True, live=None, staged=True):
+def get_meeting(library, identifier, *, turns=True, live=None, staged=True, meetings_only=True):
     if identifier == "latest":
-        newest = meetings(library, limit=1, live=live)
+        newest = meetings(library, limit=1, live=live, meetings_only=meetings_only)
         if not newest:
             raise MissingSession(identifier)
         identifier = newest[0]["id"]
@@ -153,9 +153,11 @@ def get_meeting(library, identifier, *, turns=True, live=None, staged=True):
     except ValueError:
         if not re.fullmatch(r"[0-9a-fA-F-]{6,36}", identifier):
             raise MissingSession(identifier) from None
-        matches = [row["id"] for row in meetings(library, limit=None, live=live) if row["id"].startswith(identifier.lower())]
+        matches = [row["id"] for row in meetings(library, limit=None, live=live, meetings_only=meetings_only)
+                   if row["id"].startswith(identifier.lower())]
         if len(matches) > 1:
-            raise ValueError("That meeting ID prefix matches more than one meeting.") from None
+            subject = "meeting" if meetings_only else "session"
+            raise ValueError(f"That {subject} ID prefix matches more than one {subject}.") from None
         if not matches:
             raise MissingSession(identifier) from None
         key = matches[0]
@@ -190,7 +192,7 @@ def get_meeting(library, identifier, *, turns=True, live=None, staged=True):
                         "transcript": {"durationSeconds": draft["duration"], "segments": segments,
                                        "speakerNames": {} if mixed else SOURCE_LABELS, "text": "",
                                        "transcriptSource": "rolling" if segments else "draft"}}
-    if not session["meeting"]:
+    if meetings_only and not session["meeting"]:
         raise MissingSession(key)
     return session
 
@@ -296,18 +298,19 @@ def speech_excerpt(turn, *, before):
 
 
 def meeting_search_report(library, query, limit=10, *, identifier=None, since=None, until=None, live=None,
-                          include_in_progress=True, fuzzy=True):
+                          include_in_progress=True, fuzzy=True, meetings_only=True):
     from saved_dictations import search_vocabulary
 
     vocabulary = search_vocabulary() if fuzzy else ()
-    key = get_meeting(library, identifier, turns=False, live=live)["id"] if identifier else None
-    rows = meetings(library, limit=None, since=since, until=until, live=live, include_in_progress=include_in_progress)
+    key = get_meeting(library, identifier, turns=False, live=live, meetings_only=meetings_only)["id"] if identifier else None
+    rows = meetings(library, limit=None, since=since, until=until, live=live,
+                    include_in_progress=include_in_progress, meetings_only=meetings_only)
     passages, details, speech = [], {}, {}
     for row in rows:
         if key and row["id"] != key:
             continue
         try:
-            detail = meeting_detail(get_meeting(library, row["id"], live=live))
+            detail = meeting_detail(get_meeting(library, row["id"], live=live, meetings_only=meetings_only))
         except MissingSession:
             continue
         route = None if detail.get("staged") else f"/?session={detail['id']}&tab=transcript"
@@ -456,6 +459,15 @@ def render_export(detail, kind, *, use_24_hour=False, include_date=True, compani
         prefix = f"{len(cues) + 1}\n" if kind == "srt" else ""
         cues.append(f"{prefix}{first} --> {last}\n{body}")
     return ("WEBVTT\n\n" if kind == "vtt" else "") + ("\n\n".join(cues) + "\n" if cues else "")
+
+
+def use_24_hour_clock(library):
+    if library.read_only and not library.path.is_file():
+        return False
+    from meeting_exports import clock_24
+
+    with library.connection() as db:
+        return clock_24(db)
 
 
 def export_name(session, kind):

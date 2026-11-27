@@ -417,6 +417,8 @@ class SessionStore:
                         meeting_brief.enqueue(db, key, refinalize=True, automatic=True)
 
     def list(self, query, *, meetings_only=False):
+        if self.read_only and not self.path.is_file():
+            return []
         with self.connection() as db:
             db.create_function("fold", 1, str.casefold, deterministic=True)
             pending = "EXISTS(SELECT 1 FROM meeting_finalization f WHERE f.session_id=s.id)" if self.has_finalization_table(db) else "0"
@@ -458,6 +460,8 @@ class SessionStore:
                      "finalizationPending": bool(row["finalizationPending"])} for row in rows]
 
     def exists(self, key):
+        if self.read_only and not self.path.is_file():
+            return False
         with self.connection() as db:
             if db.execute("SELECT 1 FROM sessions WHERE id=?", (key,)).fetchone():
                 return True
@@ -465,6 +469,8 @@ class SessionStore:
                         and db.execute("SELECT 1 FROM meeting_trash WHERE id=?", (key,)).fetchone())
 
     def get(self, key, *, include_turns=False):
+        if self.read_only and not self.path.is_file():
+            raise MissingSession(key)
         for write_lock in (False, True):
             try:
                 return self._get(key, include_turns=include_turns, write_lock=write_lock)

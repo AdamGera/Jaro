@@ -5,7 +5,10 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import time
+
+from engine_paths import library_path
 
 EVENT_LOG = "live.ndjson"
 PROCESS_LOG = "server.log"
@@ -16,7 +19,11 @@ LOG_TRIM_INTERVAL = 3600
 
 
 def log_directory():
-    return Path(os.environ.get("RUMBLE_LOG_DIR") or Path.home() / "Library/Logs/Jaro")
+    if configured := os.environ.get("RUMBLE_LOG_DIR"):
+        return Path(configured)
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Logs/Jaro"
+    return library_path() / "logs"
 
 
 def open_log(name, *, mode="rb", create=False):
@@ -25,20 +32,21 @@ def open_log(name, *, mode="rb", create=False):
         path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     if mode != "rb":
         directory = path.parent.lstat()
-        if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.geteuid():
+        if not stat.S_ISDIR(directory.st_mode) or (os.name != "nt" and directory.st_uid != os.geteuid()):
             raise OSError("Jaro needs a log directory owned by the current user.")
     flags = {"rb": os.O_RDONLY, "r+b": os.O_RDWR, "a+b": os.O_RDWR | os.O_APPEND}[mode]
     if create:
         flags |= os.O_CREAT
-    descriptor = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags, 0o600)
     try:
         details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.geteuid() or details.st_mode & 0o022:
+        if not stat.S_ISREG(details.st_mode) or (os.name != "nt" and (details.st_uid != os.geteuid() or details.st_mode & 0o022)):
             raise OSError("Jaro logs must be regular files owned by the current user.")
         if mode != "rb":
-            if details.st_nlink != 1:
+            if os.name != "nt" and details.st_nlink != 1:
                 raise OSError("Jaro logs must not be hard-linked.")
-            if details.st_mode & 0o077:
+            if os.name != "nt" and details.st_mode & 0o077:
                 os.fchmod(descriptor, 0o600)
         return os.fdopen(descriptor, mode)
     except BaseException:

@@ -2516,6 +2516,17 @@ class AnnotationAgentSkillCommand(BaseModel):
     agent: Literal["claude", "codex", "opencode", "pi"] | None = None
 
 
+@app.get("/api/portable/agent-setup")
+def portable_agent_setup(request: Request):
+    if not getattr(request.app.state, "portable_workspace", False):
+        raise HTTPException(404, "Agent setup is unavailable in this workspace.")
+    from portable_login import installed_launcher
+
+    launcher = installed_launcher(WORKSPACE_ROOT)
+    cli = str(launcher.with_name("jardctl.exe" if os.name == "nt" else "jardctl")) if launcher else "jardctl"
+    return JSONResponse({"cli": cli}, headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/portable/annotation-agent-skill")
 async def portable_annotation_agent_skill(request: Request, command: AnnotationAgentSkillCommand):
     from annotation_agent_skill import manage

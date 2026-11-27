@@ -267,13 +267,15 @@ Turn on **Vocabulary menu** under **Settings → Dictation → Labs**. Open Jaro
 
 ## Control the Mac app with jardctl
 
-Open **Settings → General → CLI and MCP** to copy a CLI command or a prompt for your agent. Expand **Setup guide** and choose your MCP client to copy its connection command or configuration. MCP can read saved meetings, transcripts, notes, and screen annotations. The CLI also supports local recording controls and settings. [Claude Code MCP](https://code.claude.com/docs/en/mcp) · [OpenCode MCP](https://opencode.ai/docs/mcp-servers/)
+Open **Settings → General → CLI and MCP** to copy a CLI command or a prompt for your agent. Expand **Setup guide** and choose your MCP client to copy its connection command or configuration. MCP has read-only access to sessions, meetings, transcripts, notes, retained dictations, and screen annotations. The CLI also supports local recording controls and settings. [Claude Code MCP](https://code.claude.com/docs/en/mcp) · [OpenCode MCP](https://opencode.ai/docs/mcp-servers/)
+
+Use `jardctl sessions list --json` to find a recording, `jardctl sessions search "project update"` to find transcript or note passages, and `jardctl sessions show ID` to read one session. Use the equivalent `meetings` commands to work with meetings.
 
 With Jard running and dictation enabled, `jardctl dictation start --raw` starts a take without output processing. `jardctl dictation stop --print` delivers the text only to stdout and accepts `--json` for structured output. Printed takes appear in History when retention is enabled. If Jard hears no speech, the command exits with code 4 and leaves stdout empty.
 
 On macOS, `jardctl dictation start --print` starts a print-only take and waits for the transcript. Finish with the regular dictation shortcut or run `jardctl dictation stop` from another terminal. Add `--raw` to skip output processing. The printed transcript stays out of the clipboard and Paste Last.
 
-With Jaro running, use `jardctl vocabulary list --json`, `jardctl vocabulary add "Mei Lin" --sounds-like "May Lean,May Linn"`, or `jardctl vocabulary remove "Mei Lin"`. Added terms appear in Dictation settings and provide context to Rumble2 Flash. Alternate spellings correct whole phrases during normal dictation and output previews. Add and remove match terms case-insensitively.
+Use `jardctl vocabulary list --json`, `jardctl vocabulary add "Mei Lin" --sounds-like "May Lean,May Linn"`, or `jardctl vocabulary remove "Mei Lin"`. Keep Jaro running to edit vocabulary on macOS. Added terms appear in Dictation settings and provide context to Rumble2 Flash. Alternate spellings correct whole phrases during normal dictation and output previews. Add and remove match terms case-insensitively.
 
 Use `jardctl meetings record --title "Design review"` to name a meeting before recording starts. The title appears during recording and stays with the meeting after saving or recovery. The command uses the permissions already granted to Jaro. Omit `--title` to use the usual title selection.
 

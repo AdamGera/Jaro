@@ -5,11 +5,14 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import sqlite3
 import stat
+import sys
 from unicodedata import category, normalize
 from xml.parsers.expat import ExpatError
 
 from dictation_output import MAX_VOCABULARY
+from engine_paths import library_path
 from meeting_search import TOKEN, meeting_passages
 from saved_meetings import date_bound
 
@@ -80,14 +83,25 @@ def _preferred_terms(settings):
     return tuple(terms.values())
 
 
+def _portable_vocabulary():
+    try:
+        from portable_dictation_history import PortableDictationHistory
+
+        return PortableDictationHistory(library_path()).vocabulary_entries()
+    except (OSError, ValueError, sqlite3.Error):
+        return []
+
+
 def shared_vocabulary():
     """Return preferred terms from the current user's private preference snapshot."""
-    if os.name == "nt":
-        return ()
+    if sys.platform != "darwin":
+        return tuple(entry["term"] for entry in _portable_vocabulary())
     return _preferred_terms(_vocabulary_settings())
 
 
 def search_vocabulary(snapshot=None, *, path=None):
+    if snapshot is None and path is None and sys.platform != "darwin":
+        return tuple((entry["term"], tuple(entry["soundsLike"])) for entry in _portable_vocabulary())
     settings = _vocabulary_settings(snapshot, path)
     aliases = settings.get("vocabularySoundsLike")
     indexed = {}
