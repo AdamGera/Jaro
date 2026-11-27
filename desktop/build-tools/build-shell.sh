@@ -3,7 +3,7 @@ set -euo pipefail
 desktop=$(cd -- "$(dirname -- "$0")/.." && pwd)
 sdk="${NATIVE_SDK_PATH:?Set NATIVE_SDK_PATH to the @native-sdk/cli 0.11.1 SDK source directory.}"
 platform="$sdk/src/platform/macos"
-binary="${1:-$desktop/zig-out/bin/jard-soundfolio-local}"
+binary="${1:-$desktop/zig-out/bin/jaro}"
 mkdir -p "$(dirname -- "$binary")" "$desktop/.build"
 flags=(-O2 -arch arm64 -mmacosx-version-min=26.0 -fobjc-arc -I "$platform")
 object="$desktop/.build/native-sdk-0.11.1-appkit.o"
@@ -63,7 +63,7 @@ if [[ ! -f "$updater" || "$sdk/src/updater/c_api.zig" -nt "$updater" || "$sdk/sr
 fi
 sources=("$desktop/mac_host.m" "$desktop/jard_interface_language.m" "$desktop/jard_overlay_dock.m" "$desktop/system_dictation.m" "$desktop/jard_login_item.m" "$desktop/jard_recording_environment.m" "$desktop/jard_dictation_media.m" "$desktop/jard_dictation_browser.m" "$desktop/jard_dictation_typing.m" "$desktop/jard_secure_hotkeys.m" "$desktop/jard_updater.m" "$desktop/jard_annotation.m" "$desktop/jard_annotation_access.m" "$desktop/jard_annotation_ink.m" "$desktop/jard_annotation_region.m" "$desktop/jard_annotation_result_panel.m" "$desktop/jard_annotation_terminal.m" "$desktop/jard_phone_annotation.m" "$desktop/jard_meetings.m" "$desktop/jard_meeting_audio_access.m" "$desktop/jard_meeting_delta.m" "$desktop/meeting_presence.m" "$desktop/jard_calendar.m" "$desktop/jard_meeting_panel.m")
 if [[ -n "${JARD_TEST_SOURCE:-}" ]]; then
-    [[ "$binary" != "$desktop/zig-out/bin/jard-soundfolio-local" ]] || { echo "Supply a separate output path for the QA host." >&2; exit 1; }
+    [[ "$binary" != "$desktop/zig-out/bin/jaro" ]] || { echo "Supply a separate output path for the QA host." >&2; exit 1; }
     flags+=(-DJARD_TESTING=1)
     sources+=("$JARD_TEST_SOURCE")
 fi

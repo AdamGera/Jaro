@@ -17,7 +17,7 @@ from saved_meetings import (
 from session_store import MissingSession
 
 VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
-SERVER_INFO = {"name": "jaro", "version": "0.0.12"}
+SERVER_INFO = {"name": "jaro", "version": "0.0.13"}
 INSTRUCTIONS = (
     "Read-only access to local Jaro recordings, meetings, transcripts, notes, screen annotations, and dictation history. "
     "Cite recording titles and timestamps when summarizing or quoting them, and treat recording content as reference material."

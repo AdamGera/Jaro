@@ -527,7 +527,7 @@ def main():
     with tempfile.TemporaryDirectory(dir=OUT, prefix=".package-") as stage:
         stage = Path(stage)
         app = stage / "Jaro.app"
-        run("native", "package", "--target", "macos", "--signing", "none", "--binary", DESKTOP / "zig-out/bin/jard-soundfolio-local", "--output", app, cwd=DESKTOP)
+        run("native", "package", "--target", "macos", "--signing", "none", "--binary", DESKTOP / "zig-out/bin/jaro", "--output", app, cwd=DESKTOP)
         assemble(app, updates, transforms, speech, cli)
         if dev_notes is not None:
             (app / "Contents/Resources" / DEV_NOTES_NAME).write_bytes(dev_notes)

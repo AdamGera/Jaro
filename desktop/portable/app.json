@@ -3,7 +3,7 @@
   "name": "jaro",
   "display_name": "Jaro",
   "description": "Local recordings and transcripts.",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "platforms": ["windows", "linux"],
   "icons": ["assets/icon.png"],
   "web_engine": "system",
