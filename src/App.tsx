@@ -58,6 +58,7 @@ type Session = {
   diarization: boolean
   meeting: boolean
   id?: string
+  notesDraftId?: string
   preview?: ReturnType<typeof livePreview>
   previewUpdate?: Promise<void>
 }
@@ -94,6 +95,25 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   const [live, setLive] = useState(true)
   const [previewPaused, setPreviewPaused] = useState(false)
   const [tab, setTab] = useState("transcript")
+  const tabRef = useRef(tab)
+  const setActiveTab = useCallback((next: string) => {
+    tabRef.current = next
+    setTab(next)
+  }, [])
+  const keepNotesTab = useCallback((fallback: string) => tabRef.current === "notes" ? "notes" : fallback, [])
+  const [captureId, setCaptureId] = useState<string | null>(null)
+  const captureIdRef = useRef<string | null>(null)
+  const [captureFlowKey, setCaptureFlowKey] = useState<string | null>(null)
+  const liveNotesFlush = useRef<(() => Promise<boolean>) | null>(null)
+  const savedNotesDrafts = useRef<Set<string>>(new Set())
+  const setActiveCapture = useCallback((id: string | null) => {
+    captureIdRef.current = id
+    setCaptureId(id)
+    setCaptureFlowKey(id)
+  }, [])
+  const recordSavedDraft = useCallback((id: string) => {
+    savedNotesDrafts.current.add(id)
+  }, [])
   const [result, setResult] = useState(EMPTY_TRANSCRIPT)
   const [feedback, setFeedback] = useState("")
   const [processed, setProcessed] = useState<ProcessingAudio | null>(null)
@@ -310,26 +330,29 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     setCurrent({ ...saved, saved })
     setResult(previous => preserveLive && saved.status === "processing" && !saved.transcript.text && previous.text
       ? { ...previous, tentative: undefined, transcriptSource: "rolling" } : saved.transcript)
-    setTab(tab)
+    setActiveTab(tab)
     setJump(at)
     setCopied(false)
     setFeedback(saved.transcript.interruption ?? "")
     return tab
   }
 
-  function clearSession(feedback = "") {
+  function clearSession(feedback = "", preserveCapture = false) {
     setCurrent(null)
     setResult(EMPTY_TRANSCRIPT)
-    setTab("transcript")
+    setActiveTab("transcript")
     setJump(undefined)
     setCopied(false)
     setFeedback(feedback)
+    if (!preserveCapture) setActiveCapture(null)
   }
 
   function openSaved(saved: SavedSession, reopening = true, preserveLive = false) {
     restoreRequest.current?.abort()
     setRestoring(false)
-    const tab = showSession(saved, saved.annotation || reopening ? "overview" : "transcript", undefined, preserveLive)
+    if (reopening) setActiveCapture(null)
+    const wanted = saved.annotation || reopening ? "overview" : keepNotesTab("transcript")
+    const tab = showSession(saved, wanted, undefined, preserveLive)
     writeSessionRoute(saved.id, tab)
   }
 
@@ -341,7 +364,8 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     nativeSession.current = controller
     setLevel(0)
     setSystemLevel(0)
-    if (!pendingNavigation.current) writeSessionRoute(id, "transcript")
+    const wanted = keepNotesTab("transcript")
+    if (!pendingNavigation.current) writeSessionRoute(id, wanted)
     try {
       const saved = await readSession(id, controller.signal)
       if (!controller.signal.aborted && !pendingNavigation.current) {
@@ -359,7 +383,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     if (event.dictation) return
     deviceRevision.current++
     switch (event.event) {
-      case "started":
+      case "started": {
         if (refusedSource && captureSources(event.mode).includes(refusedSource)) setRefusedSource(null)
         nativeCapture.current = true
         nativeStopping.current = false
@@ -370,13 +394,15 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         if (event.live !== undefined) setLive(event.live)
         setMicrophoneName(event.microphone)
         if (!pendingNavigation.current) writeSessionRoute(null)
-        clearSession()
+        clearSession("", true)
+        setActiveCapture(event.session ?? crypto.randomUUID())
         setPreviewPaused(false)
         setElapsed(0)
         setLevel(0)
         setSystemLevel(0)
         setPhase("recording")
         break
+      }
       case "levels":
         if (!nativeCapture.current || nativeStopping.current) return
         setElapsed(Math.floor(event.seconds))
@@ -395,6 +421,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         break
       case "finished":
         nativeStopping.current = true
+        void liveNotesFlush.current?.().catch(() => {})
         setResult(previous => previous.tentative ? { ...previous, tentative: undefined } : previous)
         setPhase("transcribing")
         if (event.reason && event.reason !== "Stopped") setFeedback(event.reason)
@@ -410,6 +437,9 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         nativeCapture.current = false
         nativeStopping.current = false
         setPhase("idle")
+        if (captureIdRef.current && !savedNotesDrafts.current.has(captureIdRef.current)) {
+          setActiveCapture(null)
+        }
         if (event.permission) {
           recordingAccess.refused(event.permission)
           setRefusedSource(event.permission)
@@ -445,6 +475,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           nativeMeeting.current = !!devices.capture.meeting
           setLiveMeeting(devices.capture.meeting ? { shared: !!devices.capture.warm } : null)
           if (!nativeMeeting.current) setMeetingStopPending(false)
+          if (devices.capture.session && !captureIdRef.current) setActiveCapture(devices.capture.session)
           setMode(devices.capture.mode)
           setLive(devices.capture.live)
           setElapsed(Math.floor(devices.capture.seconds ?? 0))
@@ -473,7 +504,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       window.removeEventListener("focus", sync)
       nativeSession.current?.abort()
     }
-  }, [native])
+  }, [native, setActiveCapture])
 
   const restore = useEffectEvent(async () => {
     restoreRequest.current?.abort()
@@ -488,7 +519,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     }
     if (current?.saved?.id === route.id) {
       const tab = sessionTab(current.saved, route.tab)
-      setTab(tab)
+      setActiveTab(tab)
       setJump(route.at)
       setRestoring(false)
       writeSessionRoute(route.id, tab, true, route.at)
@@ -611,14 +642,14 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
             if (found) {
               const saved = await readSession(found.id, abort.signal)
               const route = readSessionRoute()
-              if (!abort.signal.aborted && route.id === saved.id) showSession(saved, saved.annotation ? route.tab : "transcript")
+              if (!abort.signal.aborted && route.id === saved.id) showSession(saved, saved.annotation ? route.tab : tabRef.current === "notes" ? "notes" : "transcript")
             } else { clearSession("Session no longer exists."); writeSessionRoute(null, "overview", true) }
             return
           }
           if ((found.processed !== processed || found.status !== lastState) && readSessionRoute().id === processingId) {
             const saved = await readSession(found.id, abort.signal)
             if (!abort.signal.aborted && readSessionRoute().id === saved.id) {
-              if (saved.status !== "processing" && !saved.finalizationPending) { showSession(saved, "transcript"); return }
+              if (saved.status !== "processing" && !saved.finalizationPending) { showSession(saved, tabRef.current === "notes" ? "notes" : "transcript"); return }
               setCurrent({ ...saved, saved })
               setResult(previous => saved.transcript.text ? saved.transcript : previous)
               setFeedback(saved.transcript.interruption ?? "")
@@ -635,9 +666,9 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   }, [phase, processingId])
 
   function changeTab(tab: string) {
-    setTab(tab)
+    setActiveTab(tab)
     setJump(undefined)
-    if (viewingSession && current) writeSessionRoute(current.id, tab)
+    if (current && (viewingSession || current.saved?.status === "processing")) writeSessionRoute(current.id, tab)
   }
 
   function sessionMediaRemoved(id: string, audioRemovedAt: string) {
@@ -648,10 +679,10 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
 
   async function finishAudio(
     audio: Blob, languages: readonly string[],
-    options: { name: string; recording?: boolean; diarization: boolean; session?: string; live?: boolean },
+    options: { name: string; recording?: boolean; diarization: boolean; session?: string; live?: boolean; notesDraft?: string },
   ) {
     const saved = await transcribeMedia(audio, languages, (seconds, duration) => setProcessed({ seconds, duration }), options,
-      id => { if (!pendingNavigation.current) writeSessionRoute(id, "transcript") })
+      id => { if (!pendingNavigation.current) writeSessionRoute(id, keepNotesTab("transcript")) })
     if (pendingNavigation.current) return
     openSaved(saved, false)
     if (saved.status === "complete" && !saved.transcript.text) setFeedback("No speech detected. Try another recording or audio file.")
@@ -665,7 +696,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
       setMeetingTake(true)
     }
     setPreviewPaused(false)
-    setTab("transcript")
+    setActiveTab("transcript")
     setPhase("starting")
     const languages = detected?.languages ?? selectedLanguages.map(({ code }) => code)
     const withSpeakers = (diarization || portableMeeting || meeting) && speakerLabelsAvailable
@@ -740,7 +771,9 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           : livePreview(languages, id, setResult, onPreviewDelayed)
         : undefined
       if (!pendingNavigation.current) writeSessionRoute(null)
-      session.current = { microphone, languages, preview, diarization: withSpeakers, id, meeting }
+      const notesDraftId = "captureId" in microphone ? microphone.captureId : crypto.randomUUID()
+      session.current = { microphone, languages, preview, diarization: withSpeakers, id, meeting, notesDraftId }
+      setActiveCapture(notesDraftId)
       if (detected) setLive(true)
       setElapsed(detected?.elapsed ?? 0)
       setLevel(0)
@@ -796,10 +829,10 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     if (native) {
       if (!nativeCapture.current || nativeStopping.current) return
       nativeStopping.current = true
-      setTab("transcript")
       setProcessed(null)
       setPhase("transcribing")
       try {
+        void liveNotesFlush.current?.().catch(() => {})
         await native.request("stop")
       } catch (error) {
         nativeStopping.current = false
@@ -811,11 +844,11 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     const active = session.current
     if (!active) return
     session.current = null
-    setTab("transcript")
     setProcessed(null)
     setPhase("transcribing")
     try {
       active.preview?.stop()
+      const notesSave = liveNotesFlush.current?.().catch(() => {})
       const timestamp = new Date().toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" })
       const name = `${t(active.meeting ? "Meeting" : "Recording")} ${timestamp}`
       if ("captureId" in active.microphone) {
@@ -829,14 +862,18 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         return
       }
       const audio = await active.microphone.stop()
+      await notesSave
       const item: DownloadItem = {
         id: crypto.randomUUID(),
         name,
         languageHints: active.languages, recording: true, audio: audio.size ? audio : undefined,
       }
       if (item.audio) setCurrent(item)
+      const notesDraft = active.notesDraftId && savedNotesDrafts.current.has(active.notesDraftId)
+        ? active.notesDraftId : undefined
       await finishAudio(audio, active.languages, {
         name: item.name, recording: true, live: !!active.preview, diarization: active.diarization, session: active.id,
+        notesDraft,
       })
     } catch (error) {
       setFeedback(message(error))
@@ -893,6 +930,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           await openAcceptedSession(saved.id)
         }
       }
+      if (discard) discardSessionDrafts(id)
       setRecoveredAudio(drafts => drafts.filter(d => d.id !== id))
       setDiscarding(null)
     } catch (error) {
@@ -914,7 +952,8 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     input.value = ""
     if (!file || !canStart) return
     setFeedback("")
-    setTab("transcript")
+    setActiveTab("transcript")
+    setActiveCapture(null)
     setProcessed(null)
     setPhase("transcribing")
     const languages = selectedLanguages.map(({ code }) => code)
@@ -982,7 +1021,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
   const meetingControls: PortableMeetingControls | undefined = hasPortableAudio && !native ? {
     phase: meetingTake ? phase : "idle", elapsed, canStart, feedback: meetingFeedback,
     start: () => void startRecording(true), stop: () => void stopRecording(),
-    showLive: () => { if (!live) toggleLive() },
+    showLive: () => { if (!live) toggleLive(); setActiveTab("transcript") },
   } : undefined
   const showScreenRecovery = recoveredAudio.some(draft => draft.screen)
   const recoveryPanel = !recording && recoveredAudio.length > 0 && <section
@@ -1077,7 +1116,8 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           <ActionTooltip label={t("New session")}>
             <Button size="sm" variant="ghost" disabled={phase !== "idle" || restoring || dictating || screenBusy} onClick={newSession} aria-label={t("New session")}><Plus /><span>{t("New session")}</span></Button>
           </ActionTooltip>
-          <QuitButton recording={recording || phase === "starting" || dictating || screenBusy || !!detectedRecording} recoverable={hasPortableAudio} onQuit={onQuit} />
+          <QuitButton recording={recording || phase === "starting" || dictating || screenBusy || !!detectedRecording} recoverable={hasPortableAudio}
+            onBeforeQuit={() => liveNotesFlush.current?.() ?? Promise.resolve()} onQuit={onQuit} />
         </nav>
       </header>
 
@@ -1087,8 +1127,13 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           <PortableModelSetup setup={modelSetup} onStarted={() => setModelStatusRequest(value => value + 1)} />
           {feedback && <p className="feedback" role="alert">{feedback}</p>}
         </> : <>
-        <ResultsPanel key={phase === "idle" && current ? `${current.id}:${current.saved?.transcriptEditRevision ?? ""}` : "capture"}
+        <ResultsPanel key={captureFlowKey ?? (phase === "idle" && current ? current.id : "capture")}
           session={phase === "idle" ? current?.saved : undefined} result={result} source={phase === "idle" && current ? current.audioUrl ?? current.audio ?? null : null}
+          captureId={captureId ?? undefined}
+          notesKey={captureFlowKey ?? current?.id}
+          notesLanguages={selectedLanguages.map(language => language.code)}
+          notesFlushRef={liveNotesFlush}
+          onNotesDraftSaved={recordSavedDraft}
           tab={tab} onTab={changeTab} working={working} recording={recording}
           followLive={recording && live && !previewPaused && !meetingStopPending} jump={jump} toolbar={sessionToolbar}
           dictationEnabled={status === "ready" && phase === "idle" && !choosingFile}

@@ -310,7 +310,10 @@ class SessionStore:
                                    ((key, start, end, encode(result)) for start, end, result in rolling))
                     if not video_only and (options["recording"] or options.get("meeting", options.get("sourceSpeakerTurns"))):
                         db.execute("INSERT INTO meeting_finalization(session_id) VALUES(?)", (key,))
-                    personal_notes.attach(db, key, notes_draft)
+                    if notes_draft:
+                        personal_notes.attach(db, key, notes_draft)
+                    elif staged and options["recording"] and not annotation:
+                        personal_notes.attach(db, key, key, required=False)
                     if video_only:
                         session_notes.initialize(db, key)
                     if annotation_location is not None:

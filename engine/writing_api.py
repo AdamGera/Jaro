@@ -94,6 +94,19 @@ async def summarize_meeting(key: UUID, request: Request):
     return meeting_brief_response(request, str(key), enqueue=True)
 
 
+def refresh_pending_overview_personal(db, key):
+    from insights import GUIDE, SUMMARY
+
+    if db.execute("SELECT 1 FROM window_notes WHERE id=? AND part IN (?,?)", (key, GUIDE, SUMMARY)).fetchone():
+        return
+    context = personal_notes.as_context(db, key)
+    db.execute(
+        """UPDATE overviews SET queued_personal=?
+           WHERE id=? AND status='queued' AND body IS NULL AND generation=0""",
+        (context, key),
+    )
+
+
 @router.get("/api/sessions/{key}/personal-notes")
 def get_personal_notes(key: UUID, request: Request):
     with request.app.state.library.connection() as db:
@@ -110,6 +123,7 @@ def save_personal_notes(key: UUID, body: personal_notes.NoteEdit, request: Reque
         revision = personal_notes.save(db, str(key), body)
         if revision is None:
             raise HTTPException(409, "My notes changed in another window.")
+        refresh_pending_overview_personal(db, str(key))
         return {"revision": revision}
 
 
@@ -118,6 +132,25 @@ def stage_personal_notes(body: personal_notes.NoteDocument, request: Request):
     check_origin(request)
     with request.app.state.library.connection() as db:
         return {"id": personal_notes.stage(db, body.document)}
+
+
+@router.get("/api/personal-note-drafts/{key}")
+def get_personal_note_draft(key: UUID, request: Request):
+    with request.app.state.library.connection() as db:
+        return JSONResponse(personal_notes.get_draft(db, str(key)), headers={"Cache-Control": "no-store"})
+
+
+@router.put("/api/personal-note-drafts/{key}")
+def save_personal_note_draft(key: UUID, body: personal_notes.NoteEdit, request: Request):
+    check_origin(request)
+    with request.app.state.library.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        revision, promoted = personal_notes.save_draft(db, str(key), body)
+        if revision is None:
+            raise HTTPException(409, "My notes changed in another window.")
+        if promoted:
+            refresh_pending_overview_personal(db, str(key))
+        return {"revision": revision, "promoted": promoted}
 
 
 @router.get("/api/overview-languages")

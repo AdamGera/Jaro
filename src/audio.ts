@@ -29,7 +29,7 @@ type ProgressEvent =
   | { error: string }
   | { seconds: number; duration: number | null }
 
-type AudioOptions = { name?: string; live?: boolean; recording?: boolean; diarization?: boolean; session?: string; offset?: number }
+type AudioOptions = { name?: string; live?: boolean; recording?: boolean; diarization?: boolean; session?: string; offset?: number; notesDraft?: string }
 
 export type AudioFrames = {
   sampleRate: number
@@ -217,6 +217,7 @@ async function sendAudio(
   if (options.diarization) params.set("diarization", "true")
   if (options.session) params.set("session", options.session)
   if (options.offset) params.set("offset", String(options.offset))
+  if (options.notesDraft) params.set("notes_draft", options.notesDraft)
   const url = params.size ? `${path}?${params}` : path
   const response = await fetch(url, {
     method: "POST",

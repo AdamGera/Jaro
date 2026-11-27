@@ -455,3 +455,85 @@ class ChatPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 app.state.insights = FakeWriter()
                 await c.post(path, json=turn)
                 self.assertEqual((await c.get(path)).json()[-1]["metadata"], {"status": "complete"})
+
+    async def test_live_note_draft_upsert_promotion_and_overview_handoff(self):
+        from uuid import uuid4
+        from insights import GUIDE
+
+        def doc(text):
+            return {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory) / "library")
+            app = FastAPI()
+            app.include_router(router)
+            app.state.library = store
+            app.state.insights = FakeWriter()
+            app.state.insights.wake = asyncio.Event()
+            draft_id = str(uuid4())
+            draft_url = f"/api/personal-note-drafts/{draft_id}"
+            session_url = f"/api/sessions/{draft_id}/personal-notes"
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://localhost"
+            ) as client:
+                initial = (await client.get(draft_url)).raise_for_status().json()
+                self.assertEqual(initial, {"document": personal_notes.EMPTY, "revision": 0, "promoted": False})
+
+                self.assertEqual(
+                    (await client.put(draft_url, json={"document": doc("Bad"), "revision": 0},
+                                      headers={"origin": "https://example.com"})).status_code,
+                    403,
+                )
+                first = (await client.put(draft_url, json={"document": doc("Key point 1"), "revision": 0})).raise_for_status().json()
+                self.assertEqual(first, {"revision": 1, "promoted": False})
+                # Idempotent duplicate write keeps the same revision.
+                dup = (await client.put(draft_url, json={"document": doc("Key point 1"), "revision": 1})).raise_for_status().json()
+                self.assertEqual(dup, {"revision": 1, "promoted": False})
+                # Stale revision triggers 409 Conflict.
+                self.assertEqual(
+                    (await client.put(draft_url, json={"document": doc("Stale"), "revision": 0})).status_code,
+                    409,
+                )
+                second = (await client.put(draft_url, json={"document": doc("Key point 1 + 2"), "revision": 1})).raise_for_status().json()
+                self.assertEqual(second, {"revision": 2, "promoted": False})
+                hydrated = (await client.get(draft_url)).raise_for_status().json()
+                self.assertEqual(hydrated, {"document": doc("Key point 1 + 2"), "revision": 2, "promoted": False})
+
+                # Promote draft into a processing session preserving revision continuity.
+                audio = Path(directory) / "recording.wav"
+                audio.write_bytes(b"audio")
+                key, _ = store.create(
+                    audio, "Recording.wav", "audio/wav", {"recording": True, "diarization": False},
+                    12, key=draft_id,
+                )
+                self.assertEqual(key, draft_id)
+                self.assertEqual(store.get(draft_id)["personalNotes"]["revision"], 2)
+
+                # A racing PUT to the draft endpoint after stop transparently writes through to personal_notes.
+                promoted = (await client.put(draft_url, json={"document": doc("Typed right after stop"), "revision": 2})).raise_for_status().json()
+                self.assertEqual(promoted, {"revision": 3, "promoted": True})
+                promoted_get = (await client.get(draft_url)).raise_for_status().json()
+                self.assertEqual(promoted_get, {"document": doc("Typed right after stop"), "revision": 3, "promoted": True})
+
+                # Finishing transcription queues the initial overview with the latest personal notes.
+                store.append(draft_id, {"text": "Spoken meeting content", "language": "English", "words": [], "segments": []}, 12)
+                store.finish(draft_id)
+                with store.connection() as db:
+                    queued = db.execute("SELECT queued_personal FROM overviews WHERE id=?", (draft_id,)).fetchone()[0]
+                self.assertEqual(queued, "Typed right after stop")
+
+                # Trailing edit before any writer checkpoint updates queued_personal in-place.
+                trailing = (await client.put(session_url, json={"document": doc("Trailing note before start"), "revision": 3})).raise_for_status().json()
+                self.assertEqual(trailing, {"revision": 4})
+                with store.connection() as db:
+                    queued = db.execute("SELECT queued_personal FROM overviews WHERE id=?", (draft_id,)).fetchone()[0]
+                    self.assertEqual(queued, "Trailing note before start")
+                    # Once GUIDE checkpoint exists, further edits leave queued_personal frozen.
+                    db.execute("INSERT INTO window_notes(id,part,data) VALUES(?,?,?)", (draft_id, GUIDE, "{}"))
+
+                later = (await client.put(session_url, json={"document": doc("Edit after writer started"), "revision": 4})).raise_for_status().json()
+                self.assertEqual(later, {"revision": 5})
+                with store.connection() as db:
+                    queued = db.execute("SELECT queued_personal FROM overviews WHERE id=?", (draft_id,)).fetchone()[0]
+                    self.assertEqual(queued, "Trailing note before start")
+                    self.assertTrue(selection(db, draft_id)["notesChanged"])

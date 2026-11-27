@@ -207,7 +207,7 @@ function applyWindowChrome(chrome: WindowChrome) {
 
 type CaptureOptions = { diarization: boolean; languages: string[] }
 export type RecordingDraft = { id: string; seconds: number; meeting?: boolean; screen?: boolean; videoOnly?: boolean }
-type ActiveCapture = { dictation?: string; meeting?: string; warm?: boolean; mode: RecordingMode; live: boolean; seconds?: number; text?: string; tentative?: string; segments?: SpeakerSegment[] }
+type ActiveCapture = { session?: string; dictation?: string; meeting?: string; warm?: boolean; mode: RecordingMode; live: boolean; seconds?: number; text?: string; tentative?: string; segments?: SpeakerSegment[] }
 export type DictationDestination = "dictation" | "history" | "output"
 export type WindowNavigation = {
   id: string
@@ -341,7 +341,7 @@ export type DesktopBridge = {
 }
 
 export type DesktopCaptureEvent = { dictation?: string; meeting?: string } & (
-  | { event: "started"; mode: RecordingMode; microphone: string; live?: boolean; warm?: boolean }
+  | { event: "started"; mode: RecordingMode; microphone: string; live?: boolean; warm?: boolean; session?: string }
   | { event: "levels"; seconds: number; mic: number; system: number; microphone?: string }
   | { event: "sourceChanged"; microphone: string; message: string }
   | { event: "preview"; text: string; tentative?: string; segments?: SpeakerSegment[] }

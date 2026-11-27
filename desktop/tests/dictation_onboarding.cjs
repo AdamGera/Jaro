@@ -43,6 +43,8 @@ async function run() {
     let personalNotes = { revision: 1, document: { type: "doc", content: [
       { type: "paragraph", content: [{ type: "text", text: "Saved fixture notes" }] },
     ] } }
+    let holdLiveNote
+    let liveNoteWrite
     let retention = null
     let wholeRetention = null
     let annotationRetention = { mediaDays: 7, recordDays: 30, includeExisting: false }
@@ -141,6 +143,16 @@ async function run() {
           return route.fulfill({ json: { revision: personalNotes.revision } })
         }
         return route.fulfill({ json: personalNotes })
+      }
+      if (pathname === `/api/personal-note-drafts/${meetingId}`) {
+        if (route.request().method() === "PUT") {
+          const edit = route.request().postDataJSON()
+          liveNoteWrite = edit
+          await holdLiveNote
+          personalNotes = { document: edit.document, revision: edit.revision + 1 }
+          return route.fulfill({ json: { revision: personalNotes.revision, promoted: true } })
+        }
+        return route.fulfill({ json: { document: { type: "doc", content: [{ type: "paragraph" }] }, revision: 0 } })
       }
       if (pathname === "/api/meetings/audio-retention") {
         if (route.request().method() === "PUT") retention = Number(searchParams.get("days")) || null
@@ -3154,7 +3166,7 @@ async function run() {
       })
       return capture("preview", { text: segments.map(turn => turn.text).join(" "), segments })
     }
-    await capture("started", { mode: "both", microphone: "Fixture microphone", live: true })
+    await capture("started", { mode: "both", microphone: "Fixture microphone", live: true, session: meetingId })
     await publishLiveTurns(26)
     await button("View live transcript").click()
     const liveTranscript = page.locator("[data-live-transcript]")
@@ -3200,8 +3212,29 @@ async function run() {
     await publishLiveTurns(34)
     await liveTurn(34).waitFor()
     assert.ok(Math.abs(await liveTranscript.evaluate(area => area.scrollTop) - stopping) <= 2)
+    let releaseLiveNote
+    holdLiveNote = new Promise(resolve => { releaseLiveNote = resolve })
+    await page.getByRole("tab", { name: "My Notes", exact: true }).click()
+    const liveEditor = page.getByRole("textbox", { name: "My notes" })
+    await liveEditor.fill("Keep this note across Stop")
+    await liveEditor.evaluate(node => { window.liveEditorBeforeStop = node })
+    saved.status = "processing"
+    const accepted = page.waitForResponse(response => new URL(response.url()).pathname === `/api/sessions/${meetingId}`)
     await capture("finished", { reason: "Stopped" })
     await capture("accepted", { id: meetingId })
+    await accepted
+    assert.equal(await liveEditor.evaluate(node => node === window.liveEditorBeforeStop), true)
+    assert.equal(await liveEditor.textContent(), "Keep this note across Stop")
+    const noteSaved = page.waitForResponse(response => response.request().method() === "PUT" &&
+      new URL(response.url()).pathname === `/api/personal-note-drafts/${meetingId}`)
+    releaseLiveNote()
+    await noteSaved
+    assert.equal(liveNoteWrite.revision, 0)
+    saved.status = "complete"
+    await page.getByRole("tab", { name: "Overview", exact: true }).waitFor()
+    assert.equal(await liveEditor.evaluate(node => node === window.liveEditorBeforeStop), true)
+    assert.equal(await liveEditor.textContent(), "Keep this note across Stop")
+    await page.getByRole("tab", { name: "Transcript", exact: true }).click()
     await page.getByRole("tabpanel", { name: "Transcript" }).getByText("Final meeting transcript", { exact: true }).waitFor()
 
     saved.status = "interrupted"
@@ -3222,6 +3255,9 @@ async function run() {
     await meetingWorkspace.getByRole("button", { name: "Copied" }).waitFor()
     await meetingWorkspace.locator(".meeting-workspace-open").click()
     await page.getByRole("tabpanel", { name: "Transcript" }).getByText("Recovered meeting transcript", { exact: true }).waitFor()
+    await page.getByRole("tab", { name: "My Notes", exact: true }).click()
+    assert.equal(await liveEditor.textContent(), "Keep this note across Stop")
+    await page.getByRole("tab", { name: "Transcript", exact: true }).click()
     await button("Open audio player").waitFor()
     await button("Meeting exports").click()
     await page.getByRole("menuitem", { name: "Copy transcript" }).waitFor()

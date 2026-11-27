@@ -5,7 +5,10 @@ const sessionId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
 const tabs = new Set(["overview", "timeline", "transcript", "notes", "analytics", "annotation"])
 
 export function sessionTab(session: SavedSession, wanted: string) {
-  if (session.status !== "complete") return session.annotation && wanted !== "transcript" ? "overview" : "transcript"
+  if (session.status !== "complete") {
+    if (session.annotation) return wanted === "transcript" ? "transcript" : "overview"
+    return wanted === "notes" ? "notes" : "transcript"
+  }
   return wanted === "annotation" ? "overview" : wanted
 }
 

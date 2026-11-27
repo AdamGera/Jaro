@@ -386,6 +386,51 @@ class NativeEngineTests(unittest.TestCase):
         with app.state.library.connection() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM meeting_rolling WHERE session_id=?", (stage["id"],)).fetchone()[0], 0)
 
+    def test_live_recording_notes_auto_attach_and_survive_non_discard_abandon(self):
+        ep, key = self.new_stage()
+        doc = lambda text: {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}
+        self.assertEqual(
+            self.client.put(f"/api/personal-note-drafts/{key}", json={"document": doc("First live thought"), "revision": 0},
+                            headers={"Origin": URL}).raise_for_status().json(),
+            {"revision": 1, "promoted": False},
+        )
+        self.assertEqual(
+            self.client.put(f"/api/personal-note-drafts/{key}", json={"document": doc("Final live note"), "revision": 1},
+                            headers={"Origin": URL}).raise_for_status().json(),
+            {"revision": 2, "promoted": False},
+        )
+        submitted = self.client.post(
+            ep + "/submit", params={"recording": "true", "name": "Call", "language": "en"}, headers=self.header
+        ).raise_for_status().json()
+        self.assertEqual(submitted["id"], key)
+        self.client.portal.call(self.wait_for_jobs)
+        saved = self.client.get(f"/api/sessions/{key}").raise_for_status().json()
+        self.assertEqual(saved["status"], "complete")
+        self.assertEqual(saved["personalNotes"], {"document": doc("Final live note"), "revision": 2})
+        with app.state.library.connection() as db:
+            self.assertEqual(
+                db.execute("SELECT queued_personal FROM overviews WHERE id=?", (key,)).fetchone()[0],
+                "Final live note",
+            )
+
+        # Non-discard abandon (e.g. 0-byte capture error) keeps the notes draft; explicit discard deletes it.
+        ep2, key2 = self.new_stage()
+        self.client.put(f"/api/personal-note-drafts/{key2}", json={"document": doc("Keep on mic error"), "revision": 0},
+                        headers={"Origin": URL}).raise_for_status()
+        self.assertEqual(self.client.delete(ep2, headers=self.header).status_code, 204)
+        self.assertEqual(
+            self.client.get(f"/api/personal-note-drafts/{key2}").raise_for_status().json()["document"],
+            doc("Keep on mic error"),
+        )
+        ep3, key3 = self.new_stage()
+        self.client.put(f"/api/personal-note-drafts/{key3}", json={"document": doc("Explicit discard"), "revision": 0},
+                        headers={"Origin": URL}).raise_for_status()
+        self.assertEqual(self.client.delete(ep3, params={"discard": "true"}, headers=self.header).status_code, 204)
+        self.assertEqual(
+            self.client.get(f"/api/personal-note-drafts/{key3}").raise_for_status().json()["revision"],
+            0,
+        )
+
     @staticmethod
     async def wait_for_jobs():
         await asyncio.wait_for(asyncio.gather(*app.state.jobs), timeout=10)

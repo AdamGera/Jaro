@@ -6,8 +6,8 @@ import { desktopBridge } from "@/desktop"
 import { Button } from "./ui/button"
 import { ActionTooltip } from "./ui/tooltip"
 
-export function QuitButton({ recording, recoverable = false, onQuit }: {
-  recording: boolean; recoverable?: boolean; onQuit: () => void
+export function QuitButton({ recording, recoverable = false, onBeforeQuit, onQuit }: {
+  recording: boolean; recoverable?: boolean; onBeforeQuit?: () => Promise<unknown>; onQuit: () => void
 }) {
   const { t } = useInterfaceLanguage()
   const native = desktopBridge()
@@ -18,6 +18,7 @@ export function QuitButton({ recording, recoverable = false, onQuit }: {
     setBusy(true)
     setError("")
     try {
+      await onBeforeQuit?.().catch(() => {})
       if (native) await native.request("stop")
       const response = await fetch("/api/quit", { method: "POST", headers: { "X-Jard-Action": "quit" } })
       if (response.status === 405 || response.status === 404) {

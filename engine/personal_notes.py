@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS personal_notes (
 );
 CREATE TABLE IF NOT EXISTS personal_note_drafts (
     id TEXT PRIMARY KEY, document TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
     created INTEGER NOT NULL DEFAULT (unixepoch())
 );
 """
@@ -105,6 +106,9 @@ class NoteEdit(NoteDocument):
 
 def migrate(db):
     db.executescript(SCHEMA)
+    draft_columns = {row["name"] for row in db.execute("PRAGMA table_info(personal_note_drafts)")}
+    if "revision" not in draft_columns:
+        db.execute("ALTER TABLE personal_note_drafts ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
     columns = {row["name"] for row in db.execute("PRAGMA table_info(overviews)")}
     for name in ("queued_personal", "published_personal"):
         if name not in columns:
@@ -129,20 +133,53 @@ def save(db, key, edit):
     return revision
 
 
+def get_draft(db, key):
+    if db.execute("SELECT 1 FROM sessions WHERE id=?", (key,)).fetchone():
+        return {"promoted": True, **get(db, key)}
+    row = db.execute("SELECT document,revision FROM personal_note_drafts WHERE id=?", (key,)).fetchone()
+    if row:
+        return {"document": json.loads(row[0]), "revision": row[1], "promoted": False}
+    return {"document": EMPTY, "revision": 0, "promoted": False}
+
+
+def save_draft(db, key, edit):
+    if db.execute("SELECT 1 FROM sessions WHERE id=?", (key,)).fetchone():
+        return save(db, key, edit), True
+    row = db.execute("SELECT document,revision FROM personal_note_drafts WHERE id=?", (key,)).fetchone()
+    current_doc = json.loads(row[0]) if row else EMPTY
+    current_rev = row[1] if row else 0
+    if current_doc == edit.document:
+        return current_rev, False
+    if current_rev != edit.revision:
+        return None, False
+    revision = edit.revision + 1
+    db.execute("DELETE FROM personal_note_drafts WHERE created < unixepoch() - 604800 AND id!=?", (key,))
+    db.execute("""INSERT INTO personal_note_drafts(id,document,revision,created) VALUES(?,?,?,unixepoch())
+                  ON CONFLICT(id) DO UPDATE SET document=excluded.document,revision=excluded.revision,
+                  created=excluded.created""", (key, encode(edit.document), revision))
+    return revision, False
+
+
+def delete_draft(db, key):
+    db.execute("DELETE FROM personal_note_drafts WHERE id=?", (key,))
+
+
 def stage(db, document):
     key = str(uuid4())
     db.execute("DELETE FROM personal_note_drafts WHERE created < unixepoch() - 604800")
-    db.execute("INSERT INTO personal_note_drafts(id,document) VALUES(?,?)", (key, encode(document)))
+    db.execute("INSERT INTO personal_note_drafts(id,document,revision) VALUES(?,?,1)", (key, encode(document)))
     return key
 
 
-def attach(db, key, draft):
+def attach(db, key, draft, *, required=True):
     if not draft:
         return
-    row = db.execute("SELECT document FROM personal_note_drafts WHERE id=?", (draft,)).fetchone()
+    row = db.execute("SELECT document,revision FROM personal_note_drafts WHERE id=?", (draft,)).fetchone()
     if not row:
-        raise ValueError("The notes draft is unavailable. Try starting the session again.")
-    db.execute("INSERT INTO personal_notes VALUES(?,?,1)", (key, row[0]))
+        if required:
+            raise ValueError("The notes draft is unavailable. Try starting the session again.")
+        return
+    db.execute("INSERT INTO personal_notes(id,document,revision) VALUES(?,?,?)", (key, row[0], row[1]))
     db.execute("DELETE FROM personal_note_drafts WHERE id=?", (draft,))
 
 

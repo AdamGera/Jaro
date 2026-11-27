@@ -1,6 +1,6 @@
 import { MeetingTranscriptEdit } from "./meeting-transcript-edit"
 import { useInterfaceLanguage } from "@/interface-language"
-import { Component, lazy, Suspense, useCallback, useDeferredValue, useMemo, useEffect, useRef, useState, type ReactNode } from "react"
+import { Component, lazy, Suspense, useCallback, useDeferredValue, useMemo, useEffect, useRef, useState, type ReactNode, type RefObject } from "react"
 import { createPortal } from "react-dom"
 import { AudioLines, CalendarDays, ChartNoAxesColumnIncreasing, Check, ChevronUp, Clock3, Copy, Download, FileText, LayoutDashboard, ListTree, Pencil, Play, RotateCw, Scissors, StickyNote, UsersRound } from "lucide-react"
 import { isSettledMeeting, type MeetingBrief, type MeetingExport, type SavedSession, type Transcript } from "@/audio"
@@ -28,6 +28,9 @@ const NoteMarkdown = lazy(() => import("./note-markdown").then(module => ({ defa
 
 type Props = {
   result: Transcript; session?: SavedSession; source: Blob | string | null
+  captureId?: string; notesKey?: string; notesLanguages?: string[]
+  notesFlushRef?: RefObject<(() => Promise<boolean>) | null>
+  onNotesDraftSaved?: (id: string) => void
   tab: string; onTab: (tab: string) => void
   jump?: number
   toolbar?: HTMLElement | null
@@ -427,10 +430,13 @@ function ManagedMeetingExport({ id, initial, title }: { id: string; initial: Mee
   </>
 }
 
-export function ResultsPanel({ result, session, source, tab, onTab, jump, toolbar, working, recording, followLive, emptyText, progress, copied, onCopy, dictationEnabled, onDictationBusy, onMeetingRenamed, onMeetingEdited }: Props) {
+export function ResultsPanel({ result, session, source, captureId, notesKey, notesLanguages, notesFlushRef, onNotesDraftSaved, tab, onTab, jump, toolbar, working, recording, followLive, emptyText, progress, copied, onCopy, dictationEnabled, onDictationBusy, onMeetingRenamed, onMeetingEdited }: Props) {
   const { t } = useInterfaceLanguage()
   const complete = session?.status === "complete"
   const reviewable = complete || !!session?.annotation || isSettledMeeting(session)
+  const liveNotesId = session?.id ?? captureId
+  const showCaptureTabs = !reviewable && !!liveNotesId && !session?.annotation
+  const showNotes = !!liveNotesId && (complete || !session?.annotation)
   const meetingsManaged = !!session?.meetingsManaged
   const briefMeeting = complete && session.meeting && result.text.trim() ? session.id : undefined
   const meetingBrief = useMeetingBrief(meetingsManaged ? undefined : briefMeeting, session?.meetingBrief)
@@ -565,7 +571,7 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
     </div>
   )
   const transcriptClass = hasTranscriptText ? "transcript-body has-text" : "transcript-body"
-  if (!session || !reviewable) return <section className="transcript-panel capture-panel" aria-label={t("Transcript")}>
+  if (!reviewable && !showCaptureTabs) return <section className="transcript-panel capture-panel" aria-label={t("Transcript")}>
     <LiveTranscriptScroll className={transcriptClass} following={followLive} hasText={hasTranscriptText}>
       {transcriptContent}
     </LiveTranscriptScroll>
@@ -576,13 +582,13 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
     {source && <AudioPlayer player={player} />}
   </section>
 
-  const meetingTitle = session.meetingTitle || session.meetingCalendar?.title || meetingBrief.brief?.title ||
-    session.provisionalTitle || draft?.title || version?.title || session.name
-  const canRegenerate = !meetingsManaged && !!writingTab && !!version && !!writing && version.language === writing.target
+  const meetingTitle = session ? (session.meetingTitle || session.meetingCalendar?.title || meetingBrief.brief?.title ||
+    session.provisionalTitle || draft?.title || version?.title || session.name) : ""
+  const canRegenerate = reviewable && !meetingsManaged && !!writingTab && !!version && !!writing && version.language === writing.target
   const regenerateLabel = t(writingTab === "overview" ? "Regenerate overview" : "Regenerate timeline")
-  const canCopyOverview = tab === "overview" && !!overviewText && !editing
-  const canEditOverview = tab === "overview" && !!version && !!editRevision && !editing
-  const canUseTranscriptTools = tab === "transcript" && !!result.text && !recording && !working
+  const canCopyOverview = reviewable && tab === "overview" && !!overviewText && !editing
+  const canEditOverview = reviewable && tab === "overview" && !!version && !!editRevision && !editing
+  const canUseTranscriptTools = reviewable && tab === "transcript" && !!result.text && !recording && !working
   const toolbarActions = <>
     {canUseTranscriptTools && <>
       <TranscriptFind open={findOpen} onOpen={toggleFind} query={query} onQuery={changeQuery}
@@ -609,9 +615,9 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
         onClick={() => setEditing({ ...version, editRevision })}><Pencil aria-hidden="true" /></Button>
     </ActionTooltip>}
   </>
-  return <div className="session-sheet">
-    {toolbar && createPortal(toolbarActions, toolbar)}
-    <header className="session-heading">
+  return <div className={reviewable ? "session-sheet" : "capture-sheet"}>
+    {reviewable && toolbar && createPortal(toolbarActions, toolbar)}
+    {reviewable && session ? <header className="session-heading">
       {complete && session.meeting ? <MeetingTitle id={session.id} title={meetingTitle} onRenamed={onMeetingRenamed} /> :
         <h1 dir="auto">{meetingTitle}</h1>}
       <div className="session-meta">
@@ -629,20 +635,27 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
       {session.meetingMicrophoneWarning === "digitalSilence" && <p className="annotation-interruption">
         {t("The microphone stopped sending sound during this meeting. Mac audio continued recording.")}
       </p>}
-    </header>
-    <Tabs className="transcript-panel" value={tab} onValueChange={changeTab}>
+    </header> : null}
+    <Tabs className={reviewable ? "transcript-panel" : "transcript-panel capture-panel"}
+      data-tabs={!reviewable ? "true" : undefined}
+      value={tab} onValueChange={changeTab}>
       <div className="panel-heading" data-scrolled={scrolled}>
-        <TabsList ref={tabList} aria-label="Recording results">
-          {(complete || session.annotation) && <TabsTrigger value="overview"><LayoutDashboard aria-hidden="true" className="size-3.5" />{t("Overview")}</TabsTrigger>}
-          {complete && <TabsTrigger value="notes"><StickyNote aria-hidden="true" className="size-3.5" />{t("My Notes")}</TabsTrigger>}
-          <TabsTrigger value="transcript"><FileText aria-hidden="true" className="size-3.5" />{t("Transcript")}</TabsTrigger>
-          {complete && <TabsTrigger value="timeline"><ListTree aria-hidden="true" className="size-3.5" />{t("Timeline")}</TabsTrigger>}
-          {complete && <TabsTrigger value="analytics" disabled={working || recording}>
-            <ChartNoAxesColumnIncreasing aria-hidden="true" className="size-3.5" />{t("Speaker analytics")}
-          </TabsTrigger>}
+        <TabsList ref={tabList} aria-label={reviewable ? "Recording results" : t("Recording view")}>
+          {reviewable && session ? <>
+            {(complete || session.annotation) && <TabsTrigger value="overview"><LayoutDashboard aria-hidden="true" className="size-3.5" />{t("Overview")}</TabsTrigger>}
+            {showNotes && <TabsTrigger value="notes"><StickyNote aria-hidden="true" className="size-3.5" />{t("My Notes")}</TabsTrigger>}
+            <TabsTrigger value="transcript"><FileText aria-hidden="true" className="size-3.5" />{t("Transcript")}</TabsTrigger>
+            {complete && <TabsTrigger value="timeline"><ListTree aria-hidden="true" className="size-3.5" />{t("Timeline")}</TabsTrigger>}
+            {complete && <TabsTrigger value="analytics" disabled={working || recording}>
+              <ChartNoAxesColumnIncreasing aria-hidden="true" className="size-3.5" />{t("Speaker analytics")}
+            </TabsTrigger>}
+          </> : <>
+            <TabsTrigger value="transcript"><FileText aria-hidden="true" className="size-3.5" />{t("Conversation")}</TabsTrigger>
+            <TabsTrigger value="notes"><StickyNote aria-hidden="true" className="size-3.5" />{t("My Notes")}</TabsTrigger>
+          </>}
         </TabsList>
       </div>
-      <TabsContent value="overview" forceMount={editing ? true : undefined} hidden={tab !== "overview"}
+      {reviewable && session ? <TabsContent key="overview" value="overview" forceMount={editing ? true : undefined} hidden={tab !== "overview"}
         className="note-body" onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
         {!editing && briefMeeting && (!meetingsManaged || meetingBrief.brief?.summary) && <details className="meeting-quick-brief">
           <summary>{t("Quick brief")}</summary>
@@ -677,8 +690,8 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
             videoExpired={!!session.audioRemovedAt} unavailable={!!session.annotationStorageUnavailable} setVideo={setVideo}
             onPlay={() => player.audio.current?.pause()} />}
         </SessionImages>}
-      </TabsContent>
-      <TabsContent value="timeline" className="note-body timeline-body" onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
+      </TabsContent> : null}
+      {reviewable && session ? <TabsContent key="timeline" value="timeline" className="note-body timeline-body" onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
         {noteStatus}
         {timeline && <ol className="topic-list" aria-label="Topic timeline" lang={timeline.language}>
           {timeline.topics.map((topic,i) => <li key={i}>
@@ -690,30 +703,55 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
             </button>
           </li>)}
         </ol>}
+      </TabsContent> : null}
+      <TabsContent key="transcript" value="transcript"
+        forceMount={showCaptureTabs ? true : undefined}
+        hidden={tab !== "transcript"}
+        className={reviewable ? transcriptClass : "capture-transcript-pane"}
+        onScroll={reviewable ? e => setScrolled(e.currentTarget.scrollTop > 2) : undefined}>
+        {reviewable && session ? (
+          session.transcriptEditRevision && !working && !recording
+            ? <MeetingTranscriptEdit key={session.transcriptEditRevision} session={session} onEdited={onMeetingEdited}>{transcriptContent}</MeetingTranscriptEdit>
+            : transcriptContent
+        ) : (
+          <LiveTranscriptScroll className={transcriptClass} following={followLive} hasText={hasTranscriptText}
+            onScroll={top => setScrolled(top > 2)}>
+            {transcriptContent}
+          </LiveTranscriptScroll>
+        )}
       </TabsContent>
-      <TabsContent value="transcript" className={transcriptClass}
+      {showNotes && liveNotesId ? <TabsContent key="notes" value="notes" forceMount hidden={tab !== "notes"}
+        className="note-body personal-note-body"
         onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
-        {session.transcriptEditRevision && !working && !recording
-          ? <MeetingTranscriptEdit session={session} onEdited={onMeetingEdited}>{transcriptContent}</MeetingTranscriptEdit>
-          : transcriptContent}
-      </TabsContent>
-      {complete && <TabsContent value="notes" forceMount hidden={tab !== "notes"} className="note-body personal-note-body"
-        onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
-        {(notesOpened || tab === "notes") && <NotesErrorBoundary key={session.id}>
+        {(notesOpened || tab === "notes") && <NotesErrorBoundary key={notesKey ?? liveNotesId}>
           <Suspense fallback={<p className="notes-load-state" role="status">Opening My Notes…</p>}>
-            <PersonalNotesEditor sessionId={session.id} initial={session.personalNotes} languages={session.languageHints}
-              dictationEnabled={dictationEnabled} onDictationBusy={onDictationBusy} onSaved={overview.refreshNotes}
-              notesChanged={writing?.notesChanged} overviewBusy={!!editing || overview.requesting || writing?.status === "queued"}
-              onUpdateOverview={result.text && !meetingsManaged ? () => { overview.updatePersonal(); changeTab("overview") } : undefined} />
+            <PersonalNotesEditor
+              sessionId={liveNotesId}
+              mode={session ? "session" : "draft"}
+              initial={session?.personalNotes}
+              languages={session?.languageHints ?? notesLanguages ?? []}
+              dictationEnabled={dictationEnabled && complete}
+              dictationDisabledReason={!complete ? t("Stop recording to dictate into notes.") : undefined}
+              onDictationBusy={onDictationBusy}
+              onSaved={complete ? overview.refreshNotes : undefined}
+              onDraftSaved={onNotesDraftSaved}
+              notesChanged={complete ? writing?.notesChanged : undefined}
+              overviewBusy={!!editing || overview.requesting || writing?.status === "queued"}
+              onUpdateOverview={complete && result.text && !meetingsManaged ? () => { overview.updatePersonal(); changeTab("overview") } : undefined}
+              flushRef={notesFlushRef} />
           </Suspense>
         </NotesErrorBoundary>}
-      </TabsContent>}
-      <TabsContent value="analytics" className="analytics-body" onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
+      </TabsContent> : null}
+      {reviewable && session ? <TabsContent key="analytics" value="analytics" className="analytics-body" onScroll={e => setScrolled(e.currentTarget.scrollTop > 2)}>
         <Suspense fallback={null}><SpeakerAnalytics result={result} time={player.time} ready={ready} seek={player.seek} /></Suspense>
-      </TabsContent>
-      {working && (result.text || session.annotation) && <div className="processing-footer">{progress}</div>}
+      </TabsContent> : null}
+      {!reviewable && meetingsManaged && session?.finalizationPending && <p className="processing-footer" role="status">
+        {t("Meeting transcription is managed by your organization.")}
+      </p>}
+      {working && (result.text || session?.annotation) && <div className="processing-footer">{progress}</div>}
+      {!reviewable && source && <AudioPlayer player={player} />}
     </Tabs>
-    <footer className="session-dock" aria-label="Recording tools">
+    {reviewable && session ? <footer className="session-dock" aria-label="Recording tools">
       {source && <>
         <div id="session-audio-player" className="audio-popover" hidden={dock !== "audio"}>
           {(tracks?.mic || tracks?.system) && <label className="session-audio-source">Playback source
@@ -745,6 +783,6 @@ export function ResultsPanel({ result, session, source, tab, onTab, jump, toolba
           onOpen={toggleChat} onExpand={resizeChat}
           ready={ready} cite={cite} />
       </Suspense>}
-    </footer>
+    </footer> : null}
   </div>
 }

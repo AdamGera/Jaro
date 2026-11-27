@@ -227,6 +227,10 @@ html:has(.workspace-settings)::-webkit-scrollbar,
 }
 
 .capture-panel .transcript-body { padding-block: 1.5rem; scroll-padding-top: 1.5rem; }
+.capture-panel[data-tabs="true"] .transcript-body { padding-block: var(--header-height) 1.5rem; scroll-padding-top: var(--header-height); }
+.capture-transcript-pane { min-height: 0; flex: 1; display: flex; flex-direction: column; }
+.capture-panel .personal-note-body { padding: var(--header-height) 2.1rem 1.25rem; }
+.capture-panel .personal-note-document { min-height: 9rem; padding-bottom: 1rem; }
 .capture-panel .empty-state { margin-bottom: 0; }
 .live-transcript-content { display: flow-root; }
 .capture-panel .transcript-body:not(.has-text) .live-transcript-content { display: grid; }
@@ -647,7 +651,7 @@ html:has(.workspace-settings)::-webkit-scrollbar,
   .workspace { width: calc(100% - 2rem); }
   .transcript-panel { --header-height: 4.25rem; border-radius: 1.5rem; }
   .panel-heading { padding-inline: 1.25rem; }
-  .transcript-body, .analytics-body { padding-inline: 1.25rem; }
+  .transcript-body, .analytics-body, .capture-panel .personal-note-body { padding-inline: 1.25rem; }
   .panel-heading [role="tab"] { padding-inline: .6rem; font-size: .79rem; }
   .speaker-shares li { gap: .4rem; grid-template-columns: 4.8rem 1fr 2.8rem 2.8rem; }
   .control-dock button[data-slot="button"] { padding-inline: 0.62rem; }

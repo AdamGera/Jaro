@@ -1019,7 +1019,7 @@ class MacBridge:
                 "mode": mode,
                 "live": live,
                 "warm": warm is not None,
-                **({"dictation": dictation} if dictation else {}),
+                **({"dictation": dictation} if dictation else {"session": stage["id"]}),
                 **({"meeting": meeting, "meetingLabel": meeting_label, "meetingCalendar": calendar,
                     "meetingTurns": [], **({"meetingTitle": title} if title else {})} if meeting else {}),
                 "seconds": 0,
@@ -1375,7 +1375,8 @@ class MacBridge:
                         mode=capture["mode"],
                         microphone=event["microphone"],
                         **({"warm": True} if take.warm_events is not None else {}),
-                        **({"live": True, "session": stage["id"]} if meeting else {}),
+                        **({"session": stage["id"]} if not capture_id else {}),
+                        **({"live": True} if meeting else {}),
                         **({"microphoneAvailable": event["microphoneAvailable"]}
                            if meeting and type(event.get("microphoneAvailable")) is bool else {}),
                         **({"openedAt": event["openedAt"]} if capture_id and "openedAt" in event else {}),
@@ -2569,7 +2570,7 @@ class MacBridge:
                     except BlockingIOError:
                         raise ValueError("This recording is already being recovered.") from None
                     if command == "jard.discard":
-                        return await self.api("DELETE", "native/staging/" + key)
+                        return await self.api("DELETE", "native/staging/" + key, params={"discard": "true"})
                     result = await self.submit(
                         key, self.options(args), name="Recovered meeting" if draft.get("meeting") else "Recovered recording",
                         mime="audio/wav", recording=True, recover=True,

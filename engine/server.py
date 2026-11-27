@@ -4398,13 +4398,14 @@ async def stopped_portable_recording(state, key):
 
 @app.post("/api/portable/recording/{key}/finish")
 async def save_portable_recording(request: Request, key: UUID, name: str = "", diarization: bool = False,
-                                live: bool = False, session: UUID | None = None):
+                                live: bool = False, session: UUID | None = None, notes_draft: UUID | None = None):
     state = portable_capture_state(request)
     return await finish_portable_capture(state, key, transcription_languages(request, require_ready=False), name=name,
-                                         diarization=diarization, live=live, session=session)
+                                         diarization=diarization, live=live, session=session, notes_draft=notes_draft)
 
 
-async def finish_portable_capture(state, key, languages, *, name="", diarization=False, live=False, session=None, recovering=False):
+async def finish_portable_capture(state, key, languages, *, name="", diarization=False, live=False, session=None,
+                                  recovering=False, notes_draft=None):
     from portable_capture import clear_draft, draft_frames, draft_metadata, draft_tracks
 
     async with state.portable_recording_lock:
@@ -4451,8 +4452,14 @@ async def finish_portable_capture(state, key, languages, *, name="", diarization
                     elif provider != "Meeting":
                         name = f"{provider} meeting"
                     name = name or "Meeting"
+                resolved_draft = str(notes_draft) if notes_draft else None
+                if not resolved_draft and isinstance(candidate := metadata.get("notesDraft"), str) and candidate:
+                    with state.library.connection() as db:
+                        if db.execute("SELECT 1 FROM personal_note_drafts WHERE id=?", (candidate,)).fetchone():
+                            resolved_draft = candidate
                 accepted = await accept_audio(state, path, name, "audio/wav", languages, True, diarization, live, True,
-                                              stage_id=str(key), tracks=tracks, meeting_provider=provider if explicit_meeting else None,
+                                              stage_id=str(key), notes_draft=resolved_draft, tracks=tracks,
+                                              meeting_provider=provider if explicit_meeting else None,
                                               meeting_started=started, meeting_title=title, meeting_voice_input=voice,
                                               rolling=rolling, applies_retention=explicit_meeting)
         with suppress(OSError):
@@ -4463,6 +4470,7 @@ async def finish_portable_capture(state, key, languages, *, name="", diarization
 @app.delete("/api/portable/recording/{key}", status_code=204)
 async def discard_portable_recording(request: Request, key: UUID):
     from portable_capture import clear_draft
+    import personal_notes
 
     state = portable_capture_state(request)
     async with state.portable_recording_lock:
@@ -4472,6 +4480,8 @@ async def discard_portable_recording(request: Request, key: UUID):
             async with stopped_portable_recording(state, key):
                 pass
             clear_draft(state.portable_recording_dir / f"{key}.wav")
+            with state.library.connection() as db:
+                personal_notes.delete_draft(db, str(key))
     return Response(status_code=204)
 
 
@@ -4955,7 +4965,7 @@ def stage_path(state, key):
 
 
 @app.delete("/api/native/staging/{key}", status_code=204)
-async def abandon_stage(request: Request, key: UUID, dictation: bool = False):
+async def abandon_stage(request: Request, key: UUID, dictation: bool = False, discard: bool = False):
     check_native(request)
     if key in request.app.state.submitting:
         raise HTTPException(409, "Audio is being accepted.")
@@ -4972,6 +4982,11 @@ async def abandon_stage(request: Request, key: UUID, dictation: bool = False):
         track.unlink(missing_ok=True)
     for asset in staged_annotation_paths(path).values():
         asset.unlink(missing_ok=True)
+    if discard and not dictation:
+        import personal_notes
+
+        with request.app.state.library.connection() as db:
+            personal_notes.delete_draft(db, str(key))
     return Response(status_code=204)
 
 
