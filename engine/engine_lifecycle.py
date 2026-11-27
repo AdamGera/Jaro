@@ -22,7 +22,7 @@ from engine_paths import library_path
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("RUMBLE_PORT", 8765))
 URL = f"http://{HOST}:{PORT}"
-API_VERSION = 6
+API_VERSION = 7
 LEASE_SECONDS = 90
 WORKSPACE_CONNECT = "/_desktop/connect"
 

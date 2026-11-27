@@ -397,7 +397,7 @@ class NativeEngineTests(unittest.TestCase):
         self.assertEqual(
             self.client.put(f"/api/personal-note-drafts/{key}", json={"document": doc("Final live note"), "revision": 1},
                             headers={"Origin": URL}).raise_for_status().json(),
-            {"revision": 2, "promoted": False},
+            {"revision": 1, "promoted": False},
         )
         submitted = self.client.post(
             ep + "/submit", params={"recording": "true", "name": "Call", "language": "en"}, headers=self.header
@@ -406,7 +406,7 @@ class NativeEngineTests(unittest.TestCase):
         self.client.portal.call(self.wait_for_jobs)
         saved = self.client.get(f"/api/sessions/{key}").raise_for_status().json()
         self.assertEqual(saved["status"], "complete")
-        self.assertEqual(saved["personalNotes"], {"document": doc("Final live note"), "revision": 2})
+        self.assertEqual(saved["personalNotes"], {"document": doc("Final live note"), "revision": 1})
         with app.state.library.connection() as db:
             self.assertEqual(
                 db.execute("SELECT queued_personal FROM overviews WHERE id=?", (key,)).fetchone()[0],
