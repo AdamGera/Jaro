@@ -79,6 +79,8 @@ Use the same section to mute dictation cues, choose a sound style, preview its s
 
 Under **While dictating**, choose whether to leave playback alone, mute or lower other apps on the default output, or pause compatible media players. Jaro restores playback when the take ends and preserves volume changes you make during the take.
 
+The dictation shortcut and `jardctl dictation start` work during Meetings, Sessions, and Annotate. Jaro suspends the playback effect while recording computer audio, including when you start the recording partway through a dictation.
+
 Jaro asks the desktop to prevent idle sleep while it records dictation, audio, or video. When recording ends, Jaro releases the request and the system resumes its usual power policy.
 
 Add names and alternate spellings with **Vocabulary** under **Voice input**. Enter whole-phrase rules such as `kitchen table => studio desk` under **Settings → Dictation → Output and vocabulary corrections**. Rules apply to new system dictations and can hold up to 4,000 characters. History shows the corrected text and keeps the original audio.

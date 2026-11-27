@@ -86,8 +86,8 @@ class LinuxDictation(PortableDictation):
             return "pasted"
         if action in ("start", "toggle") and self.can_start_recording and not running:
             state = self.state
-            if state.status != "ready" or state.portable_recording or getattr(state, "portable_screencast", None):
-                raise CaptureError("Dictation is unavailable while Jaro starts or records audio.")
+            if state.status != "ready":
+                raise CaptureError("Dictation is unavailable until the local speech model is ready.")
             self.schedule(raw=raw)
             return "starting"
         if action in ("stop", "toggle") and not running and self.phase == "recording":

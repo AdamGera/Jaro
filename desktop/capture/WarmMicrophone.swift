@@ -557,7 +557,9 @@ private final class WarmMicrophone {
     }
 
     func beginMeeting(_ request: WarmMeeting, path: String, stop: AsyncStream<String>.Continuation) async throws {
-        let recorder = Recorder(mode: .both, path: path, stopReason: stop, externalMicrophone: true, retainSources: true,
+        let captureMode: CaptureMode = request.mode == "mic" ? .mic : .both
+        let keepSources = request.retainSources ?? true
+        let recorder = Recorder(mode: captureMode, path: path, stopReason: stop, externalMicrophone: true, retainSources: keepSources,
                                 callApplication: request.callApplication, meetingSystemMode: request.systemMode,
                                 hostPID: request.hostPID, sharedMeetingID: request.meeting, meetingInputsChanged: { [events] inputs in
                                     events.yield(.meetingInputs(request.meeting, inputs))
@@ -774,6 +776,8 @@ private struct WarmAnnotation: Decodable {
 private struct WarmMeeting: Decodable {
     let meeting: UUID
     let start: String?
+    let mode: String?
+    let retainSources: Bool?
     let systemAudio: String?
     let hostPID: Int32?
     let callApplication: String?

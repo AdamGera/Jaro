@@ -40,6 +40,7 @@ BOOL JardShowDockIconEnabled(void);
 - (void)pasteLastFromMenu;
 - (NSDictionary *)sdkMicrophoneSettings;
 - (void)setSDKCaptureActive:(BOOL)active;
+- (void)setSystemAudioRecordingActive:(BOOL)active;
 - (void)setMeetingPasteAction:(void (^)(void))action;
 - (void)setMeetingPasteAvailable:(BOOL)available;
 - (void)setAnnotationInput:(JardAnnotationInput)input;

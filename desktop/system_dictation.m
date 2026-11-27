@@ -7,6 +7,7 @@
 #import "jard_interface_language.h"
 #import "jard_permission_return.h"
 #import "jard_recording_environment.h"
+#import "jard_overlay_dock.h"
 #import "jard_secure_hotkeys.h"
 #import "indicator/JardDictationMeter.h"
 #import "indicator/JardHUDPlacement.h"
@@ -650,6 +651,7 @@ static BOOL JardMaintainEventTap(JardEventTap *tap, CGEventTapLocation location,
 @property(nonatomic) BOOL annotationActive;
 @property(nonatomic) BOOL annotationMicrophoneShared;
 @property(nonatomic) BOOL annotationPreservesDictation;
+@property(nonatomic) BOOL systemAudioRecordingActive;
 @property(nonatomic, copy) NSString *annotationPhase;
 @property(nonatomic) NSUInteger annotationCueGeneration;
 @property(nonatomic) BOOL captureUsesSharedMicrophone;
@@ -1412,6 +1414,14 @@ static BOOL JardPrivateHistoryFile(NSURL *url) {
 
 - (BOOL)annotationEnabled { return self.annotationEvents != nil && [self.settings[@"annotationEnabled"] boolValue]; }
 
+- (void)setSystemAudioRecordingActive:(BOOL)active {
+    if (_systemAudioRecordingActive == active) return;
+    _systemAudioRecordingActive = active;
+    if (active && self.captureIntentional && self.recordingEnvironment) {
+        [self.recordingEnvironment setDictationMode:nil percent:0];
+    }
+}
+
 - (void)setAnnotationActive:(BOOL)active {
     [self setAnnotationActive:active microphoneShared:NO];
 }
@@ -1456,7 +1466,8 @@ static BOOL JardPrivateHistoryFile(NSURL *url) {
         if (cue) cue();
         return;
     }
-    [self.recordingEnvironment setAnnotationRecording:recording mode:self.settings[@"audioWhileDictating"]
+    [self.recordingEnvironment setAnnotationRecording:recording
+        mode:self.systemAudioRecordingActive ? nil : self.settings[@"audioWhileDictating"]
         percent:[self.settings[@"lowerAudioPercent"] doubleValue] completion:cue];
 }
 
@@ -2050,8 +2061,7 @@ static NSString *annotationTerminalDirectory(AXUIElementRef element) {
             self.accessibilityGrantedInSettings();
     }
     BOOL available = self.workspace && trusted && !self.closed && ![self sessionUnavailable] && !self.updatePaused;
-    BOOL dictation = available && (!self.annotationActive || self.annotationMicrophoneShared || self.annotationPreservesDictation) &&
-        !self.annotationPasteReply && !self.sdkRecording &&
+    BOOL dictation = available && !self.annotationPasteReply && !self.sdkRecording &&
         [self.settings[@"enabled"] boolValue] && [microphoneStatus() isEqual:@"granted"];
     if (self.dictationKeyEnabled != dictation) [self resetShortcutEvidenceAt:NSProcessInfo.processInfo.systemUptime];
     if (self.dictationKeyEnabled && !dictation) {
@@ -2254,15 +2264,24 @@ static NSString *annotationTerminalDirectory(AXUIElementRef element) {
 }
 
 static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
-    if (reorder) [panel orderOut:nil];
-    // AppKit can read back the intended flags even while the panel is stranded.
-    panel.collectionBehavior = NSWindowCollectionBehaviorDefault;
-    panel.collectionBehavior = dictationHUDBehavior;
-    if (reorder) [panel orderFrontRegardless];
+    if (reorder) {
+        [panel orderOut:nil];
+        // Pull a panel stranded on another full-screen Space onto the active Space without
+        // clearing FullScreenAuxiliary while shown, then restore CanJoinAllSpaces.
+        panel.collectionBehavior = (dictationHUDBehavior & ~NSWindowCollectionBehaviorCanJoinAllSpaces) |
+            NSWindowCollectionBehaviorMoveToActiveSpace;
+        [panel orderFrontRegardless];
+        panel.collectionBehavior = dictationHUDBehavior;
+    } else {
+        panel.collectionBehavior = dictationHUDBehavior;
+    }
 }
 
 - (void)rehomeHUDAt:(NSTimeInterval)now {
     reapplyHUDWindowBehavior(self.hud, YES);
+    if (self.liveTextPanel.visible && !self.liveTextPanel.onActiveSpace) {
+        reapplyHUDWindowBehavior(self.liveTextPanel, YES);
+    }
     NSTimeInterval wait = fmin(3, 0.15 * (1u << self.hudRehomeAttempts));
     self.hudRehomeDeadline = now + wait;
     self.hudRehomeAttempts++;
@@ -2270,6 +2289,9 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
 
 - (void)checkHUDSpaceAt:(NSTimeInterval)now {
     if (!self.hud.visible) return;
+    if (self.liveTextPanel.visible && !self.liveTextPanel.onActiveSpace && self.hud.onActiveSpace) {
+        reapplyHUDWindowBehavior(self.liveTextPanel, YES);
+    }
     if (self.hud.onActiveSpace) {
         self.hudRehomeAttempts = 0;
         self.hudRehomeDeadline = 0;
@@ -2299,14 +2321,21 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
 - (NSPoint)hudEdgeOrigin:(NSString *)placement {
     NSScreen *screen = activeScreen();
     if (!screen) return self.hud.frame.origin;
-    return JardDictationHUDOrigin(screen.frame, screen.visibleFrame, screen.safeAreaInsets.top,
-                                  self.hud.frame.size, [placement isEqual:@"bottom"]);
+    BOOL bottom = [placement isEqual:@"bottom"];
+    NSPoint origin = JardDictationHUDOrigin(screen.frame, screen.visibleFrame, screen.safeAreaInsets.top,
+                                            self.hud.frame.size, bottom);
+    NSRect desired = NSMakeRect(origin.x, origin.y, NSWidth(self.hud.frame), NSHeight(self.hud.frame));
+    JardOverlayEdge edge = bottom ? JardOverlayEdgeBottom : JardOverlayEdgeTop;
+    NSRect resolved = [JardOverlayDock.shared resolvedFrameForSurface:JardOverlaySurfaceDictationHUD
+                                                              desired:desired
+                                                                 edge:edge
+                                                            displayID:JardDisplayIDForScreen(screen)
+                                                              visible:screen.visibleFrame];
+    return resolved.origin;
 }
 
-- (void)trackHUDAt:(NSTimeInterval)now {
-    [self checkHUDSpaceAt:now];
-    if (!self.hud.visible || now < self.nextHUDPlacementAt) return;
-    self.nextHUDPlacementAt = now + 0.1;
+- (void)repositionHUDForOverlayDock {
+    if (!self.hud.visible) return;
     NSString *placement = self.settings[@"placement"];
     if ([placement isEqual:@"cursor"] || [placement isEqual:@"off"]) return;
     NSPoint origin = [self hudEdgeOrigin:placement];
@@ -2314,6 +2343,19 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
         [self.hud setFrameOrigin:origin];
         [self positionLiveTextPlate];
     }
+    NSScreen *screen = self.hud.screen ?: activeScreen();
+    if (screen) {
+        JardOverlayEdge edge = [placement isEqual:@"bottom"] ? JardOverlayEdgeBottom : JardOverlayEdgeTop;
+        [JardOverlayDock.shared claimSurface:JardOverlaySurfaceDictationHUD frame:self.hud.frame
+                                        edge:edge displayID:JardDisplayIDForScreen(screen)];
+    }
+}
+
+- (void)trackHUDAt:(NSTimeInterval)now {
+    [self checkHUDSpaceAt:now];
+    if (!self.hud.visible || now < self.nextHUDPlacementAt) return;
+    self.nextHUDPlacementAt = now + 0.1;
+    [self repositionHUDForOverlayDock];
 }
 
 - (void)showHUD:(NSString *)label stage:(JardIndicatorStage)stage {
@@ -2368,6 +2410,16 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
         [self.hud setFrameOrigin:point];
         reapplyHUDWindowBehavior(self.hud, NO);
         [self.hud orderFrontRegardless];
+        __weak typeof(self) weakDock = self;
+        [JardOverlayDock.shared setObserver:^{ [weakDock repositionHUDForOverlayDock]; } forSurface:JardOverlaySurfaceDictationHUD];
+        if (![placement isEqual:@"cursor"]) {
+            NSScreen *dockScreen = self.hud.screen ?: activeScreen();
+            if (dockScreen) {
+                JardOverlayEdge edge = [placement isEqual:@"bottom"] ? JardOverlayEdgeBottom : JardOverlayEdgeTop;
+                [JardOverlayDock.shared claimSurface:JardOverlaySurfaceDictationHUD frame:self.hud.frame
+                                                edge:edge displayID:JardDisplayIDForScreen(dockScreen)];
+            }
+        }
     }
     if (self.hud.visible) [self.meter announceStatus];
     if (!self.animation) {
@@ -2457,6 +2509,7 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     self.inputRMS = 0;
     [self hideLiveTextPlate];
     [self.hud orderOut:nil];
+    [JardOverlayDock.shared releaseSurface:JardOverlaySurfaceDictationHUD];
     [self.meter dismiss];
 }
 
@@ -2647,7 +2700,7 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     dispatch_block_t suppressOutput = ^{
         JardSystemDictation *owner = weakSelf;
         if (!owner || owner.closed || owner.takeSequence != sequence || owner.cancelled || owner.stopping) return;
-        [owner.recordingEnvironment setDictationMode:preferences[@"audioWhileDictating"]
+        [owner.recordingEnvironment setDictationMode:owner.systemAudioRecordingActive ? nil : preferences[@"audioWhileDictating"]
             percent:[preferences[@"lowerAudioPercent"] doubleValue]];
     };
     if (self.captureStartCue) [self.captureStartCue afterPlayback:suppressOutput];
@@ -2662,7 +2715,9 @@ static void reapplyHUDWindowBehavior(NSPanel *panel, BOOL reorder) {
     self.captureIntentional = YES;
     [self prepareCaptureOutputContext];
     if (!self.recordingEnvironment) self.recordingEnvironment = JardRecordingEnvironment.new;
-    [self.recordingEnvironment beginWithMode:[self captureWaitsForStartCue] ? nil : self.capturePreferences[@"audioWhileDictating"]
+    NSString *audioMode = (self.systemAudioRecordingActive || [self captureWaitsForStartCue])
+        ? nil : self.capturePreferences[@"audioWhileDictating"];
+    [self.recordingEnvironment beginWithMode:audioMode
         percent:[self.capturePreferences[@"lowerAudioPercent"] doubleValue]];
     [self announceCaptureStartIfReady];
 }

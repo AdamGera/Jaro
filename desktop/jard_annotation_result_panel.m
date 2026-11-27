@@ -273,6 +273,8 @@ static BOOL rememberModifier(NSEventModifierFlags flags) {
 @property(nonatomic, strong) NSProgressIndicator *undoProgress;
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic) BOOL pending, routeActionPending, hovered, hasPreview, canInspect, undoOffered, undoHovered;
+@property(nonatomic) BOOL ignoringRestingPointer;
+@property(nonatomic) NSPoint restingPointer;
 @property(nonatomic) NSTimeInterval deadline, routeDeadline;
 @property(nonatomic) NSTimeInterval undoRemaining, undoUntil, undoLastTick;
 @end
@@ -565,8 +567,10 @@ static BOOL rememberModifier(NSEventModifierFlags flags) {
         } else if (phaseChanged && [@[@"failed", @"unconfirmed"] containsObject:phase]) self.playCue(@"error");
     }
     if (newOffer) {
-        self.hovered = NSPointInRect(NSEvent.mouseLocation, self.window.frame);
-        self.routeAction(self.session, @"shown", self.hovered, nil);
+        self.restingPointer = NSEvent.mouseLocation;
+        self.ignoringRestingPointer = NSPointInRect(self.restingPointer, self.window.frame);
+        self.hovered = NO;
+        self.routeAction(self.session, @"shown", NO, nil);
     } else if ([phase isEqual:@"countdown"] || [phase isEqual:@"held"]) {
         self.hovered = [phase isEqual:@"held"];
         [self tick];
@@ -588,7 +592,14 @@ static BOOL rememberModifier(NSEventModifierFlags flags) {
 - (void)tick {
     if (!self.window.visible || !self.available()) { [self endForNextCapture]; return; }
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-    BOOL hovered = NSPointInRect(NSEvent.mouseLocation, self.window.frame);
+    NSPoint mouse = NSEvent.mouseLocation;
+    BOOL inside = NSPointInRect(mouse, self.window.frame);
+    if (self.ignoringRestingPointer) {
+        if (!inside || hypot(mouse.x - self.restingPointer.x, mouse.y - self.restingPointer.y) > 4.0) {
+            self.ignoringRestingPointer = NO;
+        }
+    }
+    BOOL hovered = inside && !self.ignoringRestingPointer;
     BOOL countdown = [self.routePhase isEqual:@"countdown"], held = [self.routePhase isEqual:@"held"];
     if ((countdown || held) && self.hovered != hovered) {
         self.hovered = hovered;

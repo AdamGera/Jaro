@@ -730,7 +730,7 @@ export function ResultsPanel({ result, session, source, captureId, notesKey, not
               mode={session ? "session" : "draft"}
               initial={session?.personalNotes}
               languages={session?.languageHints ?? notesLanguages ?? []}
-              dictationEnabled={dictationEnabled && complete}
+              dictationEnabled={dictationEnabled}
               dictationDisabledReason={!complete ? t("Stop recording to dictate into notes.") : undefined}
               onDictationBusy={onDictationBusy}
               onSaved={complete ? overview.refreshNotes : undefined}

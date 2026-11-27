@@ -225,13 +225,13 @@ export function DictationVocabulary({ saved, saveVocabulary, external, request }
         <Dialog.Title>{t("Vocabulary")}</Dialog.Title>
         <Dialog.Description>{t("Give Rumble2 Flash up to 32 names or terms. Alternate spellings match whole phrases.")}</Dialog.Description>
         <div className="dictation-vocabulary-headings" aria-hidden="true">
-          <span>{t("Term")}</span><span>{t("Sounds like")}</span>
+          <span>{t("Spell as")}</span><span>{t("Misheard as (optional)")}</span>
         </div>
         <div className="dictation-vocabulary-list" ref={list}>
           {editor?.rows.map(row => <div className="dictation-vocabulary-row" key={row.id} data-row={row.id} data-added={row.id === added}>
-            <input type="text" aria-label={t("Term")} placeholder={t("e.g. Mei Lin")} dir="auto" value={row.term}
+            <input type="text" aria-label={t("Spell as")} placeholder={t("e.g. Mei Lin")} dir="auto" value={row.term}
               onChange={event => edit(row.id, { term: event.target.value })} />
-            <input type="text" aria-label={t("Sounds like")} placeholder={t("Comma-separated spellings")} dir="auto" value={row.spellings}
+            <input type="text" aria-label={t("Misheard as (optional)")} placeholder={t("Comma-separated spellings")} dir="auto" value={row.spellings}
               onChange={event => edit(row.id, { spellings: event.target.value })} />
             <Button type="button" size="icon-sm" variant="ghost" aria-label={t("Remove term")} onClick={() => remove(row.id)}><X /></Button>
           </div>)}

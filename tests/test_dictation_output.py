@@ -65,7 +65,7 @@ class DictationOutputTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_steps_work_in_preview_and_delivery_in_order(self):
         steps = parse_profiles("default | lowercase, spongebob-case, no-trailing-punctuation")[0].steps
         for preview in (True, False):
-            result = await process("Sponge 12 Bob?!…", steps, preview=preview)
+            result = await process("Sponge 12 Bob.", steps, preview=preview)
             self.assertEqual(result.text, "sPoNgE 12 bOb")
             self.assertFalse(result.warnings)
         self.assertEqual((await process("ABCD", ("spongebob-case", "lowercase"))).text, "abcd")
@@ -100,9 +100,12 @@ class DictationOutputTests(unittest.IsolatedAsyncioTestCase):
 
     def test_trailing_punctuation_keeps_quotes_spaces_and_non_sentence_symbols(self):
         for text, expected in (
-            ("Wait, what?!… \t", "Wait, what \t"), ("好的。", "好的"), ("你好；：", "你好"),
+            ("Good dog. \t", "Good dog \t"), ("好的。", "好的"), ("你好；：", "你好"),
+            ("Wait, what?!… \t", "Wait, what?!… \t"), ("Are you coming?", "Are you coming?"),
+            ("Ship it!", "Ship it!"), ("你好？", "你好？"), ("太好了！", "太好了！"),
+            ("Really?.", "Really?"), ("Well...", "Well..."), ("...", "..."),
             ('He said "hi."', 'He said "hi."'), ("(see above)", "(see above)"), ("up 5%", "up 5%"),
-            ("   ", "   "), ("...", ""), ("", ""),
+            ("   ", "   "), ("", ""),
         ):
             self.assertEqual(remove_trailing_punctuation(text), expected)
 
@@ -291,10 +294,13 @@ class DictationOutputTests(unittest.IsolatedAsyncioTestCase):
         async def rewrite(_):
             self.fail("A sample preview must not run a rewrite.")
 
-        result = await process("JARO AUDIO?!", ("lowercase", "rewrite", "script", "no-trailing-punctuation"),
+        result = await process("JARO AUDIO.", ("lowercase", "rewrite", "script", "no-trailing-punctuation"),
                                corrections="Jaro Audio => Jaro", rewrite=rewrite, builtins_only=True)
         self.assertEqual(result.text, "jaro")
         self.assertEqual(result.warnings, ())
+        kept = await process("JARO AUDIO?!", ("lowercase", "rewrite", "script", "no-trailing-punctuation"),
+                             corrections="Jaro Audio => Jaro", rewrite=rewrite, builtins_only=True)
+        self.assertEqual(kept.text, "jaro?!")
 
     async def test_alternate_spellings_match_whole_phrases_before_output_steps(self):
         result = await process("MAY LEAN, may, maybe, and MAY LEAN.", ("replace", "lowercase"),

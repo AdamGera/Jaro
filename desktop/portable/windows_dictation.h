@@ -13,7 +13,7 @@ typedef struct {
 
 enum { JARO_DICTATION_INPUT = 0x4a61726f, PASTE_CONTINUATION_CHANGED = 6 };
 
-enum { PASTE_PICKER_ROWS = 8, PASTE_PICKER_TEXT_BYTES = 128 * 1024 };
+enum { PASTE_PICKER_ROWS = 300, PASTE_PICKER_TEXT_BYTES = 128 * 1024 };
 typedef struct {
     DWORD sequence, count;
     WCHAR *text[PASTE_PICKER_ROWS];

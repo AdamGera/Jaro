@@ -83,6 +83,16 @@ class DictationJob:
     browser_host: str = ""
 
 
+def recording_system_audio(state):
+    recording = getattr(state, "portable_recording", None)
+    screencast = getattr(state, "portable_screencast", None)
+    return (
+        getattr(state, "portable_system_audio_starting", False)
+        or (recording is not None and getattr(recording, "mode", None) in ("system", "both"))
+        or "system" in getattr(getattr(screencast, "draft", None), "audio_sources", ())
+    )
+
+
 def resolve_print(reply, result):
     if reply is not None and not reply.done():
         reply.set_result(result)
@@ -430,7 +440,9 @@ class PortableDictation:
             return (self.capture is capture and self.phase == "recording"
                     and (while_valid is None or while_valid()))
 
-        ready = self.audio_control.begin(self.audio_preferences, delay=delay, while_valid=active)
+        ready = None if recording_system_audio(self.state) else self.audio_control.begin(
+            self.audio_preferences, delay=delay,
+            while_valid=lambda: active() and not recording_system_audio(self.state))
         if capture is not None and (self.wake_guard is None or self.wake_guard.done()):
             self.wake_guard = keep_awake_until(capture.worker, "Jaro is taking dictation", delay=delay, while_valid=active)
         self.sounds.play("start", self.capture_sound, delay=delay, while_valid=active, ready=ready)
@@ -447,44 +459,43 @@ class PortableDictation:
                 if job is not None and asyncio.current_task() is not self.action:
                     await job.done.wait()
                 return
-            async with state.portable_recording_lock:
-                if (state.status != "ready" or state.draining or state.portable_recording or getattr(state, "portable_screencast", None)
-                        or getattr(getattr(state, "portable_sdk_capture", None), "busy", False)):
-                    self.feedback = "Dictation is unavailable while Jaro starts or records audio."
-                    return
-                self.phase = "starting"
-                if prewarm := getattr(self.state, "schedule_prewarm", None):
-                    prewarm()
-                self.capture_sound = self.sound
-                # An audition or previous completion sound cannot run into the new take.
-                await self.sounds.stop()
-                await self.audio_control.settle()
-                self.folder = TemporaryDirectory(prefix=".dictation-", dir=state.library.root)
-                microphone = self.microphone
-                position = self.indicator_position
-                meter = self.indicator_helper is not None and position != "off"
-                self.capture_languages = (self.language,) if self.language else ()
-                self.capture_raw = raw
-                self.capture_voice_input = {"noise_cleanup": self.noise_cleanup, "boost": self.boost_microphone}
-                self.capture_output = self.vocabulary_entries, self.replacements, self.profiles, self.app_aliases
-                self.microphone_fallback = False
-                try:
-                    await self.start_microphone("speech.wav", microphone, meter=meter)
-                except CaptureError:
-                    if not microphone:
-                        raise
-                    await self.start_microphone("fallback.wav", "", meter=meter)
-                    self.microphone_fallback = True
-                self.feedback = ""
-                self.phase = "recording"
-                self.capture.worker.add_done_callback(self.recording_ended)
-                self.start_sound()
-                if meter:
-                    if self.indicator_stop.is_set():
-                        await self.stop_indicator()
-                    if self.indicator_task is None or self.indicator_task.done():
-                        self.indicator_stop.clear()
-                        self.indicator_task = asyncio.create_task(self.run_indicator(position))
+            if (state.status != "ready" or state.draining
+                    or getattr(getattr(state, "portable_sdk_capture", None), "busy", False)):
+                self.feedback = "Dictation is unavailable while Jaro starts or records audio."
+                return
+            self.phase = "starting"
+            if prewarm := getattr(self.state, "schedule_prewarm", None):
+                prewarm()
+            self.capture_sound = self.sound
+            # An audition or previous completion sound cannot run into the new take.
+            await self.sounds.stop()
+            await self.audio_control.settle()
+            self.folder = TemporaryDirectory(prefix=".dictation-", dir=state.library.root)
+            microphone = self.microphone
+            position = self.indicator_position
+            meter = self.indicator_helper is not None and position != "off"
+            self.capture_languages = (self.language,) if self.language else ()
+            self.capture_raw = raw
+            self.capture_voice_input = {"noise_cleanup": self.noise_cleanup, "boost": self.boost_microphone}
+            self.capture_output = self.vocabulary_entries, self.replacements, self.profiles, self.app_aliases
+            self.microphone_fallback = False
+            try:
+                await self.start_microphone("speech.wav", microphone, meter=meter)
+            except CaptureError:
+                if not microphone:
+                    raise
+                await self.start_microphone("fallback.wav", "", meter=meter)
+                self.microphone_fallback = True
+            self.feedback = ""
+            self.phase = "recording"
+            self.capture.worker.add_done_callback(self.recording_ended)
+            self.start_sound()
+            if meter:
+                if self.indicator_stop.is_set():
+                    await self.stop_indicator()
+                if self.indicator_task is None or self.indicator_task.done():
+                    self.indicator_stop.clear()
+                    self.indicator_task = asyncio.create_task(self.run_indicator(position))
         except CaptureError as failure:
             self.feedback = str(failure)
             resolve_print(printed, {"error": self.feedback})

@@ -107,7 +107,7 @@ CLAUSE_PUNCTUATION = ".!?,;:"
 CLAUSE_MARKS = tuple(CLAUSE_PUNCTUATION)
 SENTENCE_ENDINGS = (".", "!", "?", "\n")
 ALPHABETIC = regex.compile(r"\p{Alphabetic}")
-TRAILING_SENTENCE_MARKS = ".,!?;:…。！？、，；："
+TRAILING_SENTENCE_MARKS = ".,;:。、，；："
 
 
 @dataclass(frozen=True)
@@ -526,6 +526,8 @@ def spongebob_case(text):
 
 def remove_trailing_punctuation(text):
     body = text.rstrip()
+    if body.endswith("..."):
+        return text
     return body.rstrip(TRAILING_SENTENCE_MARKS) + text[len(body):]
 
 

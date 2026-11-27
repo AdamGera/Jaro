@@ -609,7 +609,7 @@ async def lifespan(app: FastAPI):
                 return reply["id"]
 
             state.portable_calls = CallWatcher(state, microphone_users, playback_users, start_call, finish_call,
-                                              lambda: state.status == "ready" and not portable_capture_busy(state),
+                                              lambda: state.status == "ready" and not portable_recording_busy(state),
                                               browser_pages=browser_pages)
             call_tasks = [asyncio.create_task(state.portable_calls.run()),
                           asyncio.create_task(watch_desktop_calls(state.portable_calls))]
@@ -624,7 +624,7 @@ async def lifespan(app: FastAPI):
                 async def restart_from_tray(updater):
                     await restart_from_portable_tray(state, updater, (tray_directory / "window-pid").is_file)
 
-                tray = MeetingTray(state, tray_directory, lambda: portable_capture_busy(state),
+                tray = MeetingTray(state, tray_directory, lambda: portable_recording_busy(state),
                                    lambda: portable_has_live_transcript(state) or latest_portable_meeting(library),
                                    lambda: copy_latest_portable_meeting(state),
                                    restart=restart_from_tray, meetings=state.portable_calls is not None,
@@ -1421,8 +1421,8 @@ async def start_screen_take(state, source, microphone, computer_audio, target, *
             binding = getattr(state, "desktop_annotation", None)
             if binding is None or not binding.status()["enabled"]:
                 raise HTTPException(409, "The Annotate shortcut is disabled.")
-        if portable_capture_busy(state):
-            raise HTTPException(409, "Finish the current recording or dictation first.")
+        if portable_recording_busy(state):
+            raise HTTPException(409, "Finish the current recording first.")
         if getattr(state, "screenshot_pending", False):
             raise HTTPException(409, "Finish the current screenshot first.")
         if (microphone or computer_audio) and state.status != "ready":
@@ -1467,7 +1467,13 @@ async def start_screen_take(state, source, microphone, computer_audio, target, *
         take.annotation_languages = annotation_languages
         take.observe_annotation_origin = observe_origin
         take.annotation_started_at = time.time()
-        state.portable_screencast = take
+        state.portable_system_audio_starting = computer_audio
+        try:
+            if computer_audio and (dictation := getattr(state, "portable_dictation", None)):
+                await dictation.audio_control.settle()
+            state.portable_screencast = take
+        finally:
+            state.portable_system_audio_starting = False
         take.task = start_job(state, take.record())
     return take.status()
 
@@ -3037,10 +3043,14 @@ def portable_capture_state(request):
     return state
 
 
-def portable_capture_busy(state):
+def portable_recording_busy(state):
     return (state.draining or state.portable_recording or getattr(state, "portable_screencast", None)
-            or (state.portable_dictation and state.portable_dictation.busy)
             or getattr(getattr(state, "portable_sdk_capture", None), "busy", False))
+
+
+def portable_capture_busy(state):
+    return (portable_recording_busy(state)
+            or (state.portable_dictation and state.portable_dictation.busy))
 
 
 @app.post("/api/portable/recording", status_code=201)
@@ -3068,7 +3078,7 @@ async def begin_portable_recording(state, mode, meeting, languages, *, provider=
         if mode != "both":
             raise HTTPException(400, "Meeting recording uses the microphone and computer audio.")
     async with state.portable_recording_lock:
-        if portable_capture_busy(state):
+        if portable_recording_busy(state):
             raise HTTPException(409, "Finish or recover the current recording first.")
         key = uuid4()
         path = state.portable_recording_dir / f"{key}.wav"
@@ -3076,6 +3086,7 @@ async def begin_portable_recording(state, mode, meeting, languages, *, provider=
         capture = recorder(key, path, mode, call_binaries=call_binaries) if call_binaries else recorder(key, path, mode)
         capture.meeting = meeting
         claim = None
+        state.portable_system_audio_starting = mode in ("system", "both")
         try:
             if meeting:
                 voice = await run_in_threadpool(read_meeting_voice_input, state)
@@ -3089,6 +3100,8 @@ async def begin_portable_recording(state, mode, meeting, languages, *, provider=
                     raise HTTPException(503, "Could not prepare the meeting draft.") from error
                 if voice["noiseCleanup"]:
                     stupase_cleanup(state).prepare()
+            if mode in ("system", "both") and (dictation := getattr(state, "portable_dictation", None)):
+                await dictation.audio_control.settle()
             await capture.start()
         except BaseException as error:
             if claim:
@@ -3099,7 +3112,10 @@ async def begin_portable_recording(state, mode, meeting, languages, *, provider=
             if isinstance(error, CaptureError):
                 raise HTTPException(503, str(error)) from error
             raise
-        state.portable_recording = capture
+        else:
+            state.portable_recording = capture
+        finally:
+            state.portable_system_audio_starting = False
         if meeting:
             capture.meeting_claim = claim
             capture.meeting_metadata = metadata
@@ -3652,7 +3668,7 @@ async def run_portable_meeting_command(state, command):
                 result["title"] = watcher.active.name
             return result
         if command.action == "status":
-            return {"phase": "idle" if state.status == "ready" and not portable_capture_busy(state) else "unavailable"}
+            return {"phase": "idle" if state.status == "ready" and not portable_recording_busy(state) else "unavailable"}
         if state.status != "ready":
             raise HTTPException(503, "The local speech model is unavailable.")
         try:

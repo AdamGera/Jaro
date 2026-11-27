@@ -2,6 +2,7 @@
 #import "meeting_presence.h"
 #import "jard_calendar.h"
 #import "jard_meeting_panel.h"
+#import "jard_overlay_dock.h"
 #import "jard_meeting_delta.h"
 #import "jard_interface_language.h"
 #import "indicator/JardDictationMeter.h"
@@ -1592,6 +1593,7 @@ static BOOL verifiedCall(JardCall *target, NSArray<JardCall *> *observations) {
     NSScreen *screen = self.panel.screen ?: [self indicatorScreen];
     NSRect frame = JardMeetingCornerFrame(screen.visibleFrame, NSMakeSize(width, height), corner);
     if (!NSEqualRects(self.panel.frame, frame)) [self.panel setFrame:frame display:NO];
+    [self claimMeetingOverlayDockOnScreen:screen];
 
     BOOL top = [corner hasPrefix:@"top"];
     CGFloat header = top ? height - recordingHeaderHeight : 0;
@@ -1625,6 +1627,22 @@ static BOOL verifiedCall(JardCall *target, NSArray<JardCall *> *observations) {
         [self.recordingDisclosure setAccessibilityLabel:action];
         self.recordingDisclosure.image = [NSImage imageWithSystemSymbolName:revealed ? @"chevron.up" : @"chevron.down" accessibilityDescription:nil];
     }
+}
+
+- (void)openWorkspaceButton:(id)sender {
+    if (self.openWorkspace) self.openWorkspace();
+}
+
+- (void)claimMeetingOverlayDockOnScreen:(NSScreen *)screen {
+    if (!self.panel.visible) {
+        [JardOverlayDock.shared releaseSurface:JardOverlaySurfaceMeeting];
+        return;
+    }
+    NSScreen *target = screen ?: self.panel.screen ?: [self indicatorScreen];
+    if (!target) return;
+    JardOverlayEdge edge = [self.panelCorner hasPrefix:@"bottom"] ? JardOverlayEdgeBottom : JardOverlayEdgeTop;
+    [JardOverlayDock.shared claimSurface:JardOverlaySurfaceMeeting frame:self.panel.frame
+                                    edge:edge displayID:JardDisplayIDForScreen(target)];
 }
 
 - (void)toggleRecordingControls:(id)sender {
@@ -1680,7 +1698,8 @@ static BOOL verifiedCall(JardCall *target, NSArray<JardCall *> *observations) {
     NSButton *newText = [self button:@"Copy New" action:@selector(copyNewButton:) area:NSZeroRect into:surface];
     NSButton *all = [self button:@"Copy All" action:@selector(copyAllButton:) area:NSZeroRect into:surface];
     NSButton *prompt = [self button:@"Copy Agent Prompt" action:@selector(copyMeetingAgentPrompt:) area:NSZeroRect into:surface];
-    self.recordingActions = @[stop, newText, all, prompt];
+    NSButton *openApp = [self button:@"Open in Jaro" action:@selector(openWorkspaceButton:) area:NSZeroRect into:surface];
+    self.recordingActions = @[stop, newText, all, prompt, openApp];
     self.incrementalTextButton = newText;
     self.fullTextButton = all;
     self.agentPromptButton = prompt;
@@ -1851,6 +1870,7 @@ static BOOL verifiedCall(JardCall *target, NSArray<JardCall *> *observations) {
         if (hiddenRecording) self.offerDepartureAt = 0;
         [self stopRecordingMeter];
         [self.panel orderOut:nil];
+    [JardOverlayDock.shared releaseSurface:JardOverlaySurfaceMeeting];
         self.panel = nil;
         self.caption = nil;
         return;
@@ -1893,9 +1913,13 @@ static BOOL verifiedCall(JardCall *target, NSArray<JardCall *> *observations) {
         self.panel.opaque = NO;
         self.panel.backgroundColor = NSColor.clearColor;
         self.panel.hidesOnDeactivate = NO;
+        self.panel.sharingType = NSWindowSharingNone;
         self.panel.title = @"Jard Meeting";
         __weak typeof(self) weak = self;
-        self.panel.placementChanged = ^(NSString *corner, NSScreen *display) { [weak saveCorner:corner screen:display]; };
+        self.panel.placementChanged = ^(NSString *corner, NSScreen *display) {
+            [weak saveCorner:corner screen:display];
+            [weak claimMeetingOverlayDockOnScreen:display];
+        };
         self.panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
     }
     [self.panel cancelDrag];
@@ -1911,7 +1935,7 @@ static BOOL verifiedCall(JardCall *target, NSArray<JardCall *> *observations) {
     surface.blendingMode = NSVisualEffectBlendingModeBehindWindow;
     surface.state = NSVisualEffectStateActive;
     surface.wantsLayer = YES;
-    surface.layer.cornerRadius = 13;
+    surface.layer.cornerRadius = 14;
     surface.layer.masksToBounds = YES;
     self.panel.contentView = surface;
     self.caption = [JardMeetingCaption wrappingLabelWithString:self.message ?: @""];
@@ -2008,6 +2032,7 @@ static BOOL verifiedCall(JardCall *target, NSArray<JardCall *> *observations) {
     BOOL fade = appearing || (changingOfferLayout && self.panel.reduceMotion);
     if (fade) self.panel.alphaValue = 0;
     [self.panel orderFrontRegardless];
+    [self claimMeetingOverlayDockOnScreen:self.panel.screen];
     if (fade) [NSAnimationContext runAnimationGroup:^(NSAnimationContext *animation) {
         animation.duration = self.panel.reduceMotion ? 0.08 : 0.16;
         self.panel.animator.alphaValue = 1;
@@ -2022,6 +2047,7 @@ static BOOL verifiedCall(JardCall *target, NSArray<JardCall *> *observations) {
     self.timer = nil;
     [self stopRecordingMeter];
     [self.panel orderOut:nil];
+    [JardOverlayDock.shared releaseSurface:JardOverlaySurfaceMeeting];
     self.panel = nil;
 }
 @end

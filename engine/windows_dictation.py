@@ -26,7 +26,7 @@ PASTE_REQUEST = Struct("<QQIIII32s")
 FOCUS_REQUEST = Struct("<cI")
 PICKER_HEADER = Struct("<cII")
 MAX_PASTE_BYTES = 128 * 1024
-PICKER_LIMIT = 8
+PICKER_LIMIT = 300
 MODES = ("hold", "tap", "holdDouble", "doubleTap")
 DEFAULT_SHORTCUT = "Left Alt"
 MODIFIER_MASKS = {"Alt": 1, "Ctrl": 2, "Shift": 4, "Super": 8}
@@ -439,8 +439,8 @@ class WindowsDictation(PortableDictation):
                 raise CaptureError("There is no active dictation.")
             elif self.can_start_recording:
                 state = self.state
-                if state.status != "ready" or state.portable_recording or getattr(state, "portable_screencast", None):
-                    raise CaptureError("Dictation is unavailable while Jaro starts or records audio.")
+                if state.status != "ready":
+                    raise CaptureError("Dictation is unavailable until the local speech model is ready.")
                 await self.request_command_focus()
                 if self.state.draining:
                     raise CaptureError("Jaro is preparing to restart.")

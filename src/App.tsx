@@ -1136,7 +1136,7 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
           onNotesDraftSaved={recordSavedDraft}
           tab={tab} onTab={changeTab} working={working} recording={recording}
           followLive={recording && live && !previewPaused && !meetingStopPending} jump={jump} toolbar={sessionToolbar}
-          dictationEnabled={status === "ready" && phase === "idle" && !choosingFile}
+          dictationEnabled={status === "ready" && (phase === "idle" || phase === "recording") && !choosingFile}
           onDictationBusy={setDictating}
           onMeetingEdited={saved => {
             if (readSessionRoute().id === saved.id) showSession(saved, "transcript")

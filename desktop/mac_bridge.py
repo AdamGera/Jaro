@@ -169,8 +169,8 @@ class Capture:
                 yield event
 
     async def command(self, message):
-        if self.warm_events is not None and (meeting := self.state.get("meeting")):
-            message = json.dumps({"meeting": meeting, "command": message})
+        if self.warm_events is not None and (shared := self.state.get("meeting") or self.state.get("sharedRecording")):
+            message = json.dumps({"meeting": shared, "command": message})
         self.child.stdin.write((message + "\n").encode())
         await self.child.stdin.drain()
 
@@ -791,7 +791,7 @@ class MacBridge:
         async with self.capture_lock:
             recording = self.captures.get("recording")
             if (self.updating or self.annotation or self.sdk_capture.active or self.meeting_mic_lease
-                    or "dictation" in self.captures or (recording and (not recording.state.get("meeting") or recording.warm_events is not None))):
+                    or "dictation" in self.captures or (recording and recording.warm_events is not None)):
                 return
             if self.warm_requested is None:
                 await self.close_warm()
@@ -902,14 +902,21 @@ class MacBridge:
             recording, speaking = self.captures.get("recording"), self.captures.get("dictation")
             global_dictation = bool(dictation and args.get("global") is True)
             annotation_owns_worker = self.annotation_worker is not None and self.annotation_worker is self.warm_worker
-            shared_annotation = annotation_owns_worker and (global_dictation or (meeting and self.annotation_narrating))
+            shared_annotation = (
+                bool(dictation) and (not self.annotation_narrating or annotation_owns_worker)
+                or (not dictation and (mode == "system" or (annotation_owns_worker and self.annotation_narrating)))
+            )
             if self.annotation and not shared_annotation:
                 raise ValueError("Stop the screen annotation first.")
-            shared_worker = (shared_annotation or (global_dictation and recording is not None and recording.warm_events is not None)
-                             or (meeting and speaking is not None and speaking.warm_events is not None))
+            recording_uses_mic = not dictation and mode != "system"
+            shared_worker = (
+                (self.annotation_narrating and annotation_owns_worker and (bool(dictation) or recording_uses_mic))
+                or (bool(dictation) and recording is not None and recording.warm_events is not None)
+                or (recording_uses_mic and speaking is not None and speaking.warm_events is not None)
+            )
             compatible = (
-                global_dictation and recording and recording.state.get("meeting")
-                or meeting and speaking and speaking.global_dictation
+                bool(dictation) and recording is not None
+                or (not dictation and speaking is not None)
             )
             if slot in self.captures or (self.captures and not compatible):
                 raise ValueError("A recording is already active.")
@@ -946,13 +953,19 @@ class MacBridge:
                     marker.flush()
                 options = self.input_options(args) if mode != "system" else ()
                 worker = self.warm_worker
+                worker_alive = (worker is not None and worker.child.returncode is None
+                                and worker.reader is not None and not worker.reader.done())
                 cold_recovery = global_dictation and args.get("keep") is not True
+                shared_recording_id = meeting or (stage["id"] if recording_uses_mic else None)
                 if cold_recovery and not shared_worker:
                     warm = await self.open_warm(options, on_demand=True)
-                elif meeting and not shared_worker and speaking is None:
-                    warm = await self.open_warm(self.input_options({"inputDevice": args.get("inputDevice")}), on_demand=True)
+                elif recording_uses_mic and not shared_worker and speaking is None:
+                    warm = worker if worker_alive else await self.open_warm(
+                        self.input_options({"inputDevice": args.get("inputDevice")}), on_demand=True)
+                elif dictation and not shared_worker and (not worker_alive or worker.options != options):
+                    warm = await self.open_warm(options, on_demand=True)
                 else:
-                    warm = worker if shared_worker or (global_dictation and worker and worker.options == options) else None
+                    warm = worker if shared_worker or (bool(dictation) and worker_alive and worker.options == options) else None
                 warm_events = None
                 if meeting:
                     options = ("--separate-tracks",)
@@ -964,16 +977,23 @@ class MacBridge:
                         options += ("--system-audio", backend, "--host-pid", str(os.getppid()))
                     options += self.input_options({"inputDevice": args.get("inputDevice")})
                 worker_available = warm and warm.child.returncode is None and warm.reader and not warm.reader.done()
-                if meeting and worker_available:
-                    application = args.get("meetingApplication")
-                    backend = args.get("meetingSystemAudio")
+                if shared_recording_id and worker_available:
                     warm_events = asyncio.Queue()
-                    warm.meeting = (meeting, warm_events)
-                    message = {"meeting": meeting, "start": stage["path"], "hostPID": os.getppid()}
-                    if backend in ("tap", "tapAndScreen", "screen"):
-                        message["systemAudio"] = backend
-                    if isinstance(application, str) and 0 < len(application) <= 255:
-                        message["callApplication"] = application
+                    warm.meeting = (shared_recording_id, warm_events)
+                    message = {
+                        "meeting": shared_recording_id,
+                        "start": stage["path"],
+                        "mode": mode,
+                        "retainSources": bool(meeting),
+                        "hostPID": os.getppid(),
+                    }
+                    if meeting:
+                        application = args.get("meetingApplication")
+                        backend = args.get("meetingSystemAudio")
+                        if backend in ("tap", "tapAndScreen", "screen"):
+                            message["systemAudio"] = backend
+                        if isinstance(application, str) and 0 < len(application) <= 255:
+                            message["callApplication"] = application
                     input_options = self.input_options({"inputDevice": args.get("inputDevice")})
                     if input_options:
                         message["inputDevice"] = input_options[1]
@@ -982,8 +1002,8 @@ class MacBridge:
                         await warm.child.stdin.drain()
                     except (BrokenPipeError, ConnectionResetError):
                         warm.meeting = None
-                        raise ValueError("The shared microphone stopped. Try the meeting again.") from None
-                elif worker_available:
+                        raise ValueError("The shared microphone stopped. Try recording again.") from None
+                elif dictation and worker_available:
                     try:
                         warm_events = warm.events = asyncio.Queue()
                         queued_at = args.get("queuedAt")
@@ -1000,7 +1020,7 @@ class MacBridge:
                 else:
                     if shared_worker:
                         raise ValueError("The shared microphone is unavailable.")
-                    if not meeting:
+                    if not meeting and mode != "system":
                         await self.close_warm()
                     warm = None
                 child = warm.child if warm else await asyncio.create_subprocess_exec(
@@ -1020,6 +1040,7 @@ class MacBridge:
                 "live": live,
                 "warm": warm is not None,
                 **({"dictation": dictation} if dictation else {"session": stage["id"]}),
+                **({"sharedRecording": shared_recording_id} if shared_recording_id and not meeting and warm_events is not None else {}),
                 **({"meeting": meeting, "meetingLabel": meeting_label, "meetingCalendar": calendar,
                     "meetingTurns": [], **({"meetingTitle": title} if title else {})} if meeting else {}),
                 "seconds": 0,
@@ -1326,6 +1347,7 @@ class MacBridge:
         child, stage, capture = take.child, take.stage, take.state
         capture_id = capture.get("dictation")
         meeting = capture.get("meeting")
+        shared_recording = meeting or capture.get("sharedRecording")
 
         def notify(kind, **fields):
             if capture_id:
@@ -1412,12 +1434,12 @@ class MacBridge:
                             metadata["meetingMicrophoneWarning"] = capture["meetingMicrophoneWarning"]
                             write_recording_metadata(take.marker, metadata)
                     notify(kind, active=active)
-                elif kind == "meetingMicRecoveryRequest" and meeting and take.started:
+                elif kind == "meetingMicRecoveryRequest" and shared_recording and take.started:
                     identifier = event.get("id")
                     if isinstance(identifier, str):
                         with contextlib.suppress(ValueError):
                             await self.allow_meeting_mic_recovery(take, str(UUID(identifier)))
-                elif kind == "meetingMicRecoveryDone" and meeting:
+                elif kind == "meetingMicRecoveryDone" and shared_recording:
                     identifier = event.get("id")
                     if isinstance(identifier, str):
                         self.release_meeting_mic(take, identifier)
@@ -1458,7 +1480,7 @@ class MacBridge:
                     await child.wait()
         finally:
             take.finished = True
-            if meeting:
+            if shared_recording:
                 self.release_meeting_mic(take)
             take.stop_titles()
             if take.title_job:
@@ -1688,10 +1710,14 @@ class MacBridge:
                     raise ValueError("The meeting microphone is reconnecting. Try Annotate again.")
                 if self.updating or self.annotation or self.sdk_capture.active:
                     raise ValueError("Finish the active recording or dictation first.")
-                worker = self.warm_worker if self.captures else None
-                if self.captures and (worker is None or worker.child.returncode is not None or
+                worker = self.warm_worker if any(
+                    take.state.get("mode") != "system" for take in self.captures.values()
+                ) else None
+                if any(take.state.get("mode") != "system" for take in self.captures.values()) and (
+                        worker is None or worker.child.returncode is not None or
                         worker.reader is None or worker.reader.done() or any(
-                            take.warm_events is None or take.child is not worker.child for take in self.captures.values())):
+                            take.state.get("mode") != "system" and (take.warm_events is None or take.child is not worker.child)
+                            for take in self.captures.values())):
                     raise ValueError("Finish the active recording or dictation first.")
                 if worker is None and (self.dictation_stages or self.dictation_jobs):
                     raise ValueError("Finish the active recording or dictation first.")

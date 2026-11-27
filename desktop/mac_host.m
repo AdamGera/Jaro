@@ -103,7 +103,7 @@ static BOOL JardForcedBoolean(CFStringRef key) {
 @property(nonatomic, strong) JardTerminationDelegate *terminationDelegate;
 @property(nonatomic) BOOL launchHandled, quietStartupPending, hiddenLaunchRequested;
 @property(nonatomic) NSTimeInterval startupActivationDeadline;
-@property(nonatomic) BOOL otherRecording;
+@property(nonatomic) BOOL otherRecording, otherRecordingCapturesSystemAudio;
 @property(nonatomic, copy) NSString *sdkCaptureID;
 @property(nonatomic, copy) NSString *controlExitID;
 @property(nonatomic, weak) NSWindow *window;
@@ -296,9 +296,15 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
             [self.meetings handleCapture:capture];
             if (!capture[@"meeting"] && !capture[@"dictation"]) {
                 NSString *kind = capture[@"event"];
-                if ([kind isEqual:@"started"]) self.otherRecording = YES;
-                else if ([@[@"accepted", @"error"] containsObject:kind ?: @""])
+                if ([kind isEqual:@"started"]) {
+                    self.otherRecording = YES;
+                    NSString *mode = [capture[@"mode"] isKindOfClass:NSString.class] ? capture[@"mode"] : @"";
+                    self.otherRecordingCapturesSystemAudio = [mode isEqual:@"system"] || [mode isEqual:@"both"];
+                } else if ([@[@"accepted", @"error"] containsObject:kind ?: @""]) {
                     self.otherRecording = NO;
+                    self.otherRecordingCapturesSystemAudio = NO;
+                }
+                [self.systemDictation setSystemAudioRecordingActive:[self isRecordingSystemAudio]];
                 [self refreshMeetingAvailability];
             }
             if ([self.systemDictation handleCapture:capture]) return;
@@ -378,6 +384,8 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
             [self.systemDictation helperDisconnected];
             [self.meetings bridgeDisconnected];
             self.otherRecording = NO;
+            self.otherRecordingCapturesSystemAudio = NO;
+            [self.systemDictation setSystemAudioRecordingActive:NO];
             if (self.controlExitID) { [self terminateAfterCleanup]; return; }
             [self setOwnedCapture:nil];
             [self refreshMeetingAvailability];
@@ -1257,9 +1265,16 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
     }];
 }
 
+- (BOOL)isRecordingSystemAudio {
+    NSDictionary *annotation = self.annotation.status;
+    BOOL annotationAudio = [annotation[@"phase"] isEqual:@"recording"] && [annotation[@"audio"][@"computerAudio"] boolValue];
+    return self.meetings.recording || self.otherRecordingCapturesSystemAudio || annotationAudio;
+}
+
 - (void)meetingChanged:(NSDictionary *)status {
     if (self.closing) return;
     [self.systemDictation setMeetingPasteAvailable:self.meetings.canPaste];
+    [self.systemDictation setSystemAudioRecordingActive:[self isRecordingSystemAudio]];
     [self updateWindowClosePolicy];
     if (self.showingApp) [self updateMeetingMenu:status];
     NSData *detail = [NSJSONSerialization dataWithJSONObject:status options:0 error:nil];
@@ -2015,6 +2030,7 @@ static void lidStateChanged(void *context, io_service_t service, natural_t messa
 - (void)annotationChanged:(NSDictionary *)status {
     if (self.closing) return;
     if ([status[@"busy"] boolValue]) [self.annotationResultPanel endForNextCapture];
+    [self.systemDictation setSystemAudioRecordingActive:[self isRecordingSystemAudio]];
     [self.systemDictation setAnnotationPhase:status[@"phase"]];
     [self.systemDictation setAnnotationActive:[status[@"busy"] boolValue] microphoneShared:[status[@"sharedMicrophone"] boolValue]];
     [self refreshMeetingAvailability];
@@ -2349,6 +2365,12 @@ int main(int argc, const char *argv[]) {
             [weakApp meetingChanged:status];
         }];
         app.meetings.showSystemAudioSettings = ^{ [weakApp.meetingAudioAccess showSettings]; };
+        app.meetings.openWorkspace = ^{
+            JardHost *owner = weakApp;
+            if (!owner || owner.closing) return;
+            [owner.window makeKeyAndOrderFront:nil];
+            [NSApp activateIgnoringOtherApps:YES];
+        };
         [app.systemDictation setMeetingPasteAction:^{
             JardHost *owner = weakApp;
             [owner.systemDictation enqueueMeetingPaste:^(JardPasteExcerpt ready) {

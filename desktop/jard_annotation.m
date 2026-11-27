@@ -3,6 +3,7 @@
 #import "jard_annotation_keys.h"
 #import "jard_annotation_region.h"
 #import "jard_interface_language.h"
+#import "jard_overlay_dock.h"
 #import "jard_phone_annotation.h"
 #import <AVFoundation/AVFoundation.h>
 #import <Carbon/Carbon.h>
@@ -699,8 +700,26 @@ static NSTimeInterval annotationHostTime(void) {
     }
     if (!self.overlay.visible) [self.overlay orderFrontRegardless];
     NSScreen *screen = self.phone.panel.screen;
-    if (screen && screen != self.controls.screen)
-        [self.controls setFrame:JardAnnotationControlsRect(screen.visibleFrame, NSZeroRect) display:YES];
+    if (screen && screen != self.controls.screen) {
+        [self placeControlsOnScreen:screen target:NSZeroRect];
+    }
+}
+
+- (void)placeControlsOnScreen:(NSScreen *)screen target:(NSRect)target {
+    if (!screen || !self.controls) return;
+    NSRect desired = JardAnnotationControlsRect(screen.visibleFrame, target);
+    JardOverlayEdge edge = NSMidY(desired) >= NSMidY(screen.visibleFrame) ? JardOverlayEdgeTop : JardOverlayEdgeBottom;
+    CGDirectDisplayID displayID = JardDisplayIDForScreen(screen);
+    NSRect resolved = [JardOverlayDock.shared resolvedFrameForSurface:JardOverlaySurfaceAnnotate
+                                                              desired:desired
+                                                                 edge:edge
+                                                            displayID:displayID
+                                                              visible:screen.visibleFrame];
+    if (!NSEqualRects(self.controls.frame, resolved)) [self.controls setFrame:resolved display:YES];
+    if (self.controls.visible) {
+        [JardOverlayDock.shared claimSurface:JardOverlaySurfaceAnnotate frame:self.controls.frame
+                                        edge:edge displayID:displayID];
+    }
 }
 
 static NSScreen *screenForAnnotationWindow(NSRect target) {
@@ -1302,6 +1321,17 @@ static unsigned annotationModifiers(CGEventFlags flags) {
         NSTimeInterval elapsed = CMTimeGetSeconds(recordingOutput.recordedDuration);
         self.ink.startTime = NSProcessInfo.processInfo.systemUptime - (isfinite(elapsed) && elapsed > 0 ? elapsed : 0);
         [self.controls orderFrontRegardless];
+        NSScreen *controlScreen = self.controls.screen ?: NSScreen.mainScreen;
+        if (controlScreen) {
+            [self placeControlsOnScreen:controlScreen target:self.overlay.frame];
+            __weak typeof(self) weakDock = self;
+            [JardOverlayDock.shared setObserver:^{
+                if (weakDock.controls.visible) {
+                    [weakDock placeControlsOnScreen:weakDock.controls.screen ?: NSScreen.mainScreen
+                                             target:weakDock.overlay.frame];
+                }
+            } forSurface:JardOverlaySurfaceAnnotate];
+        }
         [self beginNarrationAt:self.ink.startTime ready:^{
             [self state:@"recording" message:[self recordingScreenMessage]];
             [self updateDisplayFilter];
@@ -1359,7 +1389,7 @@ static unsigned annotationModifiers(CGEventFlags flags) {
     }
     if (!self.overlay.visible) [self.overlay orderFrontRegardless];
     if (screen != self.controls.screen) {
-        [self.controls setFrame:JardAnnotationControlsRect(screen.visibleFrame, target) display:YES];
+        [self placeControlsOnScreen:screen target:target];
     }
 }
 
@@ -1370,6 +1400,7 @@ static unsigned annotationModifiers(CGEventFlags flags) {
     [self.windowTracker invalidate];
     self.windowTracker = nil;
     [self.controls orderOut:nil];
+    [JardOverlayDock.shared releaseSurface:JardOverlaySurfaceAnnotate];
     [self.overlay orderOut:nil];
 }
 
@@ -1735,6 +1766,7 @@ static unsigned annotationModifiers(CGEventFlags flags) {
     self.originSnapshot = self.routingOrigin = nil;
     [self.overlay orderOut:nil];
     [self.controls orderOut:nil];
+    [JardOverlayDock.shared releaseSurface:JardOverlaySurfaceAnnotate];
     self.ink = nil;
     self.savedPreview = nil;
     self.stoppedAfter = nil;

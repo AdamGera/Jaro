@@ -205,6 +205,18 @@ def notes(session):
     }
 
 
+def resolve_speaker_label(speaker, labels):
+    if speaker is None:
+        return None
+    if isinstance(labels, dict):
+        raw = labels.get(str(speaker))
+        if raw is None:
+            raw = labels.get(speaker)
+        if isinstance(raw, str) and (cleaned := " ".join(raw.split())):
+            return cleaned
+    return f"Speaker {speaker}"
+
+
 def meeting_detail(session, start=None, end=None, *, speaker=None):
     start, end = parse_offset(start), parse_offset(end)
     if end is not None and end <= (start or 0):
@@ -232,7 +244,7 @@ def meeting_detail(session, start=None, end=None, *, speaker=None):
             continue
         if end is not None and (first is None or round(first * 1000) >= end):
             continue
-        name = labels.get(str(turn["speaker"])) or (f"Speaker {turn['speaker']}" if turn["speaker"] else None)
+        name = resolve_speaker_label(turn["speaker"], labels)
         if speaker and (not name or name.casefold() != speaker.casefold()):
             continue
         turns.append({"start": first, "end": last, "speaker": name, "text": turn["text"]})

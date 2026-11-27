@@ -105,7 +105,7 @@ Ordinary requests use `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` o
 
 In **Dictation → Saved dictations**, hover over a row to copy its final transcript. Drag across rows or Shift-click to select a range, or Command-click to add or remove individual rows. Copy from the detail pane to copy the selection.
 
-Open **Settings → Dictation → Output and vocabulary corrections → Ordered output profiles** to add **Lowercase**, **SpongeBob case**, or **No trailing punctuation**. Arrange the steps in the order you want and try them with sample text. Website rules accept a hostname or a pasted URL. Application rules accept the running app name, its Finder name, or its bundle ID.
+Open **Settings → Dictation → Output and vocabulary corrections → Ordered output profiles** to add **Lowercase**, **SpongeBob case**, or **No final period**. The last option keeps question marks, exclamation marks, and ellipses. Arrange the steps in the order you want and try them with sample text. Website rules accept a hostname or a pasted URL. Application rules accept the running app name, its Finder name, or its bundle ID.
 
 A local rewrite formats spoken cues such as “point one” and “point two” as a numbered list by default. Set a different list style in the profile’s rewrite instructions. If a rewrite changes a numeric literal such as `1200` or `−12.5%`, Jaro keeps the text that entered that rewrite and continues with later steps. Dictating only numbers skips rewriting.
 
@@ -144,6 +144,8 @@ During a meeting, Jard also gives the recording a provisional title once enough 
 The recording capsule shows elapsed time and a waveform that responds to your microphone and Mac audio. Hover over it or use its disclosure button to reveal **Stop & Save**, **Copy New**, **Copy All**, and **Copy Agent Prompt**. The prompt includes local `jardctl` commands for reading the meeting and catching up as speech is transcribed. The capsule keeps the final duration on screen and brings back the copy actions as soon as the transcript is ready.
 
 Choose **View live transcript** in **Settings → Meetings** while recording, or open Jaro from its meeting status menu. New turns stay in view while you’re at the bottom. Scroll up to read earlier turns, then return to the bottom to follow the meeting again.
+
+Use your system dictation shortcut during a Meeting, Session, or Annotate capture. To dictate into the recording's notes, open **My Notes** and choose **Dictate**. Notes stay open and carry into the saved session when you stop. If a capture includes computer audio, Jaro leaves playback at its current level during dictation.
 
 Live and saved meeting transcripts show speakers and timestamps in reading order. Nearby turns from the same speaker are grouped together, and pauses of 30 seconds or more show their duration between turns.
 

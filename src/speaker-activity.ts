@@ -15,7 +15,10 @@ export function speakerColor(speaker: number) {
 
 // Nemotron channels are numbered in order of first appearance.
 export function speakerLabel(speaker: number, names?: Record<number, string>) {
-  return names?.[speaker] ?? `Speaker ${String.fromCharCode(64 + speaker)}`
+  const raw = names?.[speaker]
+  const clean = typeof raw === "string" ? raw.trim() : ""
+  if (clean) return clean
+  return `Speaker ${speaker >= 1 && speaker <= 26 ? String.fromCharCode(64 + speaker) : speaker}`
 }
 
 export function transcriptForClipboard({ text, segments, speakerNames }: Transcript) {

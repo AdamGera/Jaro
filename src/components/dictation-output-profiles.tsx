@@ -17,7 +17,7 @@ const stepNames: Record<string, string> = {
   compact: "Compact whitespace",
   lowercase: "Lowercase",
   "spongebob-case": "SpongeBob case",
-  "no-trailing-punctuation": "No trailing punctuation",
+  "no-trailing-punctuation": "No final period",
   rewrite: "Rewrite with local Qwen",
   script: "Run local script",
 }

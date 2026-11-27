@@ -3,7 +3,7 @@
   "name": "jard-soundfolio-local",
   "display_name": "Jaro",
   "description": "Local dictation, meeting recordings, and transcripts on your Mac.",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "platforms": [
     "macos"
   ],

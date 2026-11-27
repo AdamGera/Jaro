@@ -287,6 +287,59 @@ def exercise_shared_meeting(binary):
                 helper.wait()
 
 
+def exercise_shared_session(binary):
+    for mode in ("mic", "both"):
+        with tempfile.TemporaryDirectory(prefix=f"jaro-shared-session-{mode}-") as folder:
+            root = Path(folder)
+            helper = subprocess.Popen([binary, "warm"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            history = []
+
+            def send(message):
+                helper.stdin.write((json.dumps(message) if isinstance(message, dict) else message) + "\n")
+                helper.stdin.flush()
+
+            def wait_for(kind, shared_id=None):
+                for line in helper.stdout:
+                    event = json.loads(line)
+                    history.append(event)
+                    assert event["event"] != "error" and "error" not in event, event
+                    if event["event"] == kind and event.get("sharedMeeting") == shared_id:
+                        return event
+                raise AssertionError(f"Missing {kind} event for shared session ({mode}).")
+
+            try:
+                wait_for("warmReady")
+                wait_for("warmAvailability")
+                session_id = str(uuid4())
+                session_path = root / f"session-{mode}.wav"
+                send({"meeting": session_id, "start": str(session_path), "mode": mode, "retainSources": False})
+                assert wait_for("started", session_id)["microphone"] == "Fixture system microphone"
+                dictation_path = root / "dictation.wav"
+                send({"start": str(dictation_path), "preRoll": False})
+                assert wait_for("started")["microphone"] == "Fixture system microphone"
+                time.sleep(.32)
+                send("stop")
+                wait_for("finished")
+                wait_for("takeEnded")
+                time.sleep(.16)
+                send({"meeting": session_id, "command": "stop"})
+                wait_for("finished", session_id)
+                wait_for("takeEnded", session_id)
+                assert not (root / (session_path.name + ".mic.wav")).exists()
+                assert not (root / (session_path.name + ".system.wav")).exists()
+                with wave.open(str(session_path), "rb") as audio:
+                    assert audio.getnframes() > 15_000
+                with wave.open(str(dictation_path), "rb") as audio:
+                    assert audio.getnframes() > 8_000
+                helper.stdin.close()
+                assert helper.wait(timeout=5) == 0
+            finally:
+                if helper.poll() is None:
+                    helper.kill()
+                    helper.wait()
+    print("Shared mic and both sessions ran on the warm microphone alongside dictation without creating extra source tracks.")
+
+
 def exercise_standalone_meeting(binary):
     with tempfile.TemporaryDirectory(prefix="jaro-standalone-meeting-") as folder:
         root = Path(folder)
@@ -719,6 +772,7 @@ run(sys.argv[1])
 exercise_annotation_narration(sys.argv[1])
 exercise_on_demand_annotation(sys.argv[1])
 exercise_shared_meeting(sys.argv[1])
+exercise_shared_session(sys.argv[1])
 exercise_standalone_meeting(sys.argv[1])
 exercise_zero_prefix(sys.argv[1])
 exercise_failed_open(sys.argv[1])

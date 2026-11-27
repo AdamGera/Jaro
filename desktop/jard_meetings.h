@@ -6,6 +6,7 @@ typedef void (^JardMeetingStart)(NSDictionary *options, BOOL requestPermissions,
 @interface JardMeetings : NSObject
 @property(nonatomic, readonly, getter=isManaged) BOOL managed;
 @property(nonatomic, copy) void (^showSystemAudioSettings)(void);
+@property(nonatomic, copy) void (^openWorkspace)(void);
 - (instancetype)initWithManaged:(BOOL)managed start:(JardMeetingStart)start send:(JardDictationSend)send
                         changed:(void (^)(NSDictionary *))changed;
 - (void)workspaceReady;
