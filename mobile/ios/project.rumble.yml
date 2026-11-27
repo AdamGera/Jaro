@@ -1,0 +1,25 @@
+include:
+  - project.yml
+targets:
+  JaroMobile:
+    sources:
+      - path: ../rumble/licenses
+        name: RumbleLicenses
+        type: group
+        buildPhase: resources
+    dependencies:
+      - framework: .build/rumble/ios/JaroRumble.xcframework
+        embed: false
+    settings:
+      base:
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) JARO_RUMBLE
+        OTHER_LDFLAGS: $(inherited) -weak_framework FoundationModels -framework Accelerate -lc++
+  JaroKeyboard:
+    settings:
+      base:
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) JARO_RUMBLE_HANDOFF
+  JaroMobileTests:
+    settings:
+      base:
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) JARO_RUMBLE
+        FRAMEWORK_SEARCH_PATHS: $(inherited) $(BUILT_PRODUCTS_DIR)

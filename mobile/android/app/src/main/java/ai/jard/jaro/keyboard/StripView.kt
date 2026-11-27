@@ -232,7 +232,7 @@ internal class StripView(context: Context, private val ime: JaroKeyboard, privat
                 held = false; tracking = false
             }
             MotionEvent.ACTION_CANCEL -> {
-                removeCallbacks(hold); if (held) ime.cancelSpeech()
+                removeCallbacks(hold); if (held) ime.cancelSpeechGesture()
                 held = false; tracking = false; v.isPressed = false
             }
         }

@@ -17,7 +17,7 @@ import ai.jard.jaro.typing.TypingWord
  * Polski, Русский): your personal dictionary and its replacements stay, English's words do not. */
 class StandInTypingTest {
     private fun word(standIn: Boolean = false): TypingWord {
-        val model = TypingModel.file(File("src/main/assets/typing/en.hextm"), "en")
+        val model = TypingModel.file(File("src/main/assets/typing/en.jarotm"), "en")
         return TypingWord(SpatialDecoder(model), spatial = true).also {
             it.decoder.personal = PersonalWords(model, listOf("Zorbex"), mapOf("myem" to "my@email.com"))
             it.standIn = standIn

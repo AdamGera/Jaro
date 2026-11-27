@@ -5,7 +5,7 @@
  #endif
  
 +#if defined(__ANDROID__)
-+// Hex: in a keyboard's process, never fork, exec gdb or lldb, or set a ptracer: print the in-process backtrace only.
++// Jaro: in a keyboard's process, never fork, exec gdb or lldb, or set a ptracer: print the in-process backtrace only.
 +void ggml_print_backtrace(void) {
 +    if (getenv("GGML_NO_BACKTRACE")) {
 +        return;

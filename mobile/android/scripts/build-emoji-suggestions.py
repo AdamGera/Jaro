@@ -19,7 +19,6 @@ import pathlib
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-SOURCE = REPO / "ios" / "HEXShared" / "FullKeyboard" / "Emoji" / "emoji-index-en.txt"
 OUT = HERE.parent / "app" / "src" / "main" / "assets" / "emoji" / "suggestions-en.txt"
 
 # The iPhone strip's own strong-match line (EmojiSuggester.strongWeight): a whole

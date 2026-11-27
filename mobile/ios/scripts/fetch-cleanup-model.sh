@@ -9,12 +9,18 @@ if [ -f "$destination/Manifest.json" ]; then
     exit 0
 fi
 
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+    printf 'Usage: %s /path/to/the-local-cleanup-model.zip\n' "$0" >&2
+    exit 2
+fi
+archive=$(CDPATH= cd -- "$(dirname -- "$1")" && printf '%s/%s\n' "$PWD" "$(basename -- "$1")")
 staging=$(mktemp -d "$ios/JaroKeyboard/CleanupTagger/.model.XXXXXX")
 trap 'rm -rf "$staging"' EXIT
-archive="$staging/model.zip"
-curl -fsSL --retry 3 -o "$archive" \
-    'https://github.com/anomalyco/hex/releases/download/ios-model-cleanup-tagger-1/HexCleanupTagger-1.mlpackage.zip'
 printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 -c -
 unzip -q "$archive" -d "$staging"
-test -f "$staging/HexCleanupTagger.mlpackage/Manifest.json"
-mv "$staging/HexCleanupTagger.mlpackage" "$destination"
+set -- "$staging"/*.mlpackage
+if [ "$#" -ne 1 ] || [ ! -f "$1/Manifest.json" ]; then
+    printf 'The archive must contain one Core ML package.\n' >&2
+    exit 1
+fi
+mv "$1" "$destination"

@@ -234,12 +234,18 @@ extension DictationController {
     func appMovedToBackground() {
         isInBackground = true
         multilingualDownload.appMovedToBackground()
+        #if JARO_RUMBLE
+        RumbleModel.shared.appMovedToBackground()
+        #endif
     }
 
     /// Picks up a download that iOS cut off while Jaro was in the background; FluidAudio
     /// resumes each file from the bytes it has.
     func appBecameActive() {
         isInBackground = false
+        #if JARO_RUMBLE
+        RumbleModel.shared.appBecameActive()
+        #endif
         refreshWarmDuration()
         multilingualDownload.appBecameActive()
         guard preparationFailedInBackground else { return }

@@ -213,6 +213,8 @@ nonisolated struct KeyboardSnapshot: Codable, Equatable, Sendable {
     /// When `message` was written (wall clock). The keyboard says it only for
     /// `messageShownFor` after that; nil (an earlier build's) reads as long past.
     let messageAt: TimeInterval?
+    /// Detected language code for `transcript` when multilingual auto-detection ran.
+    let language: String?
 
     init(
         state: KeyboardDictationState,
@@ -229,7 +231,8 @@ nonisolated struct KeyboardSnapshot: Codable, Equatable, Sendable {
         heard: String? = nil,
         stages: DictationStages? = nil,
         translationFailure: TranslationFailure? = nil,
-        messageAt: TimeInterval? = nil
+        messageAt: TimeInterval? = nil,
+        language: String? = nil
     ) {
         self.state = state
         self.heartbeat = heartbeat
@@ -246,6 +249,7 @@ nonisolated struct KeyboardSnapshot: Codable, Equatable, Sendable {
         self.stages = stages
         self.translationFailure = translationFailure
         self.messageAt = messageAt
+        self.language = language
     }
 
     var effectiveLoudnessDB: Float {
@@ -319,7 +323,8 @@ nonisolated struct KeyboardSnapshot: Codable, Equatable, Sendable {
             heard: heard,
             stages: stages,
             translationFailure: translationFailure,
-            messageAt: messageAt
+            messageAt: messageAt,
+            language: language
         )
     }
 
@@ -355,7 +360,8 @@ nonisolated struct KeyboardSnapshot: Codable, Equatable, Sendable {
             transcript: transcript,
             heard: heard,
             stages: stages,
-            translationFailure: translationFailure
+            translationFailure: translationFailure,
+            language: language
         )
     }
 

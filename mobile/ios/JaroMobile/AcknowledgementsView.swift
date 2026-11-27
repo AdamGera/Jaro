@@ -129,10 +129,39 @@ struct AcknowledgementsView: View {
         ),
     ]
 
-    /// The entries the app shows: Polish's once the keyboard bundles its model (`pl.hextm`).
+    /// The entries the app shows: Polish's once the keyboard bundles its model (`pl.jarotm`),
+    /// plus Rumble2 Flash notices when built with the optional Rumble runtime.
     static var shown: [Entry] {
-        entries + (keyboardBundles("pl.hextm") ? polishEntries : [])
+        var list = entries + (keyboardBundles("pl.jarotm") ? polishEntries : [])
+        #if JARO_RUMBLE
+        list += rumbleEntries
+        #endif
+        return list
     }
+
+    #if JARO_RUMBLE
+    static let rumbleEntries: [Entry] = [
+        Entry(
+            title: "Rumble-2-Flash",
+            body: """
+            Experiments › Rumble2 Flash downloads the Q4_K GGUF conversion by cstr \
+            (huggingface.co/cstr/rumble-2-flash-GGUF, revision 780b126) of Rumble-2-Flash \
+            by Reson8 (huggingface.co/Reson8/Rumble-2-Flash), based on Qwen3-ASR-0.6B by \
+            Qwen (huggingface.co/Qwen/Qwen3-ASR-0.6B), licensed under the Apache License, \
+            Version 2.0 (apache.org/licenses/LICENSE-2.0).
+            """
+        ),
+        Entry(
+            title: "CrispASR and ggml",
+            body: """
+            The optional Rumble2 Flash runtime builds a subset of CrispASR v0.8.55 \
+            (github.com/CrispStrobe/CrispASR) and its ggml fork (github.com/CrispStrobe/ggml), \
+            licensed under the MIT License. Jaro patches ggml to disable its embedded debugger \
+            and process-wide terminate hook.
+            """
+        ),
+    ]
+    #endif
 
     private static func keyboardBundles(_ file: String) -> Bool {
         guard let plugins = Bundle.main.builtInPlugInsURL else { return false }

@@ -559,11 +559,10 @@ internal class KeyboardEngine(
         word?.takeIf { canEndWord() }?.textReplacement(before())?.let { replace(it.original, smartWord(it.replacement)) }
         resetTyping(); clearSpaces(); surface?.suggestions(emptyList())
         val info = editor
-        if (info?.actionLabel != null && (info.imeOptions and EditorInfo.IME_FLAG_NO_ENTER_ACTION) == 0 &&
-            target.performEditorAction(info.actionId)) return
-        if (!target.defaultEditorAction()) {
-            if (editor?.inputType == InputType.TYPE_NULL) target.sendKey(KeyEvent.KEYCODE_ENTER)
-            else type("\n")
+        when (EnterPress.run(target, info?.inputType ?: (InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE),
+            info?.imeOptions ?: 0, info?.actionLabel, info?.actionId ?: 0)) {
+            EnterPress.Action, EnterPress.Key -> Unit
+            EnterPress.LineBreak -> type("\n")
         }
     }
 

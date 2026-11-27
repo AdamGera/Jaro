@@ -18,6 +18,20 @@ import ai.jard.jaro.speech.SpeechEdges
 import ai.jard.jaro.speech.speechSpan
 
 class InsertionTest {
+    @Test fun hiddenKeyboardMayFinishOnlyIntoItsOwnConnectedNonPasswordField() {
+        val field = DictationField()
+        field.start()
+        val recordedIn = field.current
+        assertTrue(field.accepts(recordedIn, connected = true, secure = false))
+        assertFalse(field.accepts(recordedIn, connected = false, secure = false))
+        assertFalse(field.accepts(recordedIn, connected = true, secure = true))
+        field.start()
+        assertFalse(field.accepts(recordedIn, connected = true, secure = false))
+        val movedTo = field.current
+        field.finish()
+        assertFalse(field.accepts(movedTo, connected = true, secure = false))
+    }
+
     @Test fun replacesASelectedWordWithoutJoiningItsNeighbours() {
         assertEquals(" hello ", insertion(" hello ", 'a', 'b'))
     }
@@ -521,7 +535,7 @@ class InsertionTest {
         assertEquals(DictationLanguage.Portuguese, DictationLanguage.automatic(null, listOf("pt")))
         assertEquals(DictationLanguage.Portuguese, DictationLanguage.automatic(null, listOf("pt", "en")))
         assertEquals(DictationLanguage.Portuguese, DictationLanguage.matching("pt"))
-        assertEquals(null, DictationLanguage.Portuguese.layout)
+        assertEquals(Spoken.Portuguese, DictationLanguage.Portuguese.layout)
         fun format(text: String, style: Style) = SpokenText.format(text, SpeechOptions(style, DictationLanguage.Portuguese,
             clean = true, translate = false, formatLists = true, spokenPunctuation = true))
         // English cleanup would drop "um" (a filler there, "a" here) and read "no" as a correction.
@@ -539,7 +553,10 @@ class InsertionTest {
         assertEquals(DictationLanguage.Russian, DictationLanguage.automatic(null, listOf("ru")))
         assertEquals(DictationLanguage.Russian, DictationLanguage.matching("ru"))
         assertEquals(null, DictationLanguage.Polish.layout)
-        assertEquals(null, DictationLanguage.Russian.layout)
+        assertEquals(Spoken.Russian, DictationLanguage.Russian.layout)
+        assertEquals(listOf("йцукенгшщзх", "фывапролджэ", "ячсмитьбю"), KeyboardLetters.rows("ru"))
+        assertEquals(listOf("е", "ё"), LetterFeedback.options('е', "ru"))
+        assertEquals(listOf("ь", "ъ"), LetterFeedback.options('ь', "ru"))
         fun format(text: String, style: Style, language: DictationLanguage) = SpokenText.format(text, SpeechOptions(style, language,
             clean = true, translate = false, formatLists = true, spokenPunctuation = true))
         // Cleanup has no Polish rules, so the particle "no" ("well") is not English's correction marker.
@@ -556,7 +573,7 @@ class InsertionTest {
     @Test fun aDictationLanguageWithoutItsOwnLayoutHasNoTypingModel() {
         // Português keeps English's keys and accents, but its typing model would be English's: until a
         // layout is pinned, English's word list only stands in for the keys' geometry and your own words.
-        assertEquals(null, typingLayout(null, DictationLanguage.Portuguese))
+        assertEquals(Spoken.Portuguese, typingLayout(null, DictationLanguage.Portuguese))
         assertEquals(null, typingLayout(null, DictationLanguage.Dutch))
         assertEquals(null, typingLayout(null, DictationLanguage.Polish))
         assertEquals(null, typingLayout(null, DictationLanguage.Russian))

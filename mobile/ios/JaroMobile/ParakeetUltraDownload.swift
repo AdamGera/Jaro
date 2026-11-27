@@ -15,6 +15,8 @@ final class ParakeetUltraDownload {
     enum State: Equatable {
         /// Nothing to say: the experiment off, not wanted for this language, or Ultra dictates.
         case idle
+        /// Off Wi-Fi without Use mobile data; bytes already on disk.
+        case waitingForWiFi(Int64)
         /// Bytes on disk.
         case downloading(Int64)
         /// Stopped, and tries again by itself in `retryIn` seconds, or once Jaro is in front (nil).
@@ -45,6 +47,11 @@ final class ParakeetUltraDownload {
     @ObservationIgnored private let session: URLSession
     @ObservationIgnored private let stallLimit: Duration
     @ObservationIgnored private let backoff: (Int) -> Int
+    @ObservationIgnored private let modelLabel: String?
+    /// Whether the connection allows starting or continuing (defaults to `SpeechModelDownloadNetwork.shared`).
+    @ObservationIgnored private let mayDownload: () -> Bool
+    /// Whether the model is still enabled and wanted (checked before resuming after Wi-Fi changes).
+    @ObservationIgnored private let isWanted: () -> Bool
     /// Now, so a background trip's length is testable.
     @ObservationIgnored private let now: () -> Date
 
@@ -55,6 +62,9 @@ final class ParakeetUltraDownload {
         session: URLSession = ParakeetUltraDownload.makeSession(),
         stallLimit: Duration = ParakeetUltraDownload.stallLimit,
         backoff: @escaping (Int) -> Int = ParakeetUltraDownload.backoff,
+        modelLabel: String? = nil,
+        mayDownload: @escaping () -> Bool = { SpeechModelDownloadNetwork.shared.mayDownload(.multilingual) },
+        isWanted: @escaping () -> Bool = { true },
         now: @escaping () -> Date = { Date() }
     ) {
         self.directory = directory
@@ -63,6 +73,9 @@ final class ParakeetUltraDownload {
         self.session = session
         self.stallLimit = stallLimit
         self.backoff = backoff
+        self.modelLabel = modelLabel
+        self.mayDownload = mayDownload
+        self.isWanted = isWanted
         self.now = now
     }
 
@@ -82,11 +95,56 @@ final class ParakeetUltraDownload {
 
     var total: Int64 { files.reduce(0) { $0 + $1.size } }
 
-    /// Starts, or resumes from what's on disk; does nothing while it runs.
+    /// Starts, or resumes from what's on disk; does nothing while it runs. Off Wi-Fi without Use
+    /// mobile data, it waits for Wi-Fi instead.
     func start() {
         guard task == nil else { return }
+        guard mayDownload() else { return waitForWiFi() }
         tries = 0
         run()
+    }
+
+    func waitForWiFi() {
+        guard task == nil else { return }
+        endBackgroundTime()
+        state = .waitingForWiFi(ParakeetUltraModel.bytesOnDisk(in: directory, files: files))
+    }
+
+    var isWaitingForWiFi: Bool {
+        if case .waitingForWiFi = state { return true }
+        return false
+    }
+
+    func connectionChanged() {
+        if mayDownload() {
+            if isWaitingForWiFi {
+                guard isWanted() else {
+                    state = .idle
+                    return
+                }
+                start()
+            }
+        } else if let running = task {
+            // Keep `task` tracked until cancellation finishes so `stop()`/`restart()` wait for
+            // the transfer to end and a quick reconnect or turn-off never leaves state out of sync.
+            running.cancel()
+            task = Task { [weak self] in
+                await running.value
+                guard let self, !Task.isCancelled else { return }
+                self.task = nil
+                guard self.isWanted() else {
+                    self.endBackgroundTime()
+                    self.state = .idle
+                    return
+                }
+                if self.mayDownload() {
+                    self.tries = 0
+                    self.run()
+                } else {
+                    self.waitForWiFi()
+                }
+            }
+        }
     }
 
     /// Starts over from what's on disk, with all the automatic tries again. The transfer it
@@ -97,6 +155,7 @@ final class ParakeetUltraDownload {
         task = nil
         tries = 0
         guard let running else {
+            guard mayDownload() else { return waitForWiFi() }
             run()
             return
         }
@@ -105,6 +164,7 @@ final class ParakeetUltraDownload {
             await running.value
             guard let self, !Task.isCancelled else { return }
             self.task = nil
+            guard self.mayDownload() else { return self.waitForWiFi() }
             self.run()
         }
     }
@@ -216,7 +276,7 @@ final class ParakeetUltraDownload {
                     task = nil
                     endBackgroundTime()
                     failedForConnection = Self.triesAgain(after: error)
-                    state = .failed(Self.message(for: error))
+                    state = .failed(Self.message(for: error, downloadSize: Self.size(total), modelLabel: modelLabel))
                     return
                 }
                 if backgroundedAt != nil {
@@ -301,9 +361,31 @@ final class ParakeetUltraDownload {
             || (ns.domain == NSPOSIXErrorDomain && ns.code == Int(ENOSPC))
     }
 
-    nonisolated static func message(for error: Error) -> String {
+    nonisolated static func message(
+        for error: Error,
+        downloadSize: String = ParakeetUltraTranscriber.downloadSize,
+        modelLabel: String? = nil
+    ) -> String {
+        if let label = modelLabel {
+            if isOutOfSpace(error) {
+                return String(localized: "\(label) needs \(downloadSize) of free space. Free some up, then try again.")
+            }
+            if error is StallWatch.Stalled || error is URLError {
+                return String(localized: "\(label) download stopped. Check your connection and try again.")
+            }
+            switch error as? ParakeetUltraModel.DownloadError {
+            case .badStatus(429):
+                return String(localized: "Hugging Face is limiting downloads right now. Try again in a few minutes.")
+            case .badStatus(let status):
+                return String(localized: "\(label) didn't download (error \(status)). Try again later.")
+            case .corrupt:
+                return String(localized: "\(label) arrived damaged. Try again.")
+            case nil:
+                return String(localized: "\(label) didn't download. Try again.")
+            }
+        }
         if isOutOfSpace(error) {
-            return String(localized: "The multilingual model needs \(ParakeetUltraTranscriber.downloadSize) of free space. Free some up, then try again.")
+            return String(localized: "The multilingual model needs \(downloadSize) of free space. Free some up, then try again.")
         }
         if error is StallWatch.Stalled || error is URLError {
             return String(localized: "The multilingual model's download stopped. Check your connection and try again.")
@@ -322,9 +404,29 @@ final class ParakeetUltraDownload {
 
     /// What Jaro says about it, or nil while there's nothing to say.
     var status: String? {
-        switch state {
+        if let label = modelLabel {
+            return switch state {
+            case .idle:
+                nil
+            case .waitingForWiFi:
+                String(localized: "Downloads on Wi-Fi.")
+            case .downloading(let bytes):
+                String(localized: "Downloading \(label): \(Self.size(bytes)) of \(Self.size(total))")
+            case .waiting(_, let seconds?):
+                String(localized: "\(label) download stopped. Trying again in \(seconds) s.")
+            case .waiting(_, nil):
+                String(localized: "\(label) download resumes when you open Jaro.")
+            case .loading:
+                String(localized: "Getting \(label) ready")
+            case .failed(let message):
+                message
+            }
+        }
+        return switch state {
         case .idle:
             nil
+        case .waitingForWiFi:
+            String(localized: "Downloads on Wi-Fi.")
         case .downloading(let bytes):
             String(localized: "Downloading the multilingual model: \(Self.size(bytes)) of \(Self.size(total))")
         case .waiting(_, let seconds?):
@@ -342,6 +444,8 @@ final class ParakeetUltraDownload {
     var fraction: Double? {
         switch state {
         case .downloading(let bytes), .waiting(let bytes, _):
+            total > 0 ? min(1, Double(bytes) / Double(total)) : 0
+        case .waitingForWiFi(let bytes) where bytes > 0:
             total > 0 ? min(1, Double(bytes) / Double(total)) : 0
         default:
             nil
@@ -381,6 +485,8 @@ struct MultilingualModelStatus: View {
     let download: ParakeetUltraDownload
     let retry: () -> Void
     let turnOff: () -> Void
+    var useMobileData: (() -> Void)? = nil
+    var accessibilityPrefix: String = "multilingual-model"
 
     var body: some View {
         if let status = download.status {
@@ -395,7 +501,7 @@ struct MultilingualModelStatus: View {
                             .foregroundStyle(JaroTheme.textBase)
                             .monospacedDigit()
                             .fixedSize(horizontal: false, vertical: true)
-                            .accessibilityIdentifier("multilingual-model-status")
+                            .accessibilityIdentifier("\(accessibilityPrefix)-status")
                         Text("Until then, Jaro uses its usual model.")
                             .font(.system(size: 12))
                             .foregroundStyle(JaroTheme.textMuted)
@@ -410,13 +516,20 @@ struct MultilingualModelStatus: View {
                 if download.isFailed {
                     HStack(spacing: 8) {
                         Button("Try again", action: retry)
-                            .accessibilityIdentifier("multilingual-model-try-again")
+                            .accessibilityIdentifier("\(accessibilityPrefix)-try-again")
                         Button("Turn off", action: turnOff)
-                            .accessibilityIdentifier("multilingual-model-turn-off")
+                            .accessibilityIdentifier("\(accessibilityPrefix)-turn-off")
                     }
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(JaroTheme.textBase)
                     .buttonStyle(MultilingualStatusButtonStyle())
+                }
+                if download.isWaitingForWiFi, let useMobileData {
+                    Button("Use mobile data", action: useMobileData)
+                        .accessibilityIdentifier("\(accessibilityPrefix)-use-mobile-data")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(JaroTheme.textBase)
+                        .buttonStyle(MultilingualStatusButtonStyle())
                 }
             }
             .padding(14)
@@ -428,7 +541,7 @@ struct MultilingualModelStatus: View {
     }
 }
 
-private struct MultilingualStatusButtonStyle: ButtonStyle {
+struct MultilingualStatusButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .padding(.horizontal, 12)

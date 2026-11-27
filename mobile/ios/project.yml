@@ -11,8 +11,8 @@ packages:
     exactVersion: 0.15.5
 settings:
   base:
-    CURRENT_PROJECT_VERSION: 1
-    MARKETING_VERSION: 0.0.9
+    CURRENT_PROJECT_VERSION: 2
+    MARKETING_VERSION: 0.0.12
     SWIFT_VERSION: 6.0
     # The compiler finds the interface's strings for the String Catalogs (Localizable.xcstrings).
     SWIFT_EMIT_LOC_STRINGS: YES
@@ -50,6 +50,23 @@ targets:
             CFBundleURLName: ai.jard.jaro.ios.keyboard-session
             CFBundleURLSchemes:
               - jaro-dictation
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Jaro words file
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - ai.jard.jaro.words
+        LSSupportsOpeningDocumentsInPlace: false
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: ai.jard.jaro.words
+            UTTypeDescription: Jaro words file
+            UTTypeConformsTo:
+              - public.json
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - jarowords
+              public.mime-type:
+                - application/vnd.jaro.words+json
         NSMicrophoneUsageDescription: Jaro turns what you say into text on this device. Audio never leaves it and is deleted once it's transcribed.
         NSSpeechRecognitionUsageDescription: Jaro uses Apple's on-device speech recognition to turn what you say into text. Nothing you say is sent to a server.
         NSSupportsLiveActivities: true

@@ -1,7 +1,7 @@
 package ai.jard.jaro.typing
 
 /** Words the words around them decide rather than the taps (iOS `AutocorrectEngine.contextChoice`,
- * #2144), scored with the model's word pairs. English: the same letters with and without an
+ * iOS), scored with the model's word pairs. English: the same letters with and without an
  * apostrophe ("id" or "I'd", "its" or "it's") and words that sound alike ("your", "there", "then");
  * "were" and "we're" aren't here, the pairs can't tell them apart. French and Italian: the same
  * letters with and without an accent, both words ("a" or "à", "ou" or "où", Italian "e" or "è"),
@@ -17,6 +17,19 @@ internal object ContextWords {
             listOf("sur", "sûr")),
         "it" to listOf(listOf("e", "è"), listOf("la", "là"), listOf("li", "lì"), listOf("da", "dà"), listOf("ne", "né"),
             listOf("se", "sé")),
+        "pt" to listOf(listOf("e", "é"), listOf("esta", "está"), listOf("estas", "estás"), listOf("nos", "nós"),
+            listOf("a", "à"), listOf("as", "às"), listOf("la", "lá"), listOf("da", "dá"), listOf("de", "dê"), listOf("va", "vá"),
+            listOf("ai", "aí"), listOf("pais", "país"), listOf("por", "pôr"), listOf("pode", "pôde"), listOf("tem", "têm"),
+            listOf("vem", "vêm"), listOf("mas", "más"), listOf("que", "quê"), listOf("sabia", "sábia"),
+            listOf("secretaria", "secretária"),
+            listOf("duvida", "dúvida"), listOf("duvidas", "dúvidas"), listOf("ira", "irá"), listOf("publica", "pública"),
+            listOf("publico", "público"), listOf("pratica", "prática"), listOf("praticas", "práticas"),
+            listOf("pratico", "prático"), listOf("critica", "crítica"), listOf("criticas", "críticas"),
+            listOf("analise", "análise"), listOf("divida", "dívida"), listOf("calculo", "cálculo"), listOf("media", "média"),
+            listOf("formula", "fórmula"), listOf("anuncio", "anúncio"), listOf("noticia", "notícia"),
+            listOf("fabrica", "fábrica"), listOf("valida", "válida"), listOf("numero", "número"), listOf("inicio", "início"),
+            listOf("estimulo", "estímulo"), listOf("peca", "peça"), listOf("copia", "cópia"), listOf("magoa", "mágoa"),
+            listOf("negocio", "negócio")),
     )
     private val groupOf = groups.mapValues { (_, list) -> list.flatMap { group -> group.map { it.lowercase() to group } }.toMap() }
     // The pairs barely spell contractions (the books split "I'd" into "I" and "'d"), so a
@@ -45,6 +58,9 @@ internal object ContextWords {
 
     /** Whether [language] has words its context decides. */
     fun decides(language: String) = language in groups
+
+    /** A Portuguese accent typed explicitly stays as typed when the next word is committed. */
+    fun keepsTypedAccent(language: String, typed: String) = language == "pt" && fold(typed) != typed
 
     private fun cost(model: TypingModel, word: String, previous: String?, next: String?, startsSentence: Boolean): Double {
         val expanded = if (model.language == "en") expansions[word.lowercase()] else null

@@ -83,7 +83,7 @@ struct ExperimentsSettingsPage: View {
             SettingsToggleRow(
                 title: String(localized: "Multilingual model (Parakeet)"),
                 detail: multilingualParakeetFits
-                    ? String(localized: "25 languages, even mixed in one sentence. \(ParakeetUltraTranscriber.downloadSize) download. Once ready, keyboard dictation opens Jaro.")
+                    ? String(localized: "25 languages, even mixed in one sentence. \(ParakeetUltraTranscriber.downloadSize) download on Wi-Fi. Once ready, keyboard dictation opens Jaro.")
                     : String(localized: "Needs an iPhone with 6 GB of memory or more"),
                 isOn: $multilingualParakeet
             )
@@ -93,7 +93,8 @@ struct ExperimentsSettingsPage: View {
                 MultilingualModelStatus(
                     download: DictationController.shared.multilingualDownload,
                     retry: { DictationController.shared.retryMultilingualParakeet() },
-                    turnOff: { multilingualParakeet = false }
+                    turnOff: { multilingualParakeet = false },
+                    useMobileData: { DictationController.shared.useMobileDataForMultilingualParakeet() }
                 )
                 .padding(.horizontal, 12)
                 .padding(.bottom, 12)

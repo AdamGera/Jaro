@@ -42,14 +42,15 @@ import androidx.compose.ui.unit.sp
 import ai.jard.jaro.speech.*
 import ai.jard.jaro.typing.TypingPreferences
 import ai.jard.jaro.updates.Updates
+import ai.jard.jaro.words.WordsPanel
 
 private enum class Page(val title: Int) {
     Home(R.string.app_name), Dictation(R.string.settings_dictation), Keyboard(R.string.settings_keyboard), Privacy(R.string.settings_privacy),
-    Labs(R.string.settings_labs),
+    Labs(R.string.settings_labs), Words(R.string.words_title),
     Language(R.string.settings_dictation_language), Layout(R.string.settings_keyboard_layout), Styles(R.string.settings_style),
     Policy(R.string.settings_privacy_policy), Licences(R.string.settings_licences), Licence(R.string.settings_licences);
     val parent get() = when (this) {
-        Language, Styles -> Dictation
+        Language, Styles, Words -> Dictation
         Layout -> Keyboard
         Policy, Licences -> Privacy
         Licence -> Licences
@@ -99,13 +100,18 @@ internal fun JaroSettings(setup: Setup, speech: SpeechPreferences, typing: Typin
     val endWithPeriod = remember(revision) { speech.endWithPeriod }
     val formatLists = remember(revision) { speech.formatLists }
     val spokenPunctuation = remember(revision) { speech.spokenPunctuation }
+    var quickDictation by remember { mutableStateOf(QuickDictation.enabled(context)) }
     val customVocabulary = remember(revision) { speech.customVocabulary }
     var vocabularyDraft by remember { mutableStateOf(speech.vocabularyTerms.joinToString("\n")) }
+    LaunchedEffect(page) { if (page == Page.Dictation) vocabularyDraft = speech.vocabularyTerms.joinToString("\n") }
+    val fasterEnglish = remember(revision) { speech.fasterEnglish }
+    val rumble2 = remember(revision) { speech.rumble2 }
     val signature = remember(revision) { speech.signature }
     var signatureDraft by remember { mutableStateOf(speech.signatureText) }
     val emojiSuggestions = remember(revision) { typing.emojiSuggestions }
     val keyboardTools = remember(revision) { typing.keyboardTools }
     val smartQuotes = remember(revision) { typing.smartQuotes }
+    val volumeInMenu = remember(revision) { typing.volumeInMenu }
     // A hidden field or leaving Labs shows the saved line again, never an unsaved draft.
     LaunchedEffect(page, signature) { if (page != Page.Labs || !signature) signatureDraft = speech.signatureText }
     val autoCapitalize = remember(revision) { typing.autoCapitalize }
@@ -245,8 +251,27 @@ internal fun JaroSettings(setup: Setup, speech: SpeechPreferences, typing: Typin
                                         Box { if (vocabularyDraft.isEmpty()) Label(stringResource(R.string.dictation_vocabulary_hint), muted = true); field() }
                                     })
                             }
+                            Rule()
+                            Entry(stringResource(R.string.words_title), action = { open(Page.Words) })
                         }
                         Card {
+                            if (BuildConfig.RUMBLE2_ENABLED) {
+                                Toggle(stringResource(R.string.rumble2_model), stringResource(R.string.rumble2_model_detail),
+                                    rumble2) {
+                                    speech.rumble2 = it
+                                    if (!it) ModelStore.rumble2.cancel(context)
+                                }
+                                if (rumble2) {
+                                    Rule()
+                                    val state = ModelStore.rumble2.state.collectAsState().value
+                                    val action = modelAction(state)
+                                    Entry(stringResource(R.string.rumble2_download),
+                                        modelStatus(state, sizeMb = 445, builtInFallback = false),
+                                        action?.let { stringResource(it) }.orEmpty(),
+                                        action?.let { { ModelStore.rumble2.download(context) } })
+                                }
+                                Rule()
+                            }
                             val action = modelAction(model)
                             Entry(stringResource(R.string.model_title), modelStatus(model), action?.let { stringResource(it) } ?: "",
                                 if (action != null) download else null)
@@ -297,6 +322,27 @@ internal fun JaroSettings(setup: Setup, speech: SpeechPreferences, typing: Typin
                             Label(stringResource(R.string.labs_output), muted = true, size = 14,
                                 mod = Modifier.padding(start = 16.dp))
                             Card {
+                                Toggle(stringResource(R.string.faster_english), stringResource(R.string.faster_english_detail),
+                                    fasterEnglish) {
+                                    speech.fasterEnglish = it
+                                    if (!it) ModelStore.english.cancel(context)
+                                }
+                                if (fasterEnglish) {
+                                    Rule()
+                                    val state = ModelStore.english.state.collectAsState().value
+                                    val action = modelAction(state)
+                                    Entry(stringResource(R.string.faster_english_model),
+                                        modelStatus(state, sizeMb = 135, builtInFallback = false),
+                                        action?.let { stringResource(it) }.orEmpty(),
+                                        action?.let { { ModelStore.english.download(context) } })
+                                }
+                                Rule()
+                                Toggle(stringResource(R.string.quick_dictation), stringResource(R.string.quick_dictation_detail),
+                                    quickDictation) {
+                                    QuickDictation.setEnabled(context, it)
+                                    quickDictation = QuickDictation.enabled(context)
+                                }
+                                Rule()
                                 Toggle(stringResource(R.string.signature), stringResource(R.string.signature_detail),
                                     signature) { speech.signature = it }
                                 if (signature) {
@@ -341,9 +387,13 @@ internal fun JaroSettings(setup: Setup, speech: SpeechPreferences, typing: Typin
                                 Rule()
                                 Toggle(stringResource(R.string.smart_quotes), stringResource(R.string.smart_quotes_detail),
                                     smartQuotes) { typing.smartQuotes = it }
+                                Rule()
+                                Toggle(stringResource(R.string.volume_in_menu), stringResource(R.string.volume_in_menu_detail),
+                                    volumeInMenu) { typing.volumeInMenu = it }
                             }
                         }
                     }
+                    Page.Words -> WordsPanel(speech, revision)
                     Page.Styles -> Card {
                         Style.entries.forEachIndexed { i, it ->
                             if (i != 0) Rule()

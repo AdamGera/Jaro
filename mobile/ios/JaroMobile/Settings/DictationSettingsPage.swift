@@ -235,9 +235,14 @@ struct DictationSettingsPage: View {
                         .padding(.top, 2)
                         .padding(.bottom, 14)
                 }
+
+                JaroWordsRows(isOn: customVocabularyOn)
             }
 
             SettingsCard {
+                #if JARO_RUMBLE
+                RumbleExperimentRows()
+                #endif
                 SettingsToggleRow(
                     title: String(localized: "Speech model in keyboard"),
                     detail: keyboardParakeetFits

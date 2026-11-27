@@ -35,7 +35,11 @@
     <string name="model_stopped">下载已停止。正在使用较小的内置模型。</string>
     <string name="model_no_connection">没有网络连接。正在使用较小的内置模型。</string>
     <string name="model_no_space">存储空间不足。正在使用较小的内置模型。</string>
-    <string name="model_loading">正在下载 190 MB · %1$d%%</string>
+    <string name="model_loading">正在下载 %1$d MB · %2$d%%</string>
+    <string name="model_optional_available">正在使用常规语音模型</string>
+    <string name="model_optional_stopped">下载已停止。正在使用常规语音模型。</string>
+    <string name="model_optional_no_connection">无网络连接。正在使用常规语音模型。</string>
+    <string name="model_optional_no_space">存储空间不足。正在使用常规语音模型。</string>
     <string name="model_download">下载</string>
     <string name="model_try_again">再试一次</string>
 
@@ -123,4 +127,19 @@
     <string name="keyboard_tools_detail">在建议栏中显示表情、粘贴、设置和撤销</string>
     <string name="smart_quotes">智能引号</string>
     <string name="smart_quotes_detail">用 ’ ‘ “ ” 代替 \' 和 \"</string>
+    <string name="volume_in_menu">Jaro 菜单中的音量</string>
+    <string name="volume_in_menu_detail">在 Jaro 菜单中添加“音量”，用于打开手机的音量控制</string>
+    <string name="quick_dictation">从快捷设置听写</string>
+    <string name="quick_dictation_detail">在快捷设置中添加 Jaro 功能块。在任何应用中点按它并说话，Jaro 会复制文字供你粘贴。适用于无法使用 Jaro 键盘的应用，例如工作应用。</string>
+    <string name="quick_tile">Jaro 听写</string>
+    <string name="quick_hint">请说话，然后点按“完成听写”</string>
+    <string name="quick_copy_failed">无法复制听写内容。请重试。</string>
+    <string name="quick_copied">已复制。请粘贴到你刚才输入的位置。</string>
+    <string name="quick_close">关闭</string>
+    <string name="faster_english">更快的英语听写</string>
+    <string name="faster_english_detail">下载后使用小型本地模型进行英语听写。其他语言仍使用 Whisper。</string>
+    <string name="faster_english_model">英语模型 · 135 MB</string>
+    <string name="rumble2_model">Rumble2 Flash</string>
+    <string name="rumble2_model_detail">使用本地模型听写最多 10 秒。支持自动检测语言，也可选择西班牙语或法语。需下载 445 MB。</string>
+    <string name="rumble2_download">Rumble2 Flash 模型 · 445 MB</string>
 </resources>

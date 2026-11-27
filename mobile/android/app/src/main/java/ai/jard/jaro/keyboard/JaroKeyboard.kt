@@ -22,7 +22,7 @@ import ai.jard.jaro.speech.LocalSpeech
 import ai.jard.jaro.speech.MicCapture
 import ai.jard.jaro.speech.Signature
 import ai.jard.jaro.speech.SpeechPhase
-import ai.jard.jaro.speech.SpeechOptions
+import ai.jard.jaro.speech.SpeechResult
 import ai.jard.jaro.speech.SpeechModel
 import ai.jard.jaro.speech.SpeechPreferences
 import ai.jard.jaro.speech.Spoken
@@ -48,6 +48,7 @@ internal fun Context.speechNote(note: String?) = when (note) {
 class JaroKeyboard : InputMethodService() {
     private var view: KeyboardView? = null
     private lateinit var capture: MicCapture
+    private val dictationField = DictationField()
     internal val preferences by lazy { SpeechPreferences(this) }
     internal var nextEnglish: Boolean? = null
     /** The options the dictation in flight started with: its language decides mid-sentence case. */
@@ -119,7 +120,9 @@ class JaroKeyboard : InputMethodService() {
         typeChanged = restarting && fieldType != attribute.inputType to attribute.imeOptions
         fieldType = attribute.inputType to attribute.imeOptions
         nextEnglish = null
-        capture.cancel() // Even a different field in the same app must not receive an old result.
+        // Android can restart input when focus moves between two web or Compose fields.
+        dictationField.start()
+        capture.cancel()
         engine.startInput(attribute)
     }
     override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
@@ -157,13 +160,13 @@ class JaroKeyboard : InputMethodService() {
         else -> R.string.keyboard_hint_hold
     })
     internal fun beginSpeech(): Boolean {
-        if (engine.secure || currentInputConnection == null || !capture.canStart ||
+        if (dictationField.current == 0L || engine.secure || currentInputConnection == null || !capture.canStart ||
             checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             view?.status(capture.phase, idleHint())
             return false
         }
         engine.clearForDictation()
-        capture.start(preferences.options(nextEnglish))
+        capture.start(preferences.options(nextEnglish), dictationField.current)
         nextEnglish = null
         return true
     }
@@ -176,22 +179,35 @@ class JaroKeyboard : InputMethodService() {
         if (capture.phase == SpeechPhase.Listening || capture.phase == SpeechPhase.Opening) capture.finish()
     }
     internal fun cancelSpeech() = capture.cancelLatest()
-    private fun commitSpeech(text: String, options: SpeechOptions) {
-        if (currentInputConnection == null || engine.secure || !isInputViewShown) return
+    internal fun cancelSpeechGesture() {
+        if (isInputViewShown) cancelSpeech() else finishSpeech()
+    }
+
+    private fun commitSpeech(result: SpeechResult, field: Long) {
+        if (!dictationField.accepts(field, currentInputConnection != null, engine.secure)) return
         // Read now, so a toggle or text changed while it transcribed applies to this dictation. Jaro's own
         // fields, such as Settings' practice box, never get the signature.
         val own = currentInputEditorInfo?.packageName == packageName
-        val signed = if (own) null else Signature.append(text, preferences.signatureText, preferences.signature)
-        engine.insertDictation(signed ?: text, if (options.translate) "en" else options.spoken.code, signed != null)
+        val signed = if (own) null else Signature.append(result.text, preferences.signatureText, preferences.signature)
+        engine.insertDictation(signed ?: result.text, result.language, signed != null)
     }
-    private fun leaveEditor() {
+    private fun leaveEditor(fieldGone: Boolean) {
+        if (fieldGone) {
+            dictationField.finish()
+            capture.cancel()
+        } else {
+            finishSpeech()
+        }
         Updates.keyboardHidden()
         viewing = false; watchClipboard()
-        view?.reset(); view?.cancelGestures(); engine.leave(); nextEnglish = null; capture.cancel()
+        view?.reset(); view?.cancelGestures(); engine.leave(); nextEnglish = null
     }
-    override fun onFinishInputView(finishingInput: Boolean) { leaveEditor(); super.onFinishInputView(finishingInput) }
-    override fun onFinishInput() { leaveEditor(); super.onFinishInput() }
-    override fun onWindowHidden() { leaveEditor(); super.onWindowHidden() }
+    override fun onFinishInputView(finishingInput: Boolean) {
+        leaveEditor(finishingInput)
+        super.onFinishInputView(finishingInput)
+    }
+    override fun onFinishInput() { leaveEditor(fieldGone = true); super.onFinishInput() }
+    override fun onWindowHidden() { leaveEditor(fieldGone = false); super.onWindowHidden() }
     // The speech model is a few hundred MB while loaded; give it back when Android runs short. Not on
     // TRIM_MEMORY_UI_HIDDEN, which only says the keyboard hid (every app switch), not that memory is low.
     override fun onTrimMemory(level: Int) {

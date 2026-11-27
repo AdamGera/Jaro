@@ -28,5 +28,15 @@
             </intent-filter>
             <meta-data android:name="android.view.im" android:resource="@xml/input_method" />
         </service>
+        <service android:name=".QuickDictationTile" android:exported="true" android:enabled="false"
+            android:label="@string/quick_tile" android:icon="@drawable/jaro_mark"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+        <activity android:name=".QuickDictationActivity" android:exported="false" android:theme="@style/JaroSheet"
+            android:taskAffinity="" android:launchMode="singleTask" android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|uiMode|density|fontScale" />
     </application>
 </manifest>

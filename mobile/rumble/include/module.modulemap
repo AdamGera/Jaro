@@ -1,0 +1,4 @@
+module JaroRumble {
+    header "jaro_rumble.h"
+    export *
+}

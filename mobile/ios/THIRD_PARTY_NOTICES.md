@@ -46,7 +46,7 @@ The app shows these under Settings › Acknowledgements (`JaroMobile/Acknowledge
   [Mozilla Public License 1.1](https://www.mozilla.org/en-US/MPL/1.1/)
   (<https://github.com/sbosio/rla-es>).
 
-Polish's three entries show while the keyboard bundles `pl.hextm`
+Polish's three entries show while the keyboard bundles the Polish typing model
 (`AcknowledgementsView.polishEntries`):
 
 - **National Corpus of Polish n-grams:** Polish word and word-pair frequencies come from
@@ -67,8 +67,16 @@ Polish's three entries show while the keyboard bundles `pl.hextm`
 - **FluidAudio:** Swift speech model runtime, version 0.15.5, from
   [FluidInference](https://github.com/FluidInference/FluidAudio/tree/0.15.5).
   The Apache-2.0 license and dependency notices are in [licenses](licenses).
-- **Optional cleanup tagger:** The build helper retrieves the published
-  [Core ML cleanup tagger](https://github.com/anomalyco/hex/releases/tag/ios-model-cleanup-tagger-1)
-  by its pinned SHA-256. Its release identifies the BERT base model as Apache-2.0.
-  The trained artifact is a separate dependency. Release archives exclude it pending
-  redistribution terms for the weights. Debug builds can use it for local tests.
+- **Optional cleanup tagger:** The build helper verifies a local Core ML artifact
+  against a pinned SHA-256. The BERT base model is Apache-2.0. The trained weights
+  are a separate dependency. Release archives exclude them pending redistribution
+  terms. Debug builds can use the artifact for local tests.
+- **Optional Rumble2 Flash build (`project.rumble.yml`):** Includes the local CPU
+  runtime built from [CrispASR](https://github.com/CrispStrobe/CrispASR) v0.8.55 and
+  its [ggml](https://github.com/CrispStrobe/ggml) fork (MIT License, patched to
+  disable the embedded debugger and process-wide terminate hook) and downloads the
+  pinned Q4_K GGUF conversion by cstr
+  ([cstr/rumble-2-flash-GGUF](https://huggingface.co/cstr/rumble-2-flash-GGUF/tree/780b126551f62603755e534952ad2942ac0ebcef))
+  of [Rumble-2-Flash](https://huggingface.co/Reson8/Rumble-2-Flash) by Reson8, based
+  on [Qwen3-ASR-0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) by Qwen (Apache
+  License, Version 2.0). Full license texts are bundled from `mobile/rumble/licenses/`.

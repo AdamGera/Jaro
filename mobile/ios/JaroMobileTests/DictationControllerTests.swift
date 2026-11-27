@@ -2078,6 +2078,52 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: model.folder.path), "nothing wrote after stop")
     }
 
+    func testQuickWiFiReconnectDuringMultilingualDownloadCancellationResumesInsteadOfStalling() async throws {
+        let model = try UltraStubModel()
+        defer { model.remove() }
+        UltraStubProtocol.script([.hang(800), .serve, .serve])
+        var allowed = true
+        let download = model.download(stallLimit: .seconds(30), mayDownload: { allowed })
+        download.start()
+        try await waitUntil { ParakeetUltraModel.bytesOnDisk(in: model.folder, files: model.files) == 800 }
+
+        allowed = false
+        download.connectionChanged()
+        XCTAssertTrue(download.isRunning, "task stays tracked until cancellation finishes")
+        allowed = true
+        download.connectionChanged()
+
+        try await waitUntil { download.state == .loading }
+        XCTAssertTrue(ParakeetUltraModel.isDownloaded(in: model.folder, files: model.files))
+    }
+
+    func testTurningMultilingualModelOffDuringWiFiCancellationDoesNotRestartLater() async throws {
+        let model = try UltraStubModel()
+        defer { model.remove() }
+        UltraStubProtocol.script([.hang(800), .serve, .serve])
+        var allowed = true
+        var wanted = true
+        let download = model.download(stallLimit: .seconds(30), mayDownload: { allowed }, isWanted: { wanted })
+        download.start()
+        try await waitUntil { ParakeetUltraModel.bytesOnDisk(in: model.folder, files: model.files) == 800 }
+
+        allowed = false
+        download.connectionChanged()
+        XCTAssertTrue(download.isRunning, "task stays tracked so stop waits for cancellation")
+        wanted = false
+        await download.stop()
+        XCTAssertEqual(download.state, .idle)
+        XCTAssertFalse(download.isRunning)
+
+        let requestsAtStop = UltraStubProtocol.requested.count
+        allowed = true
+        download.connectionChanged()
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(download.state, .idle)
+        XCTAssertFalse(download.isRunning)
+        XCTAssertEqual(UltraStubProtocol.requested.count, requestsAtStop)
+    }
+
     func testParakeetUltrasFilesArePinnedAndComplete() throws {
         let files = ParakeetUltraModel.files
         XCTAssertEqual(Set(files.map(\.path)).count, files.count)
@@ -2732,6 +2778,8 @@ private struct UltraStubModel {
 
     func download(
         stallLimit: Duration = .seconds(1),
+        mayDownload: @escaping () -> Bool = { true },
+        isWanted: @escaping () -> Bool = { true },
         now: @escaping () -> Date = { Date() }
     ) -> ParakeetUltraDownload {
         let configuration = URLSessionConfiguration.ephemeral
@@ -2743,6 +2791,8 @@ private struct UltraStubModel {
             session: URLSession(configuration: configuration),
             stallLimit: stallLimit,
             backoff: { _ in 0 },
+            mayDownload: mayDownload,
+            isWanted: isWanted,
             now: now
         )
     }

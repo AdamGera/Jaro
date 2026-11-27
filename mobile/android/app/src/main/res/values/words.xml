@@ -1,0 +1,32 @@
+<resources xmlns:tools="http://schemas.android.com/tools" tools:ignore="MissingTranslation">
+    <string name="words_title">Words</string>
+    <string name="words_import">Import words</string>
+    <string name="words_export">Export words</string>
+    <string name="words_undo">Undo last import</string>
+    <string name="words_import_error">Couldn’t read this Jaro words file.</string>
+    <string name="words_export_error">Couldn’t save the words file.</string>
+    <string name="words_exported">Saved the words file.</string>
+    <string name="words_export_partial">Saved the words file. Some entries could not be exported.</string>
+    <string name="words_replacements">Word replacements</string>
+    <string name="words_replacements_detail">Write a phrase your way whenever Jaro hears those words.</string>
+    <string name="words_heard">When I say</string>
+    <string name="words_write">Write instead</string>
+    <string name="words_add">Add</string>
+    <string name="words_save">Save</string>
+    <string name="words_edit">Edit</string>
+    <string name="words_remove">Remove</string>
+    <string name="words_cancel">Cancel</string>
+    <string name="words_review">Review words</string>
+    <string name="words_review_counts">New vocabulary terms: %1$d\nReplacements to apply: %2$d</string>
+    <string name="words_review_newer">This file uses a newer version. Review the entries Jaro can import.</string>
+    <string name="words_review_skipped">Entries skipped: %1$d</string>
+    <string name="words_review_clashes">Select which imported replacements to use in place of your saved rules.</string>
+    <string name="words_review_saved">Saved: %1$s</string>
+    <string name="words_review_imported">Imported: %1$s</string>
+    <string name="words_need_letters">Enter the words you say.</string>
+    <string name="words_hidden">Remove hidden characters.</string>
+    <string name="words_too_long">Shorten this replacement.</string>
+    <string name="words_need_output">Enter the text Jaro should write.</string>
+    <string name="words_duplicate">A replacement for these words already exists.</string>
+    <string name="words_full">Remove a replacement before adding another.</string>
+</resources>

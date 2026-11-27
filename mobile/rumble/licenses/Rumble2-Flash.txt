@@ -1,0 +1,14 @@
+Rumble-2-Flash is a multilingual speech recognition model by Reson8, based on
+Qwen3-ASR-0.6B by Qwen, and licensed under the Apache License, Version 2.0.
+https://huggingface.co/Reson8/Rumble-2-Flash
+https://huggingface.co/Qwen/Qwen3-ASR-0.6B
+
+Jaro's optional download is the Q4_K GGUF conversion by cstr. The conversion
+quantizes the model and excludes the auxiliary CTC head.
+https://huggingface.co/cstr/rumble-2-flash-GGUF/tree/780b126551f62603755e534952ad2942ac0ebcef
+
+The local inference runtime builds a subset of CrispASR v0.8.55 and its ggml
+fork under the MIT License. Jaro patches the ggml build to disable the embedded
+debugger and process-wide exception hook.
+https://github.com/CrispStrobe/CrispASR/tree/0e591b2409e47824a242baae80255d150e9aa0a9
+https://github.com/CrispStrobe/ggml/tree/97098170cff27586706c503245a0a5008635f654

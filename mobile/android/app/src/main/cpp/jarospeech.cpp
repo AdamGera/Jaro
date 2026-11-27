@@ -120,7 +120,9 @@ Java_ai_jard_jaro_speech_Whisper_decode(JNIEnv *env, jobject, jlong handle, jboo
     params.abort_callback = [](void *mine) { return abandoned.load() == *static_cast<const jlong *>(mine); };
     params.abort_callback_user_data = &job;
     params.no_context = true;
-    params.no_timestamps = true;
+    // For longer recordings, start the next window at the last timestamped segment
+    // instead of cutting the audio at 30 seconds, which can drop speech at the seam.
+    params.no_timestamps = count <= 30 * 16000;
     params.print_progress = params.print_realtime = params.print_timestamps = params.print_special = false;
     params.suppress_nst = true;
     // A fresh decoding state for every dictation (3 ms), the weights staying loaded: a state kept from an

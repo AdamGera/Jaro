@@ -1,5 +1,12 @@
-# libjarospeech resolves this class and method by their JNI names.
+# The native speech engines bind these methods by their JNI names.
 -keep class ai.jard.jaro.speech.Whisper {
+    native <methods>;
+}
+-keep class ai.jard.jaro.speech.Parakeet {
+    native <methods>;
+}
+
+-keep class ai.jard.jaro.speech.Rumble2 {
     native <methods>;
 }
 

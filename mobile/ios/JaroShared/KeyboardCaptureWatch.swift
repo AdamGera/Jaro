@@ -69,6 +69,8 @@ nonisolated struct KeyboardResult: Equatable, Sendable {
     let stages: DictationStages?
     let translationFailure: TranslationFailure?
     let expiresAt: TimeInterval?
+    /// Detected language code when an automatic multilingual engine overrides the keyboard language.
+    let language: String?
 
     init(
         id: String,
@@ -76,7 +78,8 @@ nonisolated struct KeyboardResult: Equatable, Sendable {
         heard: String? = nil,
         stages: DictationStages? = nil,
         translationFailure: TranslationFailure? = nil,
-        expiresAt: TimeInterval? = nil
+        expiresAt: TimeInterval? = nil,
+        language: String? = nil
     ) {
         self.id = id
         self.transcript = transcript
@@ -84,6 +87,7 @@ nonisolated struct KeyboardResult: Equatable, Sendable {
         self.stages = stages
         self.translationFailure = translationFailure
         self.expiresAt = expiresAt
+        self.language = language
     }
 
     func isOfferExpired(at now: TimeInterval) -> Bool {

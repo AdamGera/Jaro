@@ -20,6 +20,7 @@ struct JaroMobileApp: App {
         MultilingualParakeetSettings().applyLaunchArguments()
         KeyboardParakeetSettings().applyLaunchArguments()
         SettingsSnapshotFixture.applyDefaults()
+        JaroWordsInbox.sweep()
     }
 
     private static var initialOpenedFromKeyboard: Bool {
@@ -50,6 +51,8 @@ struct JaroMobileApp: App {
                     openPage: $openPage
                 )
                 .onOpenURL { url in
+                    // A Jaro words file from AirDrop, Files or Open in Jaro: its review sheet.
+                    if JaroWordsInbox.open(url) { return }
                     guard let request = KeyboardLaunchRequest(url: url) else { return }
                     if case .setup = request {
                         openedFromKeyboard = false

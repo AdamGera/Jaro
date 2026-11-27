@@ -4,10 +4,11 @@ Jaro is a native Android keyboard with on-device dictation. It runs on ARM64 pho
 
 Open Jaro, grant microphone access, then enable and select the Jaro keyboard in Android Settings. Open an editable field and hold the Jaro key to speak. Release to insert the transcript. You can also tap the key to start and tap the check mark to finish. In Jaro itself, use **Dictate** to record text you can copy.
 
-- Typing includes swipe gestures, autocorrection, suggestions, accents, symbol and emoji panels, and shortcuts from the Android personal dictionary. The keyboard has English, Spanish, German, Norwegian Bokmål, French, and Italian layouts.
-- Dictation adds Dutch, Portuguese, Polish, and Russian. Choose a language or use Automatic, which follows the selected keyboard layout or the phone language. Choose Polished, Casual, Notes, or Verbatim. Dictation settings also include custom vocabulary, spoken punctuation, and list formatting.
-- Labs includes an optional signature, number row, and English emoji suggestions. Changes apply on the phone.
-- The bundled Whisper Tiny model works offline after installation. Choose **Download** in Dictation settings for the optional 190 MB Whisper Small model. The build verifies the bundled model, and the app verifies the optional model against a pinned SHA-256 hash. Jaro's Android speech engine uses Whisper and whisper.cpp.
+- Typing includes swipe gestures, autocorrection, suggestions, accents, symbol and emoji panels, and shortcuts from the Android personal dictionary. The keyboard has English, Spanish, German, Norwegian Bokmål, French, Italian, Portuguese, and Russian layouts.
+- Dictation also supports Dutch, Polish, and Russian. Choose a language or use Automatic, which follows the selected keyboard layout or the phone language. Choose Polished, Casual, Notes, or Verbatim. Dictation settings also include custom vocabulary, spoken punctuation, and list formatting. Under **Dictation → Words**, add replacements or import and export vocabulary and replacements as a `.jarowords` file.
+- Hide the keyboard during dictation to finish and enter the result in the same field. Moving to another field discards unfinished dictation.
+- In **Labs**, enable **Dictate from Quick Settings** to add a tile that opens a recording panel and copies the result. Labs also includes an optional signature, number row and emoji suggestions.
+- The bundled Whisper Tiny model works offline after installation. Choose **Download** in Dictation settings for the optional 190 MB Whisper Small model. The build verifies the bundled model, and the app verifies the optional model against a pinned SHA-256 hash. Under **Labs → Faster English dictation**, download the optional 135 MB Parakeet model for English. Whisper remains the default and handles other languages.
 
 In the standard build, **Check for updates** on Home opens the Jaro Releases page in a browser. The sideloaded Preview build can also check and display its own updates inside the app. **Send feedback** opens the Jaro issue tracker.
 
@@ -21,7 +22,13 @@ Install JDK 17, Android SDK Platform 36, Android NDK 27.1.12297006, and CMake 3.
 ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
 ```
 
-Gradle fetches the pinned Whisper Tiny model and whisper.cpp when needed. The project bundles the platform-independent typing data. The debug APK is under `app/build/outputs/apk/debug/`.
+The build fetches the pinned Whisper Tiny weights, whisper.cpp, and transcribe.cpp when needed. The optional models are downloaded in the app. The project bundles the platform-independent typing data. The debug APK is under `app/build/outputs/apk/debug/`.
+
+### Rumble2 Flash build
+
+The standard build includes Whisper and supports the optional English-only Parakeet model. To include Rumble2 Flash, build the shared Android ARM64 library from the mobile runtime using the Android NDK. Set `JARO_ANDROID_RUMBLE_LIBRARY` to the resulting `libjaro_rumble.so` and `JARO_ANDROID_RUMBLE_SHA256` to its SHA-256 before running Gradle. The build requires 16 KiB ELF load segments and bundles the shared runtime notices. [Mobile runtime](../rumble/)
+
+This build enables Rumble2 Flash by default. Open **Settings → Dictation → Rumble2 Flash** to download the 445 MB model or switch models. Rumble2 Flash handles up to 10 seconds per dictation. With **Automatic** selected, it detects the spoken language and applies Jaro’s available formatting for that language. Jaro uses its standard speech engine for longer dictation, translation, or when Rumble2 Flash is unavailable.
 
 ## Release artifacts
 
@@ -37,7 +44,7 @@ Before publishing, exercise first launch, microphone denial and recovery, keyboa
 
 ## Preview verification
 
-Debug and release builds passed 155 unit tests each and Android lint. The release APK and AAB built with a disposable test key. On ARM64 Android 16.1, an offline upgrade from build 1 to build 2 preserved the selected keyboard, microphone grant, and number row setting. The number row typed into a separate app before and after the upgrade. The packaged speech engine transcribed a fixture with networking disabled. The setup flow recovered when microphone access was denied and then granted. Physical microphone insertion and TalkBack are pending.
+Debug and release builds passed 163 unit tests each and Android lint. The release APK and AAB built with a disposable test key. On ARM64 Android 16.1, an offline upgrade from build 1 to build 2 preserved the selected keyboard, microphone grant, and number row setting. The number row typed into a separate app before and after the upgrade. The setup flow recovered when microphone access was denied and then granted. The configured Rumble2 Flash APK passed offline Spanish and French tests using both automatic and explicit language selection. The regular engine handled longer recordings and low memory. Physical microphone insertion and TalkBack are pending.
 
 ## Sideloaded Preview builds
 

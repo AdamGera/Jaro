@@ -78,7 +78,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         capture = MicCapture(LocalSpeech(applicationContext),
             update = { next, reason -> phase = next; notice = speechNote(reason) },
-            meter = {}, insert = { text, _ -> transcript = text })
+            meter = {}, insert = { result, _ -> transcript = result.text })
         page = prefs.getInt("page", 0).coerceIn(0, 3)
         // The keyboard's Settings tool opens Jaro on its Keyboard page for the launch that carried the extra.
         // The task keeps its base intent, so a Recents relaunch still carries it: a restored or history
@@ -89,19 +89,21 @@ class MainActivity : ComponentActivity() {
         for (name in listOf(Settings.Secure.DEFAULT_INPUT_METHOD, Settings.Secure.ENABLED_INPUT_METHODS))
             contentResolver.registerContentObserver(Settings.Secure.getUriFor(name), false, changed)
         refresh()
-        ModelStore.refresh(this)
+        ModelStore.small.refresh(this)
+        ModelStore.english.refresh(this)
+        if (BuildConfig.RUMBLE2_ENABLED) ModelStore.rumble2.refresh(this)
         setContent {
             JaroTheme {
                 BackHandler(page in 1..2) { go(page - 1) }
-                val model = ModelStore.state.collectAsState().value
-                if (page == 3) JaroSettings(setup, speech, typing, model, { ModelStore.download(this) },
+                val model = ModelStore.small.state.collectAsState().value
+                if (page == 3) JaroSettings(setup, speech, typing, model, { ModelStore.small.download(this) },
                     phase, transcript, notice, ::dictate, capture::cancel, { transcript = "" }, { go(it) },
                     { startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)) },
                     startPage = startPage)
                 else SetupScreen(page, setup, ::go, ::askForMic,
                     enable = { enabling = true; startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS)) },
                     choose = { imm.showInputMethodPicker() }, model = model,
-                    download = { ModelStore.download(this) })
+                    download = { ModelStore.small.download(this) })
             }
         }
     }
@@ -150,11 +152,16 @@ class MainActivity : ComponentActivity() {
         }
     }
     override fun onStop() { capture.cancel(); super.onStop() }
+    @Suppress("DEPRECATION")
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_RUNNING_LOW && level != TRIM_MEMORY_UI_HIDDEN) SpeechModel.releaseSoon()
+    }
     override fun onDestroy() { capture.close(); contentResolver.unregisterContentObserver(changed); super.onDestroy() }
 }
 
 @Composable
-private fun JaroTheme(content: @Composable () -> Unit) {
+internal fun JaroTheme(content: @Composable () -> Unit) {
     val ink = colorResource(R.color.ink)
     val page = colorResource(R.color.page)
     val scheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()
@@ -304,16 +311,20 @@ private fun SetupRow(title: String, note: String, ready: Boolean, action: String
     }
 }
 
-/** The speech model's state in a few words, the same in setup and in Dictation. */
-@Composable internal fun modelStatus(state: ModelStore.State) = when (state) {
+/** The speech model's state in a few words, shared by setup, Dictation, and optional Labs models. */
+@Composable internal fun modelStatus(
+    state: ModelStore.State,
+    sizeMb: Int = 190,
+    builtInFallback: Boolean = true,
+) = when (state) {
     ModelStore.State.Ready -> stringResource(R.string.model_ready)
-    ModelStore.State.Available -> stringResource(R.string.model_available)
+    ModelStore.State.Available -> stringResource(if (builtInFallback) R.string.model_available else R.string.model_optional_available)
     is ModelStore.State.Retry -> stringResource(when (state.problem) {
-        ModelStore.Problem.Connection -> R.string.model_no_connection
-        ModelStore.Problem.Space -> R.string.model_no_space
-        ModelStore.Problem.Server -> R.string.model_stopped
+        ModelStore.Problem.Connection -> if (builtInFallback) R.string.model_no_connection else R.string.model_optional_no_connection
+        ModelStore.Problem.Space -> if (builtInFallback) R.string.model_no_space else R.string.model_optional_no_space
+        ModelStore.Problem.Server -> if (builtInFallback) R.string.model_stopped else R.string.model_optional_stopped
     })
-    is ModelStore.State.Loading -> stringResource(R.string.model_loading, state.percent)
+    is ModelStore.State.Loading -> stringResource(R.string.model_loading, sizeMb, state.percent)
 }
 internal fun modelAction(state: ModelStore.State) = when (state) {
     ModelStore.State.Available -> R.string.model_download

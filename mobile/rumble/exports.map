@@ -1,0 +1,10 @@
+{
+    global:
+        jaro_rumble_open;
+        jaro_rumble_transcribe;
+        jaro_rumble_transcribe_detected;
+        jaro_rumble_cancel;
+        jaro_rumble_free_text;
+        jaro_rumble_close;
+    local: *;
+};

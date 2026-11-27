@@ -1,4 +1,7 @@
+import java.io.RandomAccessFile
 import java.net.URI
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.DigestInputStream
@@ -82,6 +85,65 @@ val previewCode = providers.gradleProperty("jaroPreviewBuild").map { input ->
         ?: error("jaroPreviewBuild must be an Android version code.")
 }.orElse(1)
 
+// Rumble2 is built from the shared mobile runtime and is available only in explicitly configured builds.
+val rumbleLibrary = providers.environmentVariable("JARO_ANDROID_RUMBLE_LIBRARY").orNull?.let(::file)
+val rumbleSha = providers.environmentVariable("JARO_ANDROID_RUMBLE_SHA256").orNull
+if (rumbleLibrary != null) {
+    check(rumbleLibrary.isFile && rumbleLibrary.name == "libjaro_rumble.so") {
+        "JARO_ANDROID_RUMBLE_LIBRARY must point to libjaro_rumble.so."
+    }
+    check(rumbleSha?.matches(Regex("[a-f0-9]{64}")) == true) {
+        "Set JARO_ANDROID_RUMBLE_SHA256 to the approved runtime's checksum."
+    }
+}
+val verifyRumbleLibrary by tasks.registering {
+    if (rumbleLibrary != null) {
+        inputs.file(rumbleLibrary)
+        inputs.property("sha256", rumbleSha.orEmpty())
+        doLast {
+            val actual = MessageDigest.getInstance("SHA-256").digest(rumbleLibrary.readBytes()).joinToString("") { "%02x".format(it) }
+            check(actual == rumbleSha) { "Unverified Rumble2 runtime" }
+            RandomAccessFile(rumbleLibrary, "r").use { elf ->
+                fun read(size: Int) = ByteBuffer.wrap(ByteArray(size).also(elf::readFully)).order(ByteOrder.LITTLE_ENDIAN)
+                val header = read(64)
+                check(header.getInt(0) == 0x464c457f && header[4] == 2.toByte() && header[5] == 1.toByte() &&
+                    header.getShort(16) == 3.toShort() && header.getShort(18) == 183.toShort()) {
+                    "Rumble2 runtime must be an ARM64 shared library."
+                }
+                val offset = header.getLong(32)
+                val stride = header.getShort(54).toInt()
+                val segments = header.getShort(56).toInt()
+                check(stride >= 56 && segments > 0) { "Rumble2 runtime has no ELF program headers." }
+                var loadable = false
+                repeat(segments) { index ->
+                    elf.seek(offset + index.toLong() * stride)
+                    val segment = read(56)
+                    if (segment.getInt(0) == 1) {
+                        loadable = true
+                        val fileOffset = segment.getLong(8)
+                        val vaddr = segment.getLong(16)
+                        check(segment.getLong(48) >= 16_384 && fileOffset % 16_384 == vaddr % 16_384) {
+                            "Rumble2 runtime requires 16 KiB-aligned ELF load segments."
+                        }
+                    }
+                }
+                check(loadable) { "Rumble2 runtime has no loadable segment." }
+            }
+        }
+    }
+}
+
+val rumbleAssets = layout.buildDirectory.dir("generated/rumble/assets")
+val copyRumbleNotices by tasks.registering(Sync::class) {
+    if (rumbleLibrary != null) {
+        from(rootProject.file("../rumble/licenses")) {
+            exclude("Apache-2.0.txt") // Already bundled as assets/licenses/apache-2.0.txt.
+            into("licenses")
+        }
+        into(rumbleAssets)
+    }
+}
+
 android {
     namespace = "ai.jard.jaro"
     compileSdk = 36
@@ -91,12 +153,20 @@ android {
         applicationId = "ai.jard.jaro"
         minSdk = 31
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.0.9"
+        versionCode = 2
+        versionName = "0.0.12"
+        buildConfigField("boolean", "RUMBLE2_ENABLED", (rumbleLibrary != null).toString())
         ndk { abiFilters += "arm64-v8a" }
         externalNativeBuild.cmake {
             arguments += listOf("-DANDROID_STL=c++_static", "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON")
-            targets += "jarospeech"
+            targets += listOf("jarospeech", "jaroenglish")
+            if (rumbleLibrary != null) {
+                arguments += listOf("-DJARO_RUMBLE_LIBRARY=${rumbleLibrary.absolutePath}",
+                    "-DJARO_RUMBLE_INCLUDE=${rootProject.file("../rumble/include").absolutePath}")
+                targets += "jarorumblejni"
+            } else {
+                arguments += "-DJARO_RUMBLE_LIBRARY="
+            }
         }
     }
     externalNativeBuild.cmake {
@@ -136,8 +206,9 @@ android {
     sourceSets["debug"].java.srcDir("src/play/java")
     sourceSets["release"].java.srcDir("src/play/java")
     packaging.resources.excludes += "DebugProbesKt.bin"
-    buildFeatures { compose = true }
-    androidResources { noCompress += listOf("bin", "hextm", "valid", "capitals") }
+    if (rumbleLibrary != null) sourceSets["main"].assets.srcDir(rumbleAssets)
+    buildFeatures { compose = true; buildConfig = true }
+    androidResources { noCompress += listOf("bin", "jarotm", "valid", "capitals") }
     sourceSets["main"].assets.srcDir(modelAssets)
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -171,9 +242,9 @@ val verifyInter by tasks.registering {
 // Pin the licensed HXTM files. An older prototype word-pair list cannot slip into an APK.
 val verifyTypingModels by tasks.registering {
     val dir = file("src/main/assets/typing")
-    val names = listOf("en.hextm", "es.hextm", "de.hextm", "nb.hextm", "fr.hextm", "it.hextm", "en.valid",
-        "es.valid", "de.valid", "nb.valid", "fr.valid", "it.valid",
-        "en.capitals", "es.capitals", "de.capitals", "fr.capitals", "it.capitals")
+    val names = listOf("en.jarotm", "es.jarotm", "de.jarotm", "nb.jarotm", "fr.jarotm", "it.jarotm", "pt.jarotm", "en.valid",
+        "es.valid", "de.valid", "nb.valid", "fr.valid", "it.valid", "pt.valid",
+        "en.capitals", "es.capitals", "de.capitals", "fr.capitals", "it.capitals", "pt.capitals")
     val manifest = dir.resolve("SHA256SUMS")
     inputs.files(names.map(dir::resolve) + manifest)
     doLast {
@@ -185,7 +256,10 @@ val verifyTypingModels by tasks.registering {
         }
     }
 }
-tasks.named("preBuild").configure { dependsOn(prepareSpeechModel, verifyInter, verifyTypingModels) }
+tasks.named("preBuild").configure {
+    dependsOn(prepareSpeechModel, verifyInter, verifyTypingModels)
+    if (rumbleLibrary != null) dependsOn(verifyRumbleLibrary, copyRumbleNotices)
+}
 
 dependencies {
     implementation("androidx.activity:activity-compose:1.10.1")

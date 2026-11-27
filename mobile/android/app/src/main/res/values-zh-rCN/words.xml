@@ -1,0 +1,32 @@
+<resources>
+    <string name="words_title">词汇</string>
+    <string name="words_import">导入词汇</string>
+    <string name="words_export">导出词汇</string>
+    <string name="words_undo">撤销上次导入</string>
+    <string name="words_import_error">无法读取此 Jaro 词汇文件。</string>
+    <string name="words_export_error">无法保存词汇文件。</string>
+    <string name="words_exported">已保存词汇文件。</string>
+    <string name="words_export_partial">已保存词汇文件。部分条目无法导出。</string>
+    <string name="words_replacements">词语替换</string>
+    <string name="words_replacements_detail">说出指定词语时，Jaro 会写成你设置的文字。</string>
+    <string name="words_heard">当我说</string>
+    <string name="words_write">替换为</string>
+    <string name="words_add">添加</string>
+    <string name="words_save">保存</string>
+    <string name="words_edit">编辑</string>
+    <string name="words_remove">移除</string>
+    <string name="words_cancel">取消</string>
+    <string name="words_review">查看词汇</string>
+    <string name="words_review_counts">新增词条：%1$d\n要应用的替换：%2$d</string>
+    <string name="words_review_newer">此文件使用较新版本。请查看 Jaro 可以导入的条目。</string>
+    <string name="words_review_skipped">已跳过的条目：%1$d</string>
+    <string name="words_review_clashes">选择要覆盖现有规则的导入替换规则。</string>
+    <string name="words_review_saved">已保存：%1$s</string>
+    <string name="words_review_imported">已导入：%1$s</string>
+    <string name="words_need_letters">请输入你会说的词语。</string>
+    <string name="words_hidden">请移除隐藏字符。</string>
+    <string name="words_too_long">请缩短此替换规则。</string>
+    <string name="words_need_output">请输入 Jaro 应写入的文字。</string>
+    <string name="words_duplicate">这些词语已有替换规则。</string>
+    <string name="words_full">请先移除一条规则，再添加新规则。</string>
+</resources>

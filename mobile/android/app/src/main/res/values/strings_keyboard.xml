@@ -78,6 +78,7 @@
     <string name="keyboard_paste_spoken">Paste as spoken</string>
     <string name="keyboard_menu_clean">Clean up what I say</string>
     <string name="keyboard_menu_translate">Translate what I say</string>
+    <string name="keyboard_menu_volume">Volume</string>
     <string name="keyboard_menu_popups">Key pop-ups</string>
     <string name="keyboard_menu_haptics">Key haptics</string>
     <string name="keyboard_on">On</string>

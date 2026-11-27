@@ -65,15 +65,15 @@ internal class MicCapture(
     private val recognizer: Recognizer,
     private val update: (SpeechPhase, String?) -> Unit,
     private val meter: (Float) -> Unit,
-    private val insert: (String, SpeechOptions) -> Unit,
+    private val insert: (SpeechResult, Long) -> Unit,
 ) {
-    private class Ticket(val options: SpeechOptions) {
+    private class Ticket(val options: SpeechOptions, val field: Long) {
         val job = jobs.incrementAndGet()
         @Volatile var finish = false
         @Volatile var cancelled = false
         var done = false
         var note: String? = null
-        var text: String? = null
+        var result: SpeechResult? = null
     }
     private val main = Handler(Looper.getMainLooper())
     private val recorder = Executors.newSingleThreadExecutor { Thread(it, "Jaro dictation") }
@@ -89,14 +89,14 @@ internal class MicCapture(
     /** Whether a new dictation can start: nothing holds the microphone. */
     val canStart get() = active == null
 
-    fun start(options: SpeechOptions) {
+    fun start(options: SpeechOptions, field: Long = 0) {
         if (active != null) return
-        val ticket = Ticket(options)
+        val ticket = Ticket(options, field)
         active = ticket
         publish(SpeechPhase.Opening)
         // The model loads while the person speaks, not after they let go.
         transcriber.execute {
-            try { if (!ticket.cancelled) recognizer.prepare() } catch (_: Throwable) {}
+            try { if (!ticket.cancelled) recognizer.prepare(ticket.options) } catch (_: Throwable) {}
         }
         recorder.execute {
             try {
@@ -151,16 +151,16 @@ internal class MicCapture(
     }
 
     /** A dictation ends: recording stopped with nothing to transcribe, or its text is ready. */
-    private fun complete(ticket: Ticket, note: String? = null, text: String? = null) = main.post {
+    private fun complete(ticket: Ticket, note: String? = null, result: SpeechResult? = null) = main.post {
         if (active === ticket) active = null
         if (ticket.cancelled) { publish(current()); return@post }
-        ticket.done = true; ticket.note = note; ticket.text = text
+        ticket.done = true; ticket.note = note; ticket.result = result
         if (ticket !in queue) queue.addLast(ticket)
         var shown: String? = null
         while (queue.firstOrNull()?.done == true) {
             val next = queue.removeFirst()
             shown = next.note ?: shown
-            next.text?.let { insert(it, next.options) }
+            next.result?.let { insert(it, next.field) }
         }
         publish(current(), shown)
     }
@@ -177,14 +177,15 @@ internal class MicCapture(
             try {
                 if (ticket.cancelled) return@execute
                 val options = ticket.options
-                val raw = recognizer.decode(pcm, count, options.spoken.code, options.translate,
-                    options.vocabulary.takeIf { it.isNotEmpty() }?.joinToString(", "), ticket.job)
+                val raw = recognizer.decode(pcm, count, options, ticket.job)
                 if (ticket.cancelled) return@execute
-                when (val text = raw?.let { SpokenText.format(it, options) }) {
-                    null -> complete(ticket, "Couldn’t transcribe. Try again.")
-                    "" -> complete(ticket, "No speech heard")
-                    else -> complete(ticket, note, text)
+                if (raw == null) {
+                    complete(ticket, "Couldn’t transcribe. Try again.")
+                    return@execute
                 }
+                val text = SpokenText.format(raw.text, options, raw.language)
+                if (text.isEmpty()) complete(ticket, "No speech heard")
+                else complete(ticket, note, raw.copy(text = text))
             } catch (_: UnsatisfiedLinkError) {
                 complete(ticket, "Speech model unavailable")
             } catch (_: Exception) {

@@ -1,6 +1,7 @@
 package ai.jard.jaro.keyboard
 
 import android.content.Context
+import android.media.AudioManager
 import android.view.Gravity
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -54,6 +55,7 @@ internal class SpeechMenu(context: Context, private val ime: JaroKeyboard,
                 row(s(R.string.keyboard_menu_translate), onOff(prefs.translation)) {
                     prefs.translation = !prefs.translation; ime.nextEnglish = null; home()
                 }
+                if (ime.feedback.volumeInMenu) row(s(R.string.keyboard_menu_volume), "") { close(); showVolumePanel() }
                 // The system's own switcher sits in the navigation bar; this reaches the next keyboard without it.
                 row(s(R.string.keyboard_next), "") { close(); ime.nextIme() }
             }
@@ -78,6 +80,11 @@ internal class SpeechMenu(context: Context, private val ime: JaroKeyboard,
             }
             Page.Accents -> Unit
         }
+    }
+
+    private fun showVolumePanel() {
+        context.getSystemService(AudioManager::class.java)?.adjustSuggestedStreamVolume(
+            AudioManager.ADJUST_SAME, AudioManager.USE_DEFAULT_STREAM_TYPE, AudioManager.FLAG_SHOW_UI)
     }
 
     private fun row(label: String, value: String, click: () -> Unit) {

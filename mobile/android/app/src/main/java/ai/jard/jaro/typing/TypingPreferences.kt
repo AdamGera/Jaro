@@ -57,6 +57,11 @@ internal class TypingPreferences(context: Context) {
     var smartQuotes: Boolean
         get() = prefs.getBoolean(SMART_QUOTES, false)
         set(value) { prefs.edit().putBoolean(SMART_QUOTES, value).apply() }
+    /** Labs › Keyboard › Volume in the Jaro menu: a Volume row that opens Android's own volume panel.
+     * Off by default. */
+    var volumeInMenu: Boolean
+        get() = prefs.getBoolean(VOLUME_IN_MENU, false)
+        set(value) { prefs.edit().putBoolean(VOLUME_IN_MENU, value).apply() }
 
     // Remember only explicit rejection of this exact pair in this language; never save typed text.
     private fun pair(language: String, original: String, replacement: String): String {
@@ -79,5 +84,6 @@ internal class TypingPreferences(context: Context) {
         const val EMOJI_SUGGESTIONS = "emojiSuggestions"
         const val KEYBOARD_TOOLS = "keyboardTools"
         const val SMART_QUOTES = "smartQuotes"
+        const val VOLUME_IN_MENU = "volumeInMenu"
     }
 }

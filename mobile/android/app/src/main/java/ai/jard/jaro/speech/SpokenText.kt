@@ -7,8 +7,7 @@ internal object SpokenText {
     /** Custom vocabulary, spoken symbols and counts, cleanup, the style, the vocabulary's spellings
      * again (a style can capitalize "iPhone"), then Lowercase, the same wherever Jaro dictates.
      * Translation already happened in Whisper, so a translated dictation is English. */
-    fun format(raw: String, options: SpeechOptions): String {
-        val language = if (options.translate) "en" else options.spoken.code
+    fun format(raw: String, options: SpeechOptions, language: String = options.outputLanguage): String {
         val spelled = VocabularySpelling.apply(options.vocabulary, raw)
         if (options.style == Style.Verbatim || raw.isBlank()) return finished(style(spelled, options.style, language), options)
         val spoken = SpokenCleanup.counts(SpokenCleanup.symbols(spelled.trim(), language), language)
@@ -19,7 +18,8 @@ internal object SpokenText {
     }
 
     private fun finished(styled: String, options: SpeechOptions): String {
-        val text = VocabularySpelling.apply(options.vocabulary, styled)
+        val spelled = VocabularySpelling.apply(options.vocabulary, styled)
+        val text = if (options.translate) spelled else WordReplacements.apply(options.replacements, spelled)
         return if (options.lowercase) text.lowercase(Locale.ROOT) else text
     }
 

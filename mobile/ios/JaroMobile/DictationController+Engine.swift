@@ -174,8 +174,15 @@ extension DictationController {
 
     /// Turn off beside the multilingual model's status, as the switch in Experiments does.
     func turnOffMultilingualParakeet() {
+        SpeechModelDownloadNetwork.shared.forgetMobileData(for: .multilingual)
         MultilingualParakeetSettings().isEnabled = false
         multilingualParakeetChanged()
+    }
+
+    /// Use mobile data beside the multilingual model's Wi-Fi waiting line.
+    func useMobileDataForMultilingualParakeet() {
+        SpeechModelDownloadNetwork.shared.allowMobileData(for: .multilingual)
+        multilingualDownload.connectionChanged()
     }
 
     /// Before iOS 26: Parakeet loads at launch once downloaded, as before. The recognizer gets

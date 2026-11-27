@@ -217,10 +217,17 @@ nonisolated enum ParakeetUltraModel {
         }
         if offset < file.size {
             var request = URLRequest(url: url(for: file, base: base))
+            request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
             if offset > 0 {
                 request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
             }
-            let writer = try PartialFileWriter(url: partial, offset: offset, onBytes: onBytes)
+            let writer = try PartialFileWriter(
+                url: partial,
+                offset: offset,
+                expectedSize: file.size,
+                enforceHuggingFaceHosts: Self.isHuggingFaceHost(request.url?.host),
+                onBytes: onBytes
+            )
             try await writer.run(request, session: session)
         }
         guard size(of: partial) == file.size, try sha256(of: partial) == file.sha256 else {
@@ -229,6 +236,11 @@ nonisolated enum ParakeetUltraModel {
         }
         try? fileManager.removeItem(at: destination)
         try fileManager.moveItem(at: partial, to: destination)
+    }
+
+    static func isHuggingFaceHost(_ host: String?) -> Bool {
+        guard let host = host?.lowercased() else { return false }
+        return host == "huggingface.co" || host.hasSuffix(".cdn.hf.co") || host == "cas-bridge.xethub.hf.co"
     }
 
     static func sha256(of url: URL) throws -> String {
@@ -251,15 +263,25 @@ private nonisolated final class PartialFileWriter: NSObject, URLSessionDataDeleg
     private let lock = NSLock()
     private let url: URL
     private let offset: Int64
+    private let expectedSize: Int64
+    private let enforceHuggingFaceHosts: Bool
     private let onBytes: @Sendable (Int64) -> Void
     private var handle: FileHandle?
     private var written: Int64 = 0
     private var failure: Error?
     private var continuation: CheckedContinuation<Void, Error>?
 
-    init(url: URL, offset: Int64, onBytes: @escaping @Sendable (Int64) -> Void) throws {
+    init(
+        url: URL,
+        offset: Int64,
+        expectedSize: Int64,
+        enforceHuggingFaceHosts: Bool,
+        onBytes: @escaping @Sendable (Int64) -> Void
+    ) throws {
         self.url = url
         self.offset = offset
+        self.expectedSize = expectedSize
+        self.enforceHuggingFaceHosts = enforceHuggingFaceHosts
         self.onBytes = onBytes
         if !FileManager.default.fileExists(atPath: url.path) {
             FileManager.default.createFile(atPath: url.path, contents: nil)
@@ -281,15 +303,52 @@ private nonisolated final class PartialFileWriter: NSObject, URLSessionDataDeleg
 
     func urlSession(
         _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        guard enforceHuggingFaceHosts else {
+            completionHandler(request)
+            return
+        }
+        guard let target = request.url,
+              target.scheme?.lowercased() == "https",
+              target.user == nil, target.password == nil,
+              target.port == nil || target.port == 443,
+              ParakeetUltraModel.isHuggingFaceHost(target.host) else {
+            lock.withLock { failure = ParakeetUltraModel.DownloadError.badStatus(0) }
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+
+    func urlSession(
+        _ session: URLSession,
         dataTask: URLSessionDataTask,
         didReceive response: URLResponse,
         completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
     ) {
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let http = response as? HTTPURLResponse
+        let status = http?.statusCode ?? 0
+        let contentRange = http?.value(forHTTPHeaderField: "Content-Range")
         let opened: Bool = lock.withLock {
             guard status == 200 || status == 206, let handle = try? FileHandle(forWritingTo: url) else {
                 failure = ParakeetUltraModel.DownloadError.badStatus(status)
                 return false
+            }
+            if status == 206, offset > 0 {
+                let expectedRange = "bytes \(offset)-\(expectedSize - 1)/\(expectedSize)"
+                if let contentRange {
+                    if contentRange != expectedRange {
+                        failure = ParakeetUltraModel.DownloadError.corrupt(url.lastPathComponent)
+                        return false
+                    }
+                } else if enforceHuggingFaceHosts {
+                    failure = ParakeetUltraModel.DownloadError.corrupt(url.lastPathComponent)
+                    return false
+                }
             }
             let start = status == 206 ? offset : 0
             try? handle.truncate(atOffset: UInt64(start))
@@ -304,6 +363,12 @@ private nonisolated final class PartialFileWriter: NSObject, URLSessionDataDeleg
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         let total: Int64? = lock.withLock {
             guard let handle else { return nil }
+            let nextTotal = written + Int64(data.count)
+            guard nextTotal <= expectedSize else {
+                failure = ParakeetUltraModel.DownloadError.corrupt(url.lastPathComponent)
+                dataTask.cancel()
+                return nil
+            }
             do {
                 try handle.write(contentsOf: data)
             } catch {
@@ -311,7 +376,7 @@ private nonisolated final class PartialFileWriter: NSObject, URLSessionDataDeleg
                 dataTask.cancel()
                 return nil
             }
-            written += Int64(data.count)
+            written = nextTotal
             return written
         }
         if let total { onBytes(total) }

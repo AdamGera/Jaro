@@ -1066,6 +1066,7 @@ final class KeyboardViewController: UIInputViewController {
             heard: snap.heard,
             stages: snap.stages,
             translationFailure: snap.translationFailure,
+            language: snap.language,
             source: source
         )
         if source == "keyboard" {
@@ -1136,6 +1137,7 @@ final class KeyboardViewController: UIInputViewController {
         heard: String?,
         stages: DictationStages?,
         translationFailure: TranslationFailure? = nil,
+        language: String? = nil,
         source: String
     ) {
         // A two-thumb Dictate's words replace the range it picked, if the field still shows
@@ -1148,7 +1150,7 @@ final class KeyboardViewController: UIInputViewController {
             for: transcript,
             beforeContext: context.before,
             afterContext: context.after,
-            isWord: dictationWordCheck()
+            isWord: dictationWordCheck(language: language)
         )
         if learnsFromDictation {
             dictationEdits.willInsert(heard: heard, inserted: insertion, context: context)
@@ -1290,6 +1292,7 @@ final class KeyboardViewController: UIInputViewController {
             let change: String = switch reason {
             case nil: "dictating in the keyboard"
             case .multilingual: "multilingual model on, Dictate opens Jaro"
+            case .rumble: "Rumble2 Flash on, Dictate opens Jaro"
             case .speechModel: "speech model missing here, Dictate opens Jaro"
             case .memory, .openedHex: "short of memory, Dictate opens Jaro"
             }
@@ -1318,9 +1321,10 @@ final class KeyboardViewController: UIInputViewController {
 
     /// The dictation language's dictionary, for lowercasing a dictation that continues a
     /// sentence; nil (case kept) when the iPhone has no dictionary for it.
-    private func dictationWordCheck() -> ((String) -> Bool)? {
+    private func dictationWordCheck(language override: String? = nil) -> ((String) -> Bool)? {
         let settings = LanguageSettings()
-        let language = settings.resolvedDictationLanguage
+        let language = override
+            ?? settings.resolvedDictationLanguage
             ?? settings.effectiveDictationLanguage
             ?? Locale.preferredLanguages.first
             ?? "en-US"

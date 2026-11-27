@@ -321,15 +321,15 @@ extension TypingDecoder {
 }
 
 extension TypingDecoderModel {
-    /// The model for a language in the keyboard's bundle (`JaroKeyboard/TypingModel/<code>.hextm`,
+    /// The model for a language in the keyboard's bundle (`JaroKeyboard/TypingModel/<code>.jarotm`,
     /// built by `scripts/build-typing-model.py`), mapped once per process; nil when the build
     /// has none. The app's keyboard preview finds it inside the embedded keyboard.
     @MainActor static func bundled(_ language: String) -> TypingDecoderModel? {
         if let cached = loaded[language] { return cached }
-        var url = Bundle.main.url(forResource: language, withExtension: "hextm")
+        var url = Bundle.main.url(forResource: language, withExtension: "jarotm")
         if url == nil, let plugins = Bundle.main.builtInPlugInsURL,
            let keyboard = Bundle(url: plugins.appendingPathComponent("JaroKeyboard.appex")) {
-            url = keyboard.url(forResource: language, withExtension: "hextm")
+            url = keyboard.url(forResource: language, withExtension: "jarotm")
         }
         let model = url.flatMap { TypingDecoderModel(url: $0) }
         loaded[language] = model

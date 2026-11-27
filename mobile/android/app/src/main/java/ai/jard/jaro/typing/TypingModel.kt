@@ -296,7 +296,7 @@ internal class TypingModel private constructor(private val data: ByteBuffer, val
             val capitals = if (language + ".capitals" in names) read(language + ".capitals") else null
             val valid = if (language + ".valid" in names) read(language + ".valid") else null
             return assets.open("typing/never-suggest.tsv").bufferedReader().use { list ->
-                open(read(language + ".hextm"), language, valid, list, capitals)
+                open(read(language + ".jarotm"), language, valid, list, capitals)
             }
         }
         fun file(file: File, language: String): TypingModel {

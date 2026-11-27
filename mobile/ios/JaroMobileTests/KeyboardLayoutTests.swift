@@ -736,6 +736,7 @@ final class KeyboardLayoutTests: XCTestCase {
         let rows: [KeyboardLanguage: [String]] = [
             .english: ["qwertyuiop", "asdfghjkl", "zxcvbnm"],
             .norwegian: ["qwertyuiopå", "asdfghjkløæ", "zxcvbnm"],
+            .swedish: ["qwertyuiopå", "asdfghjklöä", "zxcvbnm"],
             .spanish: ["qwertyuiop", "asdfghjklñ", "zxcvbnm"],
             .german: ["qwertzuiopü", "asdfghjklöä", "yxcvbnm"],
             .italian: ["qwertyuiop", "asdfghjkl", "zxcvbnm"],
@@ -750,7 +751,9 @@ final class KeyboardLayoutTests: XCTestCase {
             .greek: ["ερτυθιοπ´", "ασδφγηξκλ", "ζχψωβνμ"],
             .serbianLatin: ["qwertzuiop", "asdfghjkl", "yxcvbnm"],
             .czech: ["qwertzuiop", "asdfghjkl´", "yxcvbnmˇ"],
+            .slovak: ["qwertzuiop", "asdfghjkl´", "yxcvbnmˇ"],
             .hungarian: ["qwertzuiop", "asdfghjkl", "yxcvbnm"],
+            .dutch: ["qwertyuiop", "asdfghjkl", "zxcvbnm"],
             .korean: ["ㅂㅈㄷㄱㅅㅛㅕㅑㅐㅔ", "ㅁㄴㅇㄹㅎㅗㅓㅏㅣ", "ㅋㅌㅊㅍㅠㅜㅡ"],
         ]
         for (language, expected) in rows {
@@ -779,11 +782,14 @@ final class KeyboardLayoutTests: XCTestCase {
             .romanian: [.qwerty, .qwertz, .azerty],
             .serbianLatin: [.qwertz, .qwerty, .azerty],
             .norwegian: [.own],
+            .swedish: [.own],
             .russian: [.own],
             .ukrainian: [.own],
             .greek: [.own],
             .czech: [.own, .qwerty],
+            .slovak: [.own, .qwerty],
             .hungarian: [.own, .qwerty],
+            .dutch: [.qwerty, .azerty, .qwertz],
             .korean: [.own],
         ]
         for language in KeyboardLanguage.allCases {
@@ -794,24 +800,28 @@ final class KeyboardLayoutTests: XCTestCase {
         XCTAssertEqual(KeyboardLayout(width: 402, language: .norwegian, letters: .qwertz).letters, .own, "not offered: its own")
         XCTAssertEqual(KeyboardLanguage.german.layoutName(.own), "QWERTZ – Deutsch")
         XCTAssertEqual(KeyboardLanguage.spanish.layoutName(.own), "QWERTY – Español")
+        XCTAssertEqual(KeyboardLanguage.swedish.layoutName(.own), "QWERTY – Svenska")
         XCTAssertEqual(KeyboardLanguage.english.layoutName(.dvorak), "Dvorak")
         XCTAssertEqual(KeyboardLanguage.czech.layoutName(.own), "QWERTZ – Čeština")
         XCTAssertEqual(KeyboardLanguage.czech.layoutName(.qwerty), "QWERTY – Čeština")
+        XCTAssertEqual(KeyboardLanguage.slovak.layoutName(.own), "QWERTZ – Slovenčina")
+        XCTAssertEqual(KeyboardLanguage.slovak.layoutName(.qwerty), "QWERTY – Slovenčina")
         XCTAssertEqual(KeyboardLanguage.hungarian.layoutName(.own), "QWERTZ – Magyar")
         XCTAssertEqual(KeyboardLanguage.hungarian.layoutName(.qwerty), "QWERTY – Magyar")
         XCTAssertEqual(KeyboardLanguage.polish.layoutName(.qwerty), "QWERTY")
+        XCTAssertEqual(KeyboardLanguage.dutch.layoutName(.qwerty), "QWERTY")
     }
 
     /// The plain layouts are the same 26 letters in every language (iOS 27.0 simulator: English,
     /// German, French, Spanish, Italian, Portuguese, Polish, Serbian and Romanian alike), but
-    /// Czech, whose QWERTY is its own with Z and Y swapped (`testCzechsRowsAndPagesMatchApples`).
+    /// Czech and Slovak, whose QWERTY is their own with Z and Y swapped (`testCzechsRowsAndPagesMatchApples`).
     func testPlainLayoutsAreApplesInEveryLanguage() {
         let plain: [KeyboardLetterLayout: [String]] = [
             .qwerty: ["qwertyuiop", "asdfghjkl", "zxcvbnm"],
             .qwertz: ["qwertzuiop", "asdfghjkl", "yxcvbnm"],
             .azerty: ["azertyuiop", "qsdfghjklm", "wxcvbn"],
         ]
-        for language in KeyboardLanguage.allCases where language != .czech {
+        for language in KeyboardLanguage.allCases where !language.typesOnCzechKeys {
             // Each French keyboard's own layout is Apple's "– French" one, with the apostrophe key.
             for letters in language.letterLayouts where letters != .own && letters != .dvorak && !(language.isFrench && letters == language.defaultLetterLayout) {
                 let layout = KeyboardLayout(width: 402, language: language, letters: letters)
@@ -1398,7 +1408,7 @@ final class KeyboardLayoutTests: XCTestCase {
             (375, .portrait, 0), (402, .portrait, 0), (440, .portrait, 0),
             (667, .landscape, 0), (874, .landscape, 0), (956, .landscape, 60),
         ]
-        for language in [KeyboardLanguage.norwegian, .german] {
+        for language in [KeyboardLanguage.norwegian, .swedish, .german] {
             for (width, orientation, inset) in cases {
                 let layout = KeyboardLayout(width: width, orientation: orientation, horizontalInset: inset, language: language)
                 let english = KeyboardLayout(width: width, orientation: orientation, horizontalInset: inset)
@@ -1729,6 +1739,20 @@ final class KeyboardLayoutTests: XCTestCase {
         for layer in [KeyboardLayer.numbers, .symbols] {
             XCTAssertEqual(KeyboardLayout(width: 402, layer: layer, language: .czech).keys, KeyboardLayout(width: 402, layer: layer).keys)
         }
+        // Apple's Slovak keyboard lists the same two layouts and shows the same keys on all four
+        // pages (iOS 26.5 and 27.2 simulators, iPhone 17 Pro, geometry captured portrait and
+        // landscape): Slovak's are Czech's.
+        for width in portraitWidths {
+            for letters in [KeyboardLetterLayout.own, .qwerty] {
+                XCTAssertEqual(KeyboardLayout(width: width, language: .slovak, letters: letters).keys, KeyboardLayout(width: width, language: .czech, letters: letters).keys)
+            }
+        }
+        for layer in [KeyboardLayer.numbers, .symbols] {
+            XCTAssertEqual(KeyboardLayout(width: 402, layer: layer, language: .slovak).keys, KeyboardLayout(width: 402, layer: layer).keys)
+        }
+        XCTAssertEqual(KeyboardLanguage.slovak.keyCoordinates().count, KeyboardLanguage.czech.keyCoordinates().count)
+        XCTAssertTrue(AutocorrectEngine.areAdjacentKeys("y", "t", language: .slovak, letters: .qwerty))
+        XCTAssertFalse(AutocorrectEngine.areAdjacentKeys("y", "t", language: .slovak))
     }
 
     /// The standard Hungarian QWERTZ, its own layout: `qwertzuiop`, `asdfghjkl`, `yxcvbnm`, so
@@ -1945,6 +1969,31 @@ final class KeyboardLayoutTests: XCTestCase {
         XCTAssertNil(AccentCatalog.options(for: "å", uppercase: false, language: .norwegian))
         let norwegianA = AccentCatalog.options(for: "a", uppercase: false, language: .norwegian)!
         XCTAssertFalse(norwegianA.contains("å") || norwegianA.contains("æ"), "they have their own keys")
+        // Swedish: Apple's Swedish options (iOS 27.2 simulator, every key held), Ø on Ö and Æ on Ä,
+        // nothing on Å, no å ä ö on A or O (their own keys), kr second on $, and the callout in
+        // Apple's arrangement, its base where Apple's is.
+        XCTAssertEqual(AccentCatalog.options(for: "ö", uppercase: false, language: .swedish), ["ö", "ø"])
+        XCTAssertEqual(AccentCatalog.options(for: "ä", uppercase: true, language: .swedish), ["Ä", "Æ"])
+        XCTAssertNil(AccentCatalog.options(for: "å", uppercase: false, language: .swedish))
+        for letter in ["a", "o"] {
+            let options = AccentCatalog.options(for: letter, uppercase: false, language: .swedish)!
+            XCTAssertTrue(options.allSatisfy { !"åäö".contains($0) }, letter)
+        }
+        XCTAssertEqual(AccentCatalog.options(for: "o", uppercase: false, language: .swedish)?.contains("ø"), true)
+        XCTAssertEqual(AccentCatalog.options(for: "s", uppercase: true, language: .swedish)?.prefix(2), ["S", "ẞ"][...])
+        for letter in ["q", "w", "r", "p", "f", "h", "j", "x", "v", "b", "m"] {
+            XCTAssertNil(AccentCatalog.options(for: letter, uppercase: false, language: .swedish), letter)
+        }
+        XCTAssertEqual(AccentCatalog.options(for: "$", uppercase: false, language: .swedish), ["$", "kr", "¢", "€", "£", "¥", "₩", "₽"])
+        for symbol in ["\"", "'", "0", "&", "-", "?", "%", "="] {
+            XCTAssertEqual(AccentCatalog.options(for: symbol, uppercase: false, language: .swedish), AccentCatalog.options(for: symbol, uppercase: false), symbol)
+        }
+        XCTAssertEqual(AccentCatalog.arrangement(for: "o", uppercase: false, language: .swedish),
+                       AccentArrangement(rows: [["ő", "ọ", "ȯ", "ø", "ō", "ô", "ó", "œ", "o", "ò", "õ"]], baseRow: 0, baseColumn: 8))
+        XCTAssertEqual(AccentCatalog.arrangement(for: "$", uppercase: false, language: .swedish)?.rows, [["$", "kr", "¢", "€", "£", "¥", "₩", "₽"]])
+        for letter in "etyuioasdgklöäzcn" {
+            XCTAssertNotNil(AccentCatalog.arrangement(for: String(letter), uppercase: false, language: .swedish), "\(letter): Apple's arrangement")
+        }
         XCTAssertTrue(AccentCatalog.options(for: "s", uppercase: false, language: .german)!.contains("ß"))
         XCTAssertFalse(AccentCatalog.options(for: "u", uppercase: false, language: .german)!.contains("ü"))
         XCTAssertNil(AccentCatalog.options(for: "ü", uppercase: false, language: .german))
@@ -2099,6 +2148,24 @@ final class KeyboardLayoutTests: XCTestCase {
             XCTAssertEqual(AccentCatalog.options(for: symbol, uppercase: false, language: .czech), AccentCatalog.options(for: symbol, uppercase: false), symbol)
             XCTAssertEqual(AccentCatalog.arrangement(for: symbol, uppercase: false, language: .czech), AccentCatalog.arrangement(for: symbol, uppercase: false), symbol)
         }
+        // Slovak: Apple's Slovak options, each Slovak letter (á ä č ď é í ĺ ľ ň ó ô ŕ š ť ú ý ž)
+        // first after the base, nothing on ´ or ˇ (no ring: Slovak has no ů of its own), and
+        // every symbol's hold English's.
+        XCTAssertEqual(AccentCatalog.options(for: "o", uppercase: false, language: .slovak), ["o", "ô", "ó", "ö", "ò", "õ", "œ", "ø", "ō"])
+        XCTAssertEqual(AccentCatalog.options(for: "a", uppercase: false, language: .slovak)?.prefix(3), ["a", "á", "ä"][...])
+        XCTAssertEqual(AccentCatalog.options(for: "l", uppercase: true, language: .slovak), ["L", "Ľ", "Ĺ", "Ł"])
+        XCTAssertNil(AccentCatalog.options(for: "ˇ", uppercase: false, language: .slovak))
+        XCTAssertNil(AccentCatalog.options(for: "´", uppercase: false, language: .slovak))
+        for word in ["á", "ä", "č", "ď", "é", "í", "ĺ", "ľ", "ň", "ó", "ô", "ŕ", "š", "ť", "ú", "ý", "ž"] {
+            let base = String(word.decomposedStringWithCanonicalMapping.unicodeScalars.prefix(1).map(Character.init))
+            XCTAssertTrue(AccentCatalog.options(for: base, uppercase: false, language: .slovak)?.contains(word) == true, word)
+        }
+        for letter in KeyboardLanguage.slovak.letterRows.joined() where !"ertzuioasdlycn".contains(letter) {
+            XCTAssertNil(AccentCatalog.options(for: letter, uppercase: false, language: .slovak), letter)
+        }
+        for symbol in ["$", "\"", "'", "0", "&", "-", "?"] {
+            XCTAssertEqual(AccentCatalog.options(for: symbol, uppercase: false, language: .slovak), AccentCatalog.options(for: symbol, uppercase: false), symbol)
+        }
         // Hungarian: its nine accented vowels on a e i o u, the base first, ó ö ő on O and ú ü ű
         // on U (ő and ű the double-acute letters, U+0151 and U+0171); every consonant holds
         // nothing. Its 123 and #+= pages are English's.
@@ -2112,11 +2179,29 @@ final class KeyboardLayoutTests: XCTestCase {
         for symbol in ["$", "\"", "'", "0", "&", "-", "?"] {
             XCTAssertEqual(AccentCatalog.options(for: symbol, uppercase: false, language: .hungarian), AccentCatalog.options(for: symbol, uppercase: false), symbol)
         }
+        // Dutch: Apple's Dutch keyboard's holds (iOS 26.5 and 27.2 runtimes, Keyboard-nl.plist),
+        // the base first: á ä on A, é ë on E, í ï on I, ó ö on O, ú ü on U, ç on C, ñ on N, and j́
+        // (j and the combining acute) on J for a stressed íj́; no ĳ ligature anywhere, nothing on
+        // the other letters, and the #+= page's € holds € $ £ ¥ ₩ ₽ as Polish's does.
+        XCTAssertEqual(AccentCatalog.options(for: "e", uppercase: false, language: .dutch), ["e", "é", "ë", "ê", "è", "ę", "ė", "ē"])
+        XCTAssertEqual(AccentCatalog.options(for: "i", uppercase: false, language: .dutch), ["i", "í", "ï", "ì", "î", "į", "ī"])
+        XCTAssertEqual(AccentCatalog.options(for: "u", uppercase: true, language: .dutch), ["U", "Ú", "Ü", "Û", "Ù", "Ū"])
+        XCTAssertEqual(AccentCatalog.options(for: "j", uppercase: false, language: .dutch), ["j", "j\u{0301}"])
+        XCTAssertEqual(AccentCatalog.options(for: "j", uppercase: true, language: .dutch), ["J", "J\u{0301}"])
+        XCTAssertEqual(AccentCatalog.options(for: "€", uppercase: false, language: .dutch), ["€", "$", "£", "¥", "₩", "₽"])
+        let dutch: Set<String> = ["a", "c", "e", "i", "j", "n", "o", "u"]
+        for letter in KeyboardLanguage.dutch.letterRows.joined() where !dutch.contains(letter) {
+            XCTAssertNil(AccentCatalog.options(for: letter, uppercase: false, language: .dutch), letter)
+        }
+        for letter in dutch {
+            XCTAssertFalse(AccentCatalog.options(for: letter, uppercase: false, language: .dutch)!.contains { $0.contains("ĳ") || $0 == "ij" }, letter)
+        }
     }
 
     func testAccentMenusOnTheNewKeysStayInside() {
         let keys: [KeyboardLanguage: [String]] = [
             .norwegian: ["å", "ø", "æ", "a", "o"],
+            .swedish: ["å", "ö", "ä", "a", "o", "n"],
             .spanish: ["ñ", "a", "o", "n"],
             .german: ["ü", "ö", "ä", "s", "a", "u"],
             .russian: ["й", "е", "х", "ж", "э", "ь", "ю", "я"],
@@ -2126,7 +2211,9 @@ final class KeyboardLayoutTests: XCTestCase {
             .romanian: ["a", "i", "s", "t"],
             .greek: ["ε", "υ", "ι", "ο", "α", "σ", "η", "κ", "ω"],
             .czech: ["e", "r", "t", "z", "u", "i", "o", "a", "s", "d", "l", "y", "c", "n", "ˇ"],
+            .slovak: ["e", "r", "t", "z", "u", "i", "o", "a", "s", "d", "l", "y", "c", "n"],
             .hungarian: ["a", "e", "i", "o", "u"],
+            .dutch: ["a", "c", "e", "i", "j", "n", "o", "u"],
         ]
         for width in portraitWidths {
             for (language, characters) in keys {
@@ -2197,15 +2284,46 @@ final class KeyboardLayoutTests: XCTestCase {
         XCTAssertEqual(automatic("cs_CZ"), .czech)
         XCTAssertEqual(automatic(nil, modes: ["emoji", "cs_CZ", "en-US"]), .czech)
         XCTAssertEqual(automatic(nil, preferred: ["cs-CZ", "en-US"]), .czech)
-        XCTAssertEqual(automatic("sk-SK"), .english, "Slovak has no layout of its own here")
+        // Swedish: Apple's DictationTranscriber lists sv-SE (iOS 26.5 and 27.2 simulators; its
+        // SpeechTranscriber doesn't), and its sv_SE spelling dictionary is a real one. Before
+        // Svenska, a Swedish iPhone typed on English's QWERTY in English.
+        XCTAssertEqual(automatic("sv-SE"), .swedish)
+        XCTAssertEqual(automatic("sv-FI", modes: ["en-US"]), .swedish)
+        XCTAssertEqual(automatic(nil, modes: ["emoji", "sv_SE", "en-US"]), .swedish)
+        XCTAssertEqual(automatic(nil, preferred: ["sv-SE", "en-US"]), .swedish)
+        XCTAssertEqual(KeyboardLanguage.swedish.dictationLanguage(supported: ["en-US", "nb-NO", "sv-SE"], preferred: ["sv-SE"]), "sv-SE")
+        XCTAssertEqual(KeyboardLanguage.swedish.dictationLanguage(supported: [], preferred: []), "sv-SE")
+        XCTAssertEqual(KeyboardLanguage.swedish.displayName, "Svenska")
+        XCTAssertEqual(KeyboardLanguage.swedish.inputModeLanguage, "sv-SE")
+        XCTAssertEqual(KeyboardLanguage.swedish.spellCheckLanguage(available: ["nb_NO", "da_DK", "sv_SE"]), "sv_SE")
+        XCTAssertNil(KeyboardLanguage.swedish.spellCheckLanguage(available: ["nb_NO", "da_DK", "fi_FI", "en_US"]), "never Norwegian's or Danish's")
         XCTAssertEqual(KeyboardLanguage.czech.dictationLanguage(supported: ["en-US", "cs-CZ"], preferred: ["cs-CZ"]), "cs-CZ")
         XCTAssertEqual(KeyboardLanguage.czech.dictationLanguage(supported: [], preferred: []), "cs-CZ")
+        // Slovak: Apple's DictationTranscriber lists sk-SK (iOS 26.5 and 27.2 simulators); the
+        // iPhone's spelling dictionary is used only where it has one (the simulators list none).
+        // Before Slovenčina, a Slovak dictation language typed English's QWERTY.
+        XCTAssertEqual(automatic("sk-SK"), .slovak)
+        XCTAssertEqual(automatic("sk-SK", modes: ["en-US"]), .slovak)
+        XCTAssertEqual(automatic(nil, modes: ["emoji", "sk_SK", "en-US"]), .slovak)
+        XCTAssertEqual(automatic(nil, preferred: ["sk-SK", "en-US"]), .slovak)
+        XCTAssertEqual(KeyboardLanguage.slovak.dictationLanguage(supported: ["en-US", "cs-CZ", "sk-SK"], preferred: ["sk-SK"]), "sk-SK")
+        XCTAssertEqual(KeyboardLanguage.slovak.dictationLanguage(supported: [], preferred: []), "sk-SK")
+        XCTAssertEqual(KeyboardLanguage.slovak.displayName, "Slovenčina")
+        XCTAssertEqual(KeyboardLanguage.slovak.inputModeLanguage, "sk-SK")
+        XCTAssertEqual(KeyboardLanguage.slovak.spellCheckLanguage(available: ["cs_CZ", "sk_SK"]), "sk_SK")
+        XCTAssertNil(KeyboardLanguage.slovak.spellCheckLanguage(available: ["cs_CZ", "hu_HU", "pl_PL", "en_US"]), "never Czech's")
         XCTAssertEqual(automatic("hu-HU", modes: ["en-US"]), .hungarian)
         XCTAssertEqual(automatic("hu_HU"), .hungarian)
         XCTAssertEqual(automatic(nil, modes: ["emoji", "hu_HU", "en-US"]), .hungarian)
         XCTAssertEqual(automatic(nil, preferred: ["hu-HU", "en-US"]), .hungarian)
         XCTAssertEqual(KeyboardLanguage.hungarian.dictationLanguage(supported: ["en-US", "hu-HU"], preferred: ["hu-HU"]), "hu-HU")
         XCTAssertEqual(KeyboardLanguage.hungarian.dictationLanguage(supported: [], preferred: []), "hu-HU", "not listed yet")
+        XCTAssertEqual(automatic("nl-NL", modes: ["en-US"]), .dutch)
+        XCTAssertEqual(automatic("nl_BE"), .dutch, "Flemish types on the same keys")
+        XCTAssertEqual(automatic(nil, modes: ["emoji", "nl_NL", "en-US"]), .dutch)
+        XCTAssertEqual(automatic(nil, preferred: ["nl-NL", "en-US"]), .dutch)
+        XCTAssertEqual(KeyboardLanguage.dutch.dictationLanguage(supported: ["en-US", "nl-NL"], preferred: ["nl-NL"]), "nl-NL")
+        XCTAssertEqual(KeyboardLanguage.dutch.dictationLanguage(supported: ["en-US", "nl-BE", "nl-NL"], preferred: ["nl-BE"]), "nl-BE", "the iPhone's own region")
         // Before Jaro knows the dictation language: the first keyboard, then language, with a layout.
         XCTAssertEqual(automatic(nil, modes: ["emoji", "nb-NO", "en-US"]), .norwegian)
         XCTAssertEqual(automatic(nil, preferred: ["nn-NO"]), .norwegian)
@@ -2278,6 +2396,10 @@ final class KeyboardLayoutTests: XCTestCase {
             .hungarian,
             "Hungarian types on its own keys"
         )
+        XCTAssertEqual(partner([.dutch, .english], .dutch, ["en_US", "nl"]), .english, "Dutch has Latin letters")
+        XCTAssertEqual(partner([.english, .dutch], .english, ["en_US", "nl"]), .dutch)
+        XCTAssertEqual(partner([.english, .german, .dutch], .dutch, ["en_US", "de", "nl"]), .english, "the first other one, of three")
+        XCTAssertNil(partner([.dutch, .english], .dutch), "no Dutch dictionary on this iPhone")
         XCTAssertNil(partner([.english], .english))
     }
 
@@ -2494,6 +2616,11 @@ final class KeyboardLayoutTests: XCTestCase {
         XCTAssertEqual(KeyboardLanguage.hungarian.spellCheckLanguage(available: ["en_US", "hu"]), "hu")
         XCTAssertNil(KeyboardLanguage.hungarian.spellCheckLanguage(available: ["en_US", "cs"]), "never English or Czech")
         XCTAssertEqual(KeyboardLanguage.spellCheckLanguage(forDictation: "hu-HU", available: ["en_US", "hu"]), "hu")
+        XCTAssertEqual(KeyboardLanguage.dutch.spellCheckLanguage(available: ["en_US", "nl_NL"]), "nl_NL")
+        XCTAssertEqual(KeyboardLanguage.dutch.spellCheckLanguage(available: ["en_US", "nl"]), "nl")
+        XCTAssertEqual(KeyboardLanguage.dutch.spellCheckLanguage(available: ["en_US", "nl_BE"]), "nl_BE")
+        XCTAssertNil(KeyboardLanguage.dutch.spellCheckLanguage(available: ["en_US", "de"]), "never English or German")
+        XCTAssertEqual(KeyboardLanguage.spellCheckLanguage(forDictation: "nl-NL", available: ["en_US", "nl"]), "nl")
         XCTAssertEqual(KeyboardLanguage.spellCheckLanguage(forDictation: "pl-PL", available: ["en_US", "pl"]), "pl")
         XCTAssertNil(KeyboardLanguage.ukrainian.spellCheckLanguage(available: ["en_US", "ru_RU"]), "never Russian or English")
         XCTAssertEqual(KeyboardLanguage.spellCheckLanguage(forDictation: "uk-UA", available: ["en_US", "uk_UA"]), "uk_UA")
@@ -2513,6 +2640,7 @@ final class KeyboardLayoutTests: XCTestCase {
         XCTAssertEqual(KeyboardLanguage.spanish.inputModeLanguage, "es-ES")
         XCTAssertEqual(KeyboardLanguage.frenchCanadian.inputModeLanguage, "fr-CA")
         XCTAssertEqual(KeyboardLanguage.hungarian.inputModeLanguage, "hu-HU")
+        XCTAssertEqual(KeyboardLanguage.dutch.inputModeLanguage, "nl-NL")
         XCTAssertEqual(KeyboardLanguage.serbianLatin.inputModeLanguage, "sr-Latn-RS")
         XCTAssertEqual(
             Set(KeyboardLanguage.allCases.map(\.inputModeLanguage)).count,

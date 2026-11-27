@@ -13,6 +13,7 @@ nonisolated struct KeyboardSelfDictation {
         case memory
         case speechModel
         case multilingual
+        case rumble
         /// Jaro saw the keyboard open it for a dictation, whatever the keyboard's reason.
         case openedHex
     }
@@ -66,8 +67,12 @@ nonisolated struct KeyboardSelfDictation {
         includeRecentHandoff: Bool = true
     ) -> Reason? {
         guard osMajorVersion >= Self.firstVersion else { return .openedHex }
+        #if JARO_RUMBLE || JARO_RUMBLE_HANDOFF
+        if RumbleDictationSettings(defaults: defaults).routesToApp { return .rumble }
+        #endif
         if includeRecentHandoff,
            let handed = handedToHex,
+           handed.reason != .rumble,
            now.timeIntervalSince(handed.at) < Self.recentWindow {
             return handed.reason
         }

@@ -5,7 +5,7 @@ import Foundation
 /// ships: `<code>.valid`, the real words outside the model (`build-valid-words.py`), and
 /// `<code>.capitals`, how often the books write a word with a capital (`build-capitals.py`).
 /// One lowercase NFC spelling per line, alone or followed by a tab and a number (a cost, a
-/// percent), sorted by its UTF-8 bytes, newline-terminated. The file is memory-mapped read-only, like the `.hextm` models,
+/// percent), sorted by its UTF-8 bytes, newline-terminated. The file is memory-mapped read-only, like the `.jarotm` models,
 /// and searched in place by bisection: no copy and no set, so a 5 MB list costs only the clean
 /// pages its lookups touch, which iOS can drop under pressure.
 nonisolated final class JaroWordList: @unchecked Sendable {

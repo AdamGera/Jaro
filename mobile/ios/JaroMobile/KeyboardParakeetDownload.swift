@@ -3,11 +3,96 @@ import Network
 import Observation
 import SwiftUI
 
+enum SpeechModelDownloadKind: String {
+    case rumble
+    case english
+    case multilingual
+}
+
+/// Shared Wi-Fi-first download rule for iOS speech models (`KeyboardParakeetDownload` and
+/// `ParakeetUltraDownload`), with a per-model "Use mobile data" override stored in the App Group.
+@MainActor
+@Observable
+final class SpeechModelDownloadNetwork {
+    static let shared = SpeechModelDownloadNetwork(
+        isUnmetered: ProcessInfo.processInfo.arguments.contains(cellularLaunchArgument) ? false : nil,
+        watchesConnection: !ProcessInfo.processInfo.arguments.contains(cellularLaunchArgument)
+    )
+    static let mobileDataKey = "settings.speechModel.mobileData"
+    static let cellularLaunchArgument = "--simulate-cellular"
+
+    private(set) var isUnmetered: Bool?
+    private(set) var mobileDataModel: String?
+    @ObservationIgnored private let defaults: UserDefaults?
+    @ObservationIgnored private let watchesConnection: Bool
+    @ObservationIgnored private var monitor: NWPathMonitor?
+    @ObservationIgnored private var observers: [@MainActor (Bool) -> Void] = []
+
+    init(
+        defaults: UserDefaults? = UserDefaults(suiteName: KeyboardBridge.appGroup),
+        isUnmetered: Bool? = nil,
+        watchesConnection: Bool = true
+    ) {
+        self.defaults = defaults
+        self.isUnmetered = isUnmetered
+        self.watchesConnection = watchesConnection
+        mobileDataModel = defaults?.string(forKey: Self.mobileDataKey)
+    }
+
+    func usesMobileData(for model: SpeechModelDownloadKind) -> Bool {
+        mobileDataModel == model.rawValue
+    }
+
+    func mayDownload(_ model: SpeechModelDownloadKind) -> Bool {
+        isUnmetered == true || usesMobileData(for: model)
+    }
+
+    func allowMobileData(for model: SpeechModelDownloadKind) {
+        mobileDataModel = model.rawValue
+        defaults?.set(model.rawValue, forKey: Self.mobileDataKey)
+    }
+
+    func forgetMobileData(for model: SpeechModelDownloadKind? = nil) {
+        guard let current = mobileDataModel, model == nil || model?.rawValue == current else { return }
+        mobileDataModel = nil
+        defaults?.removeObject(forKey: Self.mobileDataKey)
+    }
+
+    func observe(_ observer: @escaping @MainActor (Bool) -> Void) {
+        observers.append(observer)
+    }
+
+    func report(unmetered: Bool) {
+        guard unmetered != isUnmetered else { return }
+        isUnmetered = unmetered
+        for observer in observers {
+            observer(unmetered)
+        }
+    }
+
+    func watch() {
+        guard watchesConnection, monitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let unmetered = KeyboardParakeetDownload.isUnmetered(
+                satisfied: path.status == .satisfied,
+                expensive: path.isExpensive,
+                constrained: path.isConstrained,
+                cellular: path.usesInterfaceType(.cellular)
+            )
+            Task { @MainActor [weak self] in self?.report(unmetered: unmetered) }
+        }
+        monitor.start(queue: DispatchQueue.global(qos: .utility))
+        self.monitor = monitor
+    }
+}
+
 /// Settings › Dictation › Speech model in keyboard: gets Parakeet V2 into the App Group for the keyboard,
 /// with FluidAudio's download (each file resumes from its `.partial`), at launch, whenever Jaro
 /// comes back to the front, on Wi-Fi coming back and once the keyboard measured its memory,
-/// until every file is there. By itself only where the keyboard would use it (`hold`);
-/// turned on by hand, at once on any connection.
+/// until every file is there. By itself only where the keyboard would use it (`hold`), on Wi-Fi
+/// or after Use mobile data (`SpeechModelDownloadNetwork`); turned on by hand, at once on any
+/// connection.
 @MainActor
 @Observable
 final class KeyboardParakeetDownload {
@@ -35,9 +120,7 @@ final class KeyboardParakeetDownload {
 
     private(set) var state = State.idle
     @ObservationIgnored private var task: Task<Void, Never>?
-    @ObservationIgnored private var network: NWPathMonitor?
-    /// Whether the connection is one to download 464 MB on, once `network` said.
-    @ObservationIgnored private var isUnmetered: Bool?
+    @ObservationIgnored private var watching = false
 
     /// What the download weighs: Parakeet V2's four models and vocabulary, about 464 MB.
     static let bytes: Int64 = 464_400_000
@@ -61,19 +144,23 @@ final class KeyboardParakeetDownload {
 
     /// What holds the download back now, nil once it may start by itself.
     var hold: Hold? {
-        Self.hold(
+        let network = SpeechModelDownloadNetwork.shared
+        return Self.hold(
             plan: KeyboardParakeetPlan.current(),
-            unmetered: isUnmetered,
-            freeBytes: Self.freeBytes()
+            unmetered: network.isUnmetered,
+            freeBytes: Self.freeBytes(),
+            mobileData: network.usesMobileData(for: .english)
         )
     }
 
     /// Only for a keyboard that would use it: resolved from `KeyboardParakeetPlan`, plus a
-    /// connection that isn't cellular, a hotspot or Low Data Mode, and `freeSpaceNeeded` free.
+    /// connection that isn't cellular, a hotspot or Low Data Mode (unless Use mobile data was
+    /// tapped for it), and `freeSpaceNeeded` free.
     nonisolated static func hold(
         plan: KeyboardParakeetPlan,
         unmetered: Bool?,
-        freeBytes: Int64?
+        freeBytes: Int64?,
+        mobileData: Bool = false
     ) -> Hold? {
         switch plan {
         case .twoLanguage, .multilingual:
@@ -85,7 +172,7 @@ final class KeyboardParakeetDownload {
         case .tooSmall:
             return .keyboardTooSmall
         case .off, .awaitingV2Download, .readyV2:
-            guard unmetered == true else { return .notOnWiFi }
+            guard unmetered == true || mobileData else { return .notOnWiFi }
             if let freeBytes, freeBytes < freeSpaceNeeded { return .needsSpace }
             return nil
         }
@@ -122,6 +209,7 @@ final class KeyboardParakeetDownload {
                 guard let self, !Task.isCancelled else { return }
                 self.task = nil
                 self.state = .idle
+                SpeechModelDownloadNetwork.shared.forgetMobileData(for: .english)
             } catch {
                 guard let self, !Task.isCancelled else { return }
                 print("speech model in keyboard: download stopped: \(error)")
@@ -173,22 +261,21 @@ final class KeyboardParakeetDownload {
         startIfWanted()
     }
 
+    /// Use mobile data on the line that says it downloads on Wi-Fi: starts now, on any connection.
+    func useMobileData() {
+        SpeechModelDownloadNetwork.shared.allowMobileData(for: .english)
+        DictationController.shared.startKeyboardParakeetDownloadIfWanted()
+    }
+
     /// The connection, and the keyboard's word that it measured its memory, both of which can
     /// let a held download start while Jaro is open.
     private func watch() {
-        guard network == nil else { return }
-        let monitor = NWPathMonitor()
-        monitor.pathUpdateHandler = { path in
-            let unmetered = KeyboardParakeetDownload.isUnmetered(
-                satisfied: path.status == .satisfied,
-                expensive: path.isExpensive,
-                constrained: path.isConstrained,
-                cellular: path.usesInterfaceType(.cellular)
-            )
-            Task { @MainActor in KeyboardParakeetDownload.shared.networkChanged(unmetered) }
+        SpeechModelDownloadNetwork.shared.watch()
+        guard !watching else { return }
+        watching = true
+        SpeechModelDownloadNetwork.shared.observe { unmetered in
+            KeyboardParakeetDownload.shared.networkChanged(unmetered)
         }
-        monitor.start(queue: DispatchQueue.global(qos: .utility))
-        network = monitor
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(),
             nil,
@@ -201,14 +288,20 @@ final class KeyboardParakeetDownload {
         )
     }
 
-    /// Off Wi-Fi, a download Jaro started by itself stops (its files resume on Wi-Fi).
+    /// Off Wi-Fi, a download Jaro started by itself stops (its files resume on Wi-Fi) unless Use mobile data was chosen.
     private func networkChanged(_ unmetered: Bool) {
-        guard unmetered != isUnmetered else { return }
-        isUnmetered = unmetered
         if unmetered {
             DictationController.shared.startKeyboardParakeetDownloadIfWanted()
-        } else if task != nil, !KeyboardParakeetSettings().isTurnedOnByHand {
-            Task { await stop() }
+        } else if let running = task, !KeyboardParakeetSettings().isTurnedOnByHand,
+                  !SpeechModelDownloadNetwork.shared.usesMobileData(for: .english) {
+            running.cancel()
+            task = Task { [weak self] in
+                await running.value
+                guard let self, !Task.isCancelled else { return }
+                self.task = nil
+                self.state = .idle
+                DictationController.shared.startKeyboardParakeetDownloadIfWanted()
+            }
         }
     }
 }
@@ -264,7 +357,15 @@ struct KeyboardParakeetStatus: View {
                         Button("Try again") { download.retry() }
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(JaroTheme.textBase)
+                            .buttonStyle(MultilingualStatusButtonStyle())
                             .accessibilityIdentifier("keyboard-parakeet-try-again")
+                    }
+                    if case .idle = download.state, !download.isDownloaded, download.hold == .notOnWiFi {
+                        Button("Use mobile data") { download.useMobileData() }
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(JaroTheme.textBase)
+                            .buttonStyle(MultilingualStatusButtonStyle())
+                            .accessibilityIdentifier("keyboard-parakeet-use-mobile-data")
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)

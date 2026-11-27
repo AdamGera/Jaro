@@ -7,7 +7,7 @@ import ai.jard.jaro.speech.Spoken
  * case-insensitive map read: "smile" -> 😊, "haha" -> 😂, "heart" -> ❤️. */
 internal class EmojiKeywords(private val words: Map<String, String>) {
     /** [word]'s emoji for a typing model in [language], or null. The index is English only
-     * ([Spoken.English.layoutCode], the language of `en.hextm`), so another layout's model never
+     * ([Spoken.English.layoutCode], the language of `en.jarotm`), so another layout's model never
      * offers an emoji for a word that merely looks English. The current word is matched whole,
      * never as a prefix, so continuing to type keeps the word. */
     fun match(word: String, language: String): String? =

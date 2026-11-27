@@ -116,16 +116,17 @@ struct TypingLogsView: View {
 /// The system share sheet for files, over whatever is showing.
 @MainActor
 enum ShareSheet {
-    static func present(_ urls: [URL]) {
-        guard !urls.isEmpty else { return }
+    static func present(_ urls: [URL], finished: (() -> Void)? = nil) {
+        guard !urls.isEmpty else { finished?(); return }
         let scene = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
             .first { $0.activationState == .foregroundActive }
-        guard var top = scene?.keyWindow?.rootViewController else { return }
+        guard var top = scene?.keyWindow?.rootViewController else { finished?(); return }
         while let presented = top.presentedViewController, !presented.isBeingDismissed {
             top = presented
         }
         let controller = UIActivityViewController(activityItems: urls, applicationActivities: nil)
+        controller.completionWithItemsHandler = { _, _, _, _ in finished?() }
         controller.popoverPresentationController?.sourceView = top.view
         controller.popoverPresentationController?.sourceRect = CGRect(x: top.view.bounds.midX, y: 60, width: 1, height: 1)
         top.present(controller, animated: true)

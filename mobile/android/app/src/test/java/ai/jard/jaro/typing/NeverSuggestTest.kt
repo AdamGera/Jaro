@@ -6,7 +6,7 @@ import org.junit.Test
 
 class NeverSuggestTest {
     private fun word(language: String = "en", spatial: Boolean = true): TypingWord {
-        val file = File("src/main/assets/typing/$language.hextm")
+        val file = File("src/main/assets/typing/$language.jarotm")
         return TypingWord(SpatialDecoder(TypingModel.file(file, language)), spatial)
     }
 
@@ -46,7 +46,7 @@ class NeverSuggestTest {
         for ((lang, swear, slur) in listOf(
             Triple("en", "fuck", "nigger"), Triple("es", "mierda", "maricón"),
             Triple("de", "scheiße", "neger"), Triple("nb", "faen", "neger"),
-            Triple("fr", "merde", "nègre"), Triple("it", "cazzo", "frocio")
+            Triple("fr", "merde", "nègre"), Triple("it", "cazzo", "frocio"), Triple("pt", "merda", "viado")
         )) {
             val w = word(lang, spatial = false)
             assertTrue("$lang still knows the slur", w.decoder.model.index(slur) >= 0)
@@ -116,7 +116,7 @@ class NeverSuggestTest {
     @Test fun everyListedLiteralIsKeptSeparatelyFromRankedSuggestions() {
         val rows = File("src/main/assets/typing/never-suggest.tsv").readLines()
             .filterNot { it.isBlank() || it.startsWith('#') }.map { it.split('\t') }
-        for (lang in listOf("en", "es", "de", "nb", "fr", "it")) {
+        for (lang in listOf("en", "es", "de", "nb", "fr", "it", "pt")) {
             val w = word(lang)
             for ((layout, kind, entry) in rows) {
                 if (layout != "*" && layout != lang) continue
@@ -607,8 +607,15 @@ class NeverSuggestTest {
 
     // Every language has words for the strip between words: at a sentence's start, after a comma and
     // after a word the pairs don't know (0.2.0's French and Italian showed nothing there).
+    @Test fun portugueseAccentCorrectionUsesThePortugueseModel() {
+        val w = word("pt")
+        w.type("voce")
+        assertEquals("você", w.replacement())
+        assertTrue(ContextWords.keepsTypedAccent("pt", "é"))
+    }
+
     @Test fun everyLanguageOffersWordsBetweenWords() {
-        for (lang in listOf("en", "es", "de", "nb", "fr", "it")) {
+        for (lang in listOf("en", "es", "de", "nb", "fr", "it", "pt")) {
             val w = word(lang)
             for (before in listOf("", "zzqx, ", "zzqx ")) assertEquals("$lang [$before]", 3, w.predictions(before).size)
         }
@@ -627,7 +634,7 @@ class NeverSuggestTest {
         }, 107.2, 155.0)
     }
     private fun swipeReader(language: String, swears: Boolean = false) =
-        SwipeReader(SpatialDecoder(TypingModel.file(File("src/main/assets/typing/$language.hextm"), language))).also { it.prepare(swears) }
+        SwipeReader(SpatialDecoder(TypingModel.file(File("src/main/assets/typing/$language.jarotm"), language))).also { it.prepare(swears) }
     /** The word's keys' centres in order (an accented letter on its base letter's key, ß on s, œ on o and e), repeats run
      * together, a point every [step] px, moved by [dx], [dy]; with [pauses] (indexes into those keys) the finger stays
      * 0.15 s on them, at an even 750 px a second otherwise. */
@@ -668,7 +675,7 @@ class NeverSuggestTest {
         val es = swipeReader("es"); val ge = swipeGrid("es")
         for (w in listOf("año", "también", "gracias", "mañana", "teclado")) assertEquals(w, es.read(w, ge).first())
         assertEquals(setOf("esta", "está"), es.read("esta", ge).take(2).toSet())
-        for ((language, w) in listOf("de" to "hallo", "nb" to "norsk", "fr" to "bonjour", "it" to "perché", "de" to "schön", "nb" to "kjøre"))
+        for ((language, w) in listOf("de" to "hallo", "nb" to "norsk", "fr" to "bonjour", "it" to "perché", "de" to "schön", "nb" to "kjøre", "pt" to "obrigado", "pt" to "você"))
             assertTrue("$language: $w", w in swipeReader(language).read(w, swipeGrid(language)).take(2))
         // iPhone drops these: ß is swiped through s, œ through o and e.
         assertTrue(swipeReader("de").read("straße", swipeGrid("de")).take(3).contains("straße"))

@@ -66,6 +66,7 @@
     <string name="keyboard_paste_spoken">按原话粘贴</string>
     <string name="keyboard_menu_clean">整理我说的话</string>
     <string name="keyboard_menu_translate">翻译我说的话</string>
+    <string name="keyboard_menu_volume">音量</string>
     <string name="keyboard_menu_popups">字符预览</string>
     <string name="keyboard_menu_haptics">按键触感</string>
     <string name="keyboard_on">开</string>

@@ -12,6 +12,8 @@ internal object KeyboardLetters {
         // apostrophe key after n on row 3, between shift and delete.
         "fr" to listOf("azertyuiop", "qsdfghjklm", "wxcvbn'"),
         "it" to listOf("qwertyuiop", "asdfghjkl", "zxcvbnm"),
+        "pt" to listOf("qwertyuiop", "asdfghjkl", "zxcvbnm"),
+        "ru" to listOf("йцукенгшщзх", "фывапролджэ", "ячсмитьбю"),
     )
 
     /** The number row's digits, in the order Gboard's row 1 holds them. */

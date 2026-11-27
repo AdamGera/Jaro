@@ -213,7 +213,13 @@ final class DictationController {
         self.keyboardBridge = resolvedBridge
         self.transcriber = initialTranscriber
         self.transcriberFactory = transcriberFactory ?? Self.defaultTranscriber
-        self.multilingualDownload = multilingualDownload ?? ParakeetUltraDownload()
+        let resolvedMultilingualDownload = multilingualDownload ?? ParakeetUltraDownload(
+            isWanted: {
+                MultilingualParakeetSettings().isEnabled
+                    && ParakeetUltraTranscriber.chosenLanguage(availableMemory: 0) != nil
+            }
+        )
+        self.multilingualDownload = resolvedMultilingualDownload
         self.cleaner = cleaner
         self.cleanupSettings = cleanupSettings
         self.customVocabularySettings = customVocabularySettings
@@ -246,6 +252,10 @@ final class DictationController {
         wireSystemIntentBus()
         self.multilingualDownload.onDownloaded = { [weak self] in
             self?.syncMultilingualParakeet()
+        }
+        SpeechModelDownloadNetwork.shared.watch()
+        SpeechModelDownloadNetwork.shared.observe { [weak resolvedMultilingualDownload] _ in
+            resolvedMultilingualDownload?.connectionChanged()
         }
         if autoPrepareOnInit {
             // At launch no dictation is running, so any Jaro Live Activity is left over.
@@ -911,20 +921,36 @@ final class DictationController {
             let transcribeStarted = Date()
 
             do {
-                let rawText = try await activeTranscriber.transcribe(
-                    captureURL,
-                    vocabulary: session.preferences.recognitionHints
-                )
+                #if JARO_RUMBLE
+                // The regular model stays prepared for long captures and native failures.
+                let rumbleResult = await RumbleTranscriber.shared.transcribeIfReady(captureURL, duration: finalDuration)
+                let rumbleText = rumbleResult?.text
+                let detectedLanguage = rumbleResult?.language
+                try Task.checkCancellation()
+                #else
+                let rumbleText: String? = nil
+                let detectedLanguage: String? = nil
+                #endif
+                let rawText: String
+                if let rumbleText {
+                    rawText = rumbleText
+                } else {
+                    rawText = try await activeTranscriber.transcribe(
+                        captureURL,
+                        vocabulary: session.preferences.recognitionHints
+                    )
+                }
                 guard let self, self.jobGeneration == captureGeneration, !Task.isCancelled else {
                     return
                 }
+                let effectiveLanguage = detectedLanguage ?? session.language
                 // The steps in-keyboard dictation runs too, plus Apple Intelligence's cleanup.
                 let pipeline = DictationPipeline(
                     preferences: session.preferences,
-                    language: session.language
+                    language: effectiveLanguage
                 )
                 let stages = await pipeline.run(rawText) { tagged in
-                    await self.cleanedTranscriptIfEnabled(tagged, session: session)
+                    await self.cleanedTranscriptIfEnabled(tagged, session: session, language: effectiveLanguage)
                 }
                 let translated = stages.translated
                 guard self.jobGeneration == captureGeneration, !Task.isCancelled else {
@@ -945,8 +971,9 @@ final class DictationController {
                 if keyboardJobID != nil {
                     let dictationStages: DictationStages? = TypingLogSettings().isEnabled
                         ? DictationStages(
-                            engine: self.engineName,
-                            language: self.transcriptionLanguage,
+                            engine: rumbleText == nil ? self.engineName : "Rumble2 Flash",
+                            language: detectedLanguage.flatMap { Locale.current.localizedString(forIdentifier: $0) }
+                                ?? self.transcriptionLanguage,
                             style: session.preferences.style.rawValue,
                             recordedMS: Int((finalDuration * 1000).rounded()),
                             transcribeMS: Int((Date().timeIntervalSince(transcribeStarted) * 1000).rounded()),
@@ -966,7 +993,8 @@ final class DictationController {
                         heard: session.sharesHeard && translated == nil ? stages.heard : nil,
                         stages: dictationStages,
                         translationFailure: stages.translationFailure,
-                        expiresAt: self.now() + Self.resultDeliveryTTL
+                        expiresAt: self.now() + Self.resultDeliveryTTL,
+                        language: translated == nil ? detectedLanguage : nil
                     )
                     self.setKeyboardMessage(nil)
                 }
@@ -1003,14 +1031,15 @@ final class DictationController {
     /// The cleanup experiment's one pass, before formatting. Any failure keeps the raw text.
     private func cleanedTranscriptIfEnabled(
         _ rawText: String,
-        session: ActiveCaptureSession
+        session: ActiveCaptureSession,
+        language: String? = nil
     ) async -> String {
         guard session.usesCleanup,
               session.preferences.style != .verbatim,
               !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let cleaner,
               cleaner.isAvailable,
-              cleaner.supports(language: session.language) else {
+              cleaner.supports(language: language ?? session.language) else {
             return rawText
         }
         return await cleaner.clean(rawText) ?? rawText
@@ -1234,7 +1263,8 @@ final class DictationController {
                 heard: keyboardResult?.heard,
                 stages: keyboardResult?.stages,
                 translationFailure: keyboardResult?.translationFailure,
-                messageAt: displayedMessage?.at
+                messageAt: displayedMessage?.at,
+                language: keyboardResult?.language
             )
         )
     }

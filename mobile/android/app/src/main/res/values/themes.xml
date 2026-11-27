@@ -23,4 +23,9 @@
         <item name="android:textColorPrimary">@color/quiet</item>
         <item name="android:colorButtonNormal">@color/sheet</item>
     </style>
+    <style name="JaroSheet" parent="JaroApp">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
 </resources>
