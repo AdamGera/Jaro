@@ -152,6 +152,7 @@ pub async fn serve(
     engine: Arc<SpeechEngine>,
     token: Option<String>,
     ready_file: Option<PathBuf>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<()> {
     let state = Arc::new(AppState {
         engine,
@@ -161,7 +162,7 @@ pub async fn serve(
 
     // Lease reaper for abandoned streams.
     let reaper_state = state.clone();
-    tokio::spawn(async move {
+    let reaper = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3));
         loop {
             interval.tick().await;
@@ -207,14 +208,25 @@ pub async fn serve(
         std::fs::rename(pending, path)?;
     }
     tracing::info!(%addr, "jaro-speech listening");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let served = axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .await;
+    reaper.abort();
+    let _ = reaper.await;
+    served?;
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+async fn shutdown_signal(shutdown_rx: tokio::sync::oneshot::Receiver<()>) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        result = shutdown_rx => {
+            if result.is_err() {
+                // No managed stdin watcher: keep waiting for Ctrl-C.
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
 }
 
 fn check_auth(headers: &HeaderMap, expected: Option<&str>) -> Result<(), StatusCode> {

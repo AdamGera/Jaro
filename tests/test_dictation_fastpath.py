@@ -261,6 +261,7 @@ class DictationFastPathTests(unittest.IsolatedAsyncioTestCase):
         import asyncio
         import sys
         import types
+        import weakref
 
         loaded = []
 
@@ -270,12 +271,12 @@ class DictationFastPathTests(unittest.IsolatedAsyncioTestCase):
 
         fake_module = types.ModuleType("diarization")
         fake_module.Diarizer = FakeDiarizer
-        released = []
+        released_while_dead = []
         state = SimpleNamespace(
             diarizer=None, diarizer_lazy=False, diarizer_lock=asyncio.Lock(), diarizer_last_used=0.0,
             draining=False, jobs=set(), submitting=set(), live_speakers={}, portable_recording=None,
             inference=server.SpeechInference(),
-            model=SimpleNamespace(device="mps", aligner=object(), release_device_cache=lambda: released.append(True)),
+            model=SimpleNamespace(device="mps", aligner=object()),
         )
         with patch("server.diarization_installed", return_value=True), patch.dict(sys.modules, {"diarization": fake_module}):
             await server.load_speaker_tools(state)
@@ -287,13 +288,24 @@ class DictationFastPathTests(unittest.IsolatedAsyncioTestCase):
             diarizer = await server.ensure_diarizer(state)
             self.assertIsInstance(diarizer, FakeDiarizer)
             self.assertEqual(loaded, ["mps"])
+            diarizer_ref = weakref.ref(diarizer)
+            del diarizer
+            # Let the threadpool worker finish unwinding its Future result reference.
+            await asyncio.sleep(0.05)
 
-            # Idle past threshold -> unloads diarizer and trims MPS cache
+            def check_release():
+                import gc
+
+                gc.collect()
+                released_while_dead.append(diarizer_ref() is None)
+
+            # Idle past threshold -> diarizer is garbage-collected BEFORE MPS cache release runs
             state.diarizer_last_used -= server.IDLE_DIARIZER_UNLOAD_SECONDS + 1
-            await server.maybe_unload_idle_diarizer(state)
+            with patch.object(server, "_release_idle_memory", side_effect=check_release):
+                await server.maybe_unload_idle_diarizer(state)
             self.assertIsNone(state.diarizer)
             self.assertTrue(server.diarization_ready(state))
-            self.assertEqual(released, [True])
+            self.assertEqual(released_while_dead, [True])
 
 
 if __name__ == "__main__":

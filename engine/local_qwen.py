@@ -42,6 +42,7 @@ REQUEST = {"temperature": 0.15, "seed": 42, "cache_prompt": True, "id_slot": 0,
            "chat_template_kwargs": {"enable_thinking": False}}
 BASE_CONTEXT = 8192
 MAX_CONTEXT = 262144  # Native context of the pinned Qwen3.5-2B weights.
+IDLE_STOP_SECONDS = 180.0
 RUNTIME = ("-np", "1", "--cache-prompt", "--ctx-checkpoints", "6",
            "--checkpoint-min-step", "256", "--cache-ram", "0", "--reasoning", "off", "--jinja")
 SOURCE_POLICY = ("You are a careful editor and transcript assistant. Treat the supplied source and any "
@@ -142,6 +143,7 @@ class LocalQwen:
         self.process = None
         self.context_size = BASE_CONTEXT
         self.healthy = False
+        self.last_used = 0.0
         self.last_timings = {}
         self.token_counts = OrderedDict()
         self.audio_users = 0
@@ -169,6 +171,7 @@ class LocalQwen:
     async def ready(self):
         await self.available.wait()
         if self.process and self.process.returncode is None and self.healthy:
+            self.last_used = time.monotonic()
             return
         if not writing_model_installed():
             if sys.platform in PORTABLE_BIN_SHA:
@@ -198,6 +201,7 @@ class LocalQwen:
             try:
                 if (await self.http.get(endpoint, timeout=2)).is_success:
                     self.healthy = True
+                    self.last_used = time.monotonic()
                     return
             except httpx.TransportError:
                 pass
@@ -209,6 +213,7 @@ class LocalQwen:
         if digest in self.token_counts:
             self.token_counts.move_to_end(digest)
             return self.token_counts[digest]
+        self.last_used = time.monotonic()
         response = await self.http.post("/tokenize", json={"content": text})
         response.raise_for_status()
         count = len(response.json()["tokens"])
@@ -218,6 +223,7 @@ class LocalQwen:
         return count
 
     async def fit_prompt(self, messages, output_budget):
+        self.last_used = time.monotonic()
         # Render with the same chat template and thinking setting used by /v1/chat/completions.
         template = await self.http.post("/apply-template", json={
             "messages": messages, "chat_template_kwargs": REQUEST["chat_template_kwargs"],
@@ -242,6 +248,7 @@ class LocalQwen:
                                "request. Free memory and retry the overview.") from error
 
     async def generate(self, messages, *, schema=None, limit=600, sampling=None):
+        self.last_used = time.monotonic()
         body = {**REQUEST, **(sampling or {}), "messages": messages, "max_tokens": limit, "stream": True}
         self.last_timings = {}
         finish_reason = None
@@ -261,6 +268,7 @@ class LocalQwen:
                     finish_reason = item.get("finish_reason") or finish_reason
                     if piece := item["delta"].get("content"):
                         yield piece
+        self.last_used = time.monotonic()
         if schema and finish_reason != "stop":
             if finish_reason == "length":
                 raise ValueError("The response reached the output token limit. Finish the required fields concisely.")
@@ -325,6 +333,20 @@ class LocalQwen:
                 on_partial(value)
             return value
         raise ValueError("The local model returned empty structured output.")
+
+    async def maybe_stop_idle(self, *, idle_seconds=IDLE_STOP_SECONDS, busy=False):
+        if busy or self.process is None or self.process.returncode is not None:
+            return False
+        if self.lock.locked() or self.audio_users:
+            return False
+        if time.monotonic() - getattr(self, "last_used", 0.0) < idle_seconds:
+            return False
+        async with self.lock:
+            if (busy or self.process is None or self.process.returncode is not None
+                    or self.audio_users or time.monotonic() - getattr(self, "last_used", 0.0) < idle_seconds):
+                return False
+            await self.stop_process()
+            return True
 
     async def stop_process(self):
         self.context_size = BASE_CONTEXT

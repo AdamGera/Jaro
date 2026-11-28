@@ -620,7 +620,7 @@ static BOOL JardMaintainEventTap(JardEventTap *tap, CGEventTapLocation location,
 }
 
 @interface JardSystemDictation () <AVAudioPlayerDelegate> {
-    JardEventTap _sessionTap, _physicalKeyTap, _modifierFilter;
+    JardEventTap _sessionTap, _physicalKeyTap, _modifierFilter, _annotationPointerTap;
     NSTimeInterval _physicalChordTimes[8];
     NSTimeInterval _modifierSidePress[4][2];
     NSUInteger _nextPhysicalChord;
@@ -700,6 +700,7 @@ static BOOL JardMaintainEventTap(JardEventTap *tap, CGEventTapLocation location,
 @property(nonatomic, strong) JardDictationStartCue *shortcutStartCue, *captureStartCue;
 @property(nonatomic) NSTimeInterval shortcutStartCueAt;
 @property(nonatomic, strong) NSTimer *monitor, *animation;
+@property(nonatomic) NSTimeInterval monitorInterval;
 @property(nonatomic, strong) JardSecureHotkeys *secureHotkeys;
 @property(nonatomic, strong) JardPhysicalModifiers *physicalModifiers;
 @property(nonatomic, copy) NSDictionary *outputScriptReview;
@@ -835,6 +836,7 @@ static NSString *browserHost(AXUIElementRef focus, NSTimeInterval deadline) {
 static CGEventRef dictationTap(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context);
 static CGEventRef dictationPhysicalKeyTap(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context);
 static CGEventRef dictationModifierTap(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context);
+static CGEventRef dictationPointerTap(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context);
 static CGEventFlags modifierFlag(CGKeyCode code);
 static CGEventFlags JardEventModifiers(CGEventRef event, CGKeyCode code);
 static NSTimeInterval JardShortcutEventTime(CGEventRef event, BOOL physical);
@@ -1630,12 +1632,30 @@ static BOOL JardPrivateHistoryFile(NSURL *url) {
     [self stageShortcutLayout:JardCurrentShortcutLayout()];
     [self refresh];
     self.nextPreferencesRead = NSProcessInfo.processInfo.systemUptime + 2;
+    [self scheduleMonitorIfNeeded];
+}
+
+- (BOOL)needsFastMonitor {
+    return self.hasActivity || self.annotationActive || self.annotationKeyDown || self.keyDown ||
+        self.suppressedKey || self.suppressedPaste || self.suppressedMeetingPaste || self.choosingShortcut ||
+        self.ignoredRelease >= 0 || self.cancelRelease >= 0 || self.accessibilityAskedAt > 0 ||
+        self.accessibilityReturnDeadline > 0 || self.listenerStartFailed || self.secureInput ||
+        (_sessionTap.port != NULL && !JardEventTapEnabled(&_sessionTap));
+}
+
+- (void)scheduleMonitorIfNeeded {
+    if (!self.workspace || self.closed) return;
+    BOOL fast = [self needsFastMonitor];
+    NSTimeInterval target = fast ? 0.25 : 1.0;
+    if (self.monitor && fabs(self.monitorInterval - target) < 0.01) return;
+    [self.monitor invalidate];
+    self.monitorInterval = target;
     __weak typeof(self) weakSelf = self;
-    self.monitor = [NSTimer timerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
+    self.monitor = [NSTimer timerWithTimeInterval:target repeats:YES block:^(NSTimer *timer) {
         [weakSelf checkSavedPreferences];
         [weakSelf refresh];
     }];
-    self.monitor.tolerance = 0.04;
+    self.monitor.tolerance = fast ? 0.04 : 0.25;
     [NSRunLoop.mainRunLoop addTimer:self.monitor forMode:NSRunLoopCommonModes];
 }
 
@@ -1665,6 +1685,7 @@ static BOOL JardPrivateHistoryFile(NSURL *url) {
         if (self.choosingShortcut && [self.shortcutTarget isEqual:@"annotate"] &&
             app.processIdentifier != NSProcessInfo.processInfo.processIdentifier) self.choosingShortcut = NO;
         [self rememberExternalApp:app];
+        if (self.workspace && !self.closed) [self refresh];
     }
 }
 
@@ -1826,9 +1847,24 @@ static NSString *annotationTerminalDirectory(AXUIElementRef element) {
         memset(_physicalChordTimes, 0, sizeof _physicalChordTimes);
 }
 
+- (void)updateAnnotationPointerTap:(BOOL)wanted {
+    if (!wanted) {
+        JardDetachEventTap(&_annotationPointerTap);
+        return;
+    }
+    CGEventMask mask = CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventLeftMouseDragged);
+    JardMaintainEventTap(&_annotationPointerTap, kCGSessionEventTap, kCGEventTapOptionListenOnly,
+        mask, dictationPointerTap, (__bridge void *)self, @"annotation pointer");
+}
+
+- (void)reenableAnnotationPointerTap {
+    if (self.annotationActive) JardEnableEventTap(&_annotationPointerTap);
+}
+
 - (void)removeTap {
     self.modifierClaimAt = 0;
     [self updatePhysicalKeyTap:NO];
+    [self updateAnnotationPointerTap:NO];
     BOOL attached = _sessionTap.port != NULL;
     JardDetachEventTap(&_sessionTap);
     if (!attached) return;
@@ -2027,8 +2063,7 @@ static NSString *annotationTerminalDirectory(AXUIElementRef element) {
     CGEventMask mask = CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) |
         CGEventMaskBit(kCGEventOtherMouseDown) | CGEventMaskBit(kCGEventOtherMouseUp) | CGEventMaskBit(kCGEventOtherMouseDragged) |
         CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventRightMouseUp) | CGEventMaskBit(kCGEventRightMouseDragged) |
-        CGEventMaskBit(kCGEventLeftMouseDown) | CGEventMaskBit(kCGEventScrollWheel) |
-        CGEventMaskBit(kCGEventMouseMoved) | CGEventMaskBit(kCGEventLeftMouseDragged);
+        CGEventMaskBit(kCGEventLeftMouseDown) | CGEventMaskBit(kCGEventScrollWheel);
     BOOL interrupted = JardMaintainEventTap(&_sessionTap, kCGSessionEventTap, kCGEventTapOptionDefault,
         mask, dictationTap, (__bridge void *)self, @"session keyboard");
     if (interrupted) [self interruptShortcutInput:kCGEventTapDisabledByUserInput];
@@ -2094,6 +2129,8 @@ static NSString *annotationTerminalDirectory(AXUIElementRef element) {
             [self act:jardShortcutCancel(&_shortcut)];
         }
     }
+    [self updateAnnotationPointerTap:available && self.annotationActive];
+    [self scheduleMonitorIfNeeded];
 }
 
 - (NSDictionary *)status {
@@ -5152,6 +5189,7 @@ static BOOL JardShortcutBindingsOverlap(JardShortcutBinding binding, JardShortcu
     JardEnableEventTap(&_sessionTap);
     JardEnableEventTap(&_modifierFilter);
     JardEnableEventTap(&_physicalKeyTap);
+    if (self.annotationActive) JardEnableEventTap(&_annotationPointerTap);
     _sessionTap.interruptionReported = _sessionTap.port && !JardEventTapEnabled(&_sessionTap);
     NSLog(@"macOS interrupted a Jaro event tap (location %u, event %u).", (unsigned)location, (unsigned)type);
     if (sessionGap) [self interruptShortcutInput:type];
@@ -6785,9 +6823,11 @@ static NSArray *JardProfileApplications(void) {
     self.secureHotkeys = nil;
     [self removeTap];
     JardDetachEventTap(&_modifierFilter);
+    JardDetachEventTap(&_annotationPointerTap);
     [self keepShortcutListenerAwake:NO];
     [self.monitor invalidate];
     self.monitor = nil;
+    self.monitorInterval = 0;
     [self hideHUD];
     [self.guide orderOut:nil];
     [self restoreClipboard];
@@ -6825,4 +6865,16 @@ static CGEventRef dictationModifierTap(CGEventTapProxy proxy, CGEventType type, 
             [owner eventTapDisabled:kCGAnnotatedSessionEventTap type:type];
         return [owner filterModifierClaim:event type:type] ? NULL : event;
     }
+}
+
+static CGEventRef dictationPointerTap(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *context) {
+    @autoreleasepool {
+        JardSystemDictation *owner = (__bridge JardSystemDictation *)context;
+        if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+            [owner reenableAnnotationPointerTap];
+        } else if ((type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged) && owner.annotationActive) {
+            [owner handleAnnotationEvent:type event:event chordFree:NO];
+        }
+    }
+    return event;
 }

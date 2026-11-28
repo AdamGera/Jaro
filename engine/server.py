@@ -62,7 +62,7 @@ from audio_file import (
 from live_preview import (
     CommitAction, LiveWindowPlanner, SkipAction, TentativeAction, finish_live_preview, read_wav_i16_slice, trim_boundary_overlap,
 )
-from rust_speech import RustSpeechClient, start_bundled_speech, stop_speech_process
+from rust_speech import RUMBLE_GGUF_NAME, RustSpeechClient, start_bundled_speech, stop_speech_process
 from insights import Insights
 from local_qwen import writing_model_installed
 from dictation_input import CleanupFailed, MIC_GAIN, StuPASECleanup, boost_microphone, replace_mixed_microphone
@@ -74,7 +74,7 @@ import windows_dictation_commands
 import workspace_drafts
 from rumble_model import (
     DIARIZATION_ID, DIARIZATION_REVISION, REVISION, LANGUAGES, MAX_SAMPLES, MODEL_ID, SAMPLE_RATE,
-    RumbleModel, diarization_installed, prepare_model,
+    RumbleModel, alignment_weights_installed, diarization_installed, prepare_model, speech_weights_installed,
 )
 
 from engine_lifecycle import (
@@ -95,8 +95,33 @@ LANGUAGE_OPTIONS = [
     for code, name in sorted(LANGUAGES.items(), key=lambda language: language[1])
 ]
 IDLE_CACHE_TRIM_SECONDS = 15.0
-IDLE_DIARIZER_UNLOAD_SECONDS = 300.0
+IDLE_DIARIZER_UNLOAD_SECONDS = 90.0
+IDLE_MODEL_UNLOAD_SECONDS = 90.0
 logger = logging.getLogger("uvicorn.error")
+
+
+def _relief_darwin_memory():
+    if sys.platform == "darwin":
+        with suppress(OSError, AttributeError):
+            import ctypes
+
+            ctypes.CDLL("/usr/lib/libSystem.B.dylib").malloc_zone_pressure_relief(None, 0)
+
+
+def _release_idle_memory():
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        mps = getattr(torch, "mps", None)
+        if mps is not None:
+            with suppress(Exception):
+                if getattr(getattr(torch, "backends", None), "mps", None) and torch.backends.mps.is_available():
+                    mps.synchronize()
+                    mps.empty_cache()
+    _relief_darwin_memory()
+    if sys.platform == "darwin":
+        with suppress(RuntimeError):
+            asyncio.get_running_loop().call_later(1.0, _relief_darwin_memory)
 
 
 class SpeechInference:
@@ -134,6 +159,14 @@ class SpeechInference:
             await self.release()
 
 
+def default_inference_device():
+    import torch
+    from rumble_model import speech_backend
+
+    device, _ = speech_backend(torch)
+    return device
+
+
 async def load_model(app: FastAPI):
     try:
         app.state.model = await asyncio.to_thread(RumbleModel)
@@ -141,9 +174,39 @@ async def load_model(app: FastAPI):
         logger.exception("Could not load Rumble.")
         app.state.status = "error"
     else:
+        app.state.model_last_used = time.monotonic()
         app.state.diarizer = None
         await load_speaker_tools(app.state)
         app.state.status = "ready"
+
+
+async def ensure_model(state):
+    model = getattr(state, "model", None)
+    if model is not None:
+        state.model_last_used = time.monotonic()
+        return model
+    if not getattr(state, "model_lazy", False):
+        return None
+    lock = getattr(state, "model_lock", None)
+    if lock is None:
+        lock = state.model_lock = asyncio.Lock()
+    async with lock:
+        model = getattr(state, "model", None)
+        if model is not None:
+            state.model_last_used = time.monotonic()
+            return model
+        if not getattr(state, "model_lazy", False):
+            return None
+        model = await asyncio.to_thread(RumbleModel)
+        if getattr(model, "aligner", None) is None:
+            try:
+                await run_in_threadpool(model.enable_alignment)
+            except Exception:
+                logger.exception("Word timing could not start. Run Setup Jaro to install alignment weights.")
+        state.model_last_used = time.monotonic()
+        state.model = model
+        await load_speaker_tools(state)
+        return state.model
 
 
 def diarization_ready(state):
@@ -154,7 +217,8 @@ async def ensure_diarizer(state):
     if state.diarizer is not None:
         state.diarizer_last_used = time.monotonic()
         return state.diarizer
-    if not getattr(state, "diarizer_lazy", False) or getattr(state, "model", None) is None:
+    if not getattr(state, "diarizer_lazy", False) or (
+            getattr(state, "model", None) is None and not getattr(state, "model_lazy", False)):
         return None
     lock = getattr(state, "diarizer_lock", None)
     if lock is None:
@@ -163,12 +227,14 @@ async def ensure_diarizer(state):
         if state.diarizer is not None:
             state.diarizer_last_used = time.monotonic()
             return state.diarizer
-        if not getattr(state, "diarizer_lazy", False) or getattr(state, "model", None) is None:
+        if not getattr(state, "diarizer_lazy", False) or (
+                getattr(state, "model", None) is None and not getattr(state, "model_lazy", False)):
             return None
         try:
             from diarization import Diarizer
 
-            state.diarizer = await run_in_threadpool(Diarizer, state.model.device)
+            device = state.model.device if state.model is not None else await run_in_threadpool(default_inference_device)
+            state.diarizer = await run_in_threadpool(Diarizer, device)
         except Exception:
             state.diarizer_lazy = False
             logger.exception("Speaker labeling could not start. Run Setup Jaro to install its models.")
@@ -182,7 +248,7 @@ async def load_speaker_tools(state):
         state.diarizer_lazy = diarization_installed()
         if not state.diarizer_lazy:
             logger.info("Speaker labeling models are not installed yet.")
-    if state.model.aligner is None:
+    if getattr(state, "model", None) is not None and state.model.aligner is None:
         try:
             await run_in_threadpool(state.model.enable_alignment)
         except Exception:
@@ -190,7 +256,11 @@ async def load_speaker_tools(state):
 
 
 def additional_models_ready(state):
-    return diarization_ready(state) and state.model.aligner is not None and writing_model_installed()
+    model = getattr(state, "model", None)
+    aligner_ready = (model is not None and model.aligner is not None) or (
+        bool(getattr(state, "model_lazy", False)) and alignment_weights_installed()
+    )
+    return diarization_ready(state) and aligner_ready and writing_model_installed()
 
 
 def _trim_device_cache(state):
@@ -242,10 +312,38 @@ async def maybe_unload_idle_diarizer(state):
         if state.diarizer is None or getattr(state, "live_speakers", None) or getattr(state, "jobs", None):
             return
         state.diarizer = None
-        gc.collect()
-        release = getattr(getattr(state, "model", None), "release_device_cache", None)
-        if callable(release):
-            release()
+        _release_idle_memory()
+
+
+async def maybe_unload_idle_model(state):
+    if (getattr(state, "model", None) is None or not getattr(state, "model_lazy", False)
+            or rust_speech_client(state) is None or getattr(state, "draining", False)):
+        return
+    if (getattr(state, "jobs", None) or getattr(state, "submitting", None) or getattr(state, "live_speakers", None)
+            or getattr(state, "portable_recording", None) or getattr(state, "diarizer", None) is not None):
+        return
+    inference = getattr(state, "inference", None)
+    if inference is not None and (inference.active or inference.waiting_dictation):
+        return
+    if time.monotonic() - getattr(state, "model_last_used", 0.0) < IDLE_MODEL_UNLOAD_SECONDS:
+        return
+    lock = getattr(state, "model_lock", None)
+    if lock is None or lock.locked():
+        return
+    async with lock:
+        if (getattr(state, "model", None) is None or getattr(state, "jobs", None)
+                or getattr(state, "submitting", None) or getattr(state, "live_speakers", None)
+                or getattr(state, "portable_recording", None) or getattr(state, "diarizer", None) is not None):
+            return
+        if inference is not None and (inference.active or inference.waiting_dictation):
+            return
+        if time.monotonic() - getattr(state, "model_last_used", 0.0) < IDLE_MODEL_UNLOAD_SECONDS:
+            return
+        if getattr(state.model, "aligner", None) is not None:
+            state.model.aligner = None
+        state.model = None
+        _release_idle_memory()
+        logger.info("Unloaded idle PyTorch speech model to reclaim memory.")
 
 
 async def _run_prewarm(state):
@@ -316,10 +414,34 @@ def schedule_prewarm(state) -> bool:
     return True
 
 
+def bundled_speech_available_locally(state) -> bool:
+    if rust_speech_client(state) is not None:
+        return True
+    resources = Path(__file__).resolve().parents[1]
+    binary = resources.parent / "Helpers/jaro-speech"
+    library = getattr(state, "library", None)
+    if not binary.is_file() or library is None:
+        return False
+    return (library.root / "speech-models" / RUMBLE_GGUF_NAME).is_file()
+
+
 async def load_speech(app):
     app.state.status = "loading"
+    state = app.state
+    if not getattr(state, "portable_workspace", False) and bundled_speech_available_locally(state):
+        await load_bundled_speech(state)
+        if rust_speech_client(state) is not None and await asyncio.to_thread(speech_weights_installed):
+            state.model = None
+            state.model_lazy = True
+            state.diarizer = None
+            state.diarizer_lazy = diarization_installed()
+            state.status = "ready"
+            logger.info("Deferring PyTorch speech model load while bundled Rust dictation is active.")
+            return
     async with app.state.insights.model.audio_priority():
         await load_model(app)
+    if rust_speech_client(state) is not None and not getattr(state, "portable_workspace", False):
+        state.model_lazy = True
 
 
 async def start_workspace_speech(app):
@@ -436,6 +558,8 @@ async def load_bundled_speech(state):
         bundled = await start_bundled_speech(Path(__file__).resolve().parents[1], state.library.root)
         if bundled:
             state.rust_speech, state.rust_speech_process = bundled
+            if not getattr(state, "portable_workspace", False):
+                state.model_lazy = True
             logger.info("Bundled Rust dictation ready with Rumble2 Flash.")
     except (OSError, ValueError, RuntimeError, TimeoutError):
         logger.warning("Bundled Rust speech could not start. Dictation will use the local model.", exc_info=True)
@@ -445,6 +569,10 @@ async def load_bundled_speech(state):
 async def lifespan(app: FastAPI):
     app.state.status = "loading"
     app.state.inference = SpeechInference()
+    app.state.model = None
+    app.state.model_lazy = False
+    app.state.model_lock = asyncio.Lock()
+    app.state.model_last_used = 0.0
     app.state.diarizer = None
     app.state.diarizer_lazy = False
     app.state.diarizer_lock = asyncio.Lock()
@@ -678,7 +806,8 @@ async def lifespan(app: FastAPI):
                     logger.warning("Could not start the Linux desktop command listener.", exc_info=True)
             if state.portable_dictation is not None:
                 shortcut_restore = asyncio.create_task(restore_portable_shortcut(state))
-            speech_startup = asyncio.create_task(load_bundled_speech(state))
+            if portable or not bundled_speech_available_locally(state):
+                speech_startup = asyncio.create_task(load_bundled_speech(state))
             yield
         finally:
             if command_record := state.windows_dictation_control:
@@ -762,7 +891,7 @@ async def resume_annotation_routes(panel):
 async def watch_retention(app):
     next_expiry = 0
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(15)
         state = app.state
         now = time.monotonic()
         if now >= next_expiry and not state.draining:
@@ -772,12 +901,18 @@ async def watch_retention(app):
                 and (state.annotation_expiry is None or state.annotation_expiry.done())):
             state.annotation_expiry_due = now + 3600
             state.annotation_expiry = start_job(state, sweep_annotation_retention(state))
+        for key, (used, _) in list(getattr(state, "live_speakers", {}).items()):
+            if now - used > 120:
+                state.live_speakers.pop(key, None)
         await maybe_unload_idle_diarizer(state)
+        await maybe_unload_idle_model(state)
+        if insights := getattr(state, "insights", None):
+            await insights.model.maybe_stop_idle(busy=bool(insights.active_job or insights.chat_count))
 
 
 async def watch_idle(app):
     while True:
-        await asyncio.sleep(5)
+        await asyncio.sleep(10)
         state = app.state
         busy = (state.jobs or state.submitting or state.sdk_pending or getattr(state, "screenshot_pending", False)
                 or state.insights.active_job or state.insights.chat_count
@@ -2748,13 +2883,15 @@ async def decode_pcm(state, pcm: bytes, languages, speakers=None, offset=0, live
                      timed_output=False, dictation=False, measure_inference=False, screen_nonspeech=False,
                      speech_prefix_samples=None):
     queued_at = time.monotonic_ns() if measure_inference else None
+    model = await ensure_model(state)
+    if model is None:
+        raise RuntimeError("The local model is unavailable.")
 
     def inference():
         queue_ns = time.monotonic_ns() - queued_at if queued_at is not None else None
         if live and speakers:
             speakers.push(pcm, offset)
             state.diarizer_last_used = time.monotonic()
-        model = state.model
         if (screen_nonspeech and getattr(state, "sdk_embedded", False)
                 and not getattr(state, "speech_screen_prepared", False)):
             state.speech_screen_prepared = True
@@ -2788,6 +2925,7 @@ async def decode_pcm(state, pcm: bytes, languages, speakers=None, offset=0, live
             logger.warning("Retrying ASR with a dynamic cache after a memory error at %.2f seconds.", offset / SAMPLE_RATE)
             recognized = recognize()
         elapsed = time.monotonic_ns() - started if started is not None else None
+        state.model_last_used = time.monotonic()
         text, language, words = recognized
         duration = len(pcm) / (4 * SAMPLE_RATE)
         segments, word_times = speakers.label(
@@ -5748,6 +5886,8 @@ def main():
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    if sys.platform == "darwin":
+        os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.0")
     if args.embedded:
         from sdk_embedded import embedded_installation_lock, run_embedded
 

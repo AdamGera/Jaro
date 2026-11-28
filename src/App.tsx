@@ -245,6 +245,13 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
     const controller = new AbortController()
     let revision: string | undefined
     let checking = false
+    let timer: number | undefined
+    const schedule = () => {
+      window.clearTimeout(timer)
+      if (controller.signal.aborted || document.hidden) return
+      const delay = document.hasFocus() ? 2500 : 12_000
+      timer = window.setTimeout(() => void check(), delay)
+    }
     async function check() {
       if (document.hidden || checking) return
       checking = true
@@ -256,15 +263,28 @@ function Workspace({ onQuit }: { onQuit: () => void }) {
         revision = next
         window.dispatchEvent(new Event("jaro-sessions-changed"))
       } catch { /* Try again while the workspace is visible. */ }
-      finally { checking = false }
+      finally {
+        checking = false
+        schedule()
+      }
+    }
+    const resume = () => {
+      if (document.hidden) {
+        window.clearTimeout(timer)
+        return
+      }
+      void check()
     }
     void check()
-    const timer = window.setInterval(check, 1500)
-    document.addEventListener("visibilitychange", check)
+    window.addEventListener("focus", resume)
+    window.addEventListener("blur", schedule)
+    document.addEventListener("visibilitychange", resume)
     return () => {
       controller.abort()
-      window.clearInterval(timer)
-      document.removeEventListener("visibilitychange", check)
+      window.clearTimeout(timer)
+      window.removeEventListener("focus", resume)
+      window.removeEventListener("blur", schedule)
+      document.removeEventListener("visibilitychange", resume)
     }
   }, [])
 

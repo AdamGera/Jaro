@@ -60,6 +60,7 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *reminded, *calendarSnooze;
 @property(nonatomic, strong) NSDate *reminderExpires;
 @property(nonatomic, strong) NSTimer *timer;
+@property(nonatomic) NSTimeInterval timerInterval;
 @property(nonatomic, strong) JardCall *offered, *activeCall;
 @property(nonatomic) BOOL offerChoicesOpen;
 @property(nonatomic) BOOL offerAllowsAutomaticRecording;
@@ -239,13 +240,28 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
     if (self.changed) self.changed([self status]);
 }
 
+- (BOOL)needsFastPoll {
+    return self.busy || self.offered != nil || self.completionSession != nil || self.waitingForRecoveredMeeting;
+}
+
+- (void)scheduleTimerIfNeeded {
+    if (self.managed || !self.workspace || self.closed) return;
+    BOOL fast = [self needsFastPoll];
+    NSTimeInterval target = fast ? 1.0 : 1.5;
+    if (self.timer && fabs(self.timerInterval - target) < 0.01) return;
+    [self.timer invalidate];
+    self.timerInterval = target;
+    __weak typeof(self) weak = self;
+    self.timer = [NSTimer timerWithTimeInterval:target repeats:YES block:^(NSTimer *timer) { [weak poll]; }];
+    self.timer.tolerance = fast ? 0.1 : 0.25;
+    [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
+}
+
 - (void)workspaceReady {
     if (self.workspace) return;
     self.workspace = YES;
     if (!self.managed) {
-        __weak typeof(self) weak = self;
-        self.timer = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) { [weak poll]; }];
-        [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
+        [self scheduleTimerIfNeeded];
         [self.calendar refreshAt:NSDate.date];
         [self scanRecovery:NO];
     }
@@ -286,6 +302,7 @@ static CGFloat meetingClockWidth(NSTextField *caption) {
 
 - (void)poll {
     if (self.managed || !self.workspace || self.closed) return;
+    [self scheduleTimerIfNeeded];
     [self updateCompletionAt:NSProcessInfo.processInfo.systemUptime pointer:NSEvent.mouseLocation];
     if (self.waitingForRecoveredMeeting && NSProcessInfo.processInfo.systemUptime >= self.nextLatestCheck)
         [self refreshLatestMeeting];
@@ -2045,6 +2062,7 @@ static BOOL verifiedCall(JardCall *target, NSArray<JardCall *> *observations) {
     [self.calendar shutdown];
     [self.timer invalidate];
     self.timer = nil;
+    self.timerInterval = 0;
     [self stopRecordingMeter];
     [self.panel orderOut:nil];
     [JardOverlayDock.shared releaseSurface:JardOverlaySurfaceMeeting];

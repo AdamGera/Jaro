@@ -100,13 +100,16 @@ async fn main() -> Result<()> {
                     .filter(|s| !s.is_empty()),
             };
 
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             if ready_file.is_some() {
                 anyhow::ensure!(host.is_loopback() && token.as_ref().is_some_and(|value| !value.is_empty()),
                     "A managed speech process needs a loopback address and a token.");
-                std::thread::spawn(|| {
+                std::thread::spawn(move || {
                     let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
-                    std::process::exit(0);
+                    let _ = shutdown_tx.send(());
                 });
+            } else {
+                drop(shutdown_tx);
             }
             let engine = Arc::new(SpeechEngine::start(EngineConfig {
                 model_path: model,
@@ -115,7 +118,7 @@ async fn main() -> Result<()> {
                 idle_unload_secs,
             })?);
             let addr = SocketAddr::new(host, port);
-            server::serve(addr, engine, token, ready_file).await
+            server::serve(addr, engine, token, ready_file, shutdown_rx).await
         }
         Commands::Transcribe {
             model,

@@ -2,6 +2,7 @@ import asyncio
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import httpx
 import unittest
@@ -154,3 +155,30 @@ class FullContextTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "full transcript"):
             await model.fit_prompt(messages, 1000)
         model.ready.assert_awaited_once()
+
+
+class IdleStopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_maybe_stop_idle_stops_only_when_idle_and_unbusy(self):
+        model = object.__new__(LocalQwen)
+        model.lock = asyncio.Lock()
+        model.process = SimpleNamespace(returncode=None)
+        model.audio_users = 0
+        model.last_used = 10.0
+        model.stop_process = AsyncMock()
+
+        with patch("local_qwen.time.monotonic", return_value=200.0):
+            self.assertFalse(await model.maybe_stop_idle(idle_seconds=300.0))
+        model.stop_process.assert_not_awaited()
+
+        with patch("local_qwen.time.monotonic", return_value=400.0):
+            self.assertFalse(await model.maybe_stop_idle(idle_seconds=300.0, busy=True))
+        model.stop_process.assert_not_awaited()
+
+        async with model.lock:
+            with patch("local_qwen.time.monotonic", return_value=400.0):
+                self.assertFalse(await model.maybe_stop_idle(idle_seconds=300.0))
+        model.stop_process.assert_not_awaited()
+
+        with patch("local_qwen.time.monotonic", return_value=400.0):
+            self.assertTrue(await model.maybe_stop_idle(idle_seconds=300.0))
+        model.stop_process.assert_awaited_once()

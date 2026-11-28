@@ -3,7 +3,7 @@
   "name": "jaro",
   "display_name": "Jaro",
   "description": "Local dictation, meeting recordings, and transcripts on your Mac.",
-  "version": "0.0.13",
+  "version": "0.0.14",
   "platforms": [
     "macos"
   ],

@@ -27,6 +27,19 @@ def diarization_installed():
     return all((DIARIZATION_DIR / name).is_file() for name in DIARIZATION_FILES)
 
 
+def speech_weights_installed():
+    if not all((MODEL_DIR / name).is_file() for name in MODEL_FILES):
+        return False
+    try:
+        return (MODEL_DIR / "revision").read_text().strip() == REVISION
+    except OSError:
+        return False
+
+
+def alignment_weights_installed():
+    return (MODEL_DIR / "ctc/ctc_head.safetensors").is_file() and (MODEL_DIR / "ctc/ctc_vocab.json").is_file()
+
+
 def vocabulary_echo(text, vocabulary):
     if len(vocabulary) < 2:
         return False

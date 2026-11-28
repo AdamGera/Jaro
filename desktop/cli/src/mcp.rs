@@ -489,7 +489,7 @@ pub fn reply(library: &SessionStore, root: &Path, incoming: &Value) -> Option<Va
             json!({
                 "protocolVersion": chosen,
                 "capabilities": {"tools": {}, "resources": {}},
-                "serverInfo": {"name": "jaro", "version": "0.0.13"},
+                "serverInfo": {"name": "jaro", "version": "0.0.14"},
                 "instructions": INSTRUCTIONS,
             })
         }

@@ -279,6 +279,110 @@ class RustSpeechTests(unittest.TestCase):
                 self.assertIs(call_args.args[3], fake_speakers)
                 self.assertTrue(call_args.kwargs["timed_output"])
 
+    def test_load_speech_defers_pytorch_when_bundled_rust_speech_is_ready(self):
+        async def run():
+            from fastapi import FastAPI
+
+            app = FastAPI()
+            app.state.status = "loading"
+            app.state.model = None
+            app.state.model_lazy = False
+            app.state.model_lock = asyncio.Lock()
+            app.state.model_last_used = 0.0
+            app.state.diarizer = None
+            app.state.diarizer_lazy = False
+            app.state.rust_speech = SimpleNamespace(prewarm=AsyncMock())
+            app.state.rust_speech_checked = True
+            app.state.insights = SimpleNamespace(model=SimpleNamespace(audio_priority=AsyncMock()))
+
+            with (
+                patch.object(server, "bundled_speech_available_locally", return_value=True),
+                patch.object(server, "speech_weights_installed", return_value=True),
+                patch.object(server, "diarization_installed", return_value=True),
+                patch.object(server, "load_model", AsyncMock()) as eager_load,
+            ):
+                await server.load_speech(app)
+
+            eager_load.assert_not_awaited()
+            self.assertEqual(app.state.status, "ready")
+            self.assertIsNone(app.state.model)
+            self.assertTrue(app.state.model_lazy)
+            self.assertTrue(app.state.diarizer_lazy)
+
+        asyncio.run(run())
+
+    def test_lazy_model_loads_on_demand_and_unloads_when_idle(self):
+        import weakref
+
+        async def run():
+            released_while_dead = []
+            model_ref = None
+
+            class FakeModel:
+                device = "mps"
+                aligner = None
+
+                def enable_alignment(self):
+                    self.aligner = object()
+
+                def release_device_cache(self):
+                    pass
+
+            state = SimpleNamespace(
+                model=None,
+                model_lazy=True,
+                model_lock=asyncio.Lock(),
+                model_last_used=0.0,
+                diarizer=None,
+                diarizer_lazy=False,
+                rust_speech=object(),
+                rust_speech_checked=True,
+                draining=False,
+                jobs=set(),
+                submitting=set(),
+                live_speakers={},
+                portable_recording=None,
+                inference=server.SpeechInference(),
+            )
+
+            with (
+                patch.object(server, "RumbleModel", FakeModel),
+                patch.object(server, "diarization_installed", return_value=False),
+                patch.object(server.time, "monotonic", return_value=100.0),
+            ):
+                loaded = await server.ensure_model(state)
+                self.assertIsInstance(loaded, FakeModel)
+                self.assertIsNotNone(loaded.aligner)
+                self.assertEqual(state.model_last_used, 100.0)
+                model_ref = weakref.ref(loaded)
+                del loaded
+
+            def check_release():
+                released_while_dead.append(model_ref() is None)
+
+            # Too soon -> stays loaded
+            with patch.object(server.time, "monotonic", return_value=150.0):
+                await server.maybe_unload_idle_model(state)
+            self.assertIsNotNone(state.model)
+
+            # Diarizer still active -> stays loaded
+            state.diarizer = object()
+            with patch.object(server.time, "monotonic", return_value=500.0):
+                await server.maybe_unload_idle_model(state)
+            self.assertIsNotNone(state.model)
+            state.diarizer = None
+
+            # Idle past threshold -> model is garbage-collected BEFORE MPS cache release runs
+            with (
+                patch.object(server.time, "monotonic", return_value=500.0),
+                patch.object(server, "_release_idle_memory", side_effect=check_release),
+            ):
+                await server.maybe_unload_idle_model(state)
+            self.assertIsNone(state.model)
+            self.assertEqual(released_while_dead, [True])
+
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()
